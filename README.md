@@ -12,8 +12,7 @@ The first study is:
 - question: does Ponytail help or hurt DeepSWE reward, and does it use more or
   fewer tokens?
 
-This is intentionally **not leaderboard-comparable**. The point is to measure
-Will's pi-style harness choices, not mini-swe-agent.
+This is intentionally **not directly DeepSWE leaderboard-comparable** because of the harness change from mini-swe-agent to Pi. The point is to evaluate the real world effect of pi harness extensions and skills because that is what i actually use for development work. 
 
 ## Architecture
 
