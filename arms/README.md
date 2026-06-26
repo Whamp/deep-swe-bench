@@ -20,25 +20,27 @@ study compares.
 | `skills/`           | Each subdir passed to pi via `--skill` (one per entry). The baseline arm passes none.   |
 | `pi-flags`          | Extra raw flags appended to the `pi` invocation (one argv per line). Optional.          |
 | `env`               | `KEY=VALUE` lines exported into the agent container env (e.g. `PONYTAIL_DEFAULT_MODE`). |
-| `settings.json`     | Copied to `/root/.pi/agent/settings.json` before Pi starts. Optional.                  |
-| `models.json`       | Copied to `/root/.pi/agent/models.json` before Pi starts. Optional.                    |
-| `advisor.json`      | Copied to `/root/.pi/agent/advisor.json` before Pi starts. Optional.                   |
+| `settings.json`     | Copied to `/root/.pi/agent/settings.json` before Pi starts and recorded in `result.json`. Optional. |
+| `models.json`       | Copied to `/root/.pi/agent/models.json` before Pi starts and recorded in `result.json`. Optional.   |
+| `advisor.json`      | Copied to `/root/.pi/agent/advisor.json` before Pi starts and recorded in `result.json`. Optional.  |
 
 ## Arms in this study
 
-- `baseline/` — stock pi, no skills, no extensions. The fair "no ponytail"
-  control. `--no-skills --no-extensions` guarantees the operator's globally
-  installed skills can never leak in (the contamination bug ponytail's own
-  agentic bench hit: a `SessionStart` hook secretly ran ponytail on every arm).
+- `baseline/` — stock pi, no skills, no discovered extensions. The fair "no
+  ponytail" control. It explicitly loads only the local-vLLM preserve-thinking
+  shim so local Qwen gets the same transport workaround as treatment arms;
+  `--no-skills --no-extensions` still blocks operator-global discovery.
 - `ponytail-full/` — ponytail skill loaded, level pinned to **full** (the
   documented default). This is the primary comparison.
 - `ponytail-lite/` — ponytail skill loaded, level pinned to **lite**.
 - `ponytail-ultra/` — ponytail skill loaded, level pinned to **ultra**.
 - `pi-advisor-glm52/` — stock executor plus the `pi-advisor` extension using
-  `zai/glm-5.2` as advisor.
-- `pi-observational-memory/` — stock executor plus only the
-  `pi-observational-memory` extension, using the session model for memory
-  workers and persisting extension debug/state under each cell's `pi-agent/`.
+  `zai/glm-5.2` as advisor via `ZAI_API_KEY`, with Pi retry settings enabled for
+  transient Z.AI 429s. It intentionally does not route GLM-5.2 through OpenRouter.
+- `pi-observational-memory/` — stock executor plus the symmetric local-vLLM
+  preserve-thinking shim and the `pi-observational-memory` extension. Memory
+  workers are pinned to the configured local Qwen model and debug/state persists
+  under each cell's `pi-agent/`.
 
 `skills/ponytail/` is a verbatim copy of the ponytail SKILL.md from
 https://github.com/DietrichGebert/ponytail so the study is self-contained and
