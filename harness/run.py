@@ -22,8 +22,10 @@ import argparse
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -35,6 +37,20 @@ import parse_usage  # noqa: E402
 
 DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-flash"
 DEFAULT_THINKING = "high"
+TRANSIENT_EXIT = 75
+TRANSIENT_MODEL_ERROR_PATTERNS = [
+    "you've hit your usage limit",
+    "you have hit your usage limit",
+    "usage limit",
+    "weekly limit",
+    "5-hour limit",
+    "try again at",
+    "rate limit exceeded",
+    "rate_limit_exceeded",
+    "too many requests",
+    "temporarily rate limited",
+    "429",
+]
 
 
 def sh(cmd: list[str], timeout: float | None = None, **kw) -> subprocess.CompletedProcess:
@@ -124,29 +140,77 @@ def load_arm(arm: str) -> dict:
             "settings_json": settings_json if settings_json.exists() else None}
 
 
+def openai_codex_auth_mount() -> tuple[list[str], str]:
+    auth = Path.home() / ".pi" / "agent" / "auth.json"
+    data = json.loads(auth.read_text())
+    if "openai-codex" not in data:
+        sys.exit(f"openai-codex OAuth entry not found in {auth}; run Pi Codex login first")
+    tmp = tempfile.mkdtemp(prefix="dsw-codex-auth-")
+    os.chmod(tmp, 0o700)
+    (Path(tmp) / "auth.json").write_text(json.dumps({"openai-codex": data["openai-codex"]}))
+    os.chmod(Path(tmp) / "auth.json", 0o600)
+    return ["-v", f"{tmp}:/codex-auth:ro"], tmp
+
+
+def needs_openrouter_key(model: str, arm_cfg: dict) -> bool:
+    if model.startswith("openrouter/"):
+        return True
+    for key in ("models_json", "settings_json"):
+        p = arm_cfg.get(key)
+        if p and "OPENROUTER_API_KEY" in Path(p).read_text():
+            return True
+    return False
+
+
+def transient_model_error(paths: list[Path]) -> str | None:
+    for p in paths:
+        if not p.exists():
+            continue
+        is_structured = p.suffix in (".jsonl", ".ndjson")
+        with p.open(errors="replace") as f:
+            for line in f:
+                probes = []
+                if is_structured:
+                    try:
+                        d = json.loads(line)
+                        msg = d.get("message") if isinstance(d.get("message"), dict) else d
+                        for obj in (d, msg, d.get("data") if isinstance(d.get("data"), dict) else None):
+                            if isinstance(obj, dict):
+                                for key in ("errorMessage", "error", "stopReason", "message"):
+                                    val = obj.get(key)
+                                    if val and not isinstance(val, (dict, list)):
+                                        probes.append(str(val))
+                    except Exception:
+                        pass
+                else:
+                    probes.append(line)
+                for probe in probes:
+                    low = probe.lower()
+                    if any(s in low for s in TRANSIENT_MODEL_ERROR_PATTERNS):
+                        return probe.strip()[:1000]
+    return None
+
+
 def pi_cmd(arm_cfg: dict, model: str, thinking: str, append_text: str) -> list[str]:
     cmd = ["pi", "-p", "@/task/instruction.md",
            "--model", model, "--thinking", thinking, "--mode", "json", "--offline",
            "--session-dir", "/out/session",
            "--append-system-prompt", append_text]
     flags = arm_cfg["pi_flags"]
-    has_explicit_extension = any(f in ("-e", "--extension") or f.startswith("--extension=") for f in flags)
 
-    # Baseline stays fully isolated. Extension arms must not get --no-extensions:
-    # that would defeat the point of testing a normal installed Pi extension.
+    # Keep discovery isolated; Pi still loads explicit -e/--extension paths with --no-extensions.
     if not arm_cfg["skill_dirs"]:
         cmd += ["--no-skills"]
     else:
         for s in arm_cfg["skill_dirs"]:
             cmd += ["--skill", f"/arm/skills/{s.name}"]
-    if not has_explicit_extension:
-        cmd += ["--no-extensions"]
+    cmd += ["--no-extensions"]
     cmd += flags
     return cmd
 
 
 def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str, rep: int,
-             agent_timeout: float, keep: bool) -> dict:
+             agent_timeout: float, keep: bool, pass_openai_codex_oauth: bool) -> dict:
     task = load_task(task_id)
     arm_cfg = load_arm(arm)
     ensure_env_image(task.env_image)
@@ -163,11 +227,19 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
 
     suffix = f"{arm}-{task_id}-r{rep}-{os.getpid()}"
     cname = f"dsw-{suffix}"
+    if model.startswith("openai-codex/") and not pass_openai_codex_oauth:
+        sys.exit("openai-codex models require --pass-openai-codex-oauth")
+
+    env_flag = []
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
+    if api_key:
+        env_flag += ["-e", f"OPENROUTER_API_KEY={api_key}"]
+    elif needs_openrouter_key(model, arm_cfg):
         sys.exit("OPENROUTER_API_KEY not set in environment")
 
-    env_flag = ["-e", f"OPENROUTER_API_KEY={api_key}"]
+    auth_mount, auth_tmp = ([], None)
+    if pass_openai_codex_oauth:
+        auth_mount, auth_tmp = openai_codex_auth_mount()
     # Optional advisor/secondary-model providers. Passing these symmetrically is
     # harmless; only arms with matching extensions/models use them.
     if os.environ.get("ZAI_API_KEY"):
@@ -186,16 +258,21 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
                 "-v", f"{arm_cfg['dir']}:/arm:ro",
                 # /logs mount = same as /out so pre_artifacts + verifier land on host
                 "-v", f"{cell}:/logs",
+                *auth_mount,
                 *env_flag, pi_image, "sleep", str(int(agent_timeout + 600))]
     r = sh(run_args)
     if r.returncode != 0:
+        if auth_tmp:
+            shutil.rmtree(auth_tmp, ignore_errors=True)
         sys.exit(f"[cell] docker run failed:\n{r.stderr[:800]}")
 
     started = time.time()
     status = {}
     try:
-        if arm_cfg.get("advisor_json") or arm_cfg.get("models_json") or arm_cfg.get("settings_json"):
+        if pass_openai_codex_oauth or arm_cfg.get("advisor_json") or arm_cfg.get("models_json") or arm_cfg.get("settings_json"):
             sh(["docker", "exec", cname, "mkdir", "-p", "/root/.pi/agent"])
+            if pass_openai_codex_oauth:
+                sh(["docker", "exec", cname, "cp", "/codex-auth/auth.json", "/root/.pi/agent/auth.json"])
             if arm_cfg.get("advisor_json"):
                 sh(["docker", "exec", cname, "cp", "/arm/advisor.json", "/root/.pi/agent/advisor.json"])
             if arm_cfg.get("models_json"):
@@ -220,6 +297,18 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
                     status["agent_timed_out"] = True
         status["agent_wall_s"] = round(time.time() - started, 1)
 
+        sh(["docker", "exec", cname, "bash", "-lc",
+            "if [ -d /root/.pi/agent/observational-memory ]; then "
+            "mkdir -p /out/pi-agent && cp -a /root/.pi/agent/observational-memory /out/pi-agent/; fi"])
+        transient_paths = [cell / "logs" / "pi.stderr.txt", cell / "pi.jsonl"]
+        transient_paths += list((cell / "pi-agent" / "observational-memory" / "debug").glob("*.ndjson"))
+        transient = transient_model_error(transient_paths)
+        if transient and status.get("agent_exit") != "timeout":
+            status["transient_model_error"] = transient
+            (cell / "transient_error.json").write_text(json.dumps(status, indent=2))
+            print(f"[pause] transient model error for {task_id}/{arm}#{rep}: {transient}", flush=True)
+            raise SystemExit(TRANSIENT_EXIT)
+
         # --- capture ALL work (committed or not) then extract the submission patch ---
         # Commit any uncommitted edits so a forgetful agent is not scored 0 by accident.
         for c in (["add", "-A"],
@@ -238,6 +327,8 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
             "mkdir -p /out/pi-agent && cp -a /root/.pi/agent/observational-memory /out/pi-agent/; fi"])
         if not keep:
             sh(["docker", "rm", "-f", cname])
+        if auth_tmp:
+            shutil.rmtree(auth_tmp, ignore_errors=True)
 
     # --- verify in a pristine, air-gapped container ---
     reward = {"reward": -1, "partial": 0.0}
@@ -257,10 +348,24 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
         status["verifier_exit"] = "skipped_empty_patch"
 
     usage = parse_usage.parse_stream(path=cell / "pi.jsonl")
+    arm_settings = None
+    if arm_cfg.get("settings_json"):
+        arm_settings = json.loads(Path(arm_cfg["settings_json"]).read_text())
+    arm_advisor = None
+    if arm_cfg.get("advisor_json"):
+        arm_advisor = json.loads(Path(arm_cfg["advisor_json"]).read_text())
+    arm_models = None
+    if arm_cfg.get("models_json"):
+        arm_models = json.loads(Path(arm_cfg["models_json"]).read_text())
 
     rec = result_record(
         task, arm, model, rep,
+        arm_pi_flags=arm_cfg["pi_flags"],
+        arm_settings=arm_settings,
+        arm_advisor=arm_advisor,
+        arm_models=arm_models,
         thinking_level=thinking,
+        openai_codex_oauth_passed=pass_openai_codex_oauth,
         reward_binary=reward.get("reward", -1),
         reward_partial=float(reward.get("partial", 0.0)),
         f2p=reward.get("f2p"), p2p=reward.get("p2p"),
@@ -296,12 +401,15 @@ def main():
     ap.add_argument("--agent-timeout", type=float, default=None,
                     help="override task's agent timeout (s). default: task.toml")
     ap.add_argument("--keep", action="store_true", help="keep the env container for debugging")
+    ap.add_argument("--pass-openai-codex-oauth", action="store_true",
+                    help="copy only the host openai-codex OAuth entry into the agent container")
     args = ap.parse_args()
 
     task = load_task(args.task)
     to = args.agent_timeout or task.agent_timeout_s
     rec = run_cell(args.arm, args.task, model=args.model, thinking=args.thinking, run_name=args.run_name,
-                   rep=args.rep, agent_timeout=to, keep=args.keep)
+                   rep=args.rep, agent_timeout=to, keep=args.keep,
+                   pass_openai_codex_oauth=args.pass_openai_codex_oauth)
     print(json.dumps({"ok": True, "reward_partial": rec["reward_partial"],
                       "total_tokens": rec["total_tokens"]}))
 

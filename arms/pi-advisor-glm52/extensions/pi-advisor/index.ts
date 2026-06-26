@@ -51,6 +51,17 @@ interface AdvisorConfig {
 interface AdvisorUsage {
 	inputTokens: number;
 	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	totalTokens: number;
+	cost: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		total: number;
+	};
+	provider: string;
 	model: string;
 }
 
@@ -349,9 +360,21 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 				// If no text but thinking exists, use thinking as fallback
 				const finalText = adviceText || (thinkingText ? `(thinking)\n${thinkingText}` : "");
 
+				const responseUsage = response.usage;
 				const usage: AdvisorUsage = {
-					inputTokens: response.usage?.input ?? 0,
-					outputTokens: response.usage?.output ?? 0,
+					inputTokens: responseUsage?.input ?? 0,
+					outputTokens: responseUsage?.output ?? 0,
+					cacheReadTokens: responseUsage?.cacheRead ?? 0,
+					cacheWriteTokens: responseUsage?.cacheWrite ?? 0,
+					totalTokens: responseUsage?.totalTokens ?? ((responseUsage?.input ?? 0) + (responseUsage?.output ?? 0) + (responseUsage?.cacheRead ?? 0) + (responseUsage?.cacheWrite ?? 0)),
+					cost: {
+						input: responseUsage?.cost?.input ?? 0,
+						output: responseUsage?.cost?.output ?? 0,
+						cacheRead: responseUsage?.cost?.cacheRead ?? 0,
+						cacheWrite: responseUsage?.cost?.cacheWrite ?? 0,
+						total: responseUsage?.cost?.total ?? 0,
+					},
+					provider: config.provider,
 					model: config.model,
 				};
 

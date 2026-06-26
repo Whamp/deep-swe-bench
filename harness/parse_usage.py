@@ -40,7 +40,10 @@ def parse_stream(*, path: Path | None = None, text: str | None = None) -> dict:
            "cache_write_tokens": 0, "cost_usd": 0.0, "completions": 0,
            "turns": 0, "tool_calls": 0,
            "advisor_calls": 0, "advisor_input_tokens": 0,
-           "advisor_output_tokens": 0}
+           "advisor_output_tokens": 0, "advisor_cache_read_tokens": 0,
+           "advisor_cache_write_tokens": 0, "advisor_reported_total_tokens": 0,
+           "advisor_cost_usd": 0.0,
+           "advisor_provider": None, "advisor_model": None}
 
     # Each assistant message appears in several events with growing content; its
     # usage is final on the LAST event that mentions it (message_end/turn_end).
@@ -61,6 +64,15 @@ def parse_stream(*, path: Path | None = None, text: str | None = None) -> dict:
             acc["advisor_calls"] += 1
             acc["advisor_input_tokens"] += int(usage.get("inputTokens") or 0)
             acc["advisor_output_tokens"] += int(usage.get("outputTokens") or 0)
+            cache_read = int(usage.get("cacheReadTokens") or 0)
+            cache_write = int(usage.get("cacheWriteTokens") or 0)
+            component_total = int(usage.get("inputTokens") or 0) + int(usage.get("outputTokens") or 0) + cache_read + cache_write
+            acc["advisor_cache_read_tokens"] += cache_read
+            acc["advisor_cache_write_tokens"] += cache_write
+            acc["advisor_reported_total_tokens"] += int(usage.get("totalTokens") or component_total)
+            acc["advisor_cost_usd"] += float((usage.get("cost") or {}).get("total") or 0.0)
+            acc["advisor_provider"] = usage.get("provider") or acc["advisor_provider"]
+            acc["advisor_model"] = usage.get("model") or acc["advisor_model"]
         if t == "turn_start":
             acc["turns"] += 1
         msg = ev.get("message") or {}
@@ -85,6 +97,12 @@ def parse_stream(*, path: Path | None = None, text: str | None = None) -> dict:
         acc2["advisor_calls"] = acc["advisor_calls"]
         acc2["advisor_input_tokens"] = acc["advisor_input_tokens"]
         acc2["advisor_output_tokens"] = acc["advisor_output_tokens"]
+        acc2["advisor_cache_read_tokens"] = acc["advisor_cache_read_tokens"]
+        acc2["advisor_cache_write_tokens"] = acc["advisor_cache_write_tokens"]
+        acc2["advisor_reported_total_tokens"] = acc["advisor_reported_total_tokens"]
+        acc2["advisor_cost_usd"] = acc["advisor_cost_usd"]
+        acc2["advisor_provider"] = acc["advisor_provider"]
+        acc2["advisor_model"] = acc["advisor_model"]
         for line in raw.splitlines():
             line = line.strip()
             if not line.startswith("{"):
@@ -105,9 +123,13 @@ def parse_stream(*, path: Path | None = None, text: str | None = None) -> dict:
 
     acc["total_tokens"] = (acc["input_tokens"] + acc["output_tokens"]
                            + acc["cache_read_tokens"] + acc["cache_write_tokens"])
-    acc["advisor_total_tokens"] = acc["advisor_input_tokens"] + acc["advisor_output_tokens"]
+    component_advisor_total = (acc["advisor_input_tokens"] + acc["advisor_output_tokens"]
+                               + acc["advisor_cache_read_tokens"] + acc["advisor_cache_write_tokens"])
+    acc["advisor_total_tokens"] = acc["advisor_reported_total_tokens"] or component_advisor_total
     acc["combined_total_tokens"] = acc["total_tokens"] + acc["advisor_total_tokens"]
     acc["cost_usd"] = round(acc["cost_usd"], 6)
+    acc["advisor_cost_usd"] = round(acc["advisor_cost_usd"], 6)
+    acc["combined_cost_usd"] = round(acc["cost_usd"] + acc["advisor_cost_usd"], 6)
     return acc
 
 
