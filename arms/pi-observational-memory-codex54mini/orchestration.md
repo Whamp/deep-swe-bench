@@ -1,0 +1,1 @@
+Observational memory is enabled for this run. Work normally as a competent engineer; do not change your behavior just because memory is present. Memory workers use openai-codex/gpt-5.4-mini via the benchmark OAuth pass-through.
