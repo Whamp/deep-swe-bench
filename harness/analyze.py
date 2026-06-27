@@ -22,22 +22,14 @@ except Exception:  # analysis still prints summaries without scipy
 REPO = Path(__file__).resolve().parents[1]
 
 
-def load_results(run: str) -> list[dict]:
-    root = REPO / "runs" / run
+def load_results(model: str, thinking: str, configs: list[str]) -> list[dict]:
+    mleaf = model.rstrip("/").split("/")[-1]
+    root = REPO / "results" / mleaf / thinking
     rows = []
-    # prefer result.json files so resumed/skipped cells are included even if results.jsonl got duplicated
-    for p in sorted(root.glob("*/*/rep*/result.json")):
-        try:
-            rows.append(json.loads(p.read_text()))
-        except Exception:
-            pass
-    if rows:
-        return rows
-    jf = root / "results.jsonl"
-    if jf.exists():
-        for ln in jf.read_text().splitlines():
+    for config in configs:
+        for p in sorted((root / config).glob("*/rep*/result.json")):
             try:
-                rows.append(json.loads(ln))
+                rows.append(json.loads(p.read_text()))
             except Exception:
                 pass
     return rows
@@ -74,27 +66,29 @@ def holm(pvals: list[tuple[str, float]]) -> dict[str, float]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", required=True)
-    ap.add_argument("--arms", required=True, help="baseline,ponytail-full")
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--thinking", required=True)
+    ap.add_argument("--comparison", required=True, help="label for the output analysis")
+    ap.add_argument("--configs", required=True, help="baseline,ponytail-full")
     args = ap.parse_args()
-    arms = [a.strip() for a in args.arms.split(",")]
-    baseline = arms[0]
-    rows = [r for r in load_results(args.run) if r.get("arm") in arms]
+    configs = [a.strip() for a in args.configs.split(",")]
+    baseline = configs[0]
+    rows = [r for r in load_results(args.model, args.thinking, configs) if r.get("config") in configs]
     if not rows:
-        raise SystemExit(f"no results found for run {args.run}")
+        raise SystemExit(f"no results found for {args.model}/{args.thinking}/{args.configs}")
 
-    print(f"# run {args.run}\n")
-    print("## arm summary")
-    print("arm,n,mean_partial,median_tokens,median_advisor_tokens,median_combined_tokens,median_cost,median_advisor_cost,median_combined_cost,median_patch_bytes,solved,solved_rate,timeout_rate")
-    by_arm = defaultdict(list)
+    print(f"# comparison {args.comparison} ({args.model} / {args.thinking})\n")
+    print("## config summary")
+    print("config,n,mean_partial,median_tokens,median_advisor_tokens,median_combined_tokens,median_cost,median_advisor_cost,median_combined_cost,median_patch_bytes,solved,solved_rate,timeout_rate")
+    by_config = defaultdict(list)
     for r in rows:
-        by_arm[r["arm"]].append(r)
-    for arm in arms:
-        rs = by_arm[arm]
+        by_config[r["config"]].append(r)
+    for config in configs:
+        rs = by_config[config]
         if not rs:
             continue
         print(",".join([
-            arm,
+            config,
             str(len(rs)),
             fmt(mean([r.get("reward_partial") for r in rs])),
             fmt(median([r.get("total_tokens") for r in rs]), 0),
@@ -110,16 +104,16 @@ def main():
         ]))
 
     print("\n## paired deltas (other - baseline, matched by task+rep)")
-    print("arm,n,delta_partial_mean,delta_tokens_median,delta_combined_tokens_median,delta_cost_median,delta_advisor_cost_median,delta_combined_cost_median,delta_patch_bytes_median,wilcoxon_p,wilcoxon_p_holm")
-    keyed = {(r["task"], r.get("rep", 0), r["arm"]): r for r in rows}
+    print("config,n,delta_partial_mean,delta_tokens_median,delta_combined_tokens_median,delta_cost_median,delta_advisor_cost_median,delta_combined_cost_median,delta_patch_bytes_median,wilcoxon_p,wilcoxon_p_holm")
+    keyed = {(r["task"], r.get("rep", 0), r["config"]): r for r in rows}
     pvals = []
-    deltas_by_arm = {}
-    for arm in arms[1:]:
+    deltas_by_config = {}
+    for config in configs[1:]:
         pairs = []
-        for (task, rep, a), b in keyed.items():
-            if a != baseline:
+        for (task, rep, c), b in keyed.items():
+            if c != baseline:
                 continue
-            o = keyed.get((task, rep, arm))
+            o = keyed.get((task, rep, config))
             if o:
                 pairs.append((b, o))
         dp = [(o.get("reward_partial", 0.0) or 0.0) - (b.get("reward_partial", 0.0) or 0.0) for b, o in pairs]
@@ -133,21 +127,21 @@ def main():
         if wilcoxon and len(dp) >= 2 and any(x != 0 for x in dp):
             try:
                 p = float(wilcoxon(dp, zero_method="wilcox").pvalue)
-                pvals.append((arm, p))
+                pvals.append((config, p))
             except Exception:
                 p = None
-        deltas_by_arm[arm] = (len(pairs), dp, dt, dct, dc, dac, dcc, db, p)
+        deltas_by_config[config] = (len(pairs), dp, dt, dct, dc, dac, dcc, db, p)
     adj = holm(pvals)
-    for arm, (n, dp, dt, dct, dc, dac, dcc, db, p) in deltas_by_arm.items():
-        print(",".join([arm, str(n), fmt(mean(dp)), fmt(median(dt), 0), fmt(median(dct), 0), fmt(median(dc), 4), fmt(median(dac), 4), fmt(median(dcc), 4), fmt(median(db), 0), fmt(p), fmt(adj.get(arm))]))
+    for config, (n, dp, dt, dct, dc, dac, dcc, db, p) in deltas_by_config.items():
+        print(",".join([config, str(n), fmt(mean(dp)), fmt(median(dt), 0), fmt(median(dct), 0), fmt(median(dc), 4), fmt(median(dac), 4), fmt(median(dcc), 4), fmt(median(db), 0), fmt(p), fmt(adj.get(config))]))
 
     print("\n## per-task rows")
-    print("task,rep," + ",".join(f"{a}_partial,{a}_tokens,{a}_advisor_tokens,{a}_combined_tokens,{a}_cost,{a}_advisor_cost,{a}_combined_cost,{a}_patch" for a in arms))
+    print("task,rep," + ",".join(f"{a}_partial,{a}_tokens,{a}_advisor_tokens,{a}_combined_tokens,{a}_cost,{a}_advisor_cost,{a}_combined_cost,{a}_patch" for a in configs))
     keys = sorted({(r["task"], r.get("rep", 0)) for r in rows})
     for task, rep in keys:
         vals = [task, str(rep)]
-        for arm in arms:
-            r = keyed.get((task, rep, arm), {})
+        for config in configs:
+            r = keyed.get((task, rep, config), {})
             vals += [fmt(r.get("reward_partial")), str(r.get("total_tokens", "")), str(r.get("advisor_total_tokens", "")), str(r.get("combined_total_tokens", r.get("total_tokens", ""))), fmt(r.get("cost_usd"), 4), fmt(r.get("advisor_cost_usd"), 4), fmt(r.get("combined_cost_usd", r.get("cost_usd")), 4), str(r.get("patch_bytes", ""))]
         print(",".join(vals))
 

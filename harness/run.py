@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one (arm, task) cell end-to-end through pi, then the DeepSWE verifier.
+"""Run one (config, task) cell end-to-end through pi, then the DeepSWE verifier.
 
 Topology (one task):
   env container  (pi-agent image: task env image + pi). repo at /app.
@@ -13,8 +13,8 @@ with the correct toolchain; the reward is always measured in a pristine verifier
 container (separate-env grading), exactly as DeepSWE/Pier define it.
 
 Usage:
-  python run.py --arm baseline --task abs-module-cache-flags
-  python run.py --arm ponytail-full --task <id> --run-name study1 --agent-timeout 600
+  python run.py --config baseline --task abs-module-cache-flags
+  python run.py --config ponytail-full --task <id> --agent-timeout 600
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(HERE))
-from lib import load_task, instruction_text, read_reward, result_record  # noqa: E402
+from lib import load_task, instruction_text, read_reward, result_record, model_leaf  # noqa: E402
 import parse_usage  # noqa: E402
 
 DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-flash"
@@ -111,34 +111,48 @@ def ensure_verifier_image(task) -> str:
     return img
 
 
-def load_arm(arm: str) -> dict:
-    adir = REPO / "arms" / arm
-    if not adir.exists():
-        sys.exit(f"arm not found: {adir}")
+def load_config(config: str, model: str, thinking: str) -> dict:
+    """Load a config's constants (from configs/<config>/) and its model leaf
+    (from configs/<config>/<model-leaf>/<thinking>/).
+
+    The leaf dir matches the executor model-leaf, optionally with a +advisor
+    suffix (advisor configs): glob `<exec-leaf>*/<thinking>` catches both.
+    Returns 'leaf_rel' = the leaf path relative to the config dir, so the
+    in-container cp sources are /arm/<leaf_rel>/{models,advisor,settings}.json
+    (the config dir is mounted as /arm:ro, preserving /arm/extensions/).
+    """
+    cdir = REPO / "configs" / config
+    if not cdir.exists():
+        sys.exit(f"config not found: {cdir}")
+    exec_leaf = model_leaf(model)
+    candidates = sorted(p for p in cdir.glob(f"{exec_leaf}*/{thinking}") if p.is_dir())
+    leafdir = candidates[0] if candidates else cdir / exec_leaf / thinking
+    leaf_rel = leafdir.relative_to(cdir).as_posix()
     skill_dirs = []
-    sd = adir / "skills"
+    sd = cdir / "skills"
     if sd.is_dir():
         skill_dirs = [p for p in sd.iterdir() if p.is_dir()]
     pi_flags = []
-    pf = adir / "pi-flags"
+    pf = cdir / "pi-flags"
     if pf.exists():
         pi_flags = [ln.strip() for ln in pf.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
     env_lines = {}
-    ef = adir / "env"
+    ef = cdir / "env"
     if ef.exists():
         for ln in ef.read_text().splitlines():
             ln = ln.strip()
             if ln and "=" in ln and not ln.startswith("#"):
                 k, v = ln.split("=", 1)
                 env_lines[k.strip()] = v.strip()
-    advisor_json = adir / "advisor.json"
-    models_json = adir / "models.json"
-    settings_json = adir / "settings.json"
-    return {"dir": adir, "orchestration": (adir / "orchestration.md").read_text(),
+    def _leaf(name):
+        p = leafdir / name
+        return p if p.exists() else None
+    return {"dir": cdir, "leaf_rel": leaf_rel,
+            "orchestration": (cdir / "orchestration.md").read_text(),
             "skill_dirs": skill_dirs, "pi_flags": pi_flags, "env": env_lines,
-            "advisor_json": advisor_json if advisor_json.exists() else None,
-            "models_json": models_json if models_json.exists() else None,
-            "settings_json": settings_json if settings_json.exists() else None}
+            "models_json": _leaf("models.json"),
+            "advisor_json": _leaf("advisor.json"),
+            "settings_json": _leaf("settings.json")}
 
 
 def openai_codex_auth_mount() -> tuple[list[str], str]:
@@ -233,14 +247,15 @@ def pi_cmd(arm_cfg: dict, model: str, thinking: str, append_text: str) -> list[s
     return cmd
 
 
-def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str, rep: int,
+def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
              agent_timeout: float, keep: bool, pass_openai_codex_oauth: bool) -> dict:
     task = load_task(task_id)
-    arm_cfg = load_arm(arm)
+    arm_cfg = load_config(config, model, thinking)
     ensure_env_image(task.env_image)
     pi_image = ensure_pi_image(task)
 
-    cell = REPO / "runs" / run_name / arm / task_id / f"rep{rep}"
+    mleaf = model_leaf(model)
+    cell = REPO / "results" / mleaf / thinking / config / task_id / f"rep{rep}"
     cell.mkdir(parents=True, exist_ok=True)
     (cell / "artifacts").mkdir(exist_ok=True)
     (cell / "verifier").mkdir(exist_ok=True)
@@ -249,7 +264,7 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
     preamble = (HERE / "system_preamble.md").read_text()
     append_text = preamble + "\n\n" + arm_cfg["orchestration"]
 
-    suffix = f"{arm}-{task_id}-r{rep}-{os.getpid()}"
+    suffix = f"{config}-{task_id}-r{rep}-{os.getpid()}"
     cname = f"dsw-{suffix}"
     if model.startswith("openai-codex/") and not pass_openai_codex_oauth:
         sys.exit("openai-codex models require --pass-openai-codex-oauth")
@@ -271,7 +286,7 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
     for k, v in arm_cfg["env"].items():
         env_flag += ["-e", f"{k}={v}"]
 
-    print(f"[cell] task={task_id} arm={arm} lang={task.language} "
+    print(f"[cell] task={task_id} config={config} lang={task.language} "
           f"budget={agent_timeout:.0f}s model={model} thinking={thinking}", flush=True)
 
     # --- start env container (agent works here) ---
@@ -298,11 +313,11 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
             if pass_openai_codex_oauth:
                 sh(["docker", "exec", cname, "cp", "/codex-auth/auth.json", "/root/.pi/agent/auth.json"])
             if arm_cfg.get("advisor_json"):
-                sh(["docker", "exec", cname, "cp", "/arm/advisor.json", "/root/.pi/agent/advisor.json"])
+                sh(["docker", "exec", cname, "cp", f"/arm/{arm_cfg['leaf_rel']}/advisor.json", "/root/.pi/agent/advisor.json"])
             if arm_cfg.get("models_json"):
-                sh(["docker", "exec", cname, "cp", "/arm/models.json", "/root/.pi/agent/models.json"])
+                sh(["docker", "exec", cname, "cp", f"/arm/{arm_cfg['leaf_rel']}/models.json", "/root/.pi/agent/models.json"])
             if arm_cfg.get("settings_json"):
-                sh(["docker", "exec", cname, "cp", "/arm/settings.json", "/root/.pi/agent/settings.json"])
+                sh(["docker", "exec", cname, "cp", f"/arm/{arm_cfg['leaf_rel']}/settings.json", "/root/.pi/agent/settings.json"])
 
         # --- run the agent ---
         # Executor usage is read from the native session (session/*.jsonl) AFTER
@@ -345,7 +360,7 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
         if transient and status.get("agent_exit") != "timeout":
             status["transient_model_error"] = transient
             (cell / "transient_error.json").write_text(json.dumps(status, indent=2))
-            print(f"[pause] transient model error for {task_id}/{arm}#{rep}: {transient}", flush=True)
+            print(f"[pause] transient model error for {task_id}/{config}#{rep}: {transient}", flush=True)
             raise SystemExit(TRANSIENT_EXIT)
 
         # --- capture ALL work (committed or not) then extract the submission patch ---
@@ -402,7 +417,7 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
         arm_models = json.loads(Path(arm_cfg["models_json"]).read_text())
 
     rec = result_record(
-        task, arm, model, rep,
+        task, config, model, rep,
         arm_pi_flags=arm_cfg["pi_flags"],
         arm_settings=arm_settings,
         arm_advisor=arm_advisor,
@@ -422,10 +437,11 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
         **usage,
     )
     (cell / "result.json").write_text(json.dumps(rec, indent=2))
-    rl = REPO / "runs" / run_name / "results.jsonl"
+    rl = REPO / "results" / mleaf / thinking / "results.jsonl"
+    rl.parent.mkdir(parents=True, exist_ok=True)
     with open(rl, "a") as f:
         f.write(json.dumps(rec) + "\n")
-    print(f"[done] {task_id}/{arm}#{rep}: partial={rec['reward_partial']:.3f} "
+    print(f"[done] {task_id}/{config}#{rep}: partial={rec['reward_partial']:.3f} "
           f"binary={rec['reward_binary']} tok={rec['total_tokens']} "
           f"cost=${rec['cost_usd']:.4f} wall={rec['agent_wall_s']}s "
           f"patch={rec['patch_bytes']}B", flush=True)
@@ -434,9 +450,8 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", required=True)
+    ap.add_argument("--config", required=True)
     ap.add_argument("--task", required=True)
-    ap.add_argument("--run-name", default="default")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--thinking", default=DEFAULT_THINKING,
                     choices=["off", "minimal", "low", "medium", "high", "xhigh"])
@@ -450,7 +465,7 @@ def main():
 
     task = load_task(args.task)
     to = args.agent_timeout or task.agent_timeout_s
-    rec = run_cell(args.arm, args.task, model=args.model, thinking=args.thinking, run_name=args.run_name,
+    rec = run_cell(args.config, args.task, model=args.model, thinking=args.thinking,
                    rep=args.rep, agent_timeout=to, keep=args.keep,
                    pass_openai_codex_oauth=args.pass_openai_codex_oauth)
     print(json.dumps({"ok": True, "reward_partial": rec["reward_partial"],

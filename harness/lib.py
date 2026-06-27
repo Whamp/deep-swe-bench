@@ -95,12 +95,12 @@ def model_leaf(model: str, advisor_model: str | None = None) -> str:
     return leaf
 
 
-def result_record(task: Task, arm: str, model: str, rep: int, **kw) -> dict:
+def result_record(task: Task, config: str, model: str, rep: int, **kw) -> dict:
     rec = {
         "task": task.id,
         "language": task.language,
         "category": task.category,
-        "arm": arm,
+        "config": config,
         "model": model,
         "rep": rep,
     }
