@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -191,6 +192,29 @@ def transient_model_error(paths: list[Path]) -> str | None:
     return None
 
 
+def _drain_advisor_stream(proc: subprocess.Popen, path: Path) -> None:
+    """Filter pi --mode json stdout to tool-usage.jsonl, keeping only advisor
+    tool_execution_end events.
+
+    Advisor LLM usage is absent from the native session (it runs through the
+    extension's own provider path), so it is recovered from the stream. Runs in
+    a background thread so the stdout pipe never fills and blocks pi; it ends
+    naturally when the process exits and the pipe hits EOF. The substring
+    pre-filter skips the bulk of streaming lines before the JSON parse.
+    """
+    with open(path, "w") as tu:
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", "replace")
+            if '"tool_execution_end"' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("toolName") == "advisor":
+                tu.write(line)
+
+
 def pi_cmd(arm_cfg: dict, model: str, thinking: str, append_text: str) -> list[str]:
     cmd = ["pi", "-p", "@/task/instruction.md",
            "--model", model, "--thinking", thinking, "--mode", "json", "--offline",
@@ -281,26 +305,41 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
                 sh(["docker", "exec", cname, "cp", "/arm/settings.json", "/root/.pi/agent/settings.json"])
 
         # --- run the agent ---
+        # Executor usage is read from the native session (session/*.jsonl) AFTER
+        # the run; the --mode json stream is NOT persisted (ADR-0002: per-cell
+        # pi.jsonl streams ballooned to 233GB). For advisor configs the advisor
+        # LLM's usage is absent from the session, so the stream is filtered on
+        # the fly to tool-usage.jsonl (advisor tool_execution_end events only);
+        # for non-advisor configs the stream is discarded entirely.
         cmd = pi_cmd(arm_cfg, model, thinking, append_text)
         with open(cell / "logs" / "pi.stderr.txt", "w") as se:
-            with open(cell / "pi.jsonl", "w") as so:
-                # argv list, not shell: the append-system-prompt text contains
-                # newlines/spaces that a bash -lc join would mangle.
+            # argv list, not shell: the append-system-prompt text contains
+            # newlines/spaces that a bash -lc join would mangle.
+            if arm_cfg.get("advisor_json"):
                 proc = subprocess.Popen(["docker", "exec", cname, *cmd],
-                                        stdout=so, stderr=se)
-                try:
-                    proc.wait(timeout=agent_timeout)
-                    status["agent_exit"] = proc.returncode
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    status["agent_exit"] = "timeout"
-                    status["agent_timed_out"] = True
+                                        stdout=subprocess.PIPE, stderr=se)
+                drain = threading.Thread(
+                    target=_drain_advisor_stream,
+                    args=(proc, cell / "tool-usage.jsonl"), daemon=True)
+                drain.start()
+            else:
+                proc = subprocess.Popen(["docker", "exec", cname, *cmd],
+                                        stdout=subprocess.DEVNULL, stderr=se)
+            try:
+                proc.wait(timeout=agent_timeout)
+                status["agent_exit"] = proc.returncode
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                status["agent_exit"] = "timeout"
+                status["agent_timed_out"] = True
+            if arm_cfg.get("advisor_json"):
+                drain.join(timeout=30)
         status["agent_wall_s"] = round(time.time() - started, 1)
 
         sh(["docker", "exec", cname, "bash", "-lc",
             "if [ -d /root/.pi/agent/observational-memory ]; then "
             "mkdir -p /out/pi-agent && cp -a /root/.pi/agent/observational-memory /out/pi-agent/; fi"])
-        transient_paths = [cell / "logs" / "pi.stderr.txt", cell / "pi.jsonl"]
+        transient_paths = [cell / "logs" / "pi.stderr.txt"]
         transient_paths += list((cell / "pi-agent" / "observational-memory" / "debug").glob("*.ndjson"))
         transient = transient_model_error(transient_paths)
         if transient and status.get("agent_exit") != "timeout":
@@ -347,7 +386,11 @@ def run_cell(arm: str, task_id: str, *, model: str, thinking: str, run_name: str
     else:
         status["verifier_exit"] = "skipped_empty_patch"
 
-    usage = parse_usage.parse_stream(path=cell / "pi.jsonl")
+    # Executor usage from the native session (newest segment = the run that
+    # wrote result.json); advisor usage from the filtered tool-usage.jsonl.
+    usage = parse_usage.parse(
+        session_dir=cell / "session",
+        advisor_path=cell / "tool-usage.jsonl" if arm_cfg.get("advisor_json") else None)
     arm_settings = None
     if arm_cfg.get("settings_json"):
         arm_settings = json.loads(Path(arm_cfg["settings_json"]).read_text())
