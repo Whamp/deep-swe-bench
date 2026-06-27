@@ -11,7 +11,7 @@ form is configs-leaf-only). Leaf-file provenance follows §10:
     for advisor, the arm's openrouter+zai models.json. NEVER trust the mutated
     arms/baseline/models.json for a non-qwen executor (critical #2).
   - settings.json: leaf-level for observational-memory (carries the WORKER model,
-    which differs by leaf — Qwen vs gpt-5.4-mini; critical #1).
+    recovered from result.json arm_settings when historical runs prove the arm was mutated).
   - advisor.json: advisor leaf only.
 
 Usage: python3 scripts/materialize_configs.py --dry-run   (inspect, writes nothing)
@@ -50,7 +50,7 @@ LEAF_NAMES = {"models.json", "advisor.json", "settings.json"}  # model-identity 
 # Inventory of (config, model-leaf, thinking, producing-arm) from result.json.
 # Each leaf's files come from its producing arm (with the §10 consistency check).
 # Format: (config, model_leaf, thinking, arm, executor_model, worker_model_or_None)
-# worker_model only for observational-memory (from that arm's settings.json).
+# worker_model only for observational-memory (recovered from result.json arm_settings when available).
 LEAVES = [
     # config,              mleaf,                          thinking, arm,                              exec_model,                                  worker
     ("advisor",            "deepseek-v4-flash+glm-5.2",    "high",   "pi-advisor-glm52",               "openrouter/deepseek/deepseek-v4-flash",     None),
@@ -61,7 +61,7 @@ LEAVES = [
     ("baseline-wf",        "deepseek-v4-flash",            "high",   "baseline-codex-wf",              "openrouter/deepseek/deepseek-v4-flash",     None),
     ("baseline-wf",        "gpt-5.5",                      "medium", "baseline-codex-wf",              "openai-codex/gpt-5.5",                      None),
     ("observational-memory","Qwen3.6-27B-AWQ-BF16-INT4",   "high",   "pi-observational-memory",        "local-vllm/cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4", "local-vllm/cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4"),
-    ("observational-memory","deepseek-v4-flash",           "high",   "pi-observational-memory",        "openrouter/deepseek/deepseek-v4-flash",     "local-vllm/cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4"),
+    ("observational-memory","deepseek-v4-flash",           "high",   "pi-observational-memory",        "openrouter/deepseek/deepseek-v4-flash",     "openrouter/deepseek/deepseek-v4-flash"),
     ("observational-memory","gpt-5.5",                     "medium", "pi-observational-memory-codex54mini","openai-codex/gpt-5.5",                  "openai-codex/gpt-5.4-mini"),
     ("ponytail-extension", "deepseek-v4-flash",            "high",   "ponytail-pi-extension",          "openrouter/deepseek/deepseek-v4-flash",     None),
     ("ponytail-full",      "deepseek-v4-flash",            "high",   "ponytail-full",                  "openrouter/deepseek/deepseek-v4-flash",     None),
@@ -79,6 +79,11 @@ def leaf_needs_models_json(exec_model: str, worker_model, arm: str) -> tuple[boo
     if arm == "pi-advisor-glm52":
         return True, ARMS / "pi-advisor-glm52" / "models.json"
     return False, None
+
+
+def worker_setting(worker_model: str) -> dict:
+    provider, ident = worker_model.split("/", 1)
+    return {"provider": provider, "id": ident, "thinking": "low"}
 
 
 def plan() -> list[str]:
@@ -100,7 +105,7 @@ def plan() -> list[str]:
         # settings.json: leaf-level only for observational-memory (carries worker)
         if cfg == "observational-memory":
             ssrc = ARMS / arm / "settings.json"
-            parts.append(f"settings.json<={ssrc.relative_to(REPO)}")
+            parts.append(f"settings.json<={ssrc.relative_to(REPO)} with worker={worker}")
         # advisor.json
         if (ARMS / arm / "advisor.json").exists():
             parts.append(f"advisor.json<={((ARMS/arm/'advisor.json').relative_to(REPO))}")
@@ -127,7 +132,10 @@ def build():
         if cfg == "observational-memory":
             ssrc = ARMS / arm / "settings.json"
             if ssrc.exists():
-                shutil.copy2(ssrc, leafdir / "settings.json")
+                settings = json.loads(ssrc.read_text())
+                if worker:
+                    settings["observational-memory"]["model"] = worker_setting(worker)
+                (leafdir / "settings.json").write_text(json.dumps(settings, indent=2) + "\n")
         asrc = ARMS / arm / "advisor.json"
         if asrc.exists():
             shutil.copy2(asrc, leafdir / "advisor.json")
