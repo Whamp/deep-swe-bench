@@ -78,6 +78,23 @@ def read_reward(verifier_dir: Path) -> dict:
     return d
 
 
+def model_leaf(model: str, advisor_model: str | None = None) -> str:
+    """Path segment for a model: the last '/'-segment of the model id, with an
+    optional '+advisor' suffix for advisor configs.
+
+    SINGLE source of truth for the <model-leaf> path segment shared by configs/
+    leaves and results/ paths, so migrate_results.py and the harness derive it
+    identically (the resume-re-runs-everything failure mode if they diverge).
+    The results path is EXECUTOR-ONLY (never carries +advisor); the +advisor form
+    is configs-leaf-only and exists so a resumed run_batch can recompute the
+    results path from the executor --model alone.
+    """
+    leaf = model.rstrip("/").split("/")[-1]
+    if advisor_model:
+        leaf = f"{leaf}+{advisor_model.rstrip('/').split('/')[-1]}"
+    return leaf
+
+
 def result_record(task: Task, arm: str, model: str, rep: int, **kw) -> dict:
     rec = {
         "task": task.id,
