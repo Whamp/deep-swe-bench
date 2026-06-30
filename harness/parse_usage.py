@@ -1,4 +1,4 @@
-"""Parse pi token/cost/turn usage from the native session and advisor stream.
+"""Parse pi token/cost/turn usage from compact, final-state sources.
 
 pi writes its native session to ``session/*.jsonl`` (``--session-dir``). Each
 assistant message record (``type:"message"``, ``message.role == "assistant"``)
@@ -11,12 +11,18 @@ captured at run time by filtering pi's ``--mode json`` stdout down to
 ``tool-usage.jsonl`` (only ``tool_execution_end`` events with
 ``toolName == "advisor"``). ``parse_advisor_stream`` reads that filtered file.
 
-``parse(session_dir=..., advisor_path=...)`` combines both and returns the full
-usage dict that ``run.py`` spreads into ``result_record`` via ``**usage``.
+Observational-memory worker calls also run outside the main session. They are
+captured by the ``om-worker-usage-trace`` extension as compact NDJSON records
+under ``pi-agent/observational-memory/worker-usage/usage.ndjson``. Those records
+contain only final assistant usage metadata, not streamed text deltas.
 
-A missing/empty/unreadable source RAISES rather than returning zeros — the
-silent-zero path is the corruption vector if the stream-capture removal and the
-session-read switch ever land out of sync.
+``parse(session_dir=..., advisor_path=..., worker_usage_path=...)`` combines all
+available sources and returns the usage dict that ``run.py`` spreads into
+``result_record`` via ``**usage``.
+
+A missing/empty/unreadable required source RAISES rather than returning zeros —
+the silent-zero path is the corruption vector if capture and parsing ever land
+out of sync. Optional secondary sources are skipped when absent.
 """
 from __future__ import annotations
 
@@ -35,6 +41,17 @@ def _new_acc() -> dict:
         "advisor_cache_write_tokens": 0, "advisor_reported_total_tokens": 0,
         "advisor_cost_usd": 0.0,
         "advisor_provider": None, "advisor_model": None,
+        "om_worker_calls": 0, "om_worker_input_tokens": 0,
+        "om_worker_output_tokens": 0, "om_worker_cache_read_tokens": 0,
+        "om_worker_cache_write_tokens": 0, "om_worker_reported_total_tokens": 0,
+        "om_worker_cost_usd": 0.0, "om_worker_provider": None,
+        "om_worker_model": None,
+        "om_observer_calls": 0, "om_observer_total_tokens": 0,
+        "om_observer_cost_usd": 0.0,
+        "om_reflector_calls": 0, "om_reflector_total_tokens": 0,
+        "om_reflector_cost_usd": 0.0,
+        "om_dropper_calls": 0, "om_dropper_total_tokens": 0,
+        "om_dropper_cost_usd": 0.0,
     }
 
 
@@ -67,10 +84,20 @@ def _finalize(acc: dict) -> None:
                                + acc["advisor_cache_write_tokens"])
     acc["advisor_total_tokens"] = (acc["advisor_reported_total_tokens"]
                                    or component_advisor_total)
-    acc["combined_total_tokens"] = acc["total_tokens"] + acc["advisor_total_tokens"]
+    component_worker_total = (acc["om_worker_input_tokens"] + acc["om_worker_output_tokens"]
+                              + acc["om_worker_cache_read_tokens"]
+                              + acc["om_worker_cache_write_tokens"])
+    acc["om_worker_total_tokens"] = (acc["om_worker_reported_total_tokens"]
+                                     or component_worker_total)
+    acc["combined_total_tokens"] = (acc["total_tokens"] + acc["advisor_total_tokens"]
+                                    + acc["om_worker_total_tokens"])
     acc["cost_usd"] = round(acc["cost_usd"], 6)
     acc["advisor_cost_usd"] = round(acc["advisor_cost_usd"], 6)
-    acc["combined_cost_usd"] = round(acc["cost_usd"] + acc["advisor_cost_usd"], 6)
+    acc["om_worker_cost_usd"] = round(acc["om_worker_cost_usd"], 6)
+    acc["om_observer_cost_usd"] = round(acc["om_observer_cost_usd"], 6)
+    acc["om_reflector_cost_usd"] = round(acc["om_reflector_cost_usd"], 6)
+    acc["om_dropper_cost_usd"] = round(acc["om_dropper_cost_usd"], 6)
+    acc["combined_cost_usd"] = round(acc["cost_usd"] + acc["advisor_cost_usd"] + acc["om_worker_cost_usd"], 6)
 
 
 def parse_session(*, path: Path | None = None, text: str | None = None,
@@ -160,22 +187,77 @@ def parse_advisor_stream(*, path: Path | None = None, text: str | None = None) -
     return acc
 
 
-def parse(*, session_dir: Path | None = None, session_path: Path | None = None,
-          advisor_path: Path | None = None) -> dict:
-    """Combined entry point: executor usage from native session + (optional)
-    advisor usage from the filtered tool-usage.jsonl. This is what run.py calls.
+def parse_worker_usage_trace(*, path: Path | None = None, text: str | None = None) -> dict:
+    """Read observational-memory worker usage from compact trace NDJSON.
+
+    The tracer writes one ``assistant_usage`` record per worker LLM completion and
+    an ``agent_end`` summary. To avoid double counting, parse only
+    ``assistant_usage`` records.
     """
-    exec_usage = parse_session(session_dir=session_dir, path=session_path)
-    if advisor_path is None or not Path(advisor_path).exists():
-        return exec_usage
-    adv_usage = parse_advisor_stream(path=advisor_path)
-    merged = exec_usage
-    for k in ("advisor_calls", "advisor_input_tokens", "advisor_output_tokens",
-              "advisor_cache_read_tokens", "advisor_cache_write_tokens",
-              "advisor_reported_total_tokens", "advisor_cost_usd",
-              "advisor_provider", "advisor_model", "advisor_total_tokens",
-              "combined_total_tokens", "combined_cost_usd"):
-        merged[k] = adv_usage[k]
+    if path is not None:
+        raw = Path(path).read_text(encoding="utf-8", errors="ignore")
+    elif text is not None:
+        raw = text
+    else:
+        raise ValueError("parse_worker_usage_trace requires path= or text=")
+
+    acc = _new_acc()
+    for ev in _iter_jsonl(raw):
+        if ev.get("event") != "assistant_usage":
+            continue
+        usage = ev.get("usage") or {}
+        cost = usage.get("cost") or {}
+        stage = str(ev.get("stage") or "unknown")
+        input_tokens = int(usage.get("input") or 0)
+        output_tokens = int(usage.get("output") or 0)
+        cache_read = int(usage.get("cacheRead") or 0)
+        cache_write = int(usage.get("cacheWrite") or 0)
+        reported_total = int(usage.get("totalTokens") or (input_tokens + output_tokens + cache_read + cache_write))
+        cost_total = float(cost.get("total") or 0.0)
+
+        acc["om_worker_calls"] += 1
+        acc["om_worker_input_tokens"] += input_tokens
+        acc["om_worker_output_tokens"] += output_tokens
+        acc["om_worker_cache_read_tokens"] += cache_read
+        acc["om_worker_cache_write_tokens"] += cache_write
+        acc["om_worker_reported_total_tokens"] += reported_total
+        acc["om_worker_cost_usd"] += cost_total
+        acc["om_worker_provider"] = ev.get("provider") or acc["om_worker_provider"]
+        acc["om_worker_model"] = ev.get("model") or acc["om_worker_model"]
+
+        if stage in {"observer", "reflector", "dropper"}:
+            prefix = f"om_{stage}"
+            acc[f"{prefix}_calls"] += 1
+            acc[f"{prefix}_total_tokens"] += reported_total
+            acc[f"{prefix}_cost_usd"] += cost_total
+    _finalize(acc)
+    return acc
+
+
+def parse(*, session_dir: Path | None = None, session_path: Path | None = None,
+          advisor_path: Path | None = None,
+          worker_usage_path: Path | None = None) -> dict:
+    """Combined entry point: executor usage from native session plus optional
+    advisor and observational-memory worker usage.
+    """
+    merged = parse_session(session_dir=session_dir, path=session_path)
+    if advisor_path is not None and Path(advisor_path).exists():
+        adv_usage = parse_advisor_stream(path=advisor_path)
+        for k in ("advisor_calls", "advisor_input_tokens", "advisor_output_tokens",
+                  "advisor_cache_read_tokens", "advisor_cache_write_tokens",
+                  "advisor_reported_total_tokens", "advisor_cost_usd",
+                  "advisor_provider", "advisor_model", "advisor_total_tokens"):
+            merged[k] = adv_usage[k]
+    if worker_usage_path is not None and Path(worker_usage_path).exists():
+        worker_usage = parse_worker_usage_trace(path=worker_usage_path)
+        for k in ("om_worker_calls", "om_worker_input_tokens", "om_worker_output_tokens",
+                  "om_worker_cache_read_tokens", "om_worker_cache_write_tokens",
+                  "om_worker_reported_total_tokens", "om_worker_cost_usd",
+                  "om_worker_provider", "om_worker_model", "om_worker_total_tokens",
+                  "om_observer_calls", "om_observer_total_tokens", "om_observer_cost_usd",
+                  "om_reflector_calls", "om_reflector_total_tokens", "om_reflector_cost_usd",
+                  "om_dropper_calls", "om_dropper_total_tokens", "om_dropper_cost_usd"):
+            merged[k] = worker_usage[k]
     _finalize(merged)
     return merged
 

@@ -5,13 +5,13 @@ Use this only for the completed Ponytail DeepSWE graphics/thread.
 ## Run identity
 
 - run: `runs/ponytail-full-pilot-w2`
-- baseline arm: `baseline`
-- treatment arm: `ponytail-pi-extension`
+- baseline config: `baseline`
+- comparison config: `ponytail-pi-extension`
 - model: `deepseek-v4-flash`
 - thinking: `high`
 - tasks: `113 paired tasks`
-- treatment label: `Ponytail full Pi extension`
-- treatment color: `#2d2af4`
+- comparison label: `Ponytail full Pi extension`
+- comparison color: `#2d2af4`
 
 ## README-style mean table
 

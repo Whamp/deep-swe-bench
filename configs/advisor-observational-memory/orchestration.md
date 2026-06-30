@@ -1,0 +1,1 @@
+Advisor is available as the `advisor` tool. For non-trivial tasks, consult it after initial exploration, when stuck, and before final verification. You remain the executor: use advisor guidance only when it is supported by the repository evidence.

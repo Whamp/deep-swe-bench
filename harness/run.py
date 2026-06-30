@@ -155,16 +155,31 @@ def load_config(config: str, model: str, thinking: str) -> dict:
             "settings_json": _leaf("settings.json")}
 
 
-def openai_codex_auth_mount() -> tuple[list[str], str]:
-    auth = Path.home() / ".pi" / "agent" / "auth.json"
-    data = json.loads(auth.read_text())
-    if "openai-codex" not in data:
-        sys.exit(f"openai-codex OAuth entry not found in {auth}; run Pi Codex login first")
-    tmp = tempfile.mkdtemp(prefix="dsw-codex-auth-")
+def agent_auth_mount(*, pass_openai_codex_oauth: bool, pass_openrouter_env: bool) -> tuple[list[str], str | None]:
+    """Build the minimal Pi auth.json mounted into an agent container.
+
+    The main executor can use OPENROUTER_API_KEY from the process environment,
+    but extension workers call modelRegistry.getApiKeyAndHeaders(), which does
+    not use env fallback. Put an auth.json entry that resolves to the same env
+    var so worker models and the main executor share the intended credential
+    path without writing the secret into result artifacts.
+    """
+    data = {}
+    if pass_openai_codex_oauth:
+        auth = Path.home() / ".pi" / "agent" / "auth.json"
+        host_data = json.loads(auth.read_text())
+        if "openai-codex" not in host_data:
+            sys.exit(f"openai-codex OAuth entry not found in {auth}; run Pi Codex login first")
+        data["openai-codex"] = host_data["openai-codex"]
+    if pass_openrouter_env:
+        data["openrouter"] = {"type": "api_key", "key": "$OPENROUTER_API_KEY"}
+    if not data:
+        return [], None
+    tmp = tempfile.mkdtemp(prefix="dsw-agent-auth-")
     os.chmod(tmp, 0o700)
-    (Path(tmp) / "auth.json").write_text(json.dumps({"openai-codex": data["openai-codex"]}))
+    (Path(tmp) / "auth.json").write_text(json.dumps(data))
     os.chmod(Path(tmp) / "auth.json", 0o600)
-    return ["-v", f"{tmp}:/codex-auth:ro"], tmp
+    return ["-v", f"{tmp}:/agent-auth:ro"], tmp
 
 
 def needs_openrouter_key(model: str, arm_cfg: dict) -> bool:
@@ -276,9 +291,10 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     elif needs_openrouter_key(model, arm_cfg):
         sys.exit("OPENROUTER_API_KEY not set in environment")
 
-    auth_mount, auth_tmp = ([], None)
-    if pass_openai_codex_oauth:
-        auth_mount, auth_tmp = openai_codex_auth_mount()
+    auth_mount, auth_tmp = agent_auth_mount(
+        pass_openai_codex_oauth=pass_openai_codex_oauth,
+        pass_openrouter_env=bool(api_key),
+    )
     # Optional advisor/secondary-model providers. Passing these symmetrically is
     # harmless; only arms with matching extensions/models use them.
     if os.environ.get("ZAI_API_KEY"):
@@ -310,8 +326,8 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     try:
         if pass_openai_codex_oauth or arm_cfg.get("advisor_json") or arm_cfg.get("models_json") or arm_cfg.get("settings_json"):
             sh(["docker", "exec", cname, "mkdir", "-p", "/root/.pi/agent"])
-            if pass_openai_codex_oauth:
-                sh(["docker", "exec", cname, "cp", "/codex-auth/auth.json", "/root/.pi/agent/auth.json"])
+            if auth_mount:
+                sh(["docker", "exec", cname, "cp", "/agent-auth/auth.json", "/root/.pi/agent/auth.json"])
             if arm_cfg.get("advisor_json"):
                 sh(["docker", "exec", cname, "cp", f"/arm/{arm_cfg['leaf_rel']}/advisor.json", "/root/.pi/agent/advisor.json"])
             if arm_cfg.get("models_json"):
@@ -355,6 +371,7 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
             "if [ -d /root/.pi/agent/observational-memory ]; then "
             "mkdir -p /out/pi-agent && cp -a /root/.pi/agent/observational-memory /out/pi-agent/; fi"])
         transient_paths = [cell / "logs" / "pi.stderr.txt"]
+        transient_paths += list((cell / "session").glob("*.jsonl"))
         transient_paths += list((cell / "pi-agent" / "observational-memory" / "debug").glob("*.ndjson"))
         transient = transient_model_error(transient_paths)
         if transient and status.get("agent_exit") != "timeout":
@@ -402,10 +419,12 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
         status["verifier_exit"] = "skipped_empty_patch"
 
     # Executor usage from the native session (newest segment = the run that
-    # wrote result.json); advisor usage from the filtered tool-usage.jsonl.
+    # wrote result.json); advisor and observational-memory worker usage from
+    # compact sidecar traces that do not store streamed text deltas.
     usage = parse_usage.parse(
         session_dir=cell / "session",
-        advisor_path=cell / "tool-usage.jsonl" if arm_cfg.get("advisor_json") else None)
+        advisor_path=cell / "tool-usage.jsonl" if arm_cfg.get("advisor_json") else None,
+        worker_usage_path=cell / "pi-agent" / "observational-memory" / "worker-usage" / "usage.ndjson")
     arm_settings = None
     if arm_cfg.get("settings_json"):
         arm_settings = json.loads(Path(arm_cfg["settings_json"]).read_text())

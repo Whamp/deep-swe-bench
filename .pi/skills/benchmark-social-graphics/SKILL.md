@@ -10,8 +10,8 @@ Leading rule: **deterministic facts, generated style**. Image models may make th
 ## Process
 
 1. **Compute**
-   - Read paired result artifacts, usually `runs/<run>/<arm>/<task>/rep0/result.json`.
-   - Include only tasks present in both arms.
+   - Read paired result artifacts, usually `runs/<run>/<config>/<task>/rep0/result.json`.
+   - Include only tasks present in both configs.
    - Use means for README/Twitter summaries unless the user asks for medians.
    - For DeepSWE difficulty buckets, default to baseline partial-reward terciles unless a better out-of-sample difficulty signal exists.
    - Completion: every displayed metric has a computed source.
@@ -41,7 +41,7 @@ Leading rule: **deterministic facts, generated style**. Image models may make th
   - `cost · $ per task → more expensive`
   - `tokens · per task → more tokens`
 - black dot: baseline
-- blue-purple dot/arrow: treatment, default `#2d2af4`
+- blue-purple dot/arrow: comparison config, default `#2d2af4`
 - arrows: straight unless the user requests curves
 - y-axis: include 30%–100% when hard buckets sit near 40%
 - x-axis: tightest readable range that includes all points and label room
@@ -49,7 +49,7 @@ Leading rule: **deterministic facts, generated style**. Image models may make th
 Tier label placement defaults:
 
 - EASY near the easy baseline point, often lower-right if there is room
-- MEDIUM near/below the medium treatment point
+- MEDIUM near/below the medium comparison-config point
 - HARD near the hard cluster, clear of the x-axis
 
 ## References

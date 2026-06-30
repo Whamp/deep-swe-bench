@@ -8,7 +8,7 @@ The first comparison is:
 - model: `openrouter/deepseek/deepseek-v4-flash`
 - thinking: `high` (pinned with `--thinking high`)
 - baseline config: stock pi, no skills/extensions
-- treatment config: pi + the real Ponytail Pi extension, **full/default** mode
+- comparison config: pi + the real Ponytail Pi extension, **full/default** mode
 - question: does Ponytail help or hurt DeepSWE reward, and does it use more or
   fewer tokens?
 
@@ -35,7 +35,7 @@ separate-verifier setup.
 ## Configs
 
 See [`configs/`](configs/) and [`configs/README.md`](configs/README.md). A
-**config** is one pi setup (prompt treatment + skills/extensions); **model +
+**config** is one pi setup (system-prompt addition + skills/extensions); **model +
 thinking** is a separate path axis under it (the immutable-leaf rule, see
 `docs/adr/0001-directory-and-vocabulary-reorganization.md`). Only the config
 changes — model, thinking level, task image, verifier, time budget, and runner
@@ -90,6 +90,42 @@ Use `--tasks a,b,c` for an explicit paired set, or `--subset 36_v1` to read
 `subsets/36_v1.txt`. The batch runner resumes existing `result.json` files
 unless `--force` is passed (resume is by `(task, rep)` existence).
 
+For a config with no existing results for the selected model+thinking leaf,
+`run_batch.py` first runs one reusable smoke cell from `subsets/12_v0.txt` before
+batch fan-out. The default smoke check is generic; config-specific expectations
+belong in an optional `smoke.json` contract. See
+[`configs/README.md#smoke-tests-and-contracts`](configs/README.md#smoke-tests-and-contracts).
+
+### Container memory watchdog
+
+`scripts/container_memory_watchdog.py` is a host-side safety tool for active
+benchmark containers. It monitors running `dsw-*` containers and, after a
+sustained memory spike, kills the largest non-protected child process inside the
+container. It protects `pi`, `sleep`, shells, and zombies; if `pi` is the largest
+process, it logs an alert only. The script does not edit `result.json` or any
+official result artifact.
+
+Use it for long or high-concurrency batches when a pathological agent-written
+test could consume host RAM before `--agent-timeout` fires. Current conservative
+emergency policy:
+
+```sh
+nohup setsid python3 scripts/container_memory_watchdog.py \
+  --cap-gb 12 \
+  --interval 5 \
+  --consecutive 3 \
+  --grace 10 \
+  --target 'dsw-*' \
+  --manual-log runs/container-memory-watchdog/manual_interventions.ndjson \
+  --peak-log runs/container-memory-watchdog/container_peaks.ndjson \
+  --pidfile runs/container-memory-watchdog/watchdog.pid \
+  > runs/container-memory-watchdog/watchdog.out 2>&1 < /dev/null &
+```
+
+Run with `--dry-run` first when changing the policy. The separate logs are for
+future reference and manual-intervention auditing, not official benchmark
+reporting.
+
 ### Codex OAuth models
 
 For `openai-codex/*` models, pass only the host Pi `openai-codex` OAuth entry
@@ -119,7 +155,7 @@ Pi supports this via `compat.thinkingFormat: "qwen-chat-template"`, which sends
 `chat_template_kwargs.enable_thinking` and `preserve_thinking` for Qwen-compatible
 local servers. Both `baseline` and `observational-memory` load the vendored
 `local-vllm-preserve-thinking.ts` shim — a symmetric local-vLLM workaround, not a
-treatment advantage.
+config advantage.
 
 ```sh
 MODEL=local-vllm/cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4
@@ -249,3 +285,5 @@ Completed run summaries and social-card graphics are under `reports/`.
 - `harness/Dockerfile.pi-agent` — task image + pinned pi layer.
 - `scripts/materialize_configs.py` — build `configs/` from provenance.
 - `scripts/migrate_results.py` — migrate `runs/` -> `results/`.
+- `scripts/container_memory_watchdog.py` — host-side emergency RAM watchdog for
+  running `dsw-*` benchmark containers.
