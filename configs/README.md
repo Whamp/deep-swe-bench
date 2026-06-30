@@ -75,7 +75,10 @@ provenance rules.
 
 `skills/ponytail/` is a verbatim copy of the ponytail SKILL.md from
 https://github.com/DietrichGebert/ponytail so the comparison is self-contained.
-Extension configs vendor their extension source under `extensions/`.
+Extension configs vendor their extension source under `extensions/`. If an extension
+is consumed as an npm package rather than vendored source, commit its
+`package.json`/`package-lock.json`, keep `node_modules/` ignored, and document the
+required `npm ci` step in the config README.
 
 ## Adding a config + model leaf
 
