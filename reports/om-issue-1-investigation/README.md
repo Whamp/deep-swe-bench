@@ -7,9 +7,9 @@ This report consolidates what we know so far about GitHub issue #1 against the p
 
 ## Short version
 
-The original DeepSWE OM run showed a real **OM-config effect**, but it did not prove a semantic-memory effect.
+The original DeepSWE OM run showed a real **OM-config effect**, but it did not prove an executor-visible memory-content effect.
 
-The key reason: in one-shot `pi -p` benchmark runs, OM observations and reflections were recorded in the session ledger, but they usually did not reach the task executor's model context. In normal long Pi sessions, they reach the executor after compaction creates a `compactionSummary`. The published DeepSWE OM sessions had no such compaction summaries.
+The key reason: in non-projected, non-compacted one-shot `pi -p` benchmark runs, OM observations and reflections were recorded in the session ledger, but they usually did not reach the task executor's model context. In normal long Pi sessions, they reach the executor after compaction creates a `compactionSummary`. The published DeepSWE OM sessions had no such compaction summaries.
 
 We built and launched a four-arm isolation test to separate the effects:
 
@@ -21,6 +21,15 @@ We built and launched a four-arm isolation test to separate the effects:
 | `projected-om` | OM workers plus explicit provider-payload memory projection |
 
 The 12-task `12_v2` pilot is currently running with 3 reps per config.
+
+## Updates from later benchmark work
+
+Later GPT-5.5 and Qwen experiments strengthen the need for the four-arm isolation test. They show that OM configs can change benchmark outcomes, but they still do not prove that executor-visible memory content caused the change.
+
+- **GPT-5.5 low, `36_v1`:** non-projected OM observer configs improved solve rate over baseline. `observational-memory-gpt54mini-low` gained +0.093 solve rate, and `observational-memory-glm52-off` gained +0.074. Both solve-rate confidence intervals excluded zero. Because these cells used the normal, non-projected OM path, treat this as an OM-config effect until visibility is classified cell by cell.
+- **GPT-5.5 xhigh, `36_v1`:** `observational-memory-gpt54mini-low` was directionally positive: solve rate 0.657 versus 0.602 for baseline, with robust partial tied at 0.997. The solve-rate confidence interval crossed zero. Across 108 OM cells, compaction happened once and the dropper never ran, so compaction and pruning did not drive this result.
+- **Qwen3.6 off observer, GPT-5.5 low, `12_v0`:** Qwen-off OM gained solves but introduced catastrophic failures and poor worker health. A content audit found mostly grounded memories; the main problems were stale-context failures, long observer latency, and trajectory lock-in from premature completion claims. This supports the mechanical-side-effect hypothesis more than a simple hallucination hypothesis.
+- **Split-stage OM, GPT-5.5 low, `12_v0`:** `gpt-5.4-mini:low` observer plus `glm-5.2:off` reflector was clean but weak: solve rate 0.306 versus 0.250 for baseline, robust partial 0.991, and zero catastrophic cells. It underperformed the simpler `gpt-5.4-mini:low` observer config and the `glm-5.2:off` config. A stronger or different reflector alone does not explain the earlier OM gains.
 
 ## Issue claims and current verdict
 
@@ -61,7 +70,7 @@ Additional scans strengthened this:
 
 Because OM `renderSummary()` includes memory IDs, the zero-ID result is strong evidence that compaction summary projection did not fire in those benchmark sessions.
 
-### Claim 3: The old result may be caused by persistence/scaffolding, not semantic memory
+### Claim 3: The old result may be caused by persistence/scaffolding, not executor-visible memory content
 
 Current verdict: **plausible and now under test.**
 
@@ -78,7 +87,7 @@ The old data show OM sessions usually worked longer:
 - more tool calls,
 - fewer empty patches in some runs.
 
-That supports a persistence/scaffolding confound. It does not prove that semantic memory helped.
+That supports a persistence/scaffolding confound. It does not prove that executor-visible memory content helped.
 
 ## What a known working OM session looks like
 
@@ -111,7 +120,7 @@ contains ## Observations: yes
 contains ## Reflections: yes
 ```
 
-This is the reference shape for OM working as semantic memory in a long session: custom ledger entries accumulate, compaction folds them, and future turns see a `compactionSummary`.
+This is the reference shape for OM working as executor-visible semantic memory in a long session: custom ledger entries accumulate, compaction folds them, and future turns see a `compactionSummary`.
 
 ## What a published DeepSWE OM session looked like
 
@@ -294,27 +303,24 @@ tmux pane: %36
 log: results/deepseek-v4-flash/high/logs/om-isolation-12v2-4arm-w8.out
 ```
 
-At the last check:
+Status is a live operational detail. Before analysis, recompute the result count from `results/deepseek-v4-flash/high/{baseline,recall-placebo,observational-memory,projected-om}` and verify all `12_v2 × 3` cells exist for each config.
 
-```txt
-46 / 144 cells complete
-no transient errors
-no completed-cell timeouts
-```
+Do not interpret partial results.
 
 ## What to report publicly right now
 
-Do not claim the original OM DeepSWE result proved semantic memory.
+Do not claim the original OM DeepSWE result proved an executor-visible memory-content effect.
 
 A safe correction is:
 
-> We found that the original DeepSWE OM run measured an OM-config effect, not a clean semantic-memory effect. In one-shot `pi -p` runs, OM ledger entries were recorded but generally did not reach executor context because compaction did not occur before useful work. We are rerunning a four-arm isolation test with a recall-tool placebo and an explicit projected-memory arm.
+> We found that the original DeepSWE OM run measured an OM-config effect, not a clean executor-visible memory-content effect. In non-projected, non-compacted one-shot `pi -p` runs, OM ledger entries were recorded but generally did not reach executor context because compaction did not occur before useful work. We are rerunning a four-arm isolation test with a recall-tool placebo and an explicit projected-memory arm.
 
 Avoid these claims until the four-arm run finishes:
 
 - OM memory content caused the original gain.
 - Dropper/pruning caused the gain.
 - Observer model quality caused the gain through executor-visible memory.
+- Later GPT-5.5 or Qwen observer wins prove that semantic memory helped without projection or compaction visibility evidence.
 
 ## Next analysis steps
 
@@ -334,8 +340,16 @@ When the 4-arm run completes:
    - `ledger_only`,
    - `compaction_visible`,
    - `payload_projected`.
-4. Compare the four key deltas listed above.
-5. Inspect large movers before making causal claims.
+4. Report mechanism evidence:
+   - recall calls,
+   - compaction count,
+   - projection injected rows,
+   - observer and reflector calls,
+   - observer and reflector errors,
+   - append success rate,
+   - dropper calls and drops.
+5. Compare the four key deltas listed above.
+6. Inspect large movers before making causal claims.
 
 ## Evidence artifacts
 
