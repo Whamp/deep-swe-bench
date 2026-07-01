@@ -275,6 +275,7 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     (cell / "artifacts").mkdir(exist_ok=True)
     (cell / "verifier").mkdir(exist_ok=True)
     (cell / "logs").mkdir(exist_ok=True)
+    (cell / "transient_error.json").unlink(missing_ok=True)
 
     preamble = (HERE / "system_preamble.md").read_text()
     append_text = preamble + "\n\n" + arm_cfg["orchestration"]
@@ -349,6 +350,8 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
         # LLM's usage is absent from the session, so the stream is filtered on
         # the fly to tool-usage.jsonl (advisor tool_execution_end events only);
         # for non-advisor configs the stream is discarded entirely.
+        pre_session_paths = set((cell / "session").glob("*.jsonl"))
+        pre_om_debug_paths = set((cell / "pi-agent" / "observational-memory" / "debug").glob("*.ndjson"))
         cmd = pi_cmd(arm_cfg, model, thinking, append_text)
         with open(cell / "logs" / "pi.stderr.txt", "w") as se:
             # argv list, not shell: the append-system-prompt text contains
@@ -378,8 +381,8 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
             "if [ -d /root/.pi/agent/observational-memory ]; then "
             "mkdir -p /out/pi-agent && cp -a /root/.pi/agent/observational-memory /out/pi-agent/; fi"])
         transient_paths = [cell / "logs" / "pi.stderr.txt"]
-        transient_paths += list((cell / "session").glob("*.jsonl"))
-        transient_paths += list((cell / "pi-agent" / "observational-memory" / "debug").glob("*.ndjson"))
+        transient_paths += [p for p in (cell / "session").glob("*.jsonl") if p not in pre_session_paths]
+        transient_paths += [p for p in (cell / "pi-agent" / "observational-memory" / "debug").glob("*.ndjson") if p not in pre_om_debug_paths]
         transient = transient_model_error(transient_paths)
         if transient and status.get("agent_exit") != "timeout":
             status["transient_model_error"] = transient
