@@ -1,8 +1,38 @@
 # Subsamples
 
-The harness supports `--subsample harness/subsamples/<name>.txt` (one task id per line).
+The harness supports `--subset subsets/<name>.txt` (one task id per line).
 
-## Nesting: `12_v0` ⊂ `36_v1`
+There are two families of nested subsamples, both valid for different jobs:
+
+## Choosing a subsample
+
+| family | subsamples | how tasks are picked | use it when |
+|---|---|---|---|
+| **signal-dense (hand-curated)** | `12_v0`, `36_v1` | tasks chosen for discriminative value across the arms under study (reproducer tasks, known wins/losses, cross-model headroom) | cheap directional pilots where you want maximum signal per task, and you are not publishing a cross-arm comparison that needs selection neutrality |
+| **dataset-neutral (stratified)** | `12_v2`, `36_v2` | tasks chosen ONLY from task-intrinsic properties: language and cross-model pass-rate tercile. No arm outcome is ever consulted | publishable cross-arm comparisons, prompt optimization, thinking-level studies, anything where the optimizer/reader must not have peeked at arm outcomes |
+
+Both families are nested (`12 ⊂ 36 ⊂ 113`) and reproducible. They overlap only by
+chance. The signal-dense set is denser in known-discriminative tasks; the
+dataset-neutral set reproduces the population's difficulty and language mix.
+
+Selection-bias check against the 113-task population (mean cross-model pass
+rate 49.5%):
+
+| subsample | n | mean | Δ from pop | within-tercile drift |
+|---|---|---|---|---|
+| `36_v1` | 36 | 41.8 | -7.7 | picked the hard end of every bucket (-7.0 / -9.5 / -6.0) |
+| `36_v2` | 36 | 49.2 | -0.3 | matches tercile means (+2.9 / -0.1 / +1.3) |
+| `12_v0` | 12 | 55.2 | +5.7 | skews easy (2/4/6 H/M/E) |
+| `12_v2` | 12 | 47.2 | -2.2 | balanced (4/5/3 H/M/E) |
+
+The drift column is why the dataset-neutral family exists. `36_v1`'s tercile
+counts look balanced (11/14/11) but inside each bucket it systematically picked
+the harder, more discriminative tasks. That is fine for a pilot and a problem
+for a neutral comparison.
+
+## Signal-dense family: `12_v0` ⊂ `36_v1`
+
+### Nesting: `12_v0` ⊂ `36_v1`
 
 **`12_v0` (12 tasks) is fully contained in `36_v1` (36 tasks).**
 
@@ -56,22 +86,85 @@ you expand to 36, the harness skips the 12 already-done cells and runs only the
 ### How to use
 
 ```sh
-# cheap 12-task run (e.g. 3 reps × 1 arm = 36 cells)
-python3 harness/run_batch.py --arms <arm> --subsample 12_v0 \
-  --run-name <run> --model <model> --thinking <lvl> --runs 3 --workers 8
+# cheap 12-task run (e.g. 3 reps × 1 config = 36 cells)
+python3 harness/run_batch.py --configs <config> --subset 12_v0 \
+  --model <model> --thinking <lvl> --runs 3 --workers 8
 
 # later, expand to 36 without re-running any of the 12
-python3 harness/run_batch.py --arms <arm> --subsample 36_v1 \
-  --run-name <run> --model <model> --thinking <lvl> --runs 3 --workers 8
+python3 harness/run_batch.py --configs <config> --subset 36_v1 \
+  --model <model> --thinking <lvl> --runs 3 --workers 8
 # (harness skips cells with existing result.json, runs only the 24 new tasks)
 ```
 
 **Important:** expansion only works if the 12-task run and the 36-task
-expansion share the **same `--run-name`, `--arms`, `--model`, `--thinking`,
-and rep numbering**. The harness keys on `runs/<run>/<arm>/<task>/<rep>/result.json`.
+expansion share the **same `--configs`, `--model`, `--thinking`, and rep
+numbering**. The harness keys on `results/<model>/<thinking>/<config>/<task>/<rep>/result.json`.
 
-## `36_v1` — 36 tasks
+## `36_v1` — 36 tasks (signal-dense)
 
 The original fast-iteration subsample. Full list in `36_v1.txt`. Composed
 of: go 11, python 11, typescript 8, rust 4, javascript 2; 34 feature_request,
 1 bugfix, 1 enhancement.
+
+## Dataset-neutral family: `12_v2` ⊂ `36_v2`
+
+Tasks selected ONLY from task-intrinsic properties: language and cross-model
+pass-rate tercile (from `data/deepswe-v1.1-task-difficulty.tsv`). No arm
+outcome is consulted, so these subsamples are a neutral substrate for
+comparing the very arms they were not selected on. Regenerate with
+`subsets/make_stratified.py` (deterministic by `--seed`).
+
+```
+12_v2 (12) ──┐
+              ├──► 36_v2 (36)  [adds 24 tasks] ──► 113 (full)
+```
+
+### `12_v2` — 12 tasks
+
+| terciles | languages | mean pass rate | range |
+|---|---|---|---|
+| hard 4 / medium 5 / easy 3 | go 4, python 4, ts 4 | 47.2 | 16-83 |
+
+The 12-task set cannot carry rust/javascript at population share (4% of 12 is
+~0 slots), so it splits the three large languages evenly. Full list in
+`12_v2.txt`.
+
+### `36_v2` — 36 tasks
+
+| terciles | languages | mean pass rate | range |
+|---|---|---|---|
+| hard 12 / medium 14 / easy 10 | go 11, ts 11, python 10, js 2, rust 2 | 49.2 | 4-91 |
+
+Matches the 113-population mean (49.5) to within 0.3 points and reproduces the
+population language mix (ts/go/py ~30% each, rust/js ~5% each). Full list in
+`36_v2.txt`.
+
+### How to use
+
+```sh
+python3 harness/run_batch.py --configs <config> --subset 12_v2 \
+  --model <model> --thinking <lvl> --runs 3 --workers 8
+
+# expand to 36 without re-running the 12 already done
+python3 harness/run_batch.py --configs <config> --subset 36_v2 \
+  --model <model> --thinking <lvl> --runs 3 --workers 8
+```
+
+Same expansion rule as the signal-dense family: share `--configs`, `--model`,
+`--thinking`, and rep numbering so the harness skips completed cells.
+
+## Regenerating the dataset-neutral family
+
+`subsets/make_stratified.py` rebuilds `12_v2` and `36_v2` deterministically:
+
+```sh
+python3 subsets/make_stratified.py            # write 12_v2.txt, 36_v2.txt
+python3 subsets/make_stratified.py --dry-run   # print allocation, write nothing
+```
+
+Within-cell order is a pure function of `(seed, slug)` via sha256, so the
+output is stable regardless of Python dict ordering. Nesting (`12 ⊂ 36`) is
+enforced by construction: the 12-task per-cell allocations are drawn as subsets
+of the 36-task per-cell allocations. Change `--seed` to get a different
+stratified draw with the same statistical properties; this is how you build a
+fresh neutral subsample that does not overlap an existing one.
