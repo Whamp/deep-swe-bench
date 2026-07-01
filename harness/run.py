@@ -306,9 +306,15 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
           f"budget={agent_timeout:.0f}s model={model} thinking={thinking}", flush=True)
 
     # --- start env container (agent works here) ---
+    # Agent sees ONLY instruction.md + pre_artifacts.sh as /task. The reference
+    # solution/ and hidden tests/ are verifier-only (baked into the verifier
+    # image); never mount the raw task dir into the agent container.
+    task_public = tempfile.mkdtemp(prefix="dsw-task-public-")
+    shutil.copy2(task.dir / "instruction.md", Path(task_public) / "instruction.md")
+    shutil.copy2(task.dir / "pre_artifacts.sh", Path(task_public) / "pre_artifacts.sh")
     run_args = ["docker", "run", "-d", "--name", cname, "--platform", "linux/amd64",
                 "-w", "/app",
-                "-v", f"{task.dir}:/task:ro",
+                "-v", f"{task_public}:/task:ro",
                 "-v", f"{cell}:/out",
                 "-v", f"{arm_cfg['dir']}:/arm:ro",
                 # /logs mount = same as /out so pre_artifacts + verifier land on host
@@ -317,8 +323,9 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
                 *env_flag, pi_image, "sleep", str(int(agent_timeout + 600))]
     r = sh(run_args)
     if r.returncode != 0:
-        if auth_tmp:
-            shutil.rmtree(auth_tmp, ignore_errors=True)
+        for d in (auth_tmp, task_public):
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
         sys.exit(f"[cell] docker run failed:\n{r.stderr[:800]}")
 
     started = time.time()
@@ -398,8 +405,9 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
             "mkdir -p /out/pi-agent && cp -a /root/.pi/agent/observational-memory /out/pi-agent/; fi"])
         if not keep:
             sh(["docker", "rm", "-f", cname])
-        if auth_tmp:
-            shutil.rmtree(auth_tmp, ignore_errors=True)
+        for d in (auth_tmp, task_public):
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
 
     # --- verify in a pristine, air-gapped container ---
     reward = {"reward": -1, "partial": 0.0}
