@@ -58,6 +58,73 @@ def sh(cmd: list[str], timeout: float | None = None, **kw) -> subprocess.Complet
     return subprocess.run(cmd, timeout=timeout, capture_output=True, text=True, **kw)
 
 
+def strip_patch_paths(patch: Path, prefixes: tuple[bytes, ...] = (b".gocache/",)) -> int:
+    """Remove generated-cache file sections from a unified git patch.
+
+    Some agents/tools create repository-local Go build caches. If committed,
+    those caches can turn one cell's model.patch into hundreds of MB of junk.
+    Keep real source diffs; drop only whole diff sections whose a/ or b/ path
+    starts with a known generated-cache prefix.
+    """
+    if not patch.exists():
+        return 0
+    tmp = patch.with_suffix(patch.suffix + ".tmp")
+    original = patch.stat().st_size
+    removed = 0
+    dropping = False
+    current_size = 0
+    with patch.open("rb") as src, tmp.open("wb") as dst:
+        for line in src:
+            if line.startswith(b"diff --git a/"):
+                if dropping:
+                    removed += current_size
+                current_size = len(line)
+                parts = line.split()
+                paths = []
+                if len(parts) >= 4:
+                    paths = [parts[2][2:], parts[3][2:]]
+                dropping = any(path.startswith(prefix) for path in paths for prefix in prefixes)
+                if not dropping:
+                    dst.write(line)
+                continue
+            current_size += len(line)
+            if not dropping:
+                dst.write(line)
+        if dropping:
+            removed += current_size
+    tmp.replace(patch)
+    return max(removed, original - patch.stat().st_size)
+
+
+def compact_verifier_stdout(stdout: str, verifier_dir: Path) -> str:
+    """Keep verifier prelude, but do not duplicate raw suite log files.
+
+    DeepSWE verifier scripts often print full run.log/base_run.log/new_run.log
+    to stdout while also writing those files under /logs/verifier. Keeping both
+    doubles large test logs. Leave a pointer in stdout and keep the real file.
+    """
+    out: list[str] = []
+    skipping = False
+    for line in stdout.splitlines(keepends=True):
+        if line.startswith("===== raw suite output: ") and line.rstrip().endswith("====="):
+            name = line.rstrip()[len("===== raw suite output: "):]
+            name = name.removesuffix("=====").strip()
+            log_path = verifier_dir / name
+            if log_path.exists():
+                out.append(line)
+                out.append(f"[compact] raw suite output omitted; see verifier/{name} in this cell.\n")
+                skipping = True
+                continue
+        if skipping:
+            if line.startswith("====="):
+                skipping = False
+            else:
+                continue
+        if not skipping:
+            out.append(line)
+    return "".join(out)
+
+
 def ensure_env_image(env_image: str):
     r = sh(["docker", "image", "inspect", env_image])
     if r.returncode == 0:
@@ -392,6 +459,8 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
 
         # --- capture ALL work (committed or not) then extract the submission patch ---
         # Commit any uncommitted edits so a forgetful agent is not scored 0 by accident.
+        # Keep repository-local build caches out of the commit; they are never a solution.
+        sh(["docker", "exec", cname, "bash", "-lc", "find /app -type d -name .gocache -prune -exec rm -rf {} +"])
         for c in (["add", "-A"],
                   ["-c", "user.email=agent@dsw", "-c", "user.name=agent",
                    "commit", "-q", "-m", "agent work", "--allow-empty", "--no-verify"]):
@@ -400,6 +469,9 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
         r = sh(["docker", "exec", cname, "bash", "/task/pre_artifacts.sh"], timeout=120)
         (cell / "logs" / "pre_artifacts.stdout.txt").write_text(r.stdout + r.stderr)
         patch = cell / "artifacts" / "model.patch"
+        removed_patch_bytes = strip_patch_paths(patch)
+        if removed_patch_bytes:
+            status["patch_sanitized_bytes_removed"] = removed_patch_bytes
         status["patch_bytes"] = patch.stat().st_size if patch.exists() else 0
     finally:
         # Keep extension state/debug logs when an arm writes Pi agent-local data.
@@ -421,7 +493,8 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
                     "-v", f"{cell}:/logs",
                     task.verifier_image, "bash", "/tests/test.sh"],
                    timeout=task.verifier_timeout_s + 300)
-            (cell / "logs" / "verifier.stdout.txt").write_text(r.stdout + r.stderr)
+            verifier_stdout = compact_verifier_stdout(r.stdout + r.stderr, cell / "verifier")
+            (cell / "logs" / "verifier.stdout.txt").write_text(verifier_stdout)
             status["verifier_exit"] = r.returncode
             reward = read_reward(cell / "verifier")
         except subprocess.TimeoutExpired:
