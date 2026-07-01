@@ -1,0 +1,46 @@
+# codegraph-impact
+
+The **hard, caller-NAME** codegraph config (v2). A pi extension auto-builds the
+codegraph symbol graph at session start and, on every `read`/`edit`/`write` of a
+source file, injects the **names** of each symbol's non-test direct callers
+(`Symbol [role] ← callerA, callerB`).
+
+This is the fix for `codegraph-auto` (v1), which injected `brief` = caller
+**counts** and was net-harmful on 12v0×3 (−0.091 partial). The audit
+(`CODEGRAPH_PRIMITIVE_AUDIT.md`) named the better primitive: `fn-impact`.
+
+## How it works
+
+Per file (cached):
+1. `codegraph brief <file> -j` → symbols + role + callerCount.
+2. `codegraph batch fn-impact <top symbols> --depth 1 -j` → caller names, one
+   process for the whole file.
+3. test/benchmark callers filtered out (the `-T` flag does not filter on
+   `batch` in 3.15.0 — verified; filtering is in-extension by name + file path).
+4. rendered as `name [role] ← caller1, caller2, …` (≤6 callers/symbol, ≤2000 chars).
+
+## Roles
+
+- Main executor: `openai-codex/gpt-5.5`, thinking `low`.
+- No secondary LLM roles. codegraph is a local tree-sitter tool, not a model.
+
+## Prerequisite: vendor the binary
+
+```sh
+scripts/vendor_codegraph.sh
+```
+
+Populates `bin/codegraph` (~124M, hardlinked across all three codegraph configs)
+and `bin/cg`. Gitignored; the smoke gate fails loudly if `bin/` is missing.
+
+## Ceiling
+
+codegraph indexes only this repo's own sources. Cross-package, shared-type, and
+`node_modules` callers are invisible. Do not attribute integration-seam
+regressions to a tool that was structurally blind to them.
+
+## Contrast
+
+Part of the ladder on `gpt-5.5/low`, 12_v0×3:
+`baseline` → `+OM` → `codegraph-skill` (soft) → `codegraph-auto` (hard, counts)
+→ `codegraph-impact` (hard, names, this config).
