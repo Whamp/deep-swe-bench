@@ -3,7 +3,7 @@
 
 Topology (one task):
   env container  (pi-agent image: task env image + pi). repo at /app.
-    |- pi -p @/task/instruction.md --model ... --mode json   (the agent)
+    |- pi --mode rpc --model ...  (the agent, driven by harness/pi_rpc_runner.py)
     |- bash /task/pre_artifacts.sh  -> /logs/artifacts/model.patch
   verifier container (env image + hidden tests/, --network none)
     |- bash /tests/test.sh          -> /logs/verifier/reward.json
@@ -26,15 +26,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(HERE))
-from lib import load_task, instruction_text, read_reward, result_record, model_leaf  # noqa: E402
+from lib import load_task, read_reward, result_record, model_leaf  # noqa: E402
 import parse_usage  # noqa: E402
+from pi_rpc_runner import run_pi_rpc  # noqa: E402
 
 DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-flash"
 DEFAULT_THINKING = "high"
@@ -288,35 +288,34 @@ def transient_model_error(paths: list[Path]) -> str | None:
     return None
 
 
-def _drain_advisor_stream(proc: subprocess.Popen, path: Path) -> None:
-    """Filter pi --mode json stdout to tool-usage.jsonl, keeping only advisor
-    tool_execution_end events.
+_RPC_OWNED_PI_FLAGS = {
+    "-p",
+    "--print",
+    "--mode",
+    "--model",
+    "--thinking",
+    "--session-dir",
+    "--append-system-prompt",
+}
+_RPC_OWNED_PI_FLAG_PREFIXES = tuple(
+    f"{flag}=" for flag in _RPC_OWNED_PI_FLAGS if flag.startswith("--")
+)
 
-    Advisor LLM usage is absent from the native session (it runs through the
-    extension's own provider path), so it is recovered from the stream. Runs in
-    a background thread so the stdout pipe never fills and blocks pi; it ends
-    naturally when the process exits and the pipe hits EOF. The substring
-    pre-filter skips the bulk of streaming lines before the JSON parse.
-    """
-    with open(path, "w") as tu:
-        for raw in proc.stdout:
-            line = raw.decode("utf-8", "replace")
-            if '"tool_execution_end"' not in line:
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("toolName") == "advisor":
-                tu.write(line)
+
+def _validate_rpc_pi_flags(flags: list[str]) -> None:
+    """Reject config flags that would silently bypass the RPC harness contract."""
+    for flag in flags:
+        if flag in _RPC_OWNED_PI_FLAGS or flag.startswith(_RPC_OWNED_PI_FLAG_PREFIXES):
+            raise ValueError(f"config pi-flags may not override RPC runner control flag: {flag}")
 
 
 def pi_cmd(arm_cfg: dict, model: str, thinking: str, append_text: str) -> list[str]:
-    cmd = ["pi", "-p", "@/task/instruction.md",
-           "--model", model, "--thinking", thinking, "--mode", "json", "--offline",
+    flags = arm_cfg["pi_flags"]
+    _validate_rpc_pi_flags(flags)
+    cmd = ["pi", "--mode", "rpc",
+           "--model", model, "--thinking", thinking, "--offline",
            "--session-dir", "/out/session",
            "--append-system-prompt", append_text]
-    flags = arm_cfg["pi_flags"]
 
     # Keep discovery isolated; Pi still loads explicit -e/--extension paths with --no-extensions.
     if not arm_cfg["skill_dirs"]:
@@ -330,7 +329,8 @@ def pi_cmd(arm_cfg: dict, model: str, thinking: str, append_text: str) -> list[s
 
 
 def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
-             agent_timeout: float, keep: bool, pass_openai_codex_oauth: bool) -> dict:
+             agent_timeout: float, keep: bool, pass_openai_codex_oauth: bool,
+             rpc_quiescence: float) -> dict:
     task = load_task(task_id)
     arm_cfg = load_config(config, model, thinking)
     ensure_env_image(task.env_image)
@@ -412,42 +412,40 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
 
         # --- run the agent ---
         # Executor usage is read from the native session (session/*.jsonl) AFTER
-        # the run; the --mode json stream is NOT persisted (ADR-0002: per-cell
-        # pi.jsonl streams ballooned to 233GB). For advisor configs the advisor
-        # LLM's usage is absent from the session, so the stream is filtered on
-        # the fly to tool-usage.jsonl (advisor tool_execution_end events only);
-        # for non-advisor configs the stream is discarded entirely.
+        # the run. RPC stdout is consumed by harness/pi_rpc_runner.py and is NOT
+        # persisted (ADR-0002: raw per-cell streams ballooned to 233GB). For
+        # advisor configs the advisor LLM's usage is absent from the session, so
+        # the RPC runner filters only advisor tool_execution_end events into
+        # tool-usage.jsonl while discarding the full event stream.
         pre_session_paths = set((cell / "session").glob("*.jsonl"))
         pre_om_debug_paths = set((cell / "pi-agent" / "observational-memory" / "debug").glob("*.ndjson"))
         cmd = pi_cmd(arm_cfg, model, thinking, append_text)
-        with open(cell / "logs" / "pi.stderr.txt", "w") as se:
-            # argv list, not shell: the append-system-prompt text contains
-            # newlines/spaces that a bash -lc join would mangle.
-            if arm_cfg.get("advisor_json"):
-                proc = subprocess.Popen(["docker", "exec", cname, *cmd],
-                                        stdout=subprocess.PIPE, stderr=se)
-                drain = threading.Thread(
-                    target=_drain_advisor_stream,
-                    args=(proc, cell / "tool-usage.jsonl"), daemon=True)
-                drain.start()
-            else:
-                proc = subprocess.Popen(["docker", "exec", cname, *cmd],
-                                        stdout=subprocess.DEVNULL, stderr=se)
-            try:
-                proc.wait(timeout=agent_timeout)
-                status["agent_exit"] = proc.returncode
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                status["agent_exit"] = "timeout"
-                status["agent_timed_out"] = True
-            if arm_cfg.get("advisor_json"):
-                drain.join(timeout=30)
+        # argv list, not shell: the append-system-prompt text contains
+        # newlines/spaces that a bash -lc join would mangle. docker exec needs
+        # -i so the RPC driver's stdin pipe remains open until quiescence.
+        rpc_result = run_pi_rpc(
+            ["docker", "exec", "-i", cname, *cmd],
+            prompt_text=(Path(task_public) / "instruction.md").read_text(),
+            stderr_path=cell / "logs" / "pi.stderr.txt",
+            runner_log_path=cell / "logs" / "pi-rpc-runner.jsonl",
+            advisor_usage_path=(cell / "tool-usage.jsonl") if arm_cfg.get("advisor_json") else None,
+            timeout_s=agent_timeout,
+            quiescence_s=rpc_quiescence,
+        )
+        status["agent_exit"] = rpc_result.exit_code
+        if rpc_result.timed_out:
+            status["agent_timed_out"] = True
         status["agent_wall_s"] = round(time.time() - started, 1)
 
         sh(["docker", "exec", cname, "bash", "-lc",
+            "mkdir -p /out/pi-agent; "
             "if [ -d /root/.pi/agent/observational-memory ]; then "
-            "mkdir -p /out/pi-agent && cp -a /root/.pi/agent/observational-memory /out/pi-agent/; fi"])
-        transient_paths = [cell / "logs" / "pi.stderr.txt"]
+            "rm -rf /out/pi-agent/observational-memory && "
+            "cp -a /root/.pi/agent/observational-memory /out/pi-agent/observational-memory; fi; "
+            "if [ -d /root/.pi/workflows ]; then "
+            "rm -rf /out/pi-agent/workflows && "
+            "cp -a /root/.pi/workflows /out/pi-agent/workflows; fi"])
+        transient_paths = [cell / "logs" / "pi.stderr.txt", cell / "logs" / "pi-rpc-runner.jsonl"]
         transient_paths += [p for p in (cell / "session").glob("*.jsonl") if p not in pre_session_paths]
         transient_paths += [p for p in (cell / "pi-agent" / "observational-memory" / "debug").glob("*.ndjson") if p not in pre_om_debug_paths]
         transient = transient_model_error(transient_paths)
@@ -476,8 +474,13 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     finally:
         # Keep extension state/debug logs when an arm writes Pi agent-local data.
         sh(["docker", "exec", cname, "sh", "-lc",
+            "mkdir -p /out/pi-agent; "
             "if [ -d /root/.pi/agent/observational-memory ]; then "
-            "mkdir -p /out/pi-agent && cp -a /root/.pi/agent/observational-memory /out/pi-agent/; fi"])
+            "rm -rf /out/pi-agent/observational-memory && "
+            "cp -a /root/.pi/agent/observational-memory /out/pi-agent/observational-memory; fi; "
+            "if [ -d /root/.pi/workflows ]; then "
+            "rm -rf /out/pi-agent/workflows && "
+            "cp -a /root/.pi/workflows /out/pi-agent/workflows; fi"])
         if not keep:
             sh(["docker", "rm", "-f", cname])
         for d in (auth_tmp, task_public):
@@ -508,7 +511,8 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     usage = parse_usage.parse(
         session_dir=cell / "session",
         advisor_path=cell / "tool-usage.jsonl" if arm_cfg.get("advisor_json") else None,
-        worker_usage_path=cell / "pi-agent" / "observational-memory" / "worker-usage" / "usage.ndjson")
+        worker_usage_path=cell / "pi-agent" / "observational-memory" / "worker-usage" / "usage.ndjson",
+        workflow_usage_path=cell / "pi-agent" / "workflows")
     arm_settings = None
     if arm_cfg.get("settings_json"):
         arm_settings = json.loads(Path(arm_cfg["settings_json"]).read_text())
@@ -564,13 +568,16 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the env container for debugging")
     ap.add_argument("--pass-openai-codex-oauth", action="store_true",
                     help="copy only the host openai-codex OAuth entry into the agent container")
+    ap.add_argument("--rpc-quiescence", type=float, default=2.0,
+                    help="seconds Pi RPC must remain idle with no pending messages before the cell stops")
     args = ap.parse_args()
 
     task = load_task(args.task)
     to = args.agent_timeout or task.agent_timeout_s
     rec = run_cell(args.config, args.task, model=args.model, thinking=args.thinking,
                    rep=args.rep, agent_timeout=to, keep=args.keep,
-                   pass_openai_codex_oauth=args.pass_openai_codex_oauth)
+                   pass_openai_codex_oauth=args.pass_openai_codex_oauth,
+                   rpc_quiescence=args.rpc_quiescence)
     print(json.dumps({"ok": True, "reward_partial": rec["reward_partial"],
                       "total_tokens": rec["total_tokens"]}))
 
