@@ -30,7 +30,7 @@ Per file (cached):
 scripts/vendor_codegraph.sh
 ```
 
-Populates `bin/codegraph` (~124M, hardlinked across all three codegraph configs)
+Populates `bin/codegraph` (~124M, hardlinked across all codegraph configs)
 and `bin/cg`. Gitignored; the smoke gate fails loudly if `bin/` is missing.
 
 ## Ceiling

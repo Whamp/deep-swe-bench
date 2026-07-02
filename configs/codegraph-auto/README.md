@@ -16,8 +16,6 @@ into view instead of left for the model to request.
 - `extensions/codegraph-auto/index.ts` — `session_start` build + `tool_result`
   injection (cached, one `codegraph brief` per file). Writes a trace to
   `/out/codegraph-trace.jsonl` (lands in the result cell).
-- `extensions/local-vllm-preserve-thinking.ts` — no-op for gpt-5.5; loaded for
-  parity with the comparison family.
 - `skills/codegraph/SKILL.md` — deeper queries (`where`/`fn-impact`/`context`)
   the model can run on top of the auto-attached brief.
 - `smoke.json` — requires `build_ok` + `inject` trace events and the injected
@@ -34,7 +32,7 @@ scripts/vendor_codegraph.sh
 
 It prunes `@optave/codegraph` (5 grammars: ts/go/python/rust/js + linux-x64
 native core) into `configs/codegraph-auto/bin/` (~124M) and hardlinks it into
-`configs/codegraph-skill/bin/`. The smoke gate will fail loudly if `bin/` is
+all codegraph config `bin/` dirs. The smoke gate will fail loudly if `bin/` is
 missing.
 
 ## Contrast
