@@ -7,6 +7,11 @@ import tomllib
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+# Bump when harness/Dockerfile.pi-agent changes in a way that should invalidate
+# cached per-task pi images. v2 adds ripgrep/fd-find so Pi's built-in read-only
+# grep/find tools work under --offline and in recursive child agents.
+PI_IMAGE_REV = "v2-tools"
+
 # Tasks live in the sibling DeepSWE checkout (~/evals/deep-swe/tasks).
 # Override with the DEEP_SWE_TASKS env var to point elsewhere.
 def tasks_root() -> Path:
@@ -33,7 +38,7 @@ class Task:
     def pi_image(self) -> str:
         # one env image per task; tag a pi-augmented layer off it.
         slug = re.sub(r"[^a-zA-Z0-9_.-]", "-", self.env_image.split(":")[-1])
-        return f"deep-swe-pi:{slug}"
+        return f"deep-swe-pi:{PI_IMAGE_REV}-{slug}"
 
     @property
     def verifier_image(self) -> str:

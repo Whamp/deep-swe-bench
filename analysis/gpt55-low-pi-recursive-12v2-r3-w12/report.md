@@ -1,0 +1,239 @@
+# GPT-5.5 low / pi-recursive / 12_v2 × 3 report
+
+Source run tracker: `runs/gpt55-low-pi-recursive-12v2-r3-w12/track.out`
+
+Command:
+
+```bash
+python3 harness/run_batch.py --configs pi-recursive --subset 12_v2 --model openai-codex/gpt-5.5 --thinking low --runs 3 --workers 12 --pass-openai-codex-oauth --rpc-quiescence 2
+```
+
+## Completion
+
+- 36/36 cells finished successfully.
+- No agent timeouts.
+- No reward crash cells.
+- Config: `pi-recursive`.
+- Model/thinking: `openai-codex/gpt-5.5`, thinking `low`.
+
+## Headline result
+
+`pi-recursive` did **not** beat baseline on this 36-cell slice.
+
+| Metric | baseline | pi-recursive | delta |
+|---|---:|---:|---:|
+| Solves | 11/36 | 9/36 | -2 |
+| Mean partial | 0.9739 | 0.9749 | +0.0011 |
+| Median partial | 0.9968 | 0.9971 | +0.0003 |
+| Median combined tokens | 591,340 | 1,475,251 | +673,558 paired median |
+| Median combined cost | $0.8397 | $1.9121 | +$0.9611 paired median |
+| Median wall time | 198.7s | 382.1s | +173.2s paired median |
+| Total combined cost | $31.9965 | $81.9356 | +$49.9391 |
+
+Paired partial reward signal:
+
+- Mean Δpartial: `+0.0011`
+- Median Δpartial: `0.0000`
+- 95% bootstrap CI: `[-0.0212, +0.0261]`
+- Wilcoxon p: `0.7970`
+- Row wins/losses/ties: `12 / 12 / 12`
+
+Solve flips:
+
+- Recursive gained 3 solves.
+- Recursive lost 5 baseline solves.
+- Discordant binomial p: `0.7266`.
+
+## Recursive overhead
+
+Recursive child agents fired in every cell.
+
+| Recursive child metric | Value |
+|---|---:|
+| Cells with child calls | 36/36 |
+| Total child calls | 77 |
+| Median child calls per cell | 1 |
+| Mean child calls per cell | 2.1389 |
+| Max child calls in one cell | 8 |
+| Total child turns | 1,425 |
+| Total child tokens | 20,640,229 |
+| Total child cost | $32.6097 |
+| Median child tokens per cell | 258,600 |
+| Median child cost per cell | $0.5128 |
+| Child share of combined tokens | 32.43% |
+| Child share of combined cost | 39.80% |
+
+So recursion roughly doubled cost/time without producing a measurable quality gain on this subset.
+
+## Task-level pattern
+
+Best task-level partial improvement:
+
+- `participle-grammar-conflict-analysis`
+  - Baseline partial: `0.8921`
+  - Recursive partial: `0.9959`
+  - Δpartial: `+0.1038`
+  - Solves stayed `0/3`.
+
+Largest task-level regression:
+
+- `claude-code-by-agents-recursive-delegation`
+  - Baseline solves: `2/3`
+  - Recursive solves: `0/3`
+  - Baseline partial: `0.9474`
+  - Recursive partial: `0.8333`
+  - Δpartial: `-0.1140`
+
+Recursive gained solves on:
+
+- `superjson-error-stack-serialization` rep0
+- `go-critic-doc-link-checker` rep1
+- `mobly-grouped-test-barriers` rep2
+
+Recursive lost solves on:
+
+- `claude-code-by-agents-recursive-delegation` rep0, rep2
+- `go-critic-doc-link-checker` rep0
+- `langchain-request-coalescing` rep2
+- `obsidian-linter-link-format-conversion` rep0
+
+## Current verdict
+
+For `gpt-5.5 low` on `12_v2`, `pi-recursive` is a costly neutral-to-negative intervention:
+
+- Partial reward is unchanged.
+- Solve rate is worse.
+- Cost, tokens, and wall time are much higher.
+- Benefits appear concentrated in a few near-miss rows.
+- Losses include threshold flips from solved to unsolved.
+
+Do not scale this exact config without auditing whether child outputs are being returned effectively and changing the trigger policy so recursion is selective rather than always-on.
+
+## Child recursion artifact audit
+
+Follow-up audit question: did child agents actually produce and return useful information, or did the harness block them?
+
+### Data available
+
+Yes, the run saved enough data to audit this:
+
+- Parent session JSONL files under each cell's `session/` directory.
+- Child session JSONL files named like `*_d<depth>_c<call>.jsonl`.
+- Parent `rlm_query` tool-result messages containing the text returned to the parent agent.
+- Child usage fields in each `result.json`, plus `pi-recursive-cost.jsonl` / `pi-recursive-calls.counter`.
+
+### Direct parent delivery
+
+Top-level parent calls looked mechanically healthy:
+
+- Parent `rlm_query` calls: 36.
+- Parent `rlm_query` results: 36.
+- Parent returned errors: 0.
+- Empty parent returns: 0.
+- Truncated parent returns: 0.
+- Median returned text length: ~1,939 chars.
+- Mean returned text length: ~2,197 chars.
+- Max returned text length: 5,588 chars.
+
+So there is no evidence that child answers failed to return to the parent at the top level.
+
+### Full recursive tree
+
+Across all saved parent + child session files:
+
+- Child session files: 77.
+- Recursive tool calls observed across the tree: 113.
+- Recursive tool results observed across the tree: 92.
+- Explicit `rlm_query` error results: 2, both `Max calls exceeded: 8 of 8 calls already used` in one runaway Goreleaser cell.
+- Empty recursive returns: 0.
+- Truncated recursive returns: 0.
+
+Caveat: child sessions may contain copied parent history when `fork:true` is used, so simple raw JSONL scans can overcount historical tool calls. Use active-path and post-child-prompt filtering for precise analysis.
+
+### Real implementation/harness issue found
+
+Child agents were not blocked from returning answers, but they were **materially blocked from retrieving information efficiently**.
+
+The config intentionally made children read-only when no `jj` workspace is available:
+
+```ts
+const READ_ONLY_TOOLS = "read,grep,find,ls,rlm_query";
+if (workspace.readOnly) args.push("--tools", READ_ONLY_TOOLS);
+```
+
+In this benchmark container, Pi's `grep` and `find` tools depend on external `rg` and `fd`, and those were not available/downloadable in child sessions. After filtering to tool results after the child prompt:
+
+- `grep` calls in child sessions: 157, all 157 failed with `ripgrep (rg) is not available and could not be downloaded`.
+- `find` calls in child sessions: 86, all 86 failed with `fd is not available and could not be downloaded`.
+- `read` calls succeeded often: 560 child `read` results, 14 read errors.
+- `ls` mostly worked: 247 child `ls` results, 1 error.
+- 3 child sessions explicitly complained that no command execution tool was available, usually when they were asked to run tests/gofmt or inspect git diffs.
+
+This means children could still answer by using `ls` + `read`, but the read-only toolset disabled the normal shell fallback that the parent uses (`bash` with `grep`, `find`, `git diff`, `go test`, etc.). For codebase-audit subtasks, that is a serious handicap and likely inflated cost while lowering answer quality.
+
+### Other quality issues
+
+- All 36 top-level parent returns included `[stderr]` with extension debug lines like `__YPI_EXTENSION_LOADED__`, because `YPI_EXTENSION_DEBUG=1` writes to child stderr and the native tool appends stderr to the tool result. This is not fatal, but it is noisy executor context.
+- The recursive system prompt encourages broad recursive decomposition, and the config invokes the tool in every cell. This caused high cost even when the direct parent could have done the audit itself.
+- `RLM_MAX_CALLS=8` prevented unbounded blowups but caused two explicit max-call errors in a Goreleaser recursive branch.
+- Nested child results are only visible to the immediate caller unless that child synthesizes them into its final answer. The saved child session logs let us audit them offline, but the root parent does not receive every raw grandchild transcript.
+
+### Preliminary conclusion
+
+The bad result is **not** because child answers failed to return. The direct parent received nonempty child outputs in every cell.
+
+But there **is** likely a harness/config implementation problem: the child read-only toolset includes `grep` and `find`, but those tools fail in these containers because `rg`/`fd` are unavailable. Since `bash` is excluded, children cannot fall back to shell `grep/find`, cannot inspect git diffs reliably, and cannot run tests/gofmt. That makes the current `pi-recursive` config a compromised treatment.
+
+Before interpreting this as a clean negative result for recursive agents, test a fixed config that gives children a working retrieval path, e.g. one of:
+
+1. Install/provide `rg` and `fd` in the child environment.
+2. Include `bash` in the child read-only toolset but enforce no writes by instruction/container guardrails.
+3. Use `jj` workspaces so child agents can safely have full tools.
+4. Disable child re-recursion for the first clean test: top-level child audit only, no `rlm_query` available to children.
+5. Suppress debug stderr from tool-return content or move it to `details` only.
+
+
+## Config correction after audit
+
+This failure should have been caught by the first pi-recursive smoke. The original smoke proved extension registration and nonzero child usage, but did not prove that the child agent's read-only retrieval tools worked inside DeepSWE containers.
+
+Corrections made in `configs/pi-recursive`:
+
+- `YPI_EXTENSION_DEBUG=1` → `YPI_EXTENSION_DEBUG=0`, because debug stderr was being appended into parent-visible child answers.
+- `RLM_MAX_CALLS=8` → `RLM_MAX_CALLS=12`, preserving a hard recursion cap while giving bounded audit branches a little more room.
+- Smoke contract now requires durable child artifacts and forbids the exact broken child-search strings:
+  - `ripgrep (rg) is not available and could not be downloaded`
+  - `fd is not available and could not be downloaded`
+  - `Max calls exceeded`
+
+The next scored run should not proceed until a smoke/preflight proves child search/retrieval works under the selected fix path: working `rg`/`fd`, guarded child `bash`, or `jj` workspaces.
+
+### Follow-up correction: fix the Pi read-only tool dependencies
+
+The correct first fix is to make Pi's built-in read-only `grep`/`find` tools
+fully functional in the benchmark image, not to accept or route around broken
+child search.
+
+Implemented source changes:
+
+- `harness/Dockerfile.pi-agent` installs `ripgrep` and `fd-find` and symlinks
+  Debian's `/usr/bin/fdfind` to `/usr/local/bin/fd`.
+- `harness/lib.py` bumps the per-task pi image tag to `v2-tools-*` so existing
+  cached images without `rg`/`fd` are not reused.
+- `configs/pi-recursive/gpt-5.5/low/smoke.json` asserts the Dockerfile/tool-layer
+  fix and still forbids the old missing-tool errors in child session artifacts.
+
+This preserves the intended no-jj/read-only child design while restoring the
+actual retrieval capability that Pi's read-only tools depend on.
+
+### Correction: prompt changes reverted for the fixed-tools rerun
+
+The temporary jj→Git-worktree/no-jj instruction edits were too broad for the
+baseline `pi-recursive` config. They have been reverted. The next fixed-tools
+rerun should test the upstream pi-recursive prompt with working Pi read-only
+`grep`/`find` dependencies (`rg`/`fd`) and the smaller env changes only
+(`YPI_EXTENSION_DEBUG=0`, `RLM_MAX_CALLS=12`).
+
+Git-worktree-backed writable child agents should be a separate config and should
+include real launcher support for temporary `git worktree` creation and cleanup,
+not prompt-only wording.
