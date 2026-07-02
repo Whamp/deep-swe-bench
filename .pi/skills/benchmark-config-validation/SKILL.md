@@ -25,6 +25,7 @@ A **config** is not ready until every LLM role is measurable and one smoke cell 
 3. **Respect nested workers.**
    - Do not assume config-level Pi extension hooks see extension-internal worker calls.
    - `pi-observational-memory` observer/reflector/dropper calls go through direct `agentLoop` calls.
+   - Recursive/subagent configs must prove child sessions have the intended tools and no structural tool errors; extension registration alone is not a valid smoke. The pi-recursive compromised run showed that missing child `rg`/`fd` read-only tools can pass a shallow smoke while invalidating the run.
    - Put worker request mutation/audit logic in that worker path, or prove the hook fires there.
    - Completion: the proof is copied into the result cell, not just inferred from source code.
 
@@ -33,10 +34,12 @@ A **config** is not ready until every LLM role is measurable and one smoke cell 
    - Put feature-specific checks in `configs/<config>/smoke.json` or `configs/<config>/<model-leaf>/<thinking>/smoke.json`.
    - Contract paths are relative to the result cell after `harness/run.py` copies artifacts out of the container.
    - For OM worker audits, prefer `pi-agent/observational-memory/...`; files elsewhere under `/root/.pi/agent` are invisible unless `run.py` copies them.
+   - For recursive/subagent configs, assert stable child artifacts/result fields and forbid known child failure text such as missing `rg`, missing `fd`, missing command-execution tools when they are expected, or `Max calls exceeded`.
    - Completion: the config-authored `smoke.json` names every required result field, file, required text, forbidden text, and repo-level validation artifact.
 
 5. **Smoke before fan-out.**
-   - For any config with no results for the selected executor model/thinking leaf, let `harness/run_batch.py` run one rep0 smoke cell from `12_v0` unless separate evidence justifies `--no-smoke-new-configs`.
+   - For any config with no results for the selected executor model/thinking leaf, let `harness/run_batch.py` run one rep0 smoke cell unless separate evidence justifies `--no-smoke-new-configs`.
+   - The smoke task should be reusable: prefer a requested task from `12_v0`; if the batch has no `12_v0` overlap, use the first requested task.
    - Inspect the smoke `result.json` before a full comparison.
    - Completion: the smoke gate passes and leaves evidence in the result tree.
 

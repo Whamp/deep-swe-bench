@@ -47,6 +47,24 @@ file in place — add a new `<model-leaf>/<thinking>/` instead.
 | `smoke.json`        | constant | Optional smoke contract for a new config. Config-root applies to all leaves; leaf-local |
 |                     | or leaf  | `smoke.json` overrides it. See [Smoke tests and contracts](#smoke-tests-and-contracts). |
 
+## Generated local binaries
+
+`configs/**/bin/` is intentionally gitignored. Codegraph and codebase-memory
+configs use large local binaries, regenerated on demand and hardlinked across
+sibling configs so apparent duplicates share disk blocks:
+
+```sh
+scripts/vendor_codegraph.sh
+scripts/vendor_codebase_memory.sh
+```
+
+To shrink a working tree after experiments, remove only ignored/regenerable
+artifacts with:
+
+```sh
+scripts/clean_local_codegraph_artifacts.sh --yes
+```
+
 A leaf is **path-only** (no files) when its models are all built-in providers
 (openrouter / openai-codex); `models.json` is only placed when `local-vllm` is
 involved (executor or worker). See `scripts/materialize_configs.py` for the
@@ -69,16 +87,17 @@ provenance rules.
   `pi-agent/observational-memory/worker-usage/usage.ndjson`. The trace records
   token/cost metadata only; it must not persist streamed text deltas or repeated
   growing output.
-- `ponytail-full/`, `ponytail-lite/`, `ponytail-ultra/` — ponytail skill loaded,
-  level pinned to full/lite/ultra.
-- `ponytail-extension/` — ponytail loaded as a pi extension rather than a skill.
+- `ponytail-full/`, `ponytail-lite/`, `ponytail-ultra/` — Ponytail loaded as the
+  vendored Pi extension, with `PONYTAIL_DEFAULT_MODE` pinned to full/lite/ultra
+  for non-interactive benchmark cells.
+- `ponytail-extension/` — legacy/default Ponytail extension config pinned to full.
 
-`skills/ponytail/` is a verbatim copy of the ponytail SKILL.md from
-https://github.com/DietrichGebert/ponytail so the comparison is self-contained.
-Extension configs vendor their extension source under `extensions/`. If an extension
-is consumed as an npm package rather than vendored source, commit its
-`package.json`/`package-lock.json`, keep `node_modules/` ignored, and document the
-required `npm ci` step in the config README.
+Ponytail configs vendor their full extension source under `extensions/ponytail/`,
+including its bundled skills, so the comparison matches a normal user installing
+and enabling the Ponytail extension. If an extension is consumed as an npm package
+rather than vendored source, commit its `package.json`/`package-lock.json`, keep
+`node_modules/` ignored, and document the required `npm ci` step in the config
+README.
 
 ## Adding a config + model leaf
 
@@ -97,8 +116,10 @@ up. No harness changes.
 
 `harness/run_batch.py` has an automatic smoke gate for configs that have no
 existing results for the selected executor model + thinking leaf. Before it fans
-out a full batch, it runs one `rep0` cell on a task from `subsets/12_v0.txt`.
-Using `12_v0` makes the smoke result reusable data instead of a throwaway cell.
+out a full batch, it runs one `rep0` cell. It prefers the first requested task
+that appears in `subsets/12_v0.txt`; if the requested batch has no `12_v0`
+overlap, it uses the first requested task so the smoke result is still reusable
+for that comparison instead of becoming a throwaway cell.
 
 The default smoke check is deliberately generic. It only verifies that the
 harness produced a normal cell:

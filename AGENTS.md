@@ -21,8 +21,12 @@ Use project skills instead of re-reading long cautionary prose:
 - **benchmark-launch** — use before launching `harness/run_batch.py`, especially
   when more than the main executor model is involved. It is the source of truth
   for the confirmation table, credential preflight, thinking-level evidence,
-  OpenRouter/default-provider rules, post-launch verification, and whether to
-  run the container memory watchdog.
+  OpenRouter/default-provider rules, structured run-dashboard state, post-launch
+  verification, and whether to run the container memory watchdog.
+- **runboard** — use when the user explicitly asks for a Herdr/tail view. For
+  new batch launches, prefer the structured dashboard written under
+  `results/_runs/<run_id>/` and served with `scripts/run_dashboard.py`; runboard
+  is now a compatibility/tail workflow, not the primary monitor.
 
 ## Standing rules
 
@@ -37,9 +41,14 @@ Use project skills instead of re-reading long cautionary prose:
   local-vLLM shims, or any other secondary model, stop and get explicit user
   confirmation before running it.
 - For benchmark launches, “working” means the smoke gate passed and left evidence
-  in the result tree. A live process or an `ok` line is not enough.
+  in the result tree. A live process, dashboard heartbeat, or an `ok` line is not
+  enough.
 - For long or high-concurrency benchmark batches, consider
   `scripts/container_memory_watchdog.py`. It is a host-side safety tool for
   active `dsw-*` containers, logs manual interventions separately under
   `runs/container-memory-watchdog/`, and must not mutate official `result.json`
   artifacts.
+- Do not include `results/_contaminated/` in normal efficacy analyses. See
+  `docs/result-quarantine.md` before using quarantined runs; those directories
+  are diagnostic/harness-failure artifacts unless an analysis explicitly targets
+  that failure mode.

@@ -20,14 +20,16 @@ Each cell is one `(task, config, rep)`:
 
 1. Pull the DeepSWE task environment image.
 2. Build a thin cached layer that adds `pi@0.80.2` to that image.
-3. Run pi **inside the task container** at `/app`, so the agent can read/edit the
-   repo and run the task's real toolchain.
+3. Run pi **inside the task container** at `/app` through `pi --mode rpc`, so the
+   agent can read/edit the repo, run the task's real toolchain, and let
+   extension follow-up work finish before the harness stops the cell.
 4. Commit any uncommitted agent edits, then run the task's `pre_artifacts.sh` to
    produce `/logs/artifacts/model.patch`.
 5. Build/run the task verifier image with `--network none` and capture
    `/logs/verifier/reward.json`.
-6. Read usage from pi's native `session/*.jsonl` (the `--mode json` stream is no
-   longer persisted — see `docs/adr/0002-retire-pi-jsonl-stream-capture.md`).
+6. Read usage from pi's native `session/*.jsonl`; the full RPC event stream is
+   not persisted. Compact sidecars such as advisor `tool-usage.jsonl` are
+   filtered live when needed (see `docs/adr/0002-retire-pi-jsonl-stream-capture.md`).
 
 The verifier always runs in a pristine separate container, matching DeepSWE's
 separate-verifier setup.
@@ -46,8 +48,9 @@ are held constant.
 - `baseline-wf` — baseline plus the mini-swe-agent step-by-step workflow prompt.
 - `ponytail-extension` — the vendored Ponytail Pi extension, pinned to
   `PONYTAIL_DEFAULT_MODE=full`.
-- `ponytail-full` / `ponytail-lite` / `ponytail-ultra` — skill-only configs with
-  different pinned modes.
+- `ponytail-full` / `ponytail-lite` / `ponytail-ultra` — the same vendored
+  Ponytail Pi extension, pinned to full/lite/ultra modes for non-interactive
+  benchmark cells.
 - `advisor` — `pi-advisor` extension; advisor model `zai/glm-5.2` via
   `ZAI_API_KEY` (configs leaf `deepseek-v4-flash+glm-5.2`).
 - `observational-memory` — `pi-observational-memory` extension; memory workers
@@ -91,10 +94,34 @@ Use `--tasks a,b,c` for an explicit paired set, or `--subset 36_v1` to read
 unless `--force` is passed (resume is by `(task, rep)` existence).
 
 For a config with no existing results for the selected model+thinking leaf,
-`run_batch.py` first runs one reusable smoke cell from `subsets/12_v0.txt` before
-batch fan-out. The default smoke check is generic; config-specific expectations
+`run_batch.py` first runs one reusable smoke cell before batch fan-out. It
+prefers a requested task from `subsets/12_v0.txt`, then falls back to the first
+requested task. The default smoke check is generic; config-specific expectations
 belong in an optional `smoke.json` contract. See
 [`configs/README.md#smoke-tests-and-contracts`](configs/README.md#smoke-tests-and-contracts).
+
+### Live dashboard
+
+Every future `run_batch.py` execution writes structured state under
+`results/_runs/<run-id>/` while preserving the existing stdout progress lines:
+
+- `manifest.json` — command, selection, configs, planned reps, and preflight cells
+- `status.json` — live counts, active cells, heartbeat, outcomes, compact metrics
+- `events.ndjson` — append-only lifecycle events
+
+Use `--run-id my-id` to choose the directory name, or let the runner generate one.
+`--progress-interval` controls heartbeat refreshes.
+
+Serve the polling dashboard without starting or stopping any benchmark work:
+
+```sh
+python3 scripts/run_dashboard.py --host 127.0.0.1 --port 8765 --detail operational
+```
+
+Open `http://127.0.0.1:8765/`. Detail levels are `summary`, `operational`, and
+`diagnostic`. The page links result/log paths and capped file tails rather than
+inlining large raw logs. Existing `scripts/open_runboard.py` / `track.out` flows
+still work; the dashboard also lists legacy `runs/*/track.out` files when found.
 
 ### Container memory watchdog
 
@@ -218,27 +245,39 @@ non-empty patches, verifier reward, token/cost accounting, and paired analysis.
 
 ## Observational-memory eval
 
-Compare baseline to Pi with only the observational-memory extension:
+Important: stock headless `observational-memory` DeepSWE runs are diagnostic for
+this benchmark regime unless compaction/projection is explicitly exercised. In
+single-shot `pi -p` cells, observations/reflections can be recorded and folded
+without becoming executor-visible before useful work. Those historical stock OM
+result dirs are quarantined under `results/_contaminated/om-no-executor-projection/`;
+see [`docs/result-quarantine.md`](docs/result-quarantine.md).
+
+For memory-content isolation, use the explicit 4-arm design:
 
 ```sh
 source ~/.bashrc   # provides OPENROUTER_API_KEY
 python3 harness/run_batch.py \
-  --configs observational-memory \
+  --configs baseline,recall-placebo,observational-memory,projected-om \
+  --subset 12_v2 \
   --model openrouter/deepseek/deepseek-v4-flash \
   --thinking high \
-  --workers 2
-python harness/analyze.py \
-  --model openrouter/deepseek/deepseek-v4-flash \
-  --thinking high \
-  --comparison om-memory \
-  --configs baseline,observational-memory
+  --runs 3 \
+  --workers 2 \
+  --run-id om-isolation-12v2
 ```
 
+Delta interpretation:
+
+- `recall-placebo - baseline` isolates recall-tool/system-prompt scaffolding.
+- `observational-memory - recall-placebo` isolates background worker side effects
+  without guaranteed memory-content projection.
+- `projected-om - observational-memory` isolates executor-visible memory content
+  from the live projection shim.
+
 Reps accumulate under a config regardless of which subset produced them, so an
-existing baseline (e.g. from `ponytail-full-pilot`) is reused — do not rerun
-baseline unless you want fresh reps. The `observational-memory` config vendors
-extension source under `configs/` and seeds the leaf `settings.json` (worker
-model) + `models.json` from the model leaf.
+existing baseline can be reused — do not rerun baseline unless you want fresh
+reps. The OM configs vendor extension source under `configs/` and seed model leaf
+`settings.json` / `models.json` as needed.
 
 ## Advisor eval
 
@@ -278,12 +317,15 @@ Completed run summaries and social-card graphics are under `reports/`.
 ## Files
 
 - `harness/run.py` — one `(config, task, rep)` cell.
-- `harness/run_batch.py` — scheduler with resume.
+- `harness/run_batch.py` — scheduler with resume and structured run-state output.
+- `harness/run_state.py` — structured `results/_runs/<run_id>/` manifest/status/events writer.
 - `harness/analyze.py` — paired summaries + Wilcoxon/Holm where enough pairs exist.
 - `harness/parse_usage.py` — native-session token/cost parser (+ advisor tool-usage path).
 - `harness/lib.py` — shared helpers incl. `model_leaf()`.
 - `harness/Dockerfile.pi-agent` — task image + pinned pi layer.
+- `scripts/run_dashboard.py` — polling web dashboard for `results/_runs` and legacy track files.
 - `scripts/materialize_configs.py` — build `configs/` from provenance.
 - `scripts/migrate_results.py` — migrate `runs/` -> `results/`.
 - `scripts/container_memory_watchdog.py` — host-side emergency RAM watchdog for
   running `dsw-*` benchmark containers.
+- `docs/result-quarantine.md` — local quarantine policy for invalid/diagnostic result dirs.
