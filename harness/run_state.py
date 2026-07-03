@@ -499,10 +499,13 @@ class RunStateWriter:
             if state in TERMINAL_STATES:
                 counts["batch_done"] += 1
             outcome = cell.get("outcome")
-            if state in TERMINAL_STATES and outcome:
+            # Only count outcomes for cells that actually ran in THIS run.
+            # Skipped cells (existing result reused) must not inflate ok/failed
+            # buckets; their outcome is preserved on the cell for detail views.
+            if state in TERMINAL_STATES and outcome and state != "skipped":
                 if outcome in {"ok", "empty", "timeout", "transient"}:
                     counts[outcome] += 1
-                elif outcome != "skipped":
+                else:
                     counts["failed"] += 1
         for cell in preflight.values():
             state = cell.get("state")
@@ -610,20 +613,54 @@ def _failure_buckets(status: dict[str, Any]) -> dict[str, int]:
     return buckets
 
 
+# Threshold for flagging an active cell as potentially stuck. Cells running
+# longer than this without finishing may be hung on a provider request.
+STALE_CELL_THRESHOLD_S = 1800  # 30 minutes
+
+
+def _enrich_active_cells(active_cells: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], float | None, int]:
+    """Add cell_age_s to each active cell and return (cells, max_age_s, stale_count)."""
+    now = datetime.now(timezone.utc)
+    max_age: float | None = None
+    stale = 0
+    enriched = []
+    for cell in active_cells:
+        cell = dict(cell)  # shallow copy so we don't mutate the source
+        started = parse_timestamp(cell.get("started_at"))
+        if started:
+            age = max(0.0, (now - started).total_seconds())
+            cell["cell_age_s"] = round(age, 1)
+            if max_age is None or age > max_age:
+                max_age = age
+            if age > STALE_CELL_THRESHOLD_S:
+                cell["potentially_stale"] = True
+                stale += 1
+        enriched.append(cell)
+    return enriched, max_age, stale
+
+
 def project_structured_run(run_dir: Path, *, detail: str = "summary") -> dict[str, Any]:
     if detail not in DETAIL_LEVELS:
         detail = "summary"
     manifest = load_json(run_dir / "manifest.json") or {}
     status = load_json(run_dir / "status.json") or {}
     run_id = str(manifest.get("run_id") or status.get("run_id") or run_dir.name)
-    counts = status.get("counts") or {}
+    # Recompute counts from cells on read so the dashboard always reflects the
+    # current _counts logic, even for runs whose batch process cached an older
+    # version of this module.
+    counts = RunStateWriter._counts(status) if status else {}
     active_ids = status.get("active_cell_ids") or []
     all_cells = status.get("cells") or {}
-    active_cells = [all_cells[cid] for cid in active_ids if cid in all_cells]
+    raw_active = [all_cells[cid] for cid in active_ids if cid in all_cells]
+    active_cells, max_cell_age_s, stale_cell_count = _enrich_active_cells(raw_active)
     preflight = status.get("preflight") or {}
+    # run_key is the unique directory name — always unique even when two runs
+    # share the same manifest run_id (e.g. a smoke-failed rerun).  The frontend
+    # routes on run_key so every discovered run is individually addressable.
     projected = {
         "kind": "structured",
         "run_id": run_id,
+        "run_key": run_dir.name,
         "state": status.get("state", "unknown"),
         "stage": status.get("stage"),
         "created_at": manifest.get("created_at") or status.get("started_at"),
@@ -638,6 +675,8 @@ def project_structured_run(run_dir: Path, *, detail: str = "summary") -> dict[st
         "workers": manifest.get("workers"),
         "counts": counts,
         "active_count": len(active_cells),
+        "max_cell_age_s": round(max_cell_age_s, 1) if max_cell_age_s is not None else None,
+        "stale_cell_count": stale_cell_count,
         "failure_buckets": _failure_buckets(status),
         "paths": {
             "run_dir": str(run_dir),
@@ -724,6 +763,7 @@ def project_legacy_track(track_path: Path, *, detail: str = "summary") -> dict[s
     projected = {
         "kind": "legacy_track",
         "run_id": f"legacy-{run_name}",
+        "run_key": f"legacy-{run_name}",
         "legacy_name": run_name,
         "state": state,
         "stage": "track.out",
