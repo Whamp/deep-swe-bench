@@ -25,6 +25,7 @@ A launch that uses more than the main executor model must stop for user confirma
 3. **Preflight credentials.**
    - Check credentials are available to the agent container path, not just the host shell.
    - For OpenAI Codex models, require Codex OAuth and `--pass-openai-codex-oauth`.
+   - The host OAuth at `~/.pi/agent/auth.json` also drives subscription auto-resume: on a usage-limit pause `run_batch.py` queries `chatgpt.com/backend-api/wham/usage` to find the window reset time, sleeps until it, then re-launches (skipping completed cells). Opt out with `--no-auto-resume`; cap the wait with `--max-quota-wait`. GPT-5.3-Codex-Spark has a separate pool.
    - For GLM models, prefer direct ZAI through `ZAI_API_KEY`.
    - Never default to OpenRouter unless the user explicitly permits it; the standing exception is `openrouter/deepseek/deepseek-v4-flash`.
    - Completion: no role has an assumed or missing credential.

@@ -171,6 +171,43 @@ python3 harness/run_batch.py \
 The runner copies only `openai-codex` from `~/.pi/agent/auth.json`; it does not
 mount the whole host Pi agent directory.
 
+#### Subscription quota limits & auto-resume
+
+The OpenAI Codex subscription has 5-hour and weekly usage windows that can
+exhaust mid-batch. When a cell hits a usage-limit error, `run.py` writes a
+`transient_error.json` sentinel and exits 75; `run_batch.py` treats exit 75 as a
+pause signal.
+
+By default `run_batch.py` now **auto-resumes**: on a pause it queries the live
+Codex usage API (`chatgpt.com/backend-api/wham/usage`, same endpoint as
+`@marckrenn/pi-sub-core`) to find which window is exhausted and when it resets,
+sleeps until the reset (re-checking every 5m so an early reset is caught), then
+re-launches the batch. Completed cells are skipped, so only the interrupted
+work re-runs. The dashboard stage shows `quota_wait` during the sleep.
+
+The pause log names the exact reason, e.g.:
+
+```
+[pause] transient model/subscription limit detected; waiting for the window reset before auto-resume
+[resume] quota exhausted (5h @ 100% resets in 47m); sleeping ~2880s until reset, then resuming [attempt 1]
+[resume] waiting for quota reset: 46m remaining (re-check in 300s)
+...
+[resume] re-launching batch (attempt 1)
+```
+
+GPT-5.3-Codex-Spark has its own separate quota pool; the checker filters to the
+windows that govern the model being run. Tunable flags:
+
+| flag | default | meaning |
+|------|---------|---------|
+| `--no-auto-resume` | off | exit 75 immediately on any transient (old behavior) |
+| `--max-quota-wait` | `21600` (6h) | give up if the reset is further away than this |
+| `--quota-poll` | `300` (5m) | re-check interval while waiting for a reset |
+| `--rate-limit-backoff` | `60` | backoff before retrying a short (non-subscription) rate-limit |
+
+Short rate-limits (HTTP 429) get a brief backoff then retry; unclassified
+transients exit 75 for manual resume.
+
 ### Local Qwen on server60
 
 Current local model endpoint, verified before wiring this run:
