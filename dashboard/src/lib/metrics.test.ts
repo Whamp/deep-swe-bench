@@ -204,6 +204,7 @@ describe('formatting', () => {
   })
 
   it('fmtCost handles ranges', () => {
+    expect(fmtCost(0)).toBe('$0')
     expect(fmtCost(0.005)).toBe('$0.0050')
     expect(fmtCost(0.5)).toBe('$0.500')
     expect(fmtCost(1.5)).toBe('$1.50')

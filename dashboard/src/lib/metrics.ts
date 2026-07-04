@@ -91,6 +91,7 @@ export function fmtTokens(v: number | null | undefined): string {
 
 export function fmtCost(v: number | null | undefined): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return '—'
+  if (v === 0) return '$0'
   if (v < 0.01) return `$${v.toFixed(4)}`
   if (v < 1) return `$${v.toFixed(3)}`
   return `$${v.toFixed(2)}`

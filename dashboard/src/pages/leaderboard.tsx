@@ -2,11 +2,12 @@ import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip,
-  Cell as RechartsCell, LabelList,
+  Cell as RechartsCell,
 } from 'recharts'
 import { fetchCompare, fetchSubsets } from '@/lib/api'
 import type { ComparisonRun } from '@/lib/types'
 import { paretoFrontier, fmtCost, fmtTokens } from '@/lib/metrics'
+import { useIsMobile } from '@/lib/use-mobile'
 import { MeasuredContainer } from '@/components/measured-container'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -153,6 +154,7 @@ export default function Leaderboard() {
 }
 
 function ParetoScatter({ runs }: { runs: ComparisonRun[] }) {
+  const isMobile = useIsMobile()
   const points = runs.map((r) => ({ id: r.run_id, cost: r.median_cost, value: r.solve_rate, r }))
   const annotated = paretoFrontier(points)
   const chartData = annotated.map((p, i) => ({
@@ -167,29 +169,32 @@ function ParetoScatter({ runs }: { runs: ComparisonRun[] }) {
     <Card>
       <CardHeader>
         <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
-          Pareto frontier — solve rate vs median cost (upper-left = better)
+          Pareto frontier — solve rate vs median cost (upper-left = better) · hover a point for details
         </CardTitle>
       </CardHeader>
       <CardContent>
-        <MeasuredContainer height={360}>
+        <MeasuredContainer height={isMobile ? 320 : 380}>
           {(w, h) => (
-            <ScatterChart width={w} height={h} margin={{ top: 16, right: 48, bottom: 24, left: 16 }}>
+            <ScatterChart width={w} height={h} margin={{ top: 16, right: 24, bottom: 28, left: 12 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="hsl(215 14% 22%)" />
               <XAxis
                 type="number" dataKey="cost" name="Median Cost"
                 tickFormatter={(v) => fmtCost(v)}
-                stroke="hsl(215 16% 60%)"
-                label={{ value: 'Median Cost ($)', position: 'insideBottom', offset: -4, fill: 'hsl(215 16% 60%)', fontSize: 12 }}
+                stroke="hsl(215 16% 65%)" tick={{ fontSize: isMobile ? 11 : 13 }}
+                domain={[0, 'dataMax']}
+                padding={{ left: 20, right: 20 }}
+                label={{ value: 'Median Cost ($)', position: 'insideBottom', offset: -8, fill: 'hsl(215 16% 65%)', fontSize: 12 }}
               />
               <YAxis
                 type="number" dataKey="solveRate" name="Solve Rate"
                 domain={[0, 100]} unit="%"
-                stroke="hsl(215 16% 60%)"
-                label={{ value: 'Solve Rate (%)', angle: -90, position: 'insideLeft', fill: 'hsl(215 16% 60%)', fontSize: 12 }}
+                stroke="hsl(215 16% 65%)" tick={{ fontSize: isMobile ? 11 : 13 }}
+                padding={{ top: 12, bottom: 12 }}
+                label={{ value: 'Solve Rate (%)', angle: -90, position: 'insideLeft', fill: 'hsl(215 16% 65%)', fontSize: 12 }}
               />
               <Tooltip
                 cursor={{ strokeDasharray: '3 3' }}
-                contentStyle={{ background: 'hsl(215 14% 11%)', border: '1px solid hsl(215 14% 22%)', borderRadius: 8 }}
+                contentStyle={{ background: 'hsl(215 14% 11%)', border: '1px solid hsl(215 14% 22%)', borderRadius: 8, fontSize: 13 }}
                 formatter={(value: number, name: string) =>
                   name === 'Solve Rate' ? `${value.toFixed(1)}%` : fmtCost(value)}
                 labelFormatter={(_, payload) => payload?.[0]?.payload?.name || ''}
@@ -199,23 +204,17 @@ function ParetoScatter({ runs }: { runs: ComparisonRun[] }) {
                   <RechartsCell
                     key={i}
                     fill={entry.color}
-                    fillOpacity={entry.isPareto ? 1 : 0.4}
+                    fillOpacity={entry.isPareto ? 0.95 : 0.45}
                     stroke={entry.isPareto ? '#fff' : 'none'}
-                    strokeWidth={entry.isPareto ? 3 : 0}
+                    strokeWidth={entry.isPareto ? 2 : 0}
                   />
                 ))}
-                <LabelList
-                  dataKey="name"
-                  position="top"
-                  formatter={(v: string) => (chartData.find((d) => d.name === v)?.isPareto ? shortName(v) : '')}
-                  fill="hsl(215 16% 75%)"
-                  fontSize={10}
-                />
               </Scatter>
             </ScatterChart>
           )}
         </MeasuredContainer>
         <div className="mt-2 flex flex-wrap gap-2 text-xs">
+          <span className="text-muted-foreground">★ Pareto-optimal:</span>
           {chartData.filter((d) => d.isPareto).map((d) => (
             <Badge key={d.name} className="text-xs">★ {d.name}</Badge>
           ))}
@@ -223,12 +222,6 @@ function ParetoScatter({ runs }: { runs: ComparisonRun[] }) {
       </CardContent>
     </Card>
   )
-}
-
-function shortName(runId: string): string {
-  // model/thinking/config -> config (last segment), truncated
-  const seg = runId.split('/').pop() || runId
-  return seg.length > 22 ? `${seg.slice(0, 20)}…` : seg
 }
 
 interface LeaderboardTableProps {
@@ -268,13 +261,13 @@ function LeaderboardTable({ runs, sortKey, sortDir, onSort, maxN }: LeaderboardT
                 <TableHead className="text-right cursor-pointer select-none" onClick={() => onSort('solve_rate')}>
                   Solve %{arrow('solve_rate')}
                 </TableHead>
-                <TableHead className="text-right cursor-pointer select-none" onClick={() => onSort('mean_partial')}>
+                <TableHead className="hidden text-right cursor-pointer select-none md:table-cell" onClick={() => onSort('mean_partial')}>
                   Mean partial{arrow('mean_partial')}
                 </TableHead>
                 <TableHead className="text-right cursor-pointer select-none" onClick={() => onSort('median_cost')}>
                   Med cost{arrow('median_cost')}
                 </TableHead>
-                <TableHead className="text-right cursor-pointer select-none" onClick={() => onSort('median_tokens')}>
+                <TableHead className="hidden text-right cursor-pointer select-none md:table-cell" onClick={() => onSort('median_tokens')}>
                   Med tokens{arrow('median_tokens')}
                 </TableHead>
                 <TableHead className="text-right cursor-pointer select-none" onClick={() => onSort('total_cost')}>
@@ -317,11 +310,11 @@ function LeaderboardTable({ runs, sortKey, sortDir, onSort, maxN }: LeaderboardT
                         <span className="font-mono">{r.solve_rate.toFixed(1)}</span>
                       </div>
                     </TableCell>
-                    <TableCell className="text-right font-mono text-muted-foreground">
+                    <TableCell className="hidden text-right font-mono text-muted-foreground md:table-cell">
                       {(r.mean_partial * 100).toFixed(1)}
                     </TableCell>
                     <TableCell className="text-right font-mono">{fmtCost(r.median_cost)}</TableCell>
-                    <TableCell className="text-right font-mono text-muted-foreground">{fmtTokens(r.median_tokens)}</TableCell>
+                    <TableCell className="hidden text-right font-mono text-muted-foreground md:table-cell">{fmtTokens(r.median_tokens)}</TableCell>
                     <TableCell className="text-right font-mono">{fmtCost(r.total_cost)}</TableCell>
                     <TableCell className={cn('text-right font-mono text-xs', coverage < 1 && 'text-amber-500')}>
                       {r.total_cells}
