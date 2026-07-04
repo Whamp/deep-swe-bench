@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
-"""Serve a lightweight live dashboard for run_batch structured state.
+"""Serve the deep-swe-bench dashboard JSON API.
+
+The frontend is a React+Vite SPA in dashboard/. This server provides:
+  GET /api/runs              — list all discovered runs (structured + legacy)
+  GET /api/runs/<id>         — detailed projection of a single run
+  GET /api/runs/<id>/events  — events.ndjson tail
+  GET /api/compare           — aggregated cross-run benchmark metrics for charts
+  GET /api/subsets            — list available task subsets
+  GET /api/file?path=&tail=  — tail a file from the repo (allowlisted)
 
 Usage:
-    python3 scripts/run_dashboard.py --host 127.0.0.1 --port 8765
+    python3 scripts/run_dashboard.py --host 0.0.0.0 --port 8789
 """
 from __future__ import annotations
 
 import argparse
-import html
 import json
+import statistics
 import sys
 import urllib.parse
 from http import HTTPStatus
@@ -31,177 +39,14 @@ from harness.run_state import (  # noqa: E402
 
 DEFAULT_STATE_ROOT = ROOT / "results" / "_runs"
 DEFAULT_LEGACY_ROOT = ROOT / "runs"
+DEFAULT_RESULTS_ROOT = ROOT / "results"
+DEFAULT_SUBSETS_ROOT = ROOT / "subsets"
+DIFFICULTY_TSV = ROOT / "data" / "deepswe-v1.1-task-difficulty.tsv"
 
 
-INDEX_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>deep-swe-bench live dashboard</title>
-  <style>
-    :root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --muted:#8b949e; --text:#e6edf3; --line:#30363d; --good:#3fb950; --bad:#f85149; --warn:#d29922; --accent:#58a6ff; }
-    body { margin:0; font:14px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
-    header { display:flex; gap:16px; align-items:center; padding:16px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:rgba(13,17,23,.94); backdrop-filter: blur(8px); }
-    h1 { font-size:18px; margin:0; }
-    h2 { margin:0 0 10px; font-size:16px; }
-    h3 { margin:18px 0 8px; font-size:14px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; }
-    main { display:grid; grid-template-columns:minmax(300px, 420px) 1fr; gap:16px; padding:16px; }
-    .panel, .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; }
-    .panel { padding:14px; min-width:0; }
-    .card { padding:12px; margin:0 0 10px; cursor:pointer; }
-    .card:hover, .card.selected { border-color:var(--accent); }
-    .muted { color:var(--muted); }
-    .row { display:flex; justify-content:space-between; gap:12px; align-items:baseline; }
-    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted); }
-    .pill.running, .pill.completed { color:var(--good); border-color:rgba(63,185,80,.55); }
-    .pill.paused { color:var(--warn); border-color:rgba(210,153,34,.55); }
-    .pill.failed { color:var(--bad); border-color:rgba(248,81,73,.55); }
-    progress { width:100%; height:10px; accent-color:var(--accent); }
-    table { width:100%; border-collapse:collapse; }
-    th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
-    th { color:var(--muted); font-weight:600; }
-    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    pre { white-space:pre-wrap; overflow:auto; max-height:420px; background:#0b0f14; border:1px solid var(--line); border-radius:8px; padding:10px; }
-    a { color:var(--accent); text-decoration:none; }
-    .metric { display:grid; grid-template-columns:repeat(auto-fit, minmax(110px,1fr)); gap:8px; margin:10px 0; }
-    .metric div { background:#0f141b; border:1px solid var(--line); border-radius:8px; padding:8px; }
-    .metric b { display:block; font-size:18px; }
-    @media (max-width: 900px) { main { grid-template-columns:1fr; } }
-  </style>
-</head>
-<body>
-<header>
-  <h1>deep-swe-bench live dashboard</h1>
-  <label>Detail
-    <select id="detail">
-      <option value="summary">summary</option>
-      <option value="operational">operational</option>
-      <option value="diagnostic">diagnostic</option>
-    </select>
-  </label>
-  <span class="muted" id="updated">loading…</span>
-</header>
-<main>
-  <section class="panel">
-    <h2>Discovered executions</h2>
-    <div id="runs"></div>
-  </section>
-  <section class="panel">
-    <h2 id="detail-title">Select an execution</h2>
-    <div id="run-detail" class="muted">Structured state is read from results/_runs/*; legacy runs/*/track.out files appear as compatibility cards.</div>
-  </section>
-</main>
-<script>
-const DEFAULT_DETAIL = "__DEFAULT_DETAIL__";
-const params = new URLSearchParams(location.search);
-let detail = params.get('detail') || DEFAULT_DETAIL;
-let selected = params.get('run') || null;
-document.getElementById('detail').value = detail;
-document.getElementById('detail').addEventListener('change', (ev) => {
-  detail = ev.target.value;
-  params.set('detail', detail);
-  if (selected) params.set('run', selected);
-  history.replaceState(null, '', '?' + params.toString());
-  refreshAll();
-});
-function esc(v) { return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function fmtSeconds(v) { if (v === null || v === undefined) return '—'; if (v < 60) return Math.round(v) + 's'; if (v < 3600) return Math.round(v/60) + 'm'; return (v/3600).toFixed(1) + 'h'; }
-function fileLink(path, label) { return path ? `<a href="/api/file?path=${encodeURIComponent(path)}&tail=200" target="_blank" rel="noreferrer">${esc(label || path)}</a>` : '—'; }
-async function getJSON(url) { const r = await fetch(url); if (!r.ok) throw new Error(await r.text()); return r.json(); }
-function progress(counts) { const total = counts.batch_total || 0, done = counts.batch_done || 0; return `<progress value="${done}" max="${total || 1}"></progress><div class="muted">${done}/${total} done</div>`; }
-function renderCards(runs) {
-  const root = document.getElementById('runs');
-  if (!runs.length) { root.innerHTML = '<p class="muted">No structured state or legacy track files found.</p>'; return; }
-  root.innerHTML = runs.map(run => {
-    const c = run.counts || {};
-    const bad = (c.failed || 0) + (c.timeout || 0) + (c.transient || 0);
-    return `<article class="card ${run.run_id === selected ? 'selected' : ''}" data-run="${esc(run.run_id)}">
-      <div class="row"><b>${esc(run.run_id)}</b><span class="pill ${esc(run.state)}">${esc(run.state)}</span></div>
-      <div class="muted">${esc(run.model || run.kind)} ${esc(run.thinking || '')}</div>
-      ${progress(c)}
-      <div class="row muted"><span>active ${run.active_count || c.batch_running || 0}</span><span>bad ${bad}</span><span>heartbeat ${fmtSeconds(run.heartbeat_age_s)}</span></div>
-    </article>`;
-  }).join('');
-  root.querySelectorAll('.card').forEach(card => card.addEventListener('click', () => {
-    selected = card.dataset.run;
-    params.set('run', selected); params.set('detail', detail);
-    history.replaceState(null, '', '?' + params.toString());
-    refreshAll();
-  }));
-}
-function metrics(run) {
-  const c = run.counts || {};
-  return `<div class="metric">
-    <div><span class="muted">Done</span><b>${c.batch_done || 0}/${c.batch_total || 0}</b></div>
-    <div><span class="muted">Active</span><b>${run.active_count || c.batch_running || 0}</b></div>
-    <div><span class="muted">OK / empty</span><b>${c.ok || 0} / ${c.empty || 0}</b></div>
-    <div><span class="muted">Timeout / transient</span><b>${c.timeout || 0} / ${c.transient || 0}</b></div>
-    <div><span class="muted">Failed</span><b>${c.failed || 0}</b></div>
-    <div><span class="muted">ETA-ish</span><b>${fmtSeconds(run.eta_s)}</b></div>
-  </div>`;
-}
-function renderCellTable(title, cells) {
-  if (!cells || !cells.length) return '';
-  return `<h3>${esc(title)}</h3><table><thead><tr><th>Task</th><th>Config</th><th>Rep</th><th>State</th><th>Outcome</th><th>Metrics</th><th>Paths</th></tr></thead><tbody>` + cells.map(cell => {
-    const s = cell.summary || {};
-    const bits = [];
-    if (s.reward_partial !== undefined) bits.push('partial=' + s.reward_partial);
-    if (s.reward_binary !== undefined) bits.push('binary=' + s.reward_binary);
-    if (s.total_tokens !== undefined) bits.push('tok=' + s.total_tokens);
-    if (s.combined_total_tokens !== undefined) bits.push('combined=' + s.combined_total_tokens);
-    if (s.cost_usd !== undefined) bits.push('$=' + s.cost_usd);
-    if (s.agent_wall_s !== undefined) bits.push('wall=' + fmtSeconds(s.agent_wall_s));
-    return `<tr><td>${esc(cell.task)}</td><td>${esc(cell.config)}</td><td>${esc(cell.rep)}</td><td>${esc(cell.state || '')}</td><td>${esc(cell.outcome || '')}</td><td>${esc(bits.join(' · '))}</td><td>${fileLink(cell.result_path, 'result')} · ${fileLink(cell.log_path, 'log')}</td></tr>`;
-  }).join('') + '</tbody></table>';
-}
-function renderPreflight(preflight) {
-  const cells = Object.values(preflight || {});
-  return renderCellTable('Preflight / smoke', cells);
-}
-function renderDetail(run) {
-  document.getElementById('detail-title').textContent = run.run_id;
-  const c = run.counts || {};
-  const active = run.active_cells || [];
-  const recent = run.recent_finished || [];
-  let html = `<div class="row"><span class="pill ${esc(run.state)}">${esc(run.state)}</span><span class="muted">updated ${esc(run.updated_at || 'unknown')} · heartbeat ${fmtSeconds(run.heartbeat_age_s)}</span></div>`;
-  html += `<p class="muted">${esc(run.model || run.kind)} ${esc(run.thinking || '')} · configs: ${esc((run.configs || []).join(', ') || '—')}</p>`;
-  html += progress(c) + metrics(run);
-  html += `<p class="muted">State files: ${fileLink(run.paths && run.paths.manifest, 'manifest')} · ${fileLink(run.paths && run.paths.status, 'status')} · ${fileLink(run.paths && run.paths.events, 'events')}</p>`;
-  if (Object.keys(run.failure_buckets || {}).length) html += `<h3>Failure buckets</h3><pre>${esc(JSON.stringify(run.failure_buckets, null, 2))}</pre>`;
-  html += renderPreflight(run.preflight);
-  html += renderCellTable('Active cells', active);
-  html += renderCellTable('Recent finished cells', recent);
-  if (detail === 'diagnostic') {
-    if (run.events_tail) html += `<h3>Recent events</h3><pre>${esc(run.events_tail.map(e => JSON.stringify(e)).join('\n'))}</pre>`;
-    if (run.status) html += `<h3>status.json</h3><pre>${esc(JSON.stringify(run.status, null, 2))}</pre>`;
-    if (run.manifest) html += `<h3>manifest.json</h3><pre>${esc(JSON.stringify(run.manifest, null, 2))}</pre>`;
-    if (run.track_tail) html += `<h3>legacy track tail</h3><pre>${esc(run.track_tail.join('\n'))}</pre>`;
-  }
-  document.getElementById('run-detail').innerHTML = html;
-}
-async function refreshAll() {
-  try {
-    const data = await getJSON('/api/runs?detail=' + encodeURIComponent(detail));
-    const runs = data.runs || [];
-    if (!selected && runs.length) selected = runs[0].run_id;
-    renderCards(runs);
-    if (selected) {
-      const run = await getJSON('/api/runs/' + encodeURIComponent(selected) + '?detail=' + encodeURIComponent(detail));
-      renderDetail(run);
-    }
-    document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
-  } catch (err) {
-    document.getElementById('updated').textContent = 'error: ' + err.message;
-  }
-}
-refreshAll();
-setInterval(refreshAll, 3000);
-</script>
-</body>
-</html>
-"""
-
+# ---------------------------------------------------------------------------
+# Run discovery (existing API)
+# ---------------------------------------------------------------------------
 
 def load_dashboard_runs(
     state_root: str | Path = DEFAULT_STATE_ROOT,
@@ -241,6 +86,202 @@ def load_dashboard_run(
     return project_structured_run(run_dir, detail=detail)
 
 
+# ---------------------------------------------------------------------------
+# Comparison data (new /api/compare endpoint)
+# ---------------------------------------------------------------------------
+
+def load_subsets(subsets_dir: Path = DEFAULT_SUBSETS_ROOT) -> list[dict[str, Any]]:
+    """List available task subsets (.txt files, one task slug per line)."""
+    out: list[dict[str, Any]] = []
+    if not subsets_dir.is_dir():
+        return out
+    for txt in sorted(subsets_dir.glob("*.txt")):
+        try:
+            tasks = [t.strip() for t in txt.read_text().splitlines() if t.strip()]
+        except OSError:
+            continue
+        out.append({"name": txt.stem, "task_count": len(tasks), "tasks": tasks})
+    return out
+
+
+def load_subset_tasks(path: Path) -> set[str] | None:
+    """Load a subset file into a set of task slugs, or None if unreadable."""
+    try:
+        return {t.strip() for t in path.read_text().splitlines() if t.strip()}
+    except OSError:
+        return None
+
+
+def _load_difficulty_map() -> dict[str, dict[str, str]]:
+    """Load task slug -> {pass_rate, language} from the difficulty TSV."""
+    mapping: dict[str, dict[str, str]] = {}
+    if not DIFFICULTY_TSV.exists():
+        return mapping
+    try:
+        lines = DIFFICULTY_TSV.read_text().splitlines()
+        for line in lines[1:]:  # skip header
+            parts = line.split("\t")
+            if len(parts) < 5:
+                continue
+            pass_rate, language, slug = parts[0], parts[1], parts[2]
+            mapping[slug] = {"pass_rate": pass_rate, "language": language}
+    except OSError:
+        pass
+    return mapping
+
+
+def _difficulty_bucket(pass_rate_str: str) -> str:
+    try:
+        pr = float(pass_rate_str)
+    except (ValueError, TypeError):
+        return "unknown"
+    if pr < 33:
+        return "hard"
+    if pr < 66:
+        return "medium"
+    return "easy"
+
+
+def _median(values: list[float]) -> float:
+    valid = [v for v in values if v is not None and isinstance(v, (int, float))]
+    if not valid:
+        return 0.0
+    return float(statistics.median(valid))
+
+
+def _mean(values: list[float]) -> float:
+    valid = [v for v in values if v is not None and isinstance(v, (int, float))]
+    if not valid:
+        return 0.0
+    return float(statistics.fmean(valid))
+
+
+def _rep_from_parts(parts: tuple[str, ...]) -> int:
+    """Best-effort integer rep number from a result path (e.g. 'rep2' -> 2)."""
+    raw = parts[-2]
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    try:
+        return int(digits) if digits else 0
+    except ValueError:
+        return 0
+
+
+def load_comparison_data(
+    results_root: str | Path = DEFAULT_RESULTS_ROOT,
+    *,
+    subset_tasks: set[str] | None = None,
+    max_reps: int | None = None,
+) -> list[dict[str, Any]]:
+    """Scan results/ for result.json files and aggregate by model/thinking/config path.
+
+    Args:
+        results_root: Directory containing <model>/<thinking>/<config>/<task>/<rep>/result.json.
+        subset_tasks: If set, only include cells whose task slug is in this set.
+        max_reps: If set, keep at most this many lowest-numbered reps per task per config.
+
+    Returns a list of comparison run dicts with per-cell data and aggregates.
+    """
+    results_root = Path(results_root)
+    difficulty = _load_difficulty_map()
+
+    # Collect all result.json files, grouped by the path model/thinking/config
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for result_file in results_root.rglob("result.json"):
+        # Skip contaminated runs
+        if "_contaminated" in result_file.parts:
+            continue
+        try:
+            data = json.loads(result_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        # Determine the group key from path: results/<model>/<thinking>/<config>/...
+        parts = result_file.relative_to(results_root).parts
+        if len(parts) < 5:  # need at least model/thinking/config/task/rep/result.json
+            continue
+        model, thinking, config = parts[0], parts[1], parts[2]
+        task = data.get("task") or parts[-3]
+        # Subset filter: only keep cells whose task is in the chosen subset
+        if subset_tasks is not None and task not in subset_tasks:
+            continue
+        data["_group_key"] = f"{model}/{thinking}/{config}"
+        data["_model"] = model
+        data["_thinking"] = thinking
+        data["_config"] = config
+        data["_task"] = task
+        data["_rep"] = data.get("rep") if isinstance(data.get("rep"), int) else _rep_from_parts(parts)
+        groups.setdefault(data["_group_key"], []).append(data)
+
+    runs: list[dict[str, Any]] = []
+    for group_key, cells_raw in sorted(groups.items()):
+        if not cells_raw:
+            continue
+        # Optional rep cap: keep the lowest-numbered N reps per task
+        if max_reps is not None:
+            kept: list[dict[str, Any]] = []
+            by_task: dict[str, list[dict[str, Any]]] = {}
+            for c in cells_raw:
+                by_task.setdefault(c["_task"], []).append(c)
+            for task_cells in by_task.values():
+                task_cells.sort(key=lambda c: c.get("_rep", 0))
+                kept.extend(task_cells[:max_reps])
+            cells_raw = kept
+        model = cells_raw[0]["_model"]
+        thinking = cells_raw[0]["_thinking"]
+        config = cells_raw[0]["_config"]
+
+        binaries = [c.get("reward_binary") or 0 for c in cells_raw]
+        partials = [c.get("reward_partial") or 0.0 for c in cells_raw]
+        costs = [c.get("cost_usd") or 0.0 for c in cells_raw]
+        tokens = [c.get("total_tokens") or 0 for c in cells_raw]
+        walls = [c.get("agent_wall_s") or 0.0 for c in cells_raw]
+
+        solved = sum(1 for b in binaries if b >= 1)
+        total = len(binaries)
+
+        cells_out = []
+        for c in cells_raw:
+            task = c.get("_task") or c.get("task", "")
+            diff_info = difficulty.get(task, {})
+            diff_bucket = _difficulty_bucket(diff_info.get("pass_rate", ""))
+            cells_out.append({
+                "task": task,
+                "config": c.get("config", config),
+                "rep": c.get("_rep", c.get("rep", 0)),
+                "reward_binary": c.get("reward_binary") or 0,
+                "reward_partial": c.get("reward_partial") or 0.0,
+                "total_tokens": c.get("total_tokens") or 0,
+                "cost_usd": c.get("cost_usd") or 0.0,
+                "agent_wall_s": c.get("agent_wall_s") or 0.0,
+                "patch_bytes": c.get("patch_bytes") or 0,
+                "difficulty": diff_bucket,
+                "language": diff_info.get("language", c.get("language", "")),
+            })
+
+        runs.append({
+            "run_id": group_key,
+            "model": model,
+            "thinking": thinking,
+            "config": config,
+            "state": "completed",
+            "total_cells": total,
+            "distinct_tasks": len({c.get("_task") for c in cells_raw}),
+            "solved": solved,
+            "solve_rate": (solved / total * 100) if total > 0 else 0.0,
+            "mean_partial": _mean(partials),
+            "median_cost": _median(costs),
+            "median_tokens": int(_median(tokens)),
+            "median_wall_s": _median(walls),
+            "total_cost": sum(c for c in costs if isinstance(c, (int, float))),
+            "cells": cells_out,
+        })
+
+    return runs
+
+
+# ---------------------------------------------------------------------------
+# File serving (allowlisted)
+# ---------------------------------------------------------------------------
+
 def resolve_dashboard_path(raw_path: str, *, repo_root: Path = ROOT, state_root: Path = DEFAULT_STATE_ROOT) -> Path:
     if not raw_path:
         raise ValueError("missing path")
@@ -278,6 +319,10 @@ def tail_file(path: Path, *, lines: int = 200, max_bytes: int = 256_000) -> str:
     return "\n".join(data.splitlines()[-lines:]) + ("\n" if data else "")
 
 
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
+
 class DashboardHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -291,26 +336,27 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         detail: str,
         repo_root: Path = ROOT,
         legacy_root: Path | None = DEFAULT_LEGACY_ROOT,
+        results_root: Path = DEFAULT_RESULTS_ROOT,
+        subsets_root: Path | None = None,
     ):
         super().__init__(server_address, handler_class)
         self.state_root = state_root
         self.detail = detail
         self.repo_root = repo_root
         self.legacy_root = legacy_root
+        self.results_root = results_root
+        self.subsets_root = subsets_root if subsets_root is not None else repo_root / "subsets"
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
     server: DashboardHTTPServer
 
-    def log_message(self, fmt: str, *args: Any) -> None:  # keep dashboard quiet by default
+    def log_message(self, fmt: str, *args: Any) -> None:
         return
 
-    def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+    def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         try:
-            if parsed.path == "/":
-                self._send_html(INDEX_HTML.replace("__DEFAULT_DETAIL__", html.escape(self.server.detail)))
-                return
             if parsed.path == "/api/runs":
                 qs = urllib.parse.parse_qs(parsed.query)
                 detail = qs.get("detail", [self.server.detail])[0]
@@ -321,6 +367,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     legacy_root=self.server.legacy_root,
                 )
                 self._send_json({"runs": runs})
+                return
+            if parsed.path == "/api/subsets":
+                subs = load_subsets(self.server.subsets_root)
+                self._send_json({"subsets": subs})
+                return
+            if parsed.path == "/api/compare":
+                qs = urllib.parse.parse_qs(parsed.query)
+                subset = qs.get("subset", [None])[0]
+                subset_tasks = None
+                if subset:
+                    subset_tasks = load_subset_tasks(self.server.subsets_root / f"{subset}.txt")
+                    if subset_tasks is None:
+                        self._send_error(HTTPStatus.NOT_FOUND, f"unknown subset: {subset}")
+                        return
+                try:
+                    max_reps = int(qs.get("reps", ["0"])[0])
+                except ValueError:
+                    max_reps = 0
+                runs = load_comparison_data(
+                    self.server.results_root,
+                    subset_tasks=subset_tasks,
+                    max_reps=max_reps or None,
+                )
+                self._send_json({"runs": runs, "subset": subset})
                 return
             if parsed.path.startswith("/api/runs/"):
                 parts = [urllib.parse.unquote(p) for p in parsed.path.split("/") if p]
@@ -380,14 +450,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_html(self, text: str) -> None:
-        data = text.encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
     def _send_text(self, text: str) -> None:
         data = text.encode("utf-8")
         self.send_response(HTTPStatus.OK)
@@ -413,6 +475,7 @@ def make_server(
     detail: str = "operational",
     repo_root: str | Path = ROOT,
     legacy_root: str | Path | None = DEFAULT_LEGACY_ROOT,
+    results_root: str | Path = DEFAULT_RESULTS_ROOT,
 ) -> DashboardHTTPServer:
     if detail not in DETAIL_LEVELS:
         raise ValueError(f"detail must be one of {sorted(DETAIL_LEVELS)}")
@@ -424,6 +487,7 @@ def make_server(
         detail=detail,
         repo_root=Path(repo_root),
         legacy_root=legacy,
+        results_root=Path(results_root),
     )
 
 
@@ -432,12 +496,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--state-root", default=str(DEFAULT_STATE_ROOT), help="default: results/_runs")
+    ap.add_argument("--results-root", default=str(DEFAULT_RESULTS_ROOT), help="default: results/")
     ap.add_argument("--detail", choices=sorted(DETAIL_LEVELS), default="operational")
     args = ap.parse_args(argv)
 
-    server = make_server(host=args.host, port=args.port, state_root=args.state_root, detail=args.detail)
+    server = make_server(
+        host=args.host,
+        port=args.port,
+        state_root=args.state_root,
+        detail=args.detail,
+        results_root=args.results_root,
+    )
     url = f"http://{args.host}:{server.server_address[1]}/"
-    print(f"serving deep-swe-bench dashboard at {url}", flush=True)
+    print(f"serving deep-swe-bench dashboard API at {url}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

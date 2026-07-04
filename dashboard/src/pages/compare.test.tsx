@@ -38,6 +38,7 @@ function makeRun(overrides: Partial<ComparisonRun> = {}): ComparisonRun {
     config: 'baseline',
     state: 'completed',
     total_cells: 10,
+    distinct_tasks: 10,
     solved: 5,
     solve_rate: 50,
     mean_partial: 0.85,

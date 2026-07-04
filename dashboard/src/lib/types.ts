@@ -129,6 +129,7 @@ export interface ComparisonRun {
   config: string
   state: RunState
   total_cells: number
+  distinct_tasks: number
   solved: number
   solve_rate: number
   mean_partial: number
@@ -141,4 +142,15 @@ export interface ComparisonRun {
 
 export interface CompareResponse {
   runs: ComparisonRun[]
+  subset?: string | null
+}
+
+export interface Subset {
+  name: string
+  task_count: number
+  tasks: string[]
+}
+
+export interface SubsetsResponse {
+  subsets: Subset[]
 }

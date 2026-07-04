@@ -20,7 +20,7 @@ const DEFAULT_COUNT = 8
 export default function Compare() {
   const { data, isLoading, error } = useQuery({
     queryKey: ['compare'],
-    queryFn: fetchCompare,
+    queryFn: () => fetchCompare(),
     refetchInterval: 30000,
   })
 
