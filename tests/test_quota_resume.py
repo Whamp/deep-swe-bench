@@ -94,6 +94,26 @@ class TestQuotaResumerQuota:
         assert decision["retry"] is True
         assert "quota_wait" in state.stages
 
+    def test_quota_already_available_resumes_immediately(self):
+        """When the window already reset (manual reset or rollover) by the time the
+        pause handler runs, resume now instead of polling for quota_poll_s.
+
+        Regression: previously next_reset()==None -> wait_seconds()==None was
+        misread as 'reset time unknown' and polled, taxing every limit-hit with
+        a quota_poll_s wait even though quota was already available.
+        """
+        resumer = run_batch.QuotaResumer(_args(quota_poll_s=300.0))
+        state = _FakeState()
+        windows = [Window("5h", 1.0, NOW + timedelta(hours=4)),
+                   Window("Week", 0.0, NOW + timedelta(days=6))]
+        with mock.patch.object(run_batch, "_latest_transient_error_msg", return_value="usage limit reached"), \
+             mock.patch.object(run_batch.quota, "codex_windows", return_value=(windows, "api")), \
+             mock.patch.object(run_batch.time, "sleep") as sleeper:
+            decision = resumer.on_transient_pause(state)
+        assert decision["retry"] is True
+        sleeper.assert_not_called()        # no polling sleep - resume right away
+        assert "quota_wait" not in state.stages
+
     def test_sleep_rechecks_and_exits_early_when_not_exhausted(self):
         resumer = run_batch.QuotaResumer(_args(quota_poll_s=1.0))
         reset = NOW + timedelta(hours=10)

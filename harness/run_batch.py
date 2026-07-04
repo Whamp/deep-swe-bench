@@ -384,6 +384,17 @@ class QuotaResumer:
         now = datetime.now(timezone.utc)
         reset = quota.next_reset(windows)
         desc = quota.describe_pause(windows, now=now)
+
+        if not quota.exhausted_windows(windows):
+            # Quota is already available (manual reset, or the window rolled over
+            # between the pause firing and this check). Resume immediately instead
+            # of polling. Without this guard, next_reset()==None makes wait_seconds
+            # return None, which the ``wait is None`` branch below misreads as
+            # "reset time unknown" and pointlessly polls for quota_poll_s.
+            print(f"[resume] quota no longer exhausted ({desc}); resuming immediately "
+                  f"[attempt {self.attempt}]", flush=True)
+            return {"retry": True, "reason": f"quota available ({desc})"}
+
         wait = quota.wait_seconds(reset, now=now)
 
         if wait is None:
