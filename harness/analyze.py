@@ -12,26 +12,23 @@ import json
 import math
 import statistics as st
 from collections import defaultdict
-from pathlib import Path
+
+from harness import results_tree
 
 try:
     from scipy.stats import wilcoxon
 except Exception:  # analysis still prints summaries without scipy
     wilcoxon = None
 
-REPO = Path(__file__).resolve().parents[1]
-
 
 def load_results(model: str, thinking: str, configs: list[str]) -> list[dict]:
-    mleaf = model.rstrip("/").split("/")[-1]
-    root = REPO / "results" / mleaf / thinking
+    tree = results_tree.Tree.of(model, thinking)
     rows = []
-    for config in configs:
-        for p in sorted((root / config).glob("*/rep*/result.json")):
-            try:
-                rows.append(json.loads(p.read_text()))
-            except Exception:
-                pass
+    for cell in tree.cells(configs=configs):
+        try:
+            rows.append(json.loads(cell.result.read_text()))
+        except Exception:
+            pass
     return rows
 
 
