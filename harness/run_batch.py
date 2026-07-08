@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from harness import quota
+from harness import lib, quota, results_tree
 
 try:
     from harness.run_state import (
@@ -40,7 +40,7 @@ except ModuleNotFoundError:  # ``python harness/run_batch.py`` puts harness/ on 
     )
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parent
+REPO = lib.REPO
 TASKS = Path.home() / "evals" / "deep-swe" / "tasks"
 TRANSIENT_EXIT = 75
 SMOKE_SUBSET = REPO / "subsets" / "12_v0.txt"
@@ -58,10 +58,6 @@ def parse_range(s: str | None, ids: list[str]) -> list[str]:
     return ids[int(a or 0): int(b or len(ids))]
 
 
-def model_leaf_of(model: str) -> str:
-    return model.rstrip("/").split("/")[-1]
-
-
 def repo_rel(path: Path | None) -> str | None:
     if path is None:
         return None
@@ -72,16 +68,15 @@ def repo_rel(path: Path | None) -> str | None:
 
 
 def result_path(model: str, thinking: str, config: str, task: str, rep: int) -> Path:
-    return REPO / "results" / model_leaf_of(model) / thinking / config / task / f"rep{rep}" / "result.json"
+    return results_tree.Tree.of(model, thinking, repo=REPO).cell(config, task, rep).result
 
 
 def log_path(model: str, thinking: str, config: str, task: str, rep: int) -> Path:
-    return REPO / "results" / model_leaf_of(model) / thinking / "logs" / f"{task}__{config}__rep{rep}.log"
+    return results_tree.Tree.of(model, thinking, repo=REPO).log_file(config, task, rep)
 
 
 def config_has_results(model: str, thinking: str, config: str) -> bool:
-    base = REPO / "results" / model_leaf_of(model) / thinking / config
-    return base.exists() and any(base.glob("*/rep*/result.json"))
+    return results_tree.Tree.of(model, thinking, repo=REPO).has_results(config)
 
 
 def smoke_task(requested_ids: list[str]) -> str:
@@ -109,7 +104,7 @@ def smoke_contract_path(model: str, thinking: str, config: str) -> Path | None:
     Leaf-local smoke.json wins over config-level smoke.json.
     """
     cfg_dir = REPO / "configs" / config
-    leaf = model_leaf_of(model)
+    leaf = lib.model_leaf(model)
     candidates = sorted(p for p in cfg_dir.glob(f"{leaf}*/{thinking}/smoke.json") if p.is_file())
     if candidates:
         return candidates[0]
@@ -469,7 +464,7 @@ def _execute_batch(args, state, configs, ids, specs, batch_cells_by_spec, smoke_
             if not item["run"]:
                 state.preflight_skipped(item["cell"], reason=item["reason"] or "skipped")
                 continue
-            print(f"[smoke] {config} has no existing results for {model_leaf_of(args.model)}/{args.thinking}; "
+            print(f"[smoke] {config} has no existing results for {lib.model_leaf(args.model)}/{args.thinking}; "
                   f"running {task}/rep0 before batch fan-out", flush=True)
             state.preflight_started(item["cell"])
             res = run_one((task, config, 0), args)

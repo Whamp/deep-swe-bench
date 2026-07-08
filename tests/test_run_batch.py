@@ -165,5 +165,44 @@ class SmokeTaskTests(unittest.TestCase):
         self.assertEqual(task, "v2-first")
 
 
+class PathIdentityTests(unittest.TestCase):
+    """result_path / log_path / config_has_results resolve to the ADR-0001
+    results grammar (ticket #5 migrates them onto harness/results_tree.py).
+
+    Characterization for the behavior-preserving refactor: these hand-built
+    path assertions must hold before and after the migration.
+    """
+
+    def setUp(self):
+        self._old_repo = run_batch.REPO
+        self._tmp = tempfile.TemporaryDirectory()
+        run_batch.REPO = Path(self._tmp.name)
+
+    def tearDown(self):
+        run_batch.REPO = self._old_repo
+        self._tmp.cleanup()
+
+    def test_result_path_and_log_path_match_grammar(self):
+        # leaf deepseek-v4-flash == lib.model_leaf(openrouter/deepseek/deepseek-v4-flash)
+        model = "openrouter/deepseek/deepseek-v4-flash"
+        root = Path(self._tmp.name)
+        rp = run_batch.result_path(model, "high", "cfg", "task-a", 0)
+        lp = run_batch.log_path(model, "high", "cfg", "task-a", 0)
+        self.assertEqual(
+            rp, root / "results" / "deepseek-v4-flash" / "high" / "cfg" / "task-a" / "rep0" / "result.json"
+        )
+        self.assertEqual(
+            lp, root / "results" / "deepseek-v4-flash" / "high" / "logs" / "task-a__cfg__rep0.log"
+        )
+
+    def test_config_has_results_uses_existence_under_config(self):
+        model = "openrouter/deepseek/deepseek-v4-flash"
+        self.assertFalse(run_batch.config_has_results(model, "high", "cfg"))
+        base = Path(self._tmp.name) / "results" / "deepseek-v4-flash" / "high" / "cfg" / "task-a" / "rep0"
+        base.mkdir(parents=True)
+        (base / "result.json").write_text("{}")
+        self.assertTrue(run_batch.config_has_results(model, "high", "cfg"))
+
+
 if __name__ == "__main__":
     unittest.main()
