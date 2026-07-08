@@ -7,6 +7,12 @@ import tomllib
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+# Canonical repo root. Single source of truth so every harness module derives
+# the same root (previously each caller did Path(__file__).resolve().parents[1]
+# independently). Consumed by the results-tree address module today; callers
+# migrate to it in subsequent tickets (run_batch / run / run_omp / analyze).
+REPO = Path(__file__).resolve().parents[1]
+
 # Bump when harness/Dockerfile.pi-agent changes in a way that should invalidate
 # cached per-task pi images. v2 adds ripgrep/fd-find so Pi's built-in read-only
 # grep/find tools work under --offline and in recursive child agents.
