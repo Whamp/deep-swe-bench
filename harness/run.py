@@ -31,9 +31,9 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parent
 sys.path.insert(0, str(HERE))
-from lib import load_task, read_reward, result_record, model_leaf  # noqa: E402
+from lib import load_task, read_reward, result_record, model_leaf, REPO  # noqa: E402
+import results_tree  # noqa: E402
 import parse_usage  # noqa: E402
 from pi_rpc_runner import run_pi_rpc  # noqa: E402
 
@@ -430,8 +430,7 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     ensure_env_image(task.env_image)
     pi_image = ensure_pi_image(task)
 
-    mleaf = model_leaf(model)
-    cell = REPO / "results" / mleaf / thinking / config / task_id / f"rep{rep}"
+    cell = results_tree.Tree.of(model, thinking, repo=REPO).cell(config, task_id, rep).dir
     cell.mkdir(parents=True, exist_ok=True)
     (cell / "artifacts").mkdir(exist_ok=True)
     (cell / "verifier").mkdir(exist_ok=True)
@@ -644,7 +643,7 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
         **usage,
     )
     (cell / "result.json").write_text(json.dumps(rec, indent=2))
-    rl = REPO / "results" / mleaf / thinking / "results.jsonl"
+    rl = results_tree.Tree.of(model, thinking, repo=REPO).results_jsonl
     rl.parent.mkdir(parents=True, exist_ok=True)
     with open(rl, "a") as f:
         f.write(json.dumps(rec) + "\n")

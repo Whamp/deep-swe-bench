@@ -16,7 +16,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from harness import lib
+try:
+    from harness import lib
+except ModuleNotFoundError:  # direct-script mode (python harness/run.py): harness/ on sys.path, not the repo root
+    import lib
 
 
 @dataclass(frozen=True)
