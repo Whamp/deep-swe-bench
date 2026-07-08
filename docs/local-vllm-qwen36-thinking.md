@@ -79,11 +79,59 @@ Relevant rows:
 
 Pi sends no top-level `enable_thinking` and no `reasoning_effort` for this model. The controlling field is `chat_template_kwargs.enable_thinking`.
 
+The benchmark `baseline-qwen36-xhigh` leaf deliberately adds:
+
+```json
+"thinkingLevelMap": { "xhigh": "xhigh" }
+```
+
+This exposes `xhigh` as a named Pi level for the local model. It is still not a provider-side reasoning-effort level: Qwen/vLLM receives binary `enable_thinking: true` plus a top-level `thinking_token_budget` injected by `configs/baseline-qwen36-xhigh/extensions/local-vllm-preserve-thinking.ts`.
+
+The current request-shape artifact includes `xhigh` and shows:
+
+```json
+"requestedThinking": "xhigh",
+"clampedThinking": "xhigh",
+"sentChatTemplateKwargs": { "enable_thinking": true, "preserve_thinking": true },
+"sentReasoningEffort": null
+```
+
+## server60 vLLM serving evidence
+
+Validated 2026-07-04 from `server60:~/inference/serving/vllm/compose.yaml`.
+
+The active service is `vllm/vllm-openai:nightly` on port `30000`, serving:
+
+```text
+cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4
+```
+
+Important compose fields:
+
+- `--reasoning-parser=qwen3`
+- `--reasoning-config {"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}`
+- `--default-chat-template-kwargs {"preserve_thinking": true}`
+- comment documents that hard budget is per-request top-level `thinking_token_budget`, not server default
+
+For benchmark configs, the vendored extension injects:
+
+- `chat_template_kwargs.preserve_thinking = true`
+- `thinking_token_budget` by Pi thinking level for this model:
+  - minimal: 4096
+  - low: 8192
+  - medium: 16384
+  - high: 32768
+  - xhigh: 65536
+
 ## Live endpoint evidence
 
-Artifact: `analysis/local-vllm-qwen-off-live-probe.jsonl`.
+Artifacts:
 
-The live probe checked:
+- `analysis/local-vllm-qwen-server60-compose-20260704.txt`
+- `analysis/local-vllm-qwen-off-live-probe.jsonl`
+- `analysis/local-vllm-qwen-budget-live-probe.jsonl`
+
+The off live probe checked:
 
 - `/v1/models` contained `cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4`.
 - A tiny `/v1/chat/completions` request with:
@@ -100,9 +148,29 @@ returned:
 - `hasReasoningContent`: `false`
 - usage tokens present
 
+The budgeted-thinking live probe checked the same endpoint with:
+
+```json
+{
+  "chat_template_kwargs": { "enable_thinking": true, "preserve_thinking": true },
+  "thinking_token_budget": 64
+}
+```
+
+It returned visible content (`OK`), non-empty `reasoningContent`, and usage tokens in 9.154s, proving the current server accepts the top-level budget field and does not hang indefinitely when thinking is budgeted.
+
 ## Config rules
 
 Use this provider through a model-bearing config leaf, for example:
+
+```text
+configs/<config>/Qwen3.6-27B-AWQ-BF16-INT4/xhigh/models.json
+configs/<config>/Qwen3.6-27B-AWQ-BF16-INT4/xhigh/settings.json
+```
+
+For the plain local-Qwen executor benchmark, use `configs/baseline-qwen36-xhigh/Qwen3.6-27B-AWQ-BF16-INT4/xhigh/` with `thinkingLevelMap.xhigh`, `thinkingBudgets.xhigh = 65536`, and the budgeted `local-vllm-preserve-thinking.ts` extension copied from server60.
+
+For GPT executor + Qwen observational-memory worker configs, use:
 
 ```text
 configs/<config>/gpt-5.5/low/models.json

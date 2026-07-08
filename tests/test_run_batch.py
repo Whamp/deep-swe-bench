@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -46,6 +47,18 @@ class SmokeValidationTests(unittest.TestCase):
             self.assertEqual(errors, [])
 
 
+class RunnerSelectionTests(unittest.TestCase):
+    def test_runner_script_defaults_to_pi(self):
+        args = type("Args", (), {})()
+
+        self.assertEqual(run_batch.runner_script(args).name, "run.py")
+
+    def test_runner_script_can_select_omp(self):
+        args = type("Args", (), {"agent": "omp"})()
+
+        self.assertEqual(run_batch.runner_script(args).name, "run_omp.py")
+
+
 class StructuredStateIntegrationTests(unittest.TestCase):
     def test_main_writes_structured_state_for_skipped_existing_cell_without_changing_stdout(self):
         with tempfile.TemporaryDirectory() as td:
@@ -87,11 +100,41 @@ class StructuredStateIntegrationTests(unittest.TestCase):
             self.assertEqual(status["state"], "completed")
             self.assertEqual(status["counts"]["batch_done"], 1)
             self.assertEqual(status["counts"]["batch_skipped"], 1)
-            self.assertEqual(status["counts"]["ok"], 1)
+            # Skipped cells reuse an existing result but must NOT inflate the
+            # ok bucket — they count toward batch_skipped only. The actual
+            # outcome is preserved on the cell for detail views.
+            self.assertEqual(status["counts"]["ok"], 0)
             events = (state_dir / "events.ndjson").read_text()
             self.assertIn('"event": "run_started"', events)
             self.assertIn('"event": "cell_skipped"', events)
             self.assertIn('"event": "run_completed"', events)
+
+
+class RunOneCommandTests(unittest.TestCase):
+    def test_run_one_forwards_no_initial_context_capture(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            old_repo = run_batch.REPO
+            run_batch.REPO = root
+            args = type("Args", (), {
+                "model": "openrouter/deepseek/deepseek-v4-flash",
+                "thinking": "high",
+                "force": False,
+                "agent": "pi",
+                "agent_timeout": None,
+                "rpc_quiescence": None,
+                "pass_openai_codex_oauth": False,
+                "no_initial_context_capture": True,
+            })()
+            try:
+                completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
+                with patch.object(run_batch.subprocess, "run", return_value=completed) as run_mock:
+                    run_batch.run_one(("task-a", "cfg", 0), args)
+            finally:
+                run_batch.REPO = old_repo
+
+        cmd = run_mock.call_args[0][0]
+        self.assertIn("--no-initial-context-capture", cmd)
 
 
 class SmokeTaskTests(unittest.TestCase):

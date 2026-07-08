@@ -68,7 +68,9 @@ class TestQuotaResumerQuota:
         windows = [Window("Week", 100, NOW + timedelta(days=5))]  # 5 days >> 1h max
         with mock.patch.object(run_batch, "_latest_transient_error_msg", return_value="usage limit"), \
              mock.patch.object(run_batch.quota, "codex_windows", return_value=(windows, "api")), \
+             mock.patch.object(run_batch, "datetime", wraps=datetime) as dt, \
              mock.patch.object(run_batch.time, "sleep"):
+            dt.now.return_value = NOW
             decision = resumer.on_transient_pause(state)
         assert decision["retry"] is False
         assert "too far away" in decision["reason"]

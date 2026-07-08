@@ -31,6 +31,7 @@ GRAMMARS=(typescript go python rust javascript)
 PRIMARY="$REPO/configs/codegraph-auto/bin/codegraph"
 LINKS=(
   "$REPO/configs/codegraph-skill/bin/codegraph"
+  "$REPO/configs/codegraph-cli-skill/bin/codegraph"
   "$REPO/configs/codegraph-impact/bin/codegraph"
   "$REPO/configs/codegraph-skill-om/bin/codegraph"
   "$REPO/configs/codegraph-auto-om/bin/codegraph"
@@ -89,12 +90,27 @@ write_wrapper() {
 # cg — invoke the vendored codegraph CLI. Location-independent so it works
 # both on the host (configs/<cfg>/bin/cg) and in-container (/arm/bin/cg).
 _DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_ROOT="$(cd "$_DIR/.." && pwd)"
+_BOOTSTRAP="$_ROOT/tools/codegraph-transformers-cache.mjs"
+if [ -d "$_ROOT/node_modules/@huggingface/transformers" ] && [ -f "$_BOOTSTRAP" ]; then
+  export CODEGRAPH_TRANSFORMERS_CACHE="${CODEGRAPH_TRANSFORMERS_CACHE:-/tmp/codegraph-transformers-cache}"
+  exec node --import "$_BOOTSTRAP" "$_DIR/codegraph/dist/cli.js" "$@"
+fi
 exec node "$_DIR/codegraph/dist/cli.js" "$@"
 EOF
   chmod +x "$bin_dir/cg"
 }
 write_wrapper "$(dirname "$PRIMARY")"
 for L in "${LINKS[@]}"; do write_wrapper "$(dirname "$L")"; done
+
+# The codegraph-cli-skill config intentionally exposes the full CLI surface via
+# `codegraph` on PATH, including semantic `embed`/`search`. CodeGraph keeps
+# @huggingface/transformers as an optional peer and auto-installs it on first
+# embed. In benchmark containers /arm is read-only, so install the peer into the
+# config root now; tools/codegraph also preloads a writable /tmp cache for model
+# weights.
+echo "[vendor] installing semantic-search peer deps for codegraph-cli-skill"
+npm install --prefix "$REPO/configs/codegraph-cli-skill" --no-save --no-package-lock @huggingface/transformers >/dev/null
 
 echo "[vendor] sizes:"
 du -sh "$PRIMARY" "${LINKS[@]}" 2>/dev/null | sed 's/^/  /'

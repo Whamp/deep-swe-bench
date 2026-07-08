@@ -1,0 +1,11 @@
+# wazero-multi-module-snapshots rep2 review
+
+**Bucket: under-implementation / patch-design variance in incremental compression; not wrong-file or wrong-layer CodeGraph damage.**
+
+- **Outcome delta:** clean Pi solved fully (`reward=1`, `78/78` f2p, `2/2` p2p); CodeGraph lost binary with `0.975` partial (`76/78` f2p, `2/2` p2p). The loss is exactly two hidden f2p tests, while the p2p wasm invocation tests still passed.
+- **Verifier failures:** CodeGraph failed `TestCoordinator_CaptureIncremental_FullMemoryReconstruction` and `TestCoordinator_CaptureIncremental_CompressedSmallerThanBaseline`, both with `require.go:331: expected true, but was false` (`coordinator_test.go:230` and `:1353`). Baseline verifier shows both tests passed.
+- **Patch cause:** both runs edited the same expected files (`experimental/experimental.go`, `experimental/snapshot/snapshot.go`), but CodeGraph encoded incremental diffs as `gzipBytes(encodeDiffs(diffs))` (gob-encoded `[][]DiffEntry`) with no size guard. Baseline added the crucial fallback: after `gzipBytes(diff.Bytes())`, if the incremental compressed payload was not smaller than `base.CompressedData()`, it used `gzipBytes(nil)`. That maps directly to the failed “compressed smaller than baseline” invariant and the paired full-reconstruction incremental test.
+- **Trajectory driver:** CodeGraph used graph/impact checks (`codegraph build`, `structure`, `where`, `diff-impact`, `check`) and spent much more context/cost (`+347,517` tokens, `+$0.2196`) but only `+2` tools and `+7.5s`. The graph work did not send it to the wrong layer; it likely displaced/failed to surface the semantic compression invariant.
+- **Not wrong-file/wrong-layer:** identical touched files and similar patch size (`8753` vs `8929` bytes); all restore, registry, context, marshal, summary, and p2p tests except the two incremental-compression cases passed.
+- **Other non-causal differences:** CodeGraph added typed-nil detection and tag-copy tweaks, and returned `nil` for `RestoreSnapshot(nil)`; these are not implicated by the observed failing tests.
+- **Classification:** not a broad regression or over-exploration failure. Primary cause is a small implementation miss in `CaptureIncremental` compression behavior, best explained as patch variance with incidental CodeGraph overhead rather than CodeGraph causing wrong-file work.

@@ -13,14 +13,17 @@ const SETTINGS = {
   keywordTriggerWord: TRIGGER_WORD,
   defaultConcurrency: 4,
   defaultAgentRetries: 1,
+  // Bound each subagent so a hung model call cannot stall the whole cell until
+  // the 90-min cell timeout. 600s is well past any legitimate agent run.
+  defaultAgentTimeoutMs: 600000,
   progressPanelMode: "compact",
 } as const;
 
 const MODEL_TIERS = {
   tiers: {
-    small: "openai-codex/gpt-5.4-mini:medium",
-    medium: "openai-codex/gpt-5.4:medium",
-    big: "openai-codex/gpt-5.5:medium",
+    small: "openai-codex/gpt-5.5:low",
+    medium: "openai-codex/gpt-5.5:medium",
+    big: "openai-codex/gpt-5.5:xhigh",
   },
 } as const;
 
@@ -40,7 +43,7 @@ function configureWorkflowHome(): void {
   writeJson(join(workflowHome, "settings.json"), SETTINGS);
   writeJson(join(workflowHome, "model-tiers.json"), MODEL_TIERS);
   console.error(
-    `${CONFIG_SENTINEL} trigger=${TRIGGER_WORD} small=${MODEL_TIERS.tiers.small} medium=${MODEL_TIERS.tiers.medium} big=${MODEL_TIERS.tiers.big} concurrency=${SETTINGS.defaultConcurrency} thinking=medium`,
+    `${CONFIG_SENTINEL} trigger=${TRIGGER_WORD} small=${MODEL_TIERS.tiers.small} medium=${MODEL_TIERS.tiers.medium} big=${MODEL_TIERS.tiers.big} concurrency=${SETTINGS.defaultConcurrency} agentTimeoutMs=${SETTINGS.defaultAgentTimeoutMs}`,
   );
 }
 

@@ -34,7 +34,9 @@ RUNS = REPO / "runs"
 RESULTS = REPO / "results"
 
 ARM_TO_CONFIG = {
-    "baseline": "baseline", "baseline-codex": "baseline", "baseline-codex-wf": "baseline-wf",
+    "baseline": "baseline-preamble-orchestration",
+    "baseline-codex": "baseline-preamble-orchestration",
+    "baseline-codex-wf": "baseline-preamble-orchestration-wf",
     "pi-advisor-glm52": "advisor",
     "pi-observational-memory": "observational-memory",
     "pi-observational-memory-codex54mini": "observational-memory",

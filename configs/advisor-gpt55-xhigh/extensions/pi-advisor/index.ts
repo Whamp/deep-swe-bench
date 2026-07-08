@@ -225,16 +225,6 @@ export default function advisorExtension(pi: ExtensionAPI) {
 	let usesThisRun = 0;
 	let runToolEvents: RunToolEvent[] = [];
 
-	pi.on("before_provider_request", (event: any, ctx: any) => {
-		const model = event?.model ?? ctx?.model;
-		if (model?.provider !== "openai-codex") return;
-		// ponytail: this config mixes Codex executor + Codex advisor tool calls.
-		// Disable Codex websocket cached-continuation for the executor too, otherwise
-		// the next turn after an advisor tool result can fail with
-		// "Previous response ... not found".
-		return { streamOptions: { transport: "sse" as const } };
-	});
-
 	pi.on("agent_start", async (_, ctx) => {
 		usesThisRun = 0;
 		runToolEvents = [];
@@ -357,9 +347,8 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 						signal,
 						reasoning: config.reasoning,
 						...(config.provider === "openai-codex" ? {
-							// ponytail: keep advisor off the Codex WebSocket cached-continuation
-							// path. Opening a second Codex websocket mid executor tool-call can
-							// make the executor's next turn fail with "Previous response ... not found".
+							// Keep advisor calls off Codex WebSocket cached-continuation. The
+							// executor transport is pinned separately by this config's settings.json.
 							transport: "sse" as const,
 						} : {
 							// Session-affine cache routing: repeated consultations replay

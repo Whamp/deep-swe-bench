@@ -120,6 +120,7 @@ def run_pi_rpc(
     quiescence_s: float = 2.0,
     state_poll_s: float = 0.5,
     shutdown_timeout_s: float = 10.0,
+    quiesce_after_agent_end: bool = False,
 ) -> RpcRunResult:
     """Run a Pi RPC command until idle plus quiescence or timeout.
 
@@ -238,6 +239,7 @@ def run_pi_rpc(
                     prompt_failed = state.prompt_failed
                     latest_state = dict(state.latest_state) if state.latest_state else None
                     last_activity = state.last_activity
+                    agent_end_count = state.agent_end_count
                     response_errors = list(state.response_errors)
                     write_error = state.write_error
 
@@ -269,13 +271,16 @@ def run_pi_rpc(
                     )
                     next_state_poll = now + state_poll_s
 
-                if prompt_accepted and _is_idle(latest_state) and now - last_activity >= quiescence_s:
+                state_idle = _is_idle(latest_state)
+                agent_end_idle = quiesce_after_agent_end and agent_end_count > 0
+                if prompt_accepted and (state_idle or agent_end_idle) and now - last_activity >= quiescence_s:
                     quiescent = True
                     _write_runner_log(
                         runner_log,
                         "quiescent",
                         quiet_s=round(now - last_activity, 3),
                         agent_end_count=state.agent_end_count,
+                        reason="state_idle" if state_idle else "agent_end",
                     )
                     break
 
@@ -333,6 +338,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, required=True)
     parser.add_argument("--quiescence", type=float, default=2.0)
     parser.add_argument("--state-poll", type=float, default=0.5)
+    parser.add_argument("--quiesce-after-agent-end", action="store_true",
+                        help="also stop after agent_end plus the quiet window, for RPC agents without Pi-style get_state")
     parser.add_argument("cmd", nargs=argparse.REMAINDER, help="command after --, e.g. -- pi --mode rpc ...")
     args = parser.parse_args(argv)
     cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
@@ -347,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
         timeout_s=args.timeout,
         quiescence_s=args.quiescence,
         state_poll_s=args.state_poll,
+        quiesce_after_agent_end=args.quiesce_after_agent_end,
     )
     if result.timed_out:
         return 124

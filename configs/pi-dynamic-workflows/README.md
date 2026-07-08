@@ -9,10 +9,11 @@ Uses the production `@quintinshaw/pi-dynamic-workflows` package, which builds on
   - `keywordTriggerWord`: `pi-workflow`
   - `defaultConcurrency`: `4`
   - `defaultAgentRetries`: `1`
+  - `defaultAgentTimeoutMs`: `600000` (10 min per subagent, so a hung model call fails fast instead of stalling the cell until the 90-min cell timeout)
 - The same adapter wraps the first benchmark prompt with `pi-workflow` and the package's forced workflow prompt.
 - The wrapper requires `background: false` so `pi --mode rpc` waits for the workflow result before the cell ends.
 - `gpt-5.5/low/settings.json` sets `defaultThinkingLevel: low`, so routed OpenAI Codex subagents inherit low thinking even when a tier spec has no explicit `:thinking` suffix.
-- Each tier in `model-tiers.json` carries an explicit `:medium` suffix (`openai-codex/gpt-5.4-mini:medium`, `openai-codex/gpt-5.4:medium`, `openai-codex/gpt-5.5:medium`), so every workflow subagent runs at medium thinking. The main Pi session still runs at the launch `--thinking` level (low), but the subagents that do the actual fan-out work run at medium.
+- All three tiers use `openai-codex/gpt-5.5` with an explicit `:thinking` suffix (`:low`, `:medium`, `:xhigh`). The main Pi session also runs `gpt-5.5` at the launch `--thinking` level (low); the tiers vary only the subagent thinking level. Using `gpt-5.5` (272K context) everywhere avoids the 128K-context overflow that killed `gpt-5.3-codex-spark` inventory agents on broad `rg` fan-out.
 
 ## Proposed role models
 
@@ -20,11 +21,11 @@ All roles use the existing OpenAI Codex subscription credential path (`--pass-op
 
 | workflow tier | model:thinking | intended use |
 | --- | --- | --- |
-| `small` | `openai-codex/gpt-5.4-mini:medium` | repository inventory, quick searches, narrow fact gathering |
-| `medium` | `openai-codex/gpt-5.4:medium` | focused implementation/debug/test analysis |
-| `big` | `openai-codex/gpt-5.5:medium` | synthesis, judgment, final cross-context decisions |
+| `small` | `openai-codex/gpt-5.5:low` | repository inventory, quick searches, narrow fact gathering |
+| `medium` | `openai-codex/gpt-5.5:medium` | focused implementation/debug/test analysis |
+| `big` | `openai-codex/gpt-5.5:xhigh` | synthesis, judgment, final cross-context decisions |
 
-All three tiers currently use `:medium`. Adjust the suffixes in `extensions/pi-dynamic-workflows-config.ts` (`MODEL_TIERS`) and the matching `requireText` in `gpt-5.5/low/smoke.json` to experiment with other levels (e.g. push `big` to `:high`).
+All three tiers use `gpt-5.5`; only the thinking level varies (`low` → `medium` → `xhigh`). Adjust the suffixes in `extensions/pi-dynamic-workflows-config.ts` (`MODEL_TIERS`) and the matching `requireText` in `gpt-5.5/low/smoke.json` to change them.
 
 These are config defaults, not a launch confirmation. Because this config uses secondary LLM roles, any benchmark launch must show the role table and get explicit confirmation.
 

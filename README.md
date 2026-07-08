@@ -7,7 +7,7 @@ The first comparison is:
 
 - model: `openrouter/deepseek/deepseek-v4-flash`
 - thinking: `high` (pinned with `--thinking high`)
-- baseline config: stock pi, no skills/extensions
+- baseline config: clean stock Pi for the selected model/thinking level, no skills/extensions and no config-authored prompt append
 - comparison config: pi + the real Ponytail Pi extension, **full/default** mode
 - question: does Ponytail help or hurt DeepSWE reward, and does it use more or
   fewer tokens?
@@ -30,6 +30,10 @@ Each cell is one `(task, config, rep)`:
 6. Read usage from pi's native `session/*.jsonl`; the full RPC event stream is
    not persisted. Compact sidecars such as advisor `tool-usage.jsonl` are
    filtered live when needed (see `docs/adr/0002-retire-pi-jsonl-stream-capture.md`).
+7. Capture the initial executor surface under each cell's `initial_context/`:
+   generated system prompt, system-prompt build inputs, first user prompt, and
+   the first provider request payloads. This is on by default for Pi and OMP
+   runners; pass `--no-initial-context-capture` to disable it for a run.
 
 The verifier always runs in a pristine separate container, matching DeepSWE's
 separate-verifier setup.
@@ -37,15 +41,20 @@ separate-verifier setup.
 ## Configs
 
 See [`configs/`](configs/) and [`configs/README.md`](configs/README.md). A
-**config** is one pi setup (system-prompt addition + skills/extensions); **model +
+**config** is one pi setup (optional prompt layers + skills/extensions); **model +
 thinking** is a separate path axis under it (the immutable-leaf rule, see
 `docs/adr/0001-directory-and-vocabulary-reorganization.md`). Only the config
 changes — model, thinking level, task image, verifier, time budget, and runner
 are held constant.
 
-- `baseline` — no skills and no discovered extensions; loads only the local-vLLM
-  preserve-thinking shim (a no-op for non-`local-vllm` models).
-- `baseline-wf` — baseline plus the mini-swe-agent step-by-step workflow prompt.
+- `baseline` — clean stock Pi: no skills, no config-authored extensions, no
+  harness system preamble, and no `orchestration.md` append prompt.
+- `baseline-preamble-orchestration` — historical prompt-bearing control: the
+  DeepSWE sandbox preamble plus the old "No extra guidance" orchestration.
+  Old results previously labeled `baseline` belong under this name.
+- `baseline-preamble-orchestration-wf` — historical prompt-bearing workflow
+  control: the same preamble plus the mini-swe-agent step-by-step workflow
+  prompt. Old results previously labeled `baseline-wf` belong under this name.
 - `ponytail-extension` — the vendored Ponytail Pi extension, pinned to
   `PONYTAIL_DEFAULT_MODE=full`.
 - `ponytail-full` / `ponytail-lite` / `ponytail-ultra` — the same vendored

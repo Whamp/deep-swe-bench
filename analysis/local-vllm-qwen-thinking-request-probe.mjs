@@ -14,6 +14,12 @@ const modelBase = {
   contextWindow: 262144,
   maxTokens: 16384,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  thinkingLevelMap: {
+    // Qwen/vLLM exposes binary thinking control through chat_template_kwargs.
+    // Keep xhigh visible to Pi as an explicit named level; no provider-side
+    // reasoning_effort is sent for qwen-chat-template models.
+    xhigh: 'xhigh',
+  },
   compat: {
     supportsDeveloperRole: false,
     supportsReasoningEffort: false,
@@ -21,7 +27,7 @@ const modelBase = {
   },
 };
 
-const requestedLevels = ['off', 'low'];
+const requestedLevels = ['off', 'low', 'xhigh'];
 const rows = [];
 
 const server = http.createServer((req, res) => {

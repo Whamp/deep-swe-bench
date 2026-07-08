@@ -29,6 +29,7 @@ The raw response shape is::
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -48,7 +49,10 @@ HTTP_TIMEOUT_S = 10
 # (wait for the window to reset, which may be hours/days) vs a short rate-limit
 # (retry after a brief backoff) vs an unknown transient (manual resume).
 SUBSCRIPTION_QUOTA_MARKERS = ("usage limit", "weekly limit", "weekly usage", "plan limit", "plan_limit")
-RATE_LIMIT_MARKERS = ("rate limit", "too many requests", "429", "temporarily rate limited")
+RATE_LIMIT_MARKERS = ("rate limit", "too many requests", "temporarily rate limited")
+RATE_LIMIT_REGEXES = (
+    re.compile(r"(?:http\s*)?(?:status\s*)?(?:error\s*)?\b429\b", re.I),
+)
 
 # Substring that marks the separate GPT-5.3-Codex-Spark quota pool.
 SPARK_MARKER = "spark"
@@ -184,7 +188,7 @@ def classify_transient(transient_msg: str | None) -> str:
     low = transient_msg.lower()
     if any(m in low for m in SUBSCRIPTION_QUOTA_MARKERS):
         return "quota"
-    if any(m in low for m in RATE_LIMIT_MARKERS):
+    if any(m in low for m in RATE_LIMIT_MARKERS) or any(r.search(transient_msg) for r in RATE_LIMIT_REGEXES):
         return "rate_limit"
     return "unknown"
 

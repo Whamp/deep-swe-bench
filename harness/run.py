@@ -22,6 +22,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -39,6 +40,9 @@ from pi_rpc_runner import run_pi_rpc  # noqa: E402
 DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-flash"
 DEFAULT_THINKING = "high"
 TRANSIENT_EXIT = 75
+INITIAL_CONTEXT_CAPTURE_SOURCE = HERE / "initial_context_capture.js"
+INITIAL_CONTEXT_CAPTURE_CONTAINER = "/harness/initial_context_capture.js"
+INITIAL_CONTEXT_CAPTURE_OUT = "/out/initial_context"
 TRANSIENT_MODEL_ERROR_PATTERNS = [
     "you've hit your usage limit",
     "you have hit your usage limit",
@@ -50,12 +54,61 @@ TRANSIENT_MODEL_ERROR_PATTERNS = [
     "rate_limit_exceeded",
     "too many requests",
     "temporarily rate limited",
-    "429",
+]
+TRANSIENT_MODEL_ERROR_REGEXES = [
+    re.compile(r"(?:http\s*)?(?:status\s*)?(?:error\s*)?\b429\b", re.I),
+]
+TRANSIENT_ERROR_CONTEXT_PATTERNS = [
+    "codex",
+    "openai",
+    "openrouter",
+    "provider",
+    "llm",
+    "responses",
+    "zai",
+    "z.ai",
+    "vllm",
+    "anthropic",
+    "gemini",
+]
+ERROR_CONTEXT_PATTERNS = [
+    "error",
+    "exception",
+    "traceback",
+    "failed",
+    "failure",
+    "unavailable",
 ]
 
 
 def sh(cmd: list[str], timeout: float | None = None, **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, timeout=timeout, capture_output=True, text=True, **kw)
+
+
+def initial_context_capture_mount(enabled: bool) -> list[str]:
+    if not enabled:
+        return []
+    if not INITIAL_CONTEXT_CAPTURE_SOURCE.exists():
+        sys.exit(f"initial context capture extension missing: {INITIAL_CONTEXT_CAPTURE_SOURCE}")
+    return ["-v", f"{INITIAL_CONTEXT_CAPTURE_SOURCE}:{INITIAL_CONTEXT_CAPTURE_CONTAINER}:ro"]
+
+
+def initial_context_capture_env(enabled: bool) -> list[str]:
+    if not enabled:
+        return []
+    env = ["-e", f"PI_INITIAL_CONTEXT_DIR={INITIAL_CONTEXT_CAPTURE_OUT}"]
+    for name in (
+        "PI_INITIAL_CONTEXT_MAX_CONTEXTS",
+        "PI_INITIAL_CONTEXT_MAX_PROVIDER_REQUESTS",
+        "PI_INITIAL_CONTEXT_STOP_AFTER",
+    ):
+        if os.environ.get(name):
+            env += ["-e", f"{name}={os.environ[name]}"]
+    return env
+
+
+def initial_context_capture_flags(enabled: bool) -> list[str]:
+    return ["-e", INITIAL_CONTEXT_CAPTURE_CONTAINER] if enabled else []
 
 
 def strip_patch_paths(patch: Path, prefixes: tuple[bytes, ...] = (b".gocache/",)) -> int:
@@ -214,8 +267,12 @@ def load_config(config: str, model: str, thinking: str) -> dict:
     def _leaf(name):
         p = leafdir / name
         return p if p.exists() else None
+    def _optional_text(name):
+        p = cdir / name
+        return p.read_text() if p.exists() else ""
     return {"dir": cdir, "leaf_rel": leaf_rel,
-            "orchestration": (cdir / "orchestration.md").read_text(),
+            "system_preamble": _optional_text("system_preamble.md"),
+            "orchestration": _optional_text("orchestration.md"),
             "skill_dirs": skill_dirs, "pi_flags": pi_flags, "env": env_lines,
             "models_json": _leaf("models.json"),
             "advisor_json": _leaf("advisor.json"),
@@ -259,6 +316,20 @@ def needs_openrouter_key(model: str, arm_cfg: dict) -> bool:
     return False
 
 
+def _matches_transient_marker(text: str) -> bool:
+    low = text.lower()
+    return any(s in low for s in TRANSIENT_MODEL_ERROR_PATTERNS) or any(
+        r.search(text) for r in TRANSIENT_MODEL_ERROR_REGEXES
+    )
+
+
+def _looks_like_model_error_context(text: str) -> bool:
+    low = text.lower()
+    return any(s in low for s in TRANSIENT_ERROR_CONTEXT_PATTERNS) and any(
+        s in low for s in ERROR_CONTEXT_PATTERNS
+    )
+
+
 def transient_model_error(paths: list[Path]) -> str | None:
     for p in paths:
         if not p.exists():
@@ -266,24 +337,33 @@ def transient_model_error(paths: list[Path]) -> str | None:
         is_structured = p.suffix in (".jsonl", ".ndjson")
         with p.open(errors="replace") as f:
             for line in f:
-                probes = []
+                probes: list[tuple[str, bool]] = []
                 if is_structured:
                     try:
                         d = json.loads(line)
                         msg = d.get("message") if isinstance(d.get("message"), dict) else d
-                        for obj in (d, msg, d.get("data") if isinstance(d.get("data"), dict) else None):
-                            if isinstance(obj, dict):
-                                for key in ("errorMessage", "error", "stopReason", "message"):
-                                    val = obj.get(key)
-                                    if val and not isinstance(val, (dict, list)):
-                                        probes.append(str(val))
+                        data = d.get("data") if isinstance(d.get("data"), dict) else None
+                        for obj in (d, msg, data):
+                            if not isinstance(obj, dict):
+                                continue
+                            stop = str(obj.get("stopReason") or "").lower()
+                            role = str(obj.get("role") or "").lower()
+                            assistant_error = role == "assistant" and stop == "error"
+                            for key in ("errorMessage", "error"):
+                                val = obj.get(key)
+                                if val and not isinstance(val, (dict, list)):
+                                    text = str(val)
+                                    probes.append((text, assistant_error or _looks_like_model_error_context(text)))
+                            val = obj.get("message")
+                            if val and not isinstance(val, (dict, list)):
+                                text = str(val)
+                                probes.append((text, assistant_error or _looks_like_model_error_context(text)))
                     except Exception:
                         pass
                 else:
-                    probes.append(line)
-                for probe in probes:
-                    low = probe.lower()
-                    if any(s in low for s in TRANSIENT_MODEL_ERROR_PATTERNS):
+                    probes.append((line, _looks_like_model_error_context(line)))
+                for probe, error_context in probes:
+                    if _matches_transient_marker(probe) and error_context:
                         return probe.strip()[:1000]
     return None
 
@@ -309,13 +389,25 @@ def _validate_rpc_pi_flags(flags: list[str]) -> None:
             raise ValueError(f"config pi-flags may not override RPC runner control flag: {flag}")
 
 
-def pi_cmd(arm_cfg: dict, model: str, thinking: str, append_text: str) -> list[str]:
+def config_append_text(arm_cfg: dict) -> str:
+    """Return config-authored prompt layers, without any global harness preamble."""
+    parts = []
+    for key in ("system_preamble", "orchestration"):
+        text = (arm_cfg.get(key) or "").strip("\n")
+        if text.strip():
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def pi_cmd(arm_cfg: dict, model: str, thinking: str, append_text: str,
+           capture_initial_context: bool = True) -> list[str]:
     flags = arm_cfg["pi_flags"]
     _validate_rpc_pi_flags(flags)
     cmd = ["pi", "--mode", "rpc",
            "--model", model, "--thinking", thinking, "--offline",
-           "--session-dir", "/out/session",
-           "--append-system-prompt", append_text]
+           "--session-dir", "/out/session"]
+    if append_text:
+        cmd += ["--append-system-prompt", append_text]
 
     # Keep discovery isolated; Pi still loads explicit -e/--extension paths with --no-extensions.
     if not arm_cfg["skill_dirs"]:
@@ -325,12 +417,14 @@ def pi_cmd(arm_cfg: dict, model: str, thinking: str, append_text: str) -> list[s
             cmd += ["--skill", f"/arm/skills/{s.name}"]
     cmd += ["--no-extensions"]
     cmd += flags
+    # Load last so it observes final chained before_agent_start / provider payload state.
+    cmd += initial_context_capture_flags(capture_initial_context)
     return cmd
 
 
 def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
              agent_timeout: float, keep: bool, pass_openai_codex_oauth: bool,
-             rpc_quiescence: float) -> dict:
+             rpc_quiescence: float, capture_initial_context: bool = True) -> dict:
     task = load_task(task_id)
     arm_cfg = load_config(config, model, thinking)
     ensure_env_image(task.env_image)
@@ -344,8 +438,7 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     (cell / "logs").mkdir(exist_ok=True)
     (cell / "transient_error.json").unlink(missing_ok=True)
 
-    preamble = (HERE / "system_preamble.md").read_text()
-    append_text = preamble + "\n\n" + arm_cfg["orchestration"]
+    append_text = config_append_text(arm_cfg)
 
     suffix = f"{config}-{task_id}-r{rep}-{os.getpid()}"
     cname = f"dsw-{suffix}"
@@ -369,6 +462,7 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
         env_flag += ["-e", f"ZAI_API_KEY={os.environ['ZAI_API_KEY']}"]
     for k, v in arm_cfg["env"].items():
         env_flag += ["-e", f"{k}={v}"]
+    env_flag += initial_context_capture_env(capture_initial_context)
 
     print(f"[cell] task={task_id} config={config} lang={task.language} "
           f"budget={agent_timeout:.0f}s model={model} thinking={thinking}", flush=True)
@@ -385,6 +479,7 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
                 "-v", f"{task_public}:/task:ro",
                 "-v", f"{cell}:/out",
                 "-v", f"{arm_cfg['dir']}:/arm:ro",
+                *initial_context_capture_mount(capture_initial_context),
                 # /logs mount = same as /out so pre_artifacts + verifier land on host
                 "-v", f"{cell}:/logs",
                 *auth_mount,
@@ -419,7 +514,7 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
         # tool-usage.jsonl while discarding the full event stream.
         pre_session_paths = set((cell / "session").glob("*.jsonl"))
         pre_om_debug_paths = set((cell / "pi-agent" / "observational-memory" / "debug").glob("*.ndjson"))
-        cmd = pi_cmd(arm_cfg, model, thinking, append_text)
+        cmd = pi_cmd(arm_cfg, model, thinking, append_text, capture_initial_context)
         # argv list, not shell: the append-system-prompt text contains
         # newlines/spaces that a bash -lc join would mangle. docker exec needs
         # -i so the RPC driver's stdin pipe remains open until quiescence.
@@ -526,11 +621,16 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     rec = result_record(
         task, config, model, rep,
         arm_pi_flags=arm_cfg["pi_flags"],
+        system_preamble_chars=len(arm_cfg.get("system_preamble") or ""),
+        orchestration_chars=len(arm_cfg.get("orchestration") or ""),
+        append_system_prompt_chars=len(append_text),
         arm_settings=arm_settings,
         arm_advisor=arm_advisor,
         arm_models=arm_models,
         thinking_level=thinking,
         openai_codex_oauth_passed=pass_openai_codex_oauth,
+        initial_context_capture_enabled=capture_initial_context,
+        initial_context_capture_path="initial_context" if capture_initial_context else None,
         reward_binary=reward.get("reward", -1),
         reward_partial=float(reward.get("partial", 0.0)),
         f2p=reward.get("f2p"), p2p=reward.get("p2p"),
@@ -570,6 +670,8 @@ def main():
                     help="copy only the host openai-codex OAuth entry into the agent container")
     ap.add_argument("--rpc-quiescence", type=float, default=2.0,
                     help="seconds Pi RPC must remain idle with no pending messages before the cell stops")
+    ap.add_argument("--no-initial-context-capture", action="store_true",
+                    help="disable initial system/context/provider-request capture under result initial_context/")
     args = ap.parse_args()
 
     task = load_task(args.task)
@@ -577,7 +679,8 @@ def main():
     rec = run_cell(args.config, args.task, model=args.model, thinking=args.thinking,
                    rep=args.rep, agent_timeout=to, keep=args.keep,
                    pass_openai_codex_oauth=args.pass_openai_codex_oauth,
-                   rpc_quiescence=args.rpc_quiescence)
+                   rpc_quiescence=args.rpc_quiescence,
+                   capture_initial_context=not args.no_initial_context_capture)
     print(json.dumps({"ok": True, "reward_partial": rec["reward_partial"],
                       "total_tokens": rec["total_tokens"]}))
 

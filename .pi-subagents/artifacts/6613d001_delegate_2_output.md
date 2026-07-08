@@ -1,0 +1,33 @@
+I have both rep0 and rep1 trajectories. The comparison is decisive: the two seam losses failed on **orthogonal defects**, which materially changes the classification. Let me compose the result.
+
+```json
+{
+  "task": "go-critic-doc-link-checker",
+  "rep": "rep1",
+  "direction": "seam_loss",
+  "primary_bucket": "variance_at_capability_edge — rep1's specific defect is a per-run edge-case-coverage miss; the consistent 0/2 seam-loss direction (old 2/2 solved) leaves only a WEAK aggregate seam contribution, not a single seam-text mechanism",
+  "mechanism": "SEAM checker (checkers/brokenDocLink_checker.go + checkers/internal/astwalk/doc_link_walker.go) routes two-part DocLinks like [notimported.Foo] and [strings.NewReader] into the LOCAL-TYPE-lookup path and emits `type \"X\" not found in current package`. Gold testdata expects `package \"X\" is not imported` for the same inputs. The seam agent's OWN committed positive_tests.go only exercised the THREE-part case [x.T.M]->'package x is not imported', never the two-part case, so the missing branch went uncaught. Notably the seam agent DISCOVERED the correct LookupPackage semantics during exploration (comment.Parser{LookupPackage:func(name string)(string,bool){return \"\", token.IsIdentifier(name)}} returns true for any identifier, which is exactly the behavior that yields 'package not imported') but did NOT carry it into the final checker — an integration slip, not a scope decision. CRITICAL: this is a DIFFERENT bug than rep0, where seam failed on method/EMBEDDING resolution (false positives on [GoodType.GoodMethod], [OuterGood.EmbeddedMethod], [fmt.Stringer.String], [Level0.DeepestMethod] and a false negative on [AmbiguousEmbed.Conflict]). Two independent seam runs, two orthogonal incompleteness defects.",
+  "seam_text_plausibly_mattered": "Unlikely as the proximate cause of rep1's specific failure (variance); weakly plausible only at the aggregate level (old solved 2/2, seam lost 2/2). The 'make the edit smaller' rule does NOT consistently apply: rep0 seam patch was LARGER than old (372 vs 310 adds), rep1 seam patch was SMALLER (291 vs 332). The two failures being orthogonal edge-case gaps is the signature of capability-edge variance, not a single seam-induced behavior.",
+  "confidence": "medium — high confidence the rep1 defect is variance/capability-edge rather than a direct seam-text consequence (agent found then dropped the correct LookupPackage insight; defect is orthogonal to rep0); low-medium confidence that seam text raises overall incompleteness probability on this borderline medium task.",
+  "evidence_bullets": [
+    "rep1 seam verifier FAIL: 'positive_tests.go:53: unexpected warn: [notimported.Foo]: type \"notimported\" not found in current package' — wrong message; gold wants 'package \"notimported\" is not imported'",
+    "rep1 seam verifier FAIL: 'positive_tests.go:94: unexpected warn: [strings.NewReader]: type \"strings\" not found in current package' — wrong message; gold wants 'package \"strings\" is not imported'",
+    "rep1 seam verifier: two 'unmatched' lines show the expected 'package X is not imported' warnings were never emitted → missing branch, not wrong line/position",
+    "rep1 seam's own positive_tests.go only covered the three-part package case '/*! [x.T.M]: package \"x\" is not imported */' — the two-part unimported-package case gold requires was never self-tested, so the gap was invisible at dev time",
+    "rep1 seam bash timeline shows the agent prototyped the CORRECT LookupPackage ('LookupPackage:func(name string)(string,bool){return \"\", token.IsIdentifier(name)}' → returns true for identifiers) but the final checker diverged onto a local-type-lookup path",
+    "rep0 seam failed for a DIFFERENT reason: false positives on embedded/interface methods ([GoodType.GoodMethod], [GoodInterface.Run], [OuterGood.EmbeddedMethod], [fmt.Stringer.String], [Level0.DeepestMethod]) + false negative on [AmbiguousEmbed.Conflict] — method/embedding resolution, orthogonal to rep1's package-message bug",
+    "Patch-size signal is inconsistent with 'make the edit smaller': rep0 seam 372 adds (>old 310); rep1 seam 291 adds (<old 332). Seam does not systematically shrink the checker",
+    "Both seam runs were MORE expensive but worse: rep1 +788,997 tokens, +35.2s, +6 tool calls; rep0 +917,220 tokens, +190.9s, +8 tool calls vs their old-skill counterparts — pattern of thrashing/over-exploration, consistent with capability-edge variance rather than a deterministic seam mechanism",
+    "old-skill solved this task 2/2 (rep0 old 310 adds f2p 3/3 p2p 16/16; rep1 old 332 adds f2p 3/3 p2p 16/16) — the consistent loss DIRECTION (seam 0/2) is the only seam-attributable signal, and it is weak given the orthogonal defects"
+  ],
+  "f2p_mapping": {
+    "failing_test": "github.com/go-critic/go-critic/checkers TestCheckers/brokenDocLink (FAIL; subtests /debug and /sanity still PASS) — the new-checker f2p test. Also drags the aggregate TestCheckers p2p to FAIL (15/16).",
+    "failing_inputs": "gold testdata positive_tests.go:53 [notimported.Foo] and :94 [strings.NewReader] — two-part DocLinks whose receiver is a non-imported package-name identifier",
+    "expected_vs_actual": "expected message 'package \"X\" is not imported'; seam checker emitted 'type \"X\" not found in current package'",
+    "patch_delta": "checkers/brokenDocLink_checker.go and checkers/internal/astwalk/doc_link_walker.go are missing the LookupPackage-based branch that recognizes an identifier receiver as a (non-imported) package and emits 'package \"X\" is not imported'; these refs fall through to local-type lookup instead. The gold/old checker has this branch (both old reps pass these exact cases).",
+    "self_test_gap": "rep1 seam positive_tests.go never included a two-part [pkg.Symbol] unimported-package case (only the three-part [x.T.M] case), so dev-time 'go test ./checkers -run TestCheckers/brokenDocLink' passed and the missing branch was committed undetected."
+  }
+}
+```
+
+**Summary read for the parent:** rep1's seam loss is a two-part-`[Pkg.Symbol]`-to-unimported-package message bug (`type "X" not found` vs gold's `package "X" is not imported`), caused by a missing LookupPackage branch the agent's own testdata never exercised. Crucially, rep0's seam loss on the same task was a *different* bug (method/embedding resolution), so the two losses are orthogonal edge-case gaps — the signature of capability-edge variance, not a single seam-text mechanism. Seam's "make the edit smaller" rule does not even consistently apply (rep0 seam patch was larger). The only seam-attributable signal is the 0/2 loss direction; the proximate rep1 defect is variance.

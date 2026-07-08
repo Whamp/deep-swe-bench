@@ -32,6 +32,7 @@ PRIMARY="$REPO/configs/codebase-memory/bin/codebase-memory-mcp"
 LINKS=(
   "$REPO/configs/codebase-memory-bash-hook/bin/codebase-memory-mcp"
   "$REPO/configs/codebase-memory-max/bin/codebase-memory-mcp"
+  "$REPO/configs/codebase-memory-max-pi-codex-goal/bin/codebase-memory-mcp"
   "$REPO/configs/codebase-memory-om/bin/codebase-memory-mcp"
   "$REPO/configs/codebase-memory-om-bash-hook/bin/codebase-memory-mcp"
   "$REPO/configs/codebase-memory-om-reindex/bin/codebase-memory-mcp"

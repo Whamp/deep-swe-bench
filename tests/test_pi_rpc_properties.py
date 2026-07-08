@@ -169,7 +169,10 @@ def test_pi_cmd_preserves_rpc_invariants_or_rejects_control_overrides(model, thi
     assert cmd[cmd.index("--model") + 1] == model
     assert cmd[cmd.index("--thinking") + 1] == thinking
     assert cmd[cmd.index("--session-dir") + 1] == "/out/session"
-    assert cmd[cmd.index("--append-system-prompt") + 1] == append_text
+    if append_text:
+        assert cmd[cmd.index("--append-system-prompt") + 1] == append_text
+    else:
+        assert "--append-system-prompt" not in cmd
     assert "--no-extensions" in cmd
 
     if skills:
@@ -180,10 +183,14 @@ def test_pi_cmd_preserves_rpc_invariants_or_rejects_control_overrides(model, thi
     else:
         assert "--no-skills" in cmd
 
+    capture_tail = run.initial_context_capture_flags(True)
+    assert cmd[-len(capture_tail):] == capture_tail
+    command_before_capture = cmd[:-len(capture_tail)]
+
     if flags:
-        assert cmd[-len(flags):] == flags
+        assert command_before_capture[-len(flags):] == flags
     else:
-        assert cmd[-1] == "--no-extensions"
+        assert command_before_capture[-1] == "--no-extensions"
 
 
 truthy_json_id = json_value.filter(bool)

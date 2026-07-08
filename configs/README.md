@@ -1,16 +1,17 @@
 # Configs
 
-A **config** is one configuration of the pi agent under test: a system-prompt
-addition plus the skills/extensions it loads. The harness
+A **config** is one configuration of the pi agent under test: optional
+config-authored prompt layers plus the skills/extensions it loads. The harness
 (`harness/run.py --config <name>`) loads the config and applies whatever files
-it finds. Convention over configuration: only `orchestration.md` is required.
+it finds. A clean config may contain no prompt files at all.
 
 A config is split into **constant** files (shared across every model+thinking
 variant of that config) and **model leaves** (the per-model-variant files):
 
 ```
 configs/<config>/                       # constant files
-  orchestration.md                      # appended to the system prompt (required)
+  system_preamble.md                    # optional, config-local benchmark preamble
+  orchestration.md                      # optional, appended after system_preamble.md
   pi-flags, env, skills/, extensions/   # optional, config-wide
   <model-leaf>/<thinking>/              # model leaf — the immutable variant dir
     models.json, advisor.json, settings.json   # model-identity files (optional)
@@ -35,7 +36,8 @@ file in place — add a new `<model-leaf>/<thinking>/` instead.
 
 | File / dir          | Scope    | Effect                                                                                  |
 |---------------------|----------|-----------------------------------------------------------------------------------------|
-| `orchestration.md`  | constant | Appended to the system prompt via `--append-system-prompt`. Required.                   |
+| `system_preamble.md`| constant | Optional config-local benchmark preamble. Never applied globally.                       |
+| `orchestration.md`  | constant | Optional config-local prompt appended after `system_preamble.md`.                       |
 | `skills/`           | constant | Each subdir passed to pi via `--skill`. The baseline config passes none.                |
 | `pi-flags`          | constant | Extra raw flags appended to the `pi` invocation (one argv per line).                    |
 | `env`               | constant | `KEY=VALUE` lines exported into the agent container env.                               |
@@ -72,11 +74,16 @@ provenance rules.
 
 ## Configs in this comparison
 
-- `baseline/` — stock pi, no skills, no discovered extensions. The true control.
-  Loads the local-vLLM preserve-thinking shim so local Qwen gets the same
-  transport workaround as non-baseline configs.
-- `baseline-wf/` — baseline plus the mini-swe-agent step-by-step workflow prompt
-  (benchmark-specific guidance absent from a normal AGENTS.md).
+- `baseline/` — clean stock Pi for the selected model/thinking level: no skills,
+  no config-authored extensions, no harness system preamble, and no
+  `orchestration.md` append prompt.
+- `baseline-preamble-orchestration/` — historical prompt-bearing control: the
+  DeepSWE sandbox preamble plus the old "No extra guidance" orchestration. This
+  is the correct label for old results previously stored under `baseline`.
+- `baseline-preamble-orchestration-wf/` — historical prompt-bearing workflow
+  control: the same DeepSWE sandbox preamble plus the mini-swe-agent-style
+  step-by-step workflow prompt. This is the correct label for old results
+  previously stored under `baseline-wf`.
 - `advisor/` — stock executor plus the `pi-advisor` extension using `zai/glm-5.2`
   as advisor (leaf `deepseek-v4-flash+glm-5.2`).
 - `observational-memory/` — stock executor plus the `pi-observational-memory`

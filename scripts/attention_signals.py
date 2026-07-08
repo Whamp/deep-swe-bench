@@ -41,15 +41,15 @@ OUTDIR = REPO / "analysis" / "attention-signals"
 # Default Tier-0 target set: OM-axis (low + high) and thinking-axis (low->xhigh).
 # Each tuple: (model_leaf, thinking, [configs...]).
 DEFAULT_TARGETS: list[tuple[str, str, list[str]]] = [
-    ("gpt-5.5", "low", ["baseline",
+    ("gpt-5.5", "low", ["baseline-preamble-orchestration",
                         "observational-memory-gpt55-low",
                         "observational-memory-gpt54mini-low",
                         "observational-memory-gpt54-low"]),
-    ("deepseek-v4-flash", "high", ["baseline", "observational-memory",
-                                   "baseline-wf", "ponytail-full",
+    ("deepseek-v4-flash", "high", ["baseline-preamble-orchestration", "observational-memory",
+                                   "baseline-preamble-orchestration-wf", "ponytail-full",
                                    "advisor", "advisor-observational-memory"]),
-    ("gpt-5.5", "medium", ["baseline"]),
-    ("gpt-5.5", "xhigh", ["baseline"]),
+    ("gpt-5.5", "medium", ["baseline-preamble-orchestration"]),
+    ("gpt-5.5", "xhigh", ["baseline-preamble-orchestration"]),
 ]
 
 

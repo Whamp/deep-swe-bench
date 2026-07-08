@@ -94,6 +94,42 @@ class PiRpcRunnerTests(unittest.TestCase):
             self.assertIn('"event":"quiescent"', runner_log)
             self.assertIn('"transport":"rpc"', runner_log)
 
+    def test_can_quiesce_after_agent_end_without_pi_state_shape(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = self.write_fake_rpc(
+                root,
+                """
+                import json, sys
+                for raw in sys.stdin:
+                    cmd = json.loads(raw)
+                    if cmd.get("type") == "prompt":
+                        print(json.dumps({"id": cmd.get("id"), "type": "response", "command": "prompt", "success": True}), flush=True)
+                        print(json.dumps({"type": "agent_start"}), flush=True)
+                        print(json.dumps({"type": "agent_end"}), flush=True)
+                    elif cmd.get("type") == "get_state":
+                        print(json.dumps({"id": cmd.get("id"), "type": "response", "command": "get_state", "success": True, "data": {"busy": False}}), flush=True)
+                """,
+            )
+
+            result = run_pi_rpc(
+                [sys.executable, str(fake)],
+                prompt_text="omp-like rpc",
+                stderr_path=root / "pi.stderr.txt",
+                runner_log_path=root / "pi-rpc-runner.jsonl",
+                timeout_s=5,
+                quiescence_s=0.1,
+                state_poll_s=0.05,
+                quiesce_after_agent_end=True,
+            )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertTrue(result.quiescent)
+            self.assertEqual(result.agent_end_count, 1)
+            runner_log = (root / "pi-rpc-runner.jsonl").read_text()
+            self.assertIn('"event":"quiescent"', runner_log)
+            self.assertIn('"reason":"agent_end"', runner_log)
+
     def test_timeout_kills_process_and_reports_timeout(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

