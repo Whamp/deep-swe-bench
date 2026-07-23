@@ -147,9 +147,33 @@ def run_probe_cell(*, agent: str, config: str, task_id: str, model: str, thinkin
     if r.returncode != 0:
         raise RuntimeError(r.stderr[:1000])
     try:
-        if agent == "pi" and auth_mount:
+        if agent == "pi" and (
+            auth_mount
+            or cfg.get("advisor_json")
+            or cfg.get("models_json")
+            or cfg.get("settings_json")
+        ):
             sh(["docker", "exec", cname, "mkdir", "-p", "/root/.pi/agent"])
-            sh(["docker", "exec", cname, "cp", "/agent-auth/auth.json", "/root/.pi/agent/auth.json"])
+            if auth_mount:
+                sh(["docker", "exec", cname, "cp", "/agent-auth/auth.json", "/root/.pi/agent/auth.json"])
+            if cfg.get("advisor_json"):
+                sh([
+                    "docker", "exec", cname, "cp",
+                    f"/arm/{cfg['leaf_rel']}/advisor.json",
+                    "/root/.pi/agent/advisor.json",
+                ])
+            if cfg.get("models_json"):
+                sh([
+                    "docker", "exec", cname, "cp",
+                    f"/arm/{cfg['leaf_rel']}/models.json",
+                    "/root/.pi/agent/models.json",
+                ])
+            if cfg.get("settings_json"):
+                sh([
+                    "docker", "exec", cname, "cp",
+                    f"/arm/{cfg['leaf_rel']}/settings.json",
+                    "/root/.pi/agent/settings.json",
+                ])
         rpc = run_pi_rpc(
             [*exec_prefix, *cmd],
             prompt_text=(Path(task_public) / "instruction.md").read_text(),
