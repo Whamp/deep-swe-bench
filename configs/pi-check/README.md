@@ -1,7 +1,8 @@
 # pi-check
 
-Config for running DeepSWE reps with the `pi-check` Pi extension on
-`openai-codex/gpt-5.5` at thinking `low`.
+Config for running DeepSWE reps with the `pi-check` Pi extension. Validated
+model leaves are `openai-codex/gpt-5.5` and `openai-codex/gpt-5.6-sol`, both at
+thinking `low`.
 
 ## Behavior
 
