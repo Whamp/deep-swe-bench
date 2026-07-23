@@ -31,7 +31,7 @@ The extension has no runtime npm dependencies, so no install step is required.
 
 ```sh
 python3 harness/run_batch.py \
-  --configs baseline,pi-check \
+  --configs pi-check \
   --model openai-codex/gpt-5.5 \
   --thinking low \
   --subset 12_v0 \
