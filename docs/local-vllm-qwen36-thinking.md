@@ -199,3 +199,80 @@ A benchmark config using Qwen as an observational-memory worker should require:
 - nonzero `om_worker_calls`, `om_observer_calls`, `om_worker_total_tokens`, and `combined_total_tokens`;
 - worker trace text containing `"provider":"local-vllm","model":"cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4","api":"openai-completions","thinkingLevel":"off"`;
 - no `model_unavailable` text.
+
+## ThinkingCap-Qwen3.6-27B on server60
+
+Validated 2026-07-08 for the local model id:
+
+```text
+bottlecapai/ThinkingCap-Qwen3.6-27B
+```
+
+Artifact: `analysis/local-vllm-thinkingcap-qwen36-live-probe.jsonl`.
+
+The active server60 endpoint is still:
+
+```text
+http://100.92.238.117:30000/v1
+```
+
+`/v1/models` reports `bottlecapai/ThinkingCap-Qwen3.6-27B` with
+`max_model_len: 262144`. The model uses the same Pi provider/API shape as the
+other server60 Qwen models: provider `local-vllm`, API `openai-completions`,
+`compat.thinkingFormat: "qwen-chat-template"`, dummy local API key, and zero
+priced token costs.
+
+Live probe findings:
+
+- A short request with no `chat_template_kwargs` returned no content and hit
+  `finish_reason: "length"`.
+- `chat_template_kwargs: {"enable_thinking": false}` returned `SMOKE_OK`
+  immediately.
+- `chat_template_kwargs: {"preserve_thinking": true}` with enough output tokens
+  returned `SMOKE_OK` after internal thinking.
+- `chat_template_kwargs: {"preserve_thinking": true}` plus top-level
+  `thinking_token_budget: 64` returned `SMOKE_OK` and bounded the completion to
+  70 tokens, proving this served model accepts the same top-level budget field.
+- The exact intended sampling parameters were probed successfully with
+  `temperature: 1.0`, `top_p: 0.95`, `top_k: 20`, and `min_p: 0.0`; the live
+  call returned `SMOKE_OK`.
+
+For a plain Pi baseline of this ThinkingCap model, use a model-specific baseline
+config with no config-authored prompt text, a leaf-local `models.json`, and the
+budgeted `local-vllm-preserve-thinking.ts` shim updated to include
+`bottlecapai/ThinkingCap-Qwen3.6-27B`. For thinking `high`, smoke should prove
+that stderr contains the budget debug row with `"level":"high"` and
+`"thinking_token_budget":32768`.
+
+## Restored Qwen3.6-27B clean baseline
+
+Validated 2026-07-09 after server60 was switched back to:
+
+```text
+cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4
+```
+
+The live `/v1/models` response reports `max_model_len: 262144`. The clean
+benchmark config is `configs/baseline-qwen36-27b/`, with a `high` leaf and no
+config-authored prompt text. Pi's `qwen-chat-template` compatibility supplies
+`chat_template_kwargs.enable_thinking=true`; the preserve-only extension adds
+`preserve_thinking=true` and deliberately does not add a hard
+`thinking_token_budget`.
+
+The exact sampling tuple is applied at the final provider payload:
+
+```json
+{
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 20,
+  "min_p": 0.0,
+  "presence_penalty": 0.0,
+  "repetition_penalty": 1.0
+}
+```
+
+Artifact: `analysis/local-vllm-qwen36-clean-sampling-probe.jsonl`. A live call
+with thinking and tool use enabled returned `finish_reason: "tool_calls"`,
+non-empty reasoning, and a valid `bash` call containing
+`QWEN36_CLEAN_SMOKE_OK`.
