@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import harness.run_batch as run_batch
 
@@ -108,6 +108,94 @@ class StructuredStateIntegrationTests(unittest.TestCase):
             self.assertIn('"event": "run_started"', events)
             self.assertIn('"event": "cell_skipped"', events)
             self.assertIn('"event": "run_completed"', events)
+
+
+class CellRetryTests(unittest.TestCase):
+    def _args(self, *, force=False, cell_retries=1):
+        return type("Args", (), {
+            "model": "openrouter/deepseek/deepseek-v4-flash",
+            "thinking": "high",
+            "force": force,
+            "agent": "pi",
+            "agent_timeout": None,
+            "rpc_quiescence": None,
+            "pass_openai_codex_oauth": False,
+            "no_initial_context_capture": False,
+            "cell_retries": cell_retries,
+        })()
+
+    def test_retries_nonzero_cell_when_result_is_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            old_repo = run_batch.REPO
+            run_batch.REPO = root
+            try:
+                result = run_batch.result_path(
+                    self._args().model, "high", "cfg", "task-a", 0
+                )
+                log = run_batch.log_path(
+                    self._args().model, "high", "cfg", "task-a", 0
+                )
+                cell = run_batch.make_cell(
+                    task="task-a", config="cfg", rep=0,
+                    result_path=result, log_path=log,
+                )
+                state = Mock()
+                calls = 0
+
+                def fake_run_one(_spec, _args):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        result.parent.mkdir(parents=True, exist_ok=True)
+                        result.write_text("{}")
+                    return {"task": "task-a", "config": "cfg", "rep": 0,
+                            "exit": 1 if calls == 1 else 0,
+                            "result": str(result), "log": str(log)}
+
+                with patch.object(run_batch, "run_one", side_effect=fake_run_one):
+                    returned = run_batch.run_one_with_state(
+                        ("task-a", "cfg", 0), self._args(), state, cell
+                    )
+
+                self.assertEqual(calls, 2)
+                self.assertEqual(returned["exit"], 0)
+                self.assertEqual(state.cell_started.call_count, 2)
+                self.assertEqual(state.cell_finished.call_count, 2)
+            finally:
+                run_batch.REPO = old_repo
+
+    def test_does_not_retry_nonzero_cell_when_result_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            old_repo = run_batch.REPO
+            run_batch.REPO = root
+            try:
+                args = self._args(force=True)
+                result = run_batch.result_path(args.model, "high", "cfg", "task-a", 0)
+                log = run_batch.log_path(args.model, "high", "cfg", "task-a", 0)
+                cell = run_batch.make_cell(
+                    task="task-a", config="cfg", rep=0,
+                    result_path=result, log_path=log,
+                )
+                state = Mock()
+
+                def fake_run_one(_spec, _args):
+                    result.parent.mkdir(parents=True, exist_ok=True)
+                    result.write_text("{}")
+                    return {"task": "task-a", "config": "cfg", "rep": 0,
+                            "exit": 1, "result": str(result), "log": str(log)}
+
+                with patch.object(run_batch, "run_one", side_effect=fake_run_one) as run_mock:
+                    returned = run_batch.run_one_with_state(
+                        ("task-a", "cfg", 0), args, state, cell
+                    )
+
+                self.assertEqual(run_mock.call_count, 1)
+                self.assertEqual(returned["exit"], 1)
+                self.assertEqual(state.cell_started.call_count, 1)
+            finally:
+                run_batch.REPO = old_repo
 
 
 class RunOneCommandTests(unittest.TestCase):
