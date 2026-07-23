@@ -260,20 +260,47 @@ def run_one_with_state(spec, args, state: RunStateWriter, cell: dict):
         skipped_cell["log_path"] = str(log_path(args.model, args.thinking, config, task, rep))
         state.cell_skipped(skipped_cell, reason="existing_result")
         return run_one(spec, args)
-    state.cell_started(cell)
-    try:
-        res = run_one(spec, args)
-    except BaseException:
-        state.cell_finished(cell, exit_code="exception")
-        raise
-    state.cell_finished(
-        cell,
-        result_path=res.get("result"),
-        log_path=res.get("log"),
-        exit_code=res.get("exit"),
-        transient_exit=TRANSIENT_EXIT,
-    )
-    return res
+
+    retry_limit = max(0, int(getattr(args, "cell_retries", 1)))
+    for attempt in range(retry_limit + 1):
+        state.cell_started(cell)
+        try:
+            res = run_one(spec, args)
+        except BaseException:
+            state.cell_finished(cell, exit_code="exception")
+            if attempt < retry_limit and not result.exists():
+                print(
+                    f"[retry] {task} / {config} / rep{rep}: "
+                    f"no result.json after exception; retry {attempt + 2}/{retry_limit + 1}",
+                    flush=True,
+                )
+                continue
+            raise
+        state.cell_finished(
+            cell,
+            result_path=res.get("result"),
+            log_path=res.get("log"),
+            exit_code=res.get("exit"),
+            transient_exit=TRANSIENT_EXIT,
+        )
+        # A missing result means the cell failed before the harness could write
+        # its durable artifact (for example, host storage or container setup).
+        # Retry those infrastructure failures, but leave provider transients to
+        # the quota resumer and never overwrite a result-bearing cell.
+        if (
+            res.get("exit") not in (0, TRANSIENT_EXIT)
+            and not result.exists()
+            and attempt < retry_limit
+        ):
+            print(
+                f"[retry] {task} / {config} / rep{rep}: "
+                f"no result.json after exit={res.get('exit')}; "
+                f"retry {attempt + 2}/{retry_limit + 1}",
+                flush=True,
+            )
+            continue
+        return res
+    raise AssertionError("unreachable")
 
 
 def selection_metadata(args, ids: list[str]) -> dict:
@@ -544,6 +571,8 @@ def main():
                     choices=["off", "minimal", "low", "medium", "high", "xhigh"])
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--cell-retries", type=int, default=1,
+                    help="retry a cell once when it exits without writing result.json (default: 1)")
     ap.add_argument("--agent-timeout", type=float)
     ap.add_argument("--rpc-quiescence", type=float,
                     help="seconds the agent RPC connection must remain idle before each cell stops")
