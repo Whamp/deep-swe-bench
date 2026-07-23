@@ -186,7 +186,9 @@ def load_comparison_data(
 
     # Collect all result.json files, grouped by the path model/thinking/config
     groups: dict[str, list[dict[str, Any]]] = {}
-    for result_file in results_root.rglob("result.json"):
+    # Segment the canonical layout so config directories projected from benchmark
+    # worktrees are entered; Path.rglob() skips directory symlinks.
+    for result_file in results_root.glob("*/*/*/*/*/result.json"):
         # Skip contaminated runs
         if "_contaminated" in result_file.parts:
             continue

@@ -187,6 +187,27 @@ def test_comparison_subset_filter_excludes_other_tasks(tmp_path):
     assert {c["task"] for c in filt[0]["cells"]} == {"task-a"}
 
 
+def test_comparison_discovers_symlinked_config_directory(tmp_path):
+    res = tmp_path / "results"
+    source = tmp_path / "worktree-results" / "pi-check"
+    _make_result(
+        source / "task-a" / "rep0" / "result.json",
+        reward_binary=1,
+        reward_partial=1.0,
+        task="task-a",
+        rep=0,
+    )
+    config = res / "gpt-5.5" / "low" / "pi-check"
+    config.parent.mkdir(parents=True)
+    config.symlink_to(source, target_is_directory=True)
+
+    out = run_dashboard.load_comparison_data(res)
+
+    assert [run["run_id"] for run in out] == ["gpt-5.5/low/pi-check"]
+    assert out[0]["total_cells"] == 1
+    assert out[0]["solved"] == 1
+
+
 def test_comparison_max_reps_caps_per_task(tmp_path):
     res = tmp_path / "results"
     for rep in range(5):
