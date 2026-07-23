@@ -1,10 +1,10 @@
-# OpenAI Codex GPT-5.6-SOL low thinking
+# OpenAI Codex GPT-5.6-SOL thinking levels
 
-This note validates `openai-codex/gpt-5.6-sol` at Pi thinking `low` for
-DeepSWE benchmark configs.
+This note validates `openai-codex/gpt-5.6-sol` at Pi thinking `low`, `medium`,
+and `high` for DeepSWE benchmark configs.
 
 Validated on 2026-07-23 against official OpenAI documentation, Pi model
-metadata and request behavior, and a tiny live call through Will's Codex
+metadata and request behavior, and tiny live calls through Will's Codex
 subscription OAuth.
 
 ## Provider/API path
@@ -16,7 +16,7 @@ provider: openai-codex
 model: gpt-5.6-sol
 api: openai-codex-responses
 baseUrl: https://chatgpt.com/backend-api
-thinking: low
+thinking: low | medium | high
 ```
 
 OAuth comes from the `openai-codex` entry in `~/.pi/agent/auth.json` and is
@@ -35,8 +35,8 @@ It documents `medium` as the default when effort is omitted:
 
 - <https://developers.openai.com/api/docs/guides/latest-model>
 
-Therefore this config must send explicit effort `low`; model availability or an
-accepted Pi CLI flag alone is not sufficient evidence.
+The benchmark still sends each requested effort explicitly. Model availability
+or an accepted Pi CLI flag alone is not sufficient evidence.
 
 ## Required Pi version
 
@@ -51,50 +51,67 @@ Artifact:
 analysis/openai-codex-gpt56-sol-model-registry.json
 ```
 
-## Request-shape probe
+## Request-shape probes
 
-A Pi `0.81.1` `before_provider_request` capture for
-`openai-codex/gpt-5.6-sol` at thinking `low` recorded:
+Pi `0.81.1` `before_provider_request` captures recorded these request fields:
 
 ```json
 {"model":"gpt-5.6-sol","reasoning":{"effort":"low","summary":"auto"},"stream":true,"store":false}
+{"model":"gpt-5.6-sol","reasoning":{"effort":"medium","summary":"auto"},"stream":true,"store":false}
+{"model":"gpt-5.6-sol","reasoning":{"effort":"high","summary":"auto"},"stream":true,"store":false}
 ```
 
-Artifact:
+Artifacts:
 
 ```text
 analysis/openai-codex-gpt56-sol-low-request-probe.jsonl
+analysis/openai-codex-gpt56-sol-medium-request-probe.jsonl
+analysis/openai-codex-gpt56-sol-high-request-probe.jsonl
 ```
 
-This proves Pi maps its `low` setting to the provider's explicit low-effort
-condition rather than omitting reasoning and taking the documented medium
-default.
+These captures prove Pi maps each setting to the corresponding explicit
+provider effort. In particular, the low condition does not omit reasoning and
+silently take the documented medium default.
 
-## Live subscription probe
+## Live subscription probes
 
-A tiny non-tool call through the live `openai-codex` subscription path used the
-prompt `Reply exactly OK.` The response was `OK`, with stop reason `stop` and no
-provider error.
+Tiny non-tool calls through the live `openai-codex` subscription path returned
+the expected markers with stop reason `stop` and no provider error:
 
-Artifact:
+| Thinking | Expected and observed marker | Artifact |
+| --- | --- | --- |
+| `low` | `OK` | `analysis/openai-codex-gpt56-sol-low-live-probe.jsonl` |
+| `medium` | `GPT56_SOL_MEDIUM_PROBE_OK` | `analysis/openai-codex-gpt56-sol-medium-live-probe.jsonl` |
+| `high` | `GPT56_SOL_HIGH_PROBE_OK` | `analysis/openai-codex-gpt56-sol-high-live-probe.jsonl` |
 
-```text
-analysis/openai-codex-gpt56-sol-low-live-probe.jsonl
-```
+Reasoning-token counts on trivial prompts do not define the configured effort.
+The request artifacts prove the provider conditions; the live artifacts prove
+those paths are accepted by the subscription backend.
 
-The tiny response reported zero reasoning tokens. That does not contradict the
-request capture: low effort permits the model to use little or no reasoning on
-a trivial prompt. The request artifact, not token count on this prompt, proves
-the configured effort.
+## Usage shape
+
+Pi's compact JSON events and native session records report input, output, cache
+read, cache write, and total token usage for these calls. Main executor usage in
+benchmark results must continue to come from native `session/*.jsonl` records,
+not persisted raw `--mode json` streams.
 
 ## Config and smoke requirements
 
-Each config needs a leaf at `gpt-5.6-sol/low/` containing:
+Each config needs a leaf at `gpt-5.6-sol/<thinking>/` containing:
 
-- `settings.json` with `defaultThinkingLevel` set to `low`;
-- a leaf-local `smoke.json` requiring model, thinking, Pi-version, request-probe,
-  and live-probe evidence;
-- session evidence containing `"thinkingLevel":"low"`.
+- `settings.json` with `defaultThinkingLevel` set to that leaf's thinking level;
+- a leaf-local `smoke.json` requiring model, thinking, Pi-version,
+  request-probe, and live-probe evidence;
+- session evidence containing the exact `"thinkingLevel":"<thinking>"` value;
+- captured provider-request evidence containing the matching explicit effort.
 
-Launches must use `openai-codex/gpt-5.6-sol`, `--thinking low`, and
-`--pass-openai-codex-oauth`.
+Launches must use `openai-codex/gpt-5.6-sol`, the matching `--thinking` value,
+and `--pass-openai-codex-oauth`.
+
+## Stale patterns to avoid
+
+- Do not use Pi `0.80.2`; it lacks this model registry entry.
+- Do not infer thinking semantics from `pi --list-models` or CLI acceptance.
+- Do not omit effort for a `medium` benchmark merely because the provider's
+  documented default is medium; the benchmark requires explicit evidence.
+- Do not reuse low-thinking smoke evidence for medium or high leaves.
