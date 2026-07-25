@@ -8,7 +8,11 @@ import { ErrorState } from '@/components/error-state'
 import { fmtSeconds } from '@/lib/metrics'
 
 export default function Overview() {
-  const { data: runs, isLoading, error } = useQuery({
+  const {
+    data: runs,
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: ['runs'],
     queryFn: () => fetchRuns('summary'),
     refetchInterval: 5000,
@@ -52,14 +56,15 @@ function RunCard({ run }: { run: RunSummary }) {
     <Card className="transition-colors hover:border-primary">
       {/* Real anchor for accessibility: open-in-new-tab, copy-link, keyboard nav */}
       <CardContent className="space-y-3 p-4">
-        <a href={runHref(run)} className="block space-y-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary rounded-md">
+        <a
+          href={runHref(run)}
+          className="block space-y-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary rounded-md"
+        >
           <div className="flex items-start justify-between gap-2">
             <span className="break-all text-sm font-semibold">{run.run_id}</span>
             <StateBadge state={run.state} />
           </div>
-          {isDup && (
-            <div className="text-xs text-amber-400/80">↳ {run.run_key}</div>
-          )}
+          {isDup && <div className="text-xs text-amber-400/80">↳ {run.run_key}</div>}
           <div className="text-xs text-muted-foreground">
             {run.model || run.kind} {run.thinking || ''}
           </div>
@@ -87,7 +92,9 @@ function RunCard({ run }: { run: RunSummary }) {
             {run.stale_cell_count > 0 && (
               <Badge variant="stale">{run.stale_cell_count} stale</Badge>
             )}
-            {run.max_cell_age_s != null && <span title="oldest active cell">oldest {fmtSeconds(run.max_cell_age_s)}</span>}
+            {run.max_cell_age_s != null && (
+              <span title="oldest active cell">oldest {fmtSeconds(run.max_cell_age_s)}</span>
+            )}
           </div>
         </a>
       </CardContent>

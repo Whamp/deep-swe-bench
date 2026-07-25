@@ -31,6 +31,7 @@ def _args(**over):
         max_quota_wait_s=21600.0,
         quota_poll_s=300.0,
         rate_limit_backoff_s=60.0,
+        results_root=Path("/fixture/results"),
     )
     base.update(over)
     return mock.Mock(**base)

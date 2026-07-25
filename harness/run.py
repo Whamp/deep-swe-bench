@@ -38,6 +38,7 @@ import results_tree  # noqa: E402
 from config_lock import require_matching_config_lock  # noqa: E402
 from config_resolution import resolve_config_leaf  # noqa: E402
 from lib import REPO, load_task, read_reward, result_record  # noqa: E402
+from pi_config import read_config_pi_flags, validate_pi_flags  # noqa: E402
 from pi_rpc_runner import run_pi_rpc  # noqa: E402
 
 DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-flash"
@@ -266,10 +267,7 @@ def load_resolved_config(config_root: Path, config_leaf: Path) -> dict:
     sd = cdir / "skills"
     if sd.is_dir():
         skill_dirs = [p for p in sd.iterdir() if p.is_dir()]
-    pi_flags = []
-    pf = cdir / "pi-flags"
-    if pf.exists():
-        pi_flags = [ln.strip() for ln in pf.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+    pi_flags = read_config_pi_flags(cdir)
     env_lines = {}
     ef = cdir / "env"
     if ef.exists():
@@ -341,9 +339,7 @@ def credential_route_env_flags(
         if route == "OPENAI_CODEX_OAUTH":
             continue
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", route) is None:
-            raise ValueError(
-                f"Declared credential route invalid: {route!r}"
-            )
+            raise ValueError(f"Declared credential route invalid: {route!r}")
         if not os.environ.get(route):
             sys.exit(f"Declared credential route unavailable: {route}")
         if route not in already_passed:
@@ -403,27 +399,6 @@ def transient_model_error(paths: list[Path]) -> str | None:
     return None
 
 
-_RPC_OWNED_PI_FLAGS = {
-    "-p",
-    "--print",
-    "--mode",
-    "--model",
-    "--thinking",
-    "--session-dir",
-    "--append-system-prompt",
-}
-_RPC_OWNED_PI_FLAG_PREFIXES = tuple(
-    f"{flag}=" for flag in _RPC_OWNED_PI_FLAGS if flag.startswith("--")
-)
-
-
-def _validate_rpc_pi_flags(flags: list[str]) -> None:
-    """Reject config flags that would silently bypass the RPC harness contract."""
-    for flag in flags:
-        if flag in _RPC_OWNED_PI_FLAGS or flag.startswith(_RPC_OWNED_PI_FLAG_PREFIXES):
-            raise ValueError(f"config pi-flags may not override RPC runner control flag: {flag}")
-
-
 def config_append_text(arm_cfg: dict) -> str:
     """Return config-authored prompt layers, without any global harness preamble."""
     parts = []
@@ -437,7 +412,7 @@ def config_append_text(arm_cfg: dict) -> str:
 def pi_cmd(arm_cfg: dict, model: str, thinking: str, append_text: str,
            capture_initial_context: bool = True) -> list[str]:
     flags = arm_cfg["pi_flags"]
-    _validate_rpc_pi_flags(flags)
+    validate_pi_flags(flags)
     cmd = ["pi", "--mode", "rpc",
            "--model", model, "--thinking", thinking, "--offline",
            "--session-dir", "/out/session"]
@@ -467,17 +442,27 @@ def require_explicit_cell_output(output_cell: Path | None) -> Path:
     return output_cell
 
 
-def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
-             agent_timeout: float | None, keep: bool,
-             pass_openai_codex_oauth: bool, rpc_quiescence: float,
-             capture_initial_context: bool = True,
-             credential_routes: tuple[str, ...] = (),
-             output_cell: Path | None = None,
-             persist_result_file: bool = True,
-             persist_result_index: bool = True,
-             config_root: Path | None = None,
-             config_leaf: Path | None = None,
-             task_root: Path | None = None) -> dict:
+def run_cell(
+    config: str,
+    task_id: str,
+    *,
+    model: str,
+    thinking: str,
+    rep: int,
+    agent_timeout: float | None,
+    keep: bool,
+    pass_openai_codex_oauth: bool,
+    rpc_quiescence: float,
+    capture_initial_context: bool = True,
+    credential_routes: tuple[str, ...] = (),
+    output_cell: Path | None = None,
+    persist_result_file: bool = True,
+    persist_result_index: bool = True,
+    config_root: Path | None = None,
+    config_leaf: Path | None = None,
+    task_root: Path | None = None,
+) -> dict:
+    """Execute one Pi subject cell using explicit resolved launch inputs."""
     task = load_task(task_id, root=task_root)
     agent_timeout = agent_timeout or task.agent_timeout_s
     if (config_root is None) != (config_leaf is None):
@@ -654,7 +639,8 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
 
     # --- verify in a pristine, air-gapped container ---
     reward = {"reward": -1, "partial": 0.0}
-    if status.get("patch_bytes", 0) > 0:
+    patch_bytes = status.get("patch_bytes", 0)
+    if isinstance(patch_bytes, int | float) and patch_bytes > 0:
         try:
             ensure_verifier_image(task)
             r = sh(["docker", "run", "--rm", "--network", "none", "--platform", "linux/amd64",
@@ -780,13 +766,20 @@ def main():
 
     task = load_task(args.task)
     to = args.agent_timeout or task.agent_timeout_s
-    rec = run_cell(args.config, args.task, model=args.model, thinking=args.thinking,
-                   rep=args.rep, agent_timeout=to, keep=args.keep,
-                   pass_openai_codex_oauth=args.pass_openai_codex_oauth,
-                   rpc_quiescence=args.rpc_quiescence,
-                   capture_initial_context=not args.no_initial_context_capture,
-                   output_cell=probe_output,
-                   persist_result_index=False)
+    rec = run_cell(
+        args.config,
+        args.task,
+        model=args.model,
+        thinking=args.thinking,
+        rep=args.rep,
+        agent_timeout=to,
+        keep=args.keep,
+        pass_openai_codex_oauth=args.pass_openai_codex_oauth,
+        rpc_quiescence=args.rpc_quiescence,
+        capture_initial_context=not args.no_initial_context_capture,
+        output_cell=probe_output,
+        persist_result_index=False,
+    )
     print(json.dumps({"ok": True, "reward_partial": rec["reward_partial"],
                       "total_tokens": rec["total_tokens"]}))
 

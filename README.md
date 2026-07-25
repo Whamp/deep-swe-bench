@@ -203,15 +203,20 @@ directory.
 #### Subscription quota limits and confirmed resume
 
 The OpenAI Codex subscription has 5-hour and weekly usage windows that can
-exhaust mid-batch. A detected transient writes its cell sentinel, records the
-confirmed run as paused, and makes `harness.run_batch execute` exit 75.
+exhaust mid-batch. A detected transient writes its cell sentinel and records the
+confirmed run as paused. By default, execution backs off after a short rate
+limit or waits for an exhausted quota window, then resumes the same confirmed
+plan. It rechecks launch inputs before the interrupted rep starts again.
+Completed results created by that plan are provenance-checked and skipped
+read-only; incompatible occupants or drift stop instead of being overwritten.
 
-After the provider window resets, resume by running the same `execute` command
-with the same stored plan and confirmation identity. Before another rep starts,
-the harness rechecks launch inputs. Completed results created by that exact plan
-are provenance-checked and skipped read-only; incompatible occupants or drift
-stop instead of being overwritten. Never recompile or repeat raw launch
-arguments merely to resume.
+The plan records the wait policy. Defaults are a 60-second rate-limit backoff,
+a 5-minute quota poll, and a maximum 6-hour quota wait. Add
+`--no-auto-resume` while planning to disable automatic resume. Execution exits
+75 and leaves the run paused when automatic resume is disabled, the transient
+cannot be classified, usage data is unavailable, or the reset exceeds the
+approved maximum. Resume manually with the same stored plan and confirmation
+identity. Never recompile or repeat raw launch arguments merely to resume.
 
 ### Local Qwen on server60
 

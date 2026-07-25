@@ -226,12 +226,9 @@ def _behavior_input_kind(relative_path: Path) -> str:
 
 
 def _is_collectable_behavior_file(path: Path) -> bool:
-    return (
-        not any(
-            part in _IGNORED_BEHAVIOR_DIRECTORIES for part in path.parts
-        )
-        and (path.is_file() or path.is_symlink())
-    )
+    return not any(
+        part in _IGNORED_BEHAVIOR_DIRECTORIES for part in path.parts
+    ) and (path.is_file() or path.is_symlink())
 
 
 def _collect_shared_behavior_files(
@@ -416,8 +413,7 @@ def _read_config_seal_document(seal_path: Path) -> Mapping[str, object]:
         document.get("schemaVersion") != _CONFIG_SEAL_SCHEMA_VERSION
         or document.get("preflightPassed") is not True
         or any(
-            not isinstance(document.get(field), str)
-            or not document.get(field)
+            not isinstance(document.get(field), str) or not document.get(field)
             for field in required_string_fields
         )
     ):
@@ -479,7 +475,7 @@ def record_successful_config_preflight(
                 raise ValueError(
                     "Config release seal evidence invalid: registry identity "
                     f"mismatch in {seal_path}"
-                )
+                ) from None
     finally:
         temporary_path.unlink(missing_ok=True)
     return seal_path

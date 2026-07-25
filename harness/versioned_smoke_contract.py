@@ -366,8 +366,7 @@ def validate_versioned_smoke_contract(
     repository_root: Path,
     contract_path: Path | None,
 ) -> Mapping[str, object] | None:
-    """
-    Validate durable assertions before a versioned launch can be approved.
+    """Validate durable assertions before a versioned launch can be approved.
 
     Raises:
         ValueError: The contract is malformed, brittle, or references a missing

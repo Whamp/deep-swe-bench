@@ -1,3 +1,5 @@
+"""Verify direct subject-runner and RPC command contracts."""
+
 import sys
 import tempfile
 import unittest
@@ -9,7 +11,10 @@ import harness.run_omp as run_omp
 
 
 class CredentialRouteTests(unittest.TestCase):
-    def test_declared_route_passes_only_environment_name(self):
+    """Exercise secret-free credential routing into subject containers."""
+
+    def test_declared_route_passes_only_environment_name(self) -> None:
+        """A declared route forwards its name without exposing its value."""
         secret = "credential-value-must-not-enter-docker-arguments"
         with patch.dict(
             run.os.environ,
@@ -23,7 +28,8 @@ class CredentialRouteTests(unittest.TestCase):
         self.assertEqual(flags, ["-e", "WORKER_API_KEY"])
         self.assertNotIn(secret, repr(flags))
 
-    def test_missing_declared_route_fails_by_route_name(self):
+    def test_missing_declared_route_fails_by_route_name(self) -> None:
+        """An unavailable route fails with its searchable environment name."""
         with (
             patch.dict(run.os.environ, {}, clear=True),
             self.assertRaisesRegex(
@@ -68,7 +74,8 @@ class ConfigPromptLayerTests(unittest.TestCase):
 
         self.assertEqual(run.config_append_text(cfg), "preamble\n\norchestration")
 
-    def test_advisor_config_keeps_effective_leaf_files(self):
+    def test_advisor_config_keeps_effective_leaf_files(self) -> None:
+        """Advisor configs expose every file from their resolved leaf."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config_root = root / "configs" / "advisor-config"
@@ -95,7 +102,10 @@ class ConfigPromptLayerTests(unittest.TestCase):
 
 
 class SubjectRunnerConfigResolutionTests(unittest.TestCase):
-    def test_pi_run_cell_rejects_missing_config_leaf(self):
+    """Exercise shared config resolution through both subject runners."""
+
+    def test_pi_run_cell_rejects_missing_config_leaf(self) -> None:
+        """Pi reports a searchable missing-leaf error before execution."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "configs" / "cfg").mkdir(parents=True)
@@ -122,7 +132,8 @@ class SubjectRunnerConfigResolutionTests(unittest.TestCase):
         self.assertIn("model_leaf='model'", message)
         self.assertIn("thinking='low'", message)
 
-    def test_omp_run_cell_rejects_ambiguous_config_leaf(self):
+    def test_omp_run_cell_rejects_ambiguous_config_leaf(self) -> None:
+        """OMP reports every ambiguous leaf instead of choosing one."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             direct_leaf = root / "configs" / "cfg" / "model" / "low"
@@ -153,12 +164,13 @@ class SubjectRunnerConfigResolutionTests(unittest.TestCase):
 
 
 class ProbeCommandTests(unittest.TestCase):
-    def test_pi_library_call_requires_explicit_output_cell(self):
+    """Exercise scratch-only direct subject debugging commands."""
+
+    def test_pi_library_call_requires_explicit_output_cell(self) -> None:
+        """A direct Pi library call cannot infer a canonical output cell."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "configs" / "cfg" / "model" / "low").mkdir(
-                parents=True
-            )
+            (root / "configs" / "cfg" / "model" / "low").mkdir(parents=True)
             task = type("Task", (), {"agent_timeout_s": 30.0})()
             with (
                 patch.object(run, "REPO", root),
@@ -183,12 +195,11 @@ class ProbeCommandTests(unittest.TestCase):
 
         ensure_image.assert_not_called()
 
-    def test_omp_library_call_requires_explicit_output_cell(self):
+    def test_omp_library_call_requires_explicit_output_cell(self) -> None:
+        """A direct OMP library call cannot infer a canonical output cell."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "configs" / "cfg" / "model" / "low").mkdir(
-                parents=True
-            )
+            (root / "configs" / "cfg" / "model" / "low").mkdir(parents=True)
             task = type("Task", (), {"agent_timeout_s": 30.0})()
             with (
                 patch.object(run_omp, "REPO", root),
@@ -213,7 +224,8 @@ class ProbeCommandTests(unittest.TestCase):
 
         ensure_image.assert_not_called()
 
-    def test_pi_direct_debugging_requires_scratch_probe_output(self):
+    def test_pi_direct_debugging_requires_scratch_probe_output(self) -> None:
+        """Pi direct debugging requires an explicit scratch destination."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             argv = [
@@ -233,7 +245,8 @@ class ProbeCommandTests(unittest.TestCase):
 
         run_cell.assert_not_called()
 
-    def test_pi_probe_writes_only_to_explicit_scratch_cell(self):
+    def test_pi_probe_writes_only_to_explicit_scratch_cell(self) -> None:
+        """A Pi probe forwards only its explicit scratch cell."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             probe_output = root / "scratch" / "probe-cell"
@@ -262,7 +275,8 @@ class ProbeCommandTests(unittest.TestCase):
         self.assertEqual(run_cell.call_args.kwargs["output_cell"], probe_output)
         self.assertFalse(run_cell.call_args.kwargs["persist_result_index"])
 
-    def test_omp_probe_writes_only_to_explicit_scratch_cell(self):
+    def test_omp_probe_writes_only_to_explicit_scratch_cell(self) -> None:
+        """An OMP probe forwards only its explicit scratch cell."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             probe_output = root / "scratch" / "omp-probe-cell"
@@ -422,6 +436,7 @@ class RunOmpCommandTests(unittest.TestCase):
 
             rendered = run_omp.render_omp_system_prompt(cdir)
 
+        assert isinstance(rendered, str)
         self.assertIn("cwd=/app", rendered)
         self.assertNotIn("{{current_date}}", rendered)
         self.assertIn("other={{x}}", rendered)

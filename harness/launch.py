@@ -22,6 +22,7 @@ from harness import (
     config_resolution,
     confirmed_preflight,
     lib,
+    pi_config,
     result_provenance,
     run_state,
     versioned_smoke_contract,
@@ -72,7 +73,7 @@ _OMP_KNOWN_TOOLS = frozenset(
 )
 
 
-class LaunchClarificationRequired(ValueError):
+class LaunchClarificationError(ValueError):
     """Stop planning when model behavior remains unresolved."""
 
     def __init__(self, details: Sequence[Mapping[str, object]]) -> None:
@@ -109,6 +110,7 @@ class LaunchConfigDocument(TypedDict):
     legacy: bool
     lockIdentity: str | None
     requiredCapabilities: list[str]
+    smokeAssertions: dict[str, object] | None
     smokeContract: str | None
     subjectBehavior: NotRequired[dict[str, object]]
     testedSubjectVersions: list[str]
@@ -196,6 +198,10 @@ class LaunchExecutionPolicies:
     agent_timeout_s: float | None = None
     rpc_quiescence_s: float = 2.0
     capture_initial_context: bool = True
+    auto_resume: bool = True
+    max_quota_wait_s: float = 21600.0
+    quota_poll_s: float = 300.0
+    rate_limit_backoff_s: float = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -567,6 +573,16 @@ class ConfirmedOmpRunner(Protocol):
         """Return one complete result record without writing result.json."""
 
 
+class LaunchTransientResumer(Protocol):
+    """Wait for a transient condition without changing a confirmed plan."""
+
+    def on_transient_pause(
+        self,
+        state: run_state.RunStateWriter,
+    ) -> Mapping[str, object]:
+        """Return a retry decision after any required model-free wait."""
+
+
 _ConfirmedSubjectRunner = ConfirmedPiRunner | ConfirmedOmpRunner
 
 
@@ -607,8 +623,7 @@ def _launch_plan_identity(document: Mapping[str, object]) -> str:
 
 
 def confirmed_launch_run_key(run_id: str, plan_identity: str) -> str:
-    """
-    Return a workspace-safe structured-state key for one confirmed run.
+    """Return a workspace-safe structured-state key for one confirmed run.
 
     Args:
         run_id: Operator-supplied run identifier retained in the manifest.
@@ -732,6 +747,27 @@ def _validate_launch_policies(request: LaunchRequest) -> None:
             "Launch initial-context policy invalid: expected true or false; "
             f"got {request.policies.capture_initial_context!r}"
         )
+    if not isinstance(request.policies.auto_resume, bool):
+        raise TypeError(
+            "Launch auto-resume policy invalid: expected true or false; "
+            f"got {request.policies.auto_resume!r}"
+        )
+    quota_policies = {
+        "max quota wait": request.policies.max_quota_wait_s,
+        "quota poll": request.policies.quota_poll_s,
+        "rate-limit backoff": request.policies.rate_limit_backoff_s,
+    }
+    for policy_name, policy_value in quota_policies.items():
+        if (
+            isinstance(policy_value, bool)
+            or not isinstance(policy_value, int | float)
+            or not math.isfinite(policy_value)
+            or policy_value <= 0
+        ):
+            raise ValueError(
+                "Launch quota policy invalid: expected finite positive "
+                f"seconds for {policy_name}; got {policy_value!r}"
+            )
 
 
 def _validate_launch_request(request: LaunchRequest) -> tuple[str, ...]:
@@ -973,7 +1009,7 @@ def _declared_roles_by_name(
     declared_roles: Sequence[Mapping[str, object]],
 ) -> dict[str, Mapping[str, object]]:
     if not declared_roles:
-        raise LaunchClarificationRequired(
+        raise LaunchClarificationError(
             [{"config": config_identity, "reason": "undeclared-model-roles"}]
         )
     roles_by_name: dict[str, Mapping[str, object]] = {}
@@ -1020,7 +1056,7 @@ def _validate_role_call_behavior(
         call_behavior.get("kind") if isinstance(call_behavior, dict) else None
     )
     if call_kind not in {"fixed", "bounded"}:
-        raise LaunchClarificationRequired(
+        raise LaunchClarificationError(
             [
                 {
                     "callKind": call_kind,
@@ -1058,7 +1094,7 @@ def _validated_role_selection_kind(
         selection.get("kind") if isinstance(selection, dict) else None
     )
     if selection_kind not in {"fixed", "inherited", "bounded-dynamic"}:
-        raise LaunchClarificationRequired(
+        raise LaunchClarificationError(
             [
                 {
                     "config": config_identity,
@@ -1458,6 +1494,7 @@ def _legacy_launch_config_document(
         "legacy": True,
         "lockIdentity": None,
         "requiredCapabilities": [],
+        "smokeAssertions": None,
         "smokeContract": (
             str(resolved.smoke_contract.resolve())
             if resolved.smoke_contract is not None
@@ -1501,7 +1538,7 @@ def _validate_extension_surface_coverage(
                 }
             )
     if uncovered:
-        raise LaunchClarificationRequired(uncovered)
+        raise LaunchClarificationError(uncovered)
 
 
 def _validate_role_credential_routes(
@@ -1535,6 +1572,8 @@ def _config_plan(
         if request.subject == "omp"
         else None
     )
+    if request.subject == "pi":
+        pi_config.validate_pi_config(resolved.config_root)
     versioned_identity = config_resolution.parse_versioned_config_identity(
         config_identity
     )
@@ -1617,6 +1656,11 @@ def _config_plan(
         "requiredCapabilities": _lock_string_list(
             lock_document,
             "requiredCapabilities",
+        ),
+        "smokeAssertions": (
+            dict(smoke_contract_document)
+            if smoke_contract_document is not None
+            else None
         ),
         "smokeContract": (
             str(resolved.smoke_contract.resolve())
@@ -1751,7 +1795,7 @@ def _planned_result_provenance(
     rep: int,
 ) -> result_provenance.ResultProvenance:
     """Build the exact modern provenance required for automatic reuse."""
-    return {
+    provenance: result_provenance.ResultProvenance = {
         "config": config["identity"],
         "config_lock_identity": config["lockIdentity"],
         "harness_revision": runtime.harness_revision,
@@ -1767,6 +1811,11 @@ def _planned_result_provenance(
         "thinking_level": request.thinking,
         "verifier_identity": runtime.verifier_identities[task],
     }
+    if runtime.subject_runtime_identity:
+        provenance["subject_runtime_identity"] = dict(
+            runtime.subject_runtime_identity
+        )
+    return provenance
 
 
 def _batch_cells(
@@ -2102,6 +2151,66 @@ def _render_subject_behavior_lines(
     return lines
 
 
+def _render_config_release_lines(
+    configs: Sequence[LaunchConfigDocument],
+) -> list[str]:
+    """Render exact lock, leaf, and smoke details for approval."""
+    lines: list[str] = []
+    for config in configs:
+        smoke_assertions = config["smokeAssertions"]
+        rendered_assertions = (
+            json.dumps(
+                smoke_assertions,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if smoke_assertions is not None
+            else "-"
+        )
+        lines.extend(
+            [
+                f"- {config['identity']}",
+                f"  Lock: {config['lockIdentity'] or '-'}",
+                f"  Leaf: {config['configLeaf']}",
+                f"  Smoke contract: {config['smokeContract'] or '-'}",
+                f"  Smoke assertions: {rendered_assertions}",
+            ]
+        )
+    return lines
+
+
+def _render_selected_task_lines(
+    selection: Mapping[str, object],
+) -> list[str]:
+    """Render every selected task in its approved order."""
+    tasks = selection.get("tasks")
+    if not isinstance(tasks, list):
+        raise TypeError("Launch receipt invalid: selected tasks must be a list")
+    return [f"Kind: {selection.get('kind', '-')}"] + [
+        f"- {task}" for task in tasks
+    ]
+
+
+def _render_planned_cell_lines(
+    cells: Sequence[Mapping[str, object]],
+    *,
+    include_smoke: bool,
+) -> list[str]:
+    """Render every exact result cell and optional smoke contract path."""
+    if not cells:
+        return ["- none"]
+    lines: list[str] = []
+    for cell in cells:
+        line = (
+            f"- {cell.get('task')} | {cell.get('config')} | "
+            f"rep{cell.get('rep')} | result={cell.get('resultPath')}"
+        )
+        if include_smoke:
+            line += f" | smoke={cell.get('contractPath') or '-'}"
+        lines.append(line)
+    return lines
+
+
 def _render_launch_receipt(document: LaunchPlanDocument) -> str:
     counts = document["counts"]
     subject = document["subject"]
@@ -2147,7 +2256,21 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
                     else "not captured"
                 )
                 + f"; cell retries={policies['cell_retries']}"
+                + "; auto resume="
+                + ("enabled" if policies["auto_resume"] else "disabled")
+                + (
+                    f"; max quota wait={policies['max_quota_wait_s']}s; "
+                    f"quota poll={policies['quota_poll_s']}s; "
+                    "rate-limit backoff="
+                    f"{policies['rate_limit_backoff_s']}s"
+                )
             ),
+            "",
+            "TASK SELECTION",
+            *_render_selected_task_lines(document["selection"]),
+            "",
+            "CONFIG RELEASES",
+            *_render_config_release_lines(configs),
             "",
             "MODEL ROLES",
             *_render_role_lines(configs),
@@ -2179,6 +2302,18 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
         lines.extend(_render_behavior_differences(baseline, config))
     lines.extend(
         [
+            "",
+            "PREFLIGHT CELLS",
+            *_render_planned_cell_lines(
+                document["preflightCells"],
+                include_smoke=True,
+            ),
+            "",
+            "BATCH CELLS",
+            *_render_planned_cell_lines(
+                document["batchCells"],
+                include_smoke=False,
+            ),
             "",
             "PATHS",
             f"Workspace: {paths['workspace']}",
@@ -2501,7 +2636,7 @@ def _confirmed_cell_provenance(
     cell: ConfirmedSubjectCell,
 ) -> result_provenance.ConfirmedResultProvenance:
     """Map one confirmed cell to the exact provenance written and resumed."""
-    return {
+    provenance: result_provenance.ConfirmedResultProvenance = {
         "config": cell.config_identity,
         "config_lock_identity": cell.config_lock_identity,
         "harness_revision": cell.harness_revision,
@@ -2516,6 +2651,11 @@ def _confirmed_cell_provenance(
         "thinking_level": cell.thinking,
         "verifier_identity": cell.verifier_identity,
     }
+    if cell.subject_runtime_identity:
+        provenance["subject_runtime_identity"] = dict(
+            cell.subject_runtime_identity
+        )
+    return provenance
 
 
 def _confirmed_result_record(
@@ -2538,10 +2678,6 @@ def _confirmed_result_record(
             "config_version": config_identity.version,
         }
     )
-    if cell.subject_runtime_identity:
-        confirmed_record["subject_runtime_identity"] = dict(
-            cell.subject_runtime_identity
-        )
     return confirmed_record
 
 
@@ -2750,6 +2886,10 @@ def _confirmed_launch_request(
     agent_timeout_s = policies.get("agent_timeout_s")
     rpc_quiescence_s = policies.get("rpc_quiescence_s")
     capture_initial_context = policies.get("capture_initial_context")
+    auto_resume = policies.get("auto_resume")
+    max_quota_wait_s = policies.get("max_quota_wait_s")
+    quota_poll_s = policies.get("quota_poll_s")
+    rate_limit_backoff_s = policies.get("rate_limit_backoff_s")
     if (
         not all(
             isinstance(policy, str)
@@ -2767,6 +2907,13 @@ def _confirmed_launch_request(
         or isinstance(rpc_quiescence_s, bool)
         or not isinstance(rpc_quiescence_s, int | float)
         or not isinstance(capture_initial_context, bool)
+        or not isinstance(auto_resume, bool)
+        or isinstance(max_quota_wait_s, bool)
+        or not isinstance(max_quota_wait_s, int | float)
+        or isinstance(quota_poll_s, bool)
+        or not isinstance(quota_poll_s, int | float)
+        or isinstance(rate_limit_backoff_s, bool)
+        or not isinstance(rate_limit_backoff_s, int | float)
     ):
         raise TypeError(
             "Confirmed launch policies invalid: expected resolved values"
@@ -2795,6 +2942,10 @@ def _confirmed_launch_request(
             ),
             rpc_quiescence_s=float(rpc_quiescence_s),
             capture_initial_context=capture_initial_context,
+            auto_resume=auto_resume,
+            max_quota_wait_s=float(max_quota_wait_s),
+            quota_poll_s=float(quota_poll_s),
+            rate_limit_backoff_s=float(rate_limit_backoff_s),
         ),
     )
     _validate_launch_policies(request)
@@ -2963,6 +3114,7 @@ class _ConfirmedLaunchExecutionContext:
     state: run_state.RunStateWriter
     input_verifier: _ApprovedLaunchInputVerifier
     subject_runner: _ConfirmedSubjectRunner
+    transient_resumer: LaunchTransientResumer | None
     log_path: Path
     policies: LaunchExecutionPolicies
 
@@ -3425,6 +3577,7 @@ def execute_confirmed_launch(
     runtime_resolver: LaunchRuntimeResolver,
     pi_runner: ConfirmedPiRunner | None = None,
     omp_runner: ConfirmedOmpRunner | None = None,
+    transient_resumer: LaunchTransientResumer | None = None,
 ) -> ConfirmedLaunchExecution:
     """Execute atomic preflight and conditional fan-out for one exact plan."""
     document = _confirmed_plan_document(plan, confirmation_identity)
@@ -3502,22 +3655,43 @@ def execute_confirmed_launch(
         state=state,
         input_verifier=input_verifier,
         subject_runner=subject_runner,
+        transient_resumer=transient_resumer,
         log_path=log_path,
         policies=launch_request.policies,
     )
 
     state.start_heartbeat(_CONFIRMED_HEARTBEAT_INTERVAL_S)
     try:
-        passed_preflight_paths = _execute_confirmed_preflights(
-            preflight_cells,
-            execution_context,
-        )
-        _execute_confirmed_batch(
-            batch_cells,
-            passed_preflight_paths,
-            execution_context,
-            launch_request.concurrency,
-        )
+        while True:
+            try:
+                passed_preflight_paths = _execute_confirmed_preflights(
+                    preflight_cells,
+                    execution_context,
+                )
+                _execute_confirmed_batch(
+                    batch_cells,
+                    passed_preflight_paths,
+                    execution_context,
+                    launch_request.concurrency,
+                )
+            except LaunchTransientModelError:
+                if (
+                    not launch_request.policies.auto_resume
+                    or execution_context.transient_resumer is None
+                ):
+                    raise
+                decision = (
+                    execution_context.transient_resumer.on_transient_pause(
+                        state
+                    )
+                )
+                if decision.get("retry") is not True:
+                    raise
+                state.run_resumed(
+                    reason=str(decision.get("reason", "transient cleared"))
+                )
+                continue
+            break
         state.run_completed()
         return ConfirmedLaunchExecution(
             result_path=batch_cells[0].result_path,

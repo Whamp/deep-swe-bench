@@ -7,9 +7,9 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
-RESULT_PROVENANCE_FIELDS = (
+_COMMON_RESULT_PROVENANCE_FIELDS = (
     "config",
     "config_lock_identity",
     "harness_revision",
@@ -23,10 +23,15 @@ RESULT_PROVENANCE_FIELDS = (
     "thinking_level",
     "verifier_identity",
 )
+RESULT_PROVENANCE_FIELDS = (
+    *_COMMON_RESULT_PROVENANCE_FIELDS,
+    "subject_runtime_identity",
+)
 _COMPARISON_SHARED_FIELDS = (
     "harness_revision",
     "model",
     "subject",
+    "subject_runtime_identity",
     "subject_version",
     "task_revision",
     "thinking_level",
@@ -41,6 +46,7 @@ _MODERN_PROVENANCE_MARKERS = frozenset(
         "harness_revision",
         "immutable_image_identities",
         "subject",
+        "subject_runtime_identity",
         "subject_version",
         "task_revision",
         "verifier_identity",
@@ -58,6 +64,7 @@ class ResultProvenance(TypedDict):
     model: str
     rep: int
     subject: str
+    subject_runtime_identity: NotRequired[dict[str, object]]
     subject_version: str
     task: str
     task_revision: str
@@ -134,6 +141,15 @@ def is_legacy_result_record(record: Mapping[str, object]) -> bool:
     return not any(field in record for field in _MODERN_PROVENANCE_MARKERS)
 
 
+def _required_result_provenance_fields(
+    record: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Require subject-specific runtime identity only where it exists."""
+    if record.get("subject") == "omp":
+        return RESULT_PROVENANCE_FIELDS
+    return _COMMON_RESULT_PROVENANCE_FIELDS
+
+
 def _comparison_provenance_error(
     result_path: Path,
     mismatches: Mapping[str, object],
@@ -183,9 +199,7 @@ def _comparison_shared_mismatches(
     reference: Mapping[str, object] | None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Compare provenance fixed across every result in a comparison."""
-    current = {
-        field: record.get(field) for field in _COMPARISON_SHARED_FIELDS
-    }
+    current = {field: record.get(field) for field in _COMPARISON_SHARED_FIELDS}
     mismatches = (
         {}
         if reference is None
@@ -296,7 +310,9 @@ def require_compatible_comparison_results(
             require_fields=True,
         )
         missing = [
-            field for field in RESULT_PROVENANCE_FIELDS if field not in record
+            field
+            for field in _required_result_provenance_fields(record)
+            if field not in record
         ]
         if missing:
             mismatches["missing_provenance"] = missing

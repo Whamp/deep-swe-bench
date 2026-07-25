@@ -98,7 +98,7 @@ Inheritance cycles and missing role names fail planning.
 ```
 
 The list must be non-empty and finite. Arbitrary or unbounded selection returns
-`LaunchClarificationRequired` with structured evidence.
+`LaunchClarificationError` with structured evidence.
 
 ### Call behavior
 

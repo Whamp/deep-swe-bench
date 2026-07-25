@@ -245,9 +245,7 @@ class RunStateWriter:
             self.run_dir.mkdir(parents=True, exist_ok=True)
             previous_status: Mapping[str, object] = {}
             if self.status_path.is_file():
-                loaded_status: object = json.loads(
-                    self.status_path.read_text()
-                )
+                loaded_status: object = json.loads(self.status_path.read_text())
                 if isinstance(loaded_status, Mapping):
                     previous_status = cast(
                         Mapping[str, object],
@@ -420,6 +418,27 @@ class RunStateWriter:
             self.status["paused_at"] = utc_now()
             self._save_status_locked()
             self._append_event_locked("run_paused", kind="run", reason=reason)
+
+    def run_resumed(self, *, reason: str) -> None:
+        """Resume scheduling without discarding completed cell state."""
+        with self._lock:
+            previous_resume_count = self.status.get("resume_count")
+            resume_count = (
+                previous_resume_count
+                if isinstance(previous_resume_count, int)
+                and not isinstance(previous_resume_count, bool)
+                else 0
+            )
+            self.status["state"] = "running"
+            self.status["stage"] = "resuming"
+            self.status["resumed_at"] = utc_now()
+            self.status["resume_count"] = resume_count + 1
+            self._save_status_locked()
+            self._append_event_locked(
+                "run_resumed",
+                kind="run",
+                reason=reason,
+            )
 
     def launch_input_drift(
         self,
@@ -755,8 +774,7 @@ def _enrich_active_cells(active_cells: list[dict[str, Any]]) -> tuple[list[dict[
 
 
 def project_atomic_preflight_state(status: Mapping[str, object]) -> str:
-    """
-    Project the truthful run-level state of the complete preflight gate.
+    """Project the truthful run-level state of the complete preflight gate.
 
     Args:
         status: Durable structured-run status with per-config preflight cells.
@@ -842,7 +860,9 @@ def project_structured_run(run_dir: Path, *, detail: str = "summary") -> dict[st
         "workspace": manifest.get("workspace") or manifest.get("cwd"),
         "counts": counts,
         "active_count": len(active_cells),
-        "max_cell_age_s": round(max_cell_age_s, 1) if max_cell_age_s is not None else None,
+        "max_cell_age_s": round(max_cell_age_s, 1)
+        if max_cell_age_s is not None
+        else None,
         "stale_cell_count": stale_cell_count,
         "failure_buckets": _failure_buckets(status),
         "paths": {
@@ -952,7 +972,9 @@ def project_legacy_track(track_path: Path, *, detail: str = "summary") -> dict[s
         "workspace": None,
         "counts": counts,
         "active_count": 0,
-        "failure_buckets": {k: v for k, v in buckets.items() if k not in {"ok", "empty"} and v},
+        "failure_buckets": {
+            k: v for k, v in buckets.items() if k not in {"ok", "empty"} and v
+        },
         "paths": {"track": str(track_path)},
     }
     if detail in {"operational", "diagnostic"}:

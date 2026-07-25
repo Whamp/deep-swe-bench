@@ -365,11 +365,19 @@ def test_plan_command_writes_review_artifacts_without_execution(
     assert policies["agent_timeout_s"] == 321.0
     assert policies["rpc_quiescence_s"] == 4.5
     assert policies["capture_initial_context"] is False
+    assert policies["auto_resume"] is True
+    assert policies["max_quota_wait_s"] == 21600.0
+    assert policies["quota_poll_s"] == 300.0
+    assert policies["rate_limit_backoff_s"] == 60.0
     receipt = receipt_path.read_text()
     assert f"Plan: {plan.identity}" in receipt
     assert "agent timeout=321.0" in receipt
     assert "RPC quiescence=4.5s" in receipt
     assert "initial context=not captured" in receipt
+    assert "auto resume=enabled" in receipt
+    assert "max quota wait=21600.0s" in receipt
+    assert "quota poll=300.0s" in receipt
+    assert "rate-limit backoff=60.0s" in receipt
     assert "MODEL ROLES" in receipt
     assert len(runtime_resolver.requests) == 1
     assert not results_root.exists()
@@ -548,6 +556,93 @@ def test_omp_launch_planning_records_exact_resolved_subject_behavior(
     assert not state_root.exists()
 
 
+def test_omp_launch_rejects_reuse_from_different_binary(
+    tmp_path: Path,
+) -> None:
+    """Automatic reuse requires the approved OMP binary identity."""
+    request, repository_root, tasks_root, results_root, state_root = (
+        _write_omp_launch_fixture(tmp_path)
+    )
+    request = replace(
+        request,
+        policies=replace(
+            request.policies,
+            existing_results="require-compatible",
+        ),
+    )
+    runtime = replace(
+        _runtime_identity(),
+        subject_version="omp@16.3.5",
+        subject_capabilities=frozenset({"omp-rpc"}),
+        subject_runtime_identity={
+            "binaryFingerprint": "sha256:approved-omp-binary",
+            "binaryPath": "/fixture/bin/omp",
+            "versionOutput": "omp 16.3.5",
+        },
+    )
+    lock_path = (
+        repository_root
+        / "configs"
+        / "baseline-omp@1.0.0"
+        / "gpt-5.5"
+        / "low"
+        / "config-lock.json"
+    )
+    lock_document = json.loads(lock_path.read_text())
+    result_path = (
+        results_root
+        / "gpt-5.5"
+        / "low"
+        / "baseline-omp@1.0.0"
+        / "task-a"
+        / "rep0"
+        / "result.json"
+    )
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(
+        json.dumps(
+            {
+                "config": "baseline-omp@1.0.0",
+                "config_lock_identity": lock_document["lockIdentity"],
+                "harness_revision": runtime.harness_revision,
+                "immutable_image_identities": (
+                    runtime.immutable_image_identities["task-a"]
+                ),
+                "model": "openai-codex/gpt-5.5",
+                "rep": 0,
+                "subject": "omp",
+                "subject_runtime_identity": {
+                    "binaryFingerprint": "sha256:different-omp-binary",
+                    "binaryPath": "/fixture/bin/omp",
+                    "versionOutput": "omp 16.3.5",
+                },
+                "subject_version": runtime.subject_version,
+                "task": "task-a",
+                "task_revision": runtime.task_revision,
+                "thinking_level": "low",
+                "verifier_identity": runtime.verifier_identities["task-a"],
+            }
+        )
+        + "\n"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Result provenance mismatch:",
+    ) as raised:
+        compile_launch_request(
+            request,
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(runtime),
+        )
+
+    assert "subject_runtime_identity" in str(raised.value)
+    assert str(result_path) in str(raised.value)
+
+
 def _refresh_omp_fixture_lock(repository_root: Path) -> None:
     """Refresh the temporary OMP lock after an intentional invalid mutation."""
     config_identity = "baseline-omp@1.0.0"
@@ -625,6 +720,69 @@ def test_omp_launch_restrictions_fail_during_model_free_planning(
     ) as raised:
         compile_launch_request(
             request,
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=runtime_resolver,
+        )
+
+    assert expected_detail in str(raised.value)
+    assert runtime_resolver.requests == []
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("pi_flags", "expected_detail"),
+    [
+        (
+            "--model\nprovider/other-model\n",
+            "may not override RPC runner control flag: --model",
+        ),
+        (
+            "-e\n/arm/extensions/missing.ts\n",
+            "extension target does not exist",
+        ),
+    ],
+)
+def test_pi_launch_rejects_invalid_flags_before_runtime_resolution(
+    tmp_path: Path,
+    pi_flags: str,
+    expected_detail: str,
+) -> None:
+    """Pi control overrides and missing extensions fail before approval."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    config_identity = "review-assistant@1.0.0"
+    config_root = repository_root / "configs" / config_identity
+    (config_root / "pi-flags").write_text(pi_flags)
+    lock_path = config_root / "model" / "low" / "config-lock.json"
+    previous_lock = json.loads(lock_path.read_text())
+    lock_path.unlink()
+    metadata_fields = (
+        "credentialRoutes",
+        "declaredRoles",
+        "launchSurfaces",
+        "previousRelease",
+        "requiredCapabilities",
+        "testedSubjectVersions",
+        "usageSources",
+    )
+    _write_fixture_config_lock(
+        repository_root,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {field: previous_lock[field] for field in metadata_fields},
+    )
+    runtime_resolver = FakeLaunchRuntimeResolver(_runtime_identity())
+
+    with pytest.raises(ValueError, match=r"^Pi launch flag invalid:") as raised:
+        compile_launch_request(
+            _launch_request(),
             repository_root=repository_root,
             tasks_root=tasks_root,
             results_root=results_root,
@@ -1676,7 +1834,7 @@ def test_launch_planning_requires_clarification_for_undeclared_model_roles(
         {"testedSubjectVersions": ["pi@0.81.1"]},
     )
 
-    with pytest.raises(launch.LaunchClarificationRequired) as raised:
+    with pytest.raises(launch.LaunchClarificationError) as raised:
         compile_launch_request(
             _launch_request(),
             repository_root=repository_root,
@@ -1730,7 +1888,7 @@ def test_launch_planning_requires_clarification_for_unbounded_role_calls(
         },
     )
 
-    with pytest.raises(launch.LaunchClarificationRequired) as raised:
+    with pytest.raises(launch.LaunchClarificationError) as raised:
         compile_launch_request(
             _launch_request(),
             repository_root=repository_root,
@@ -1800,7 +1958,7 @@ def test_launch_planning_requires_clarification_for_unbounded_model_selection(
         },
     )
 
-    with pytest.raises(launch.LaunchClarificationRequired) as raised:
+    with pytest.raises(launch.LaunchClarificationError) as raised:
         compile_launch_request(
             _launch_request(),
             repository_root=repository_root,
@@ -1873,7 +2031,7 @@ def test_launch_planning_requires_clarification_for_unknown_extension_behavior(
         },
     )
 
-    with pytest.raises(launch.LaunchClarificationRequired) as raised:
+    with pytest.raises(launch.LaunchClarificationError) as raised:
         compile_launch_request(
             _launch_request(),
             repository_root=repository_root,
@@ -1925,8 +2083,28 @@ def test_launch_receipt_shows_review_information_and_baseline_differences(
     assert "BEHAVIOR DIFFERENCES FROM baseline@1.0.0" in receipt
     assert "review-assistant@1.0.0" in receipt
     assert "changed prompt: orchestration.md" in receipt
+    plan_document = compiled.plan.to_document()
+    assert "TASK SELECTION\nKind: tasks\n- task-a" in receipt
+    baseline_config = plan_document["configs"][0]
+    assert "CONFIG RELEASES" in receipt
+    assert f"- {baseline_config['identity']}" in receipt
+    assert f"  Lock: {baseline_config['lockIdentity']}" in receipt
+    assert f"  Leaf: {baseline_config['configLeaf']}" in receipt
+    assert f"  Smoke contract: {baseline_config['smokeContract']}" in receipt
+    assert '  Smoke assertions: {"requireFiles":[]}' in receipt
+    for cell in plan_document["preflightCells"]:
+        assert (
+            f"- {cell['task']} | {cell['config']} | rep{cell['rep']} | "
+            f"result={cell['resultPath']} | smoke={cell['contractPath']}"
+            in receipt
+        )
+    for cell in plan_document["batchCells"]:
+        assert (
+            f"- {cell['task']} | {cell['config']} | rep{cell['rep']} | "
+            f"result={cell['resultPath']}" in receipt
+        )
     assert f"Results root: {results_root.resolve()}" in receipt
-    planned_state_path = compiled.plan.to_document()["paths"]["statePath"]
+    planned_state_path = plan_document["paths"]["statePath"]
     assert f"Structured state: {planned_state_path}\n" in receipt
 
 

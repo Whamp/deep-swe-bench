@@ -236,19 +236,29 @@ def omp_cmd(model: str, thinking: str, append_text: str, tools: str,
     return cmd
 
 
-def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
-             agent_timeout: float | None, keep: bool,
-             pass_openai_codex_oauth: bool, rpc_quiescence: float,
-             capture_initial_context: bool = True,
-             credential_routes: tuple[str, ...] = (),
-             output_cell: Path | None = None,
-             persist_result_file: bool = True,
-             persist_result_index: bool = True,
-             config_root: Path | None = None,
-             config_leaf: Path | None = None,
-             task_root: Path | None = None,
-             subject_behavior: dict[str, object] | None = None,
-             omp_binary_path: Path | None = None) -> dict:
+def run_cell(
+    config: str,
+    task_id: str,
+    *,
+    model: str,
+    thinking: str,
+    rep: int,
+    agent_timeout: float | None,
+    keep: bool,
+    pass_openai_codex_oauth: bool,
+    rpc_quiescence: float,
+    capture_initial_context: bool = True,
+    credential_routes: tuple[str, ...] = (),
+    output_cell: Path | None = None,
+    persist_result_file: bool = True,
+    persist_result_index: bool = True,
+    config_root: Path | None = None,
+    config_leaf: Path | None = None,
+    task_root: Path | None = None,
+    subject_behavior: dict[str, object] | None = None,
+    omp_binary_path: Path | None = None,
+) -> dict:
+    """Execute one OMP subject cell using explicit resolved launch inputs."""
     if not model.startswith("openai-codex/"):
         sys.exit("OMP benchmark runner currently requires explicit openai-codex/<model> model ids")
     if not pass_openai_codex_oauth:
@@ -504,13 +514,20 @@ def main() -> None:
     )
     task = load_task(args.task)
     timeout = args.agent_timeout or task.agent_timeout_s
-    rec = run_cell(args.config, args.task, model=args.model, thinking=args.thinking,
-                   rep=args.rep, agent_timeout=timeout, keep=args.keep,
-                   pass_openai_codex_oauth=args.pass_openai_codex_oauth,
-                   rpc_quiescence=args.rpc_quiescence,
-                   capture_initial_context=not args.no_initial_context_capture,
-                   output_cell=probe_output,
-                   persist_result_index=False)
+    rec = run_cell(
+        args.config,
+        args.task,
+        model=args.model,
+        thinking=args.thinking,
+        rep=args.rep,
+        agent_timeout=timeout,
+        keep=args.keep,
+        pass_openai_codex_oauth=args.pass_openai_codex_oauth,
+        rpc_quiescence=args.rpc_quiescence,
+        capture_initial_context=not args.no_initial_context_capture,
+        output_cell=probe_output,
+        persist_result_index=False,
+    )
     print(json.dumps(rec))
 
 

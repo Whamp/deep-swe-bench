@@ -12,10 +12,12 @@ import concurrent.futures
 import json
 import subprocess
 import sys
+import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Protocol, TypedDict, cast
 
 from harness import (
     config_lock,
@@ -62,6 +64,126 @@ def _confirmed_subject_exit(error: SystemExit) -> RuntimeError:
     )
 
 
+def _planned_subject_arguments(
+    cell: launch.ConfirmedSubjectCell,
+    task_root: Path,
+) -> dict[str, object]:
+    """Serialize only plan-resolved arguments for the isolated runner."""
+    arguments: dict[str, object] = {
+        "agent_timeout": cell.agent_timeout_s,
+        "capture_initial_context": cell.capture_initial_context,
+        "config_leaf": str(cell.config_leaf),
+        "config_root": str(cell.config_root),
+        "credential_routes": list(cell.credential_routes),
+        "keep": False,
+        "model": cell.model,
+        "output_cell": str(cell.result_path.parent),
+        "pass_openai_codex_oauth": (
+            "OPENAI_CODEX_OAUTH" in cell.credential_routes
+        ),
+        "persist_result_file": False,
+        "persist_result_index": False,
+        "rep": cell.rep,
+        "rpc_quiescence": cell.rpc_quiescence_s,
+        "task_root": str(task_root),
+        "thinking": cell.thinking,
+    }
+    if cell.subject == "omp":
+        binary_path = cell.subject_runtime_identity.get("binaryPath")
+        if not isinstance(binary_path, str):
+            raise TypeError(
+                "Confirmed OMP runtime invalid: binary path is missing"
+            )
+        arguments.update(
+            {
+                "capture_initial_context": (
+                    cell.capture_initial_context
+                    and bool(
+                        cell.subject_behavior.get(
+                            "captureInitialContext",
+                            True,
+                        )
+                    )
+                ),
+                "omp_binary_path": binary_path,
+                "subject_behavior": dict(cell.subject_behavior),
+            }
+        )
+    return arguments
+
+
+def _read_planned_subject_response(response_path: Path) -> Mapping[str, object]:
+    """Read one isolated-runner response or raise its domain failure."""
+    try:
+        response: object = json.loads(response_path.read_text())
+    except (json.JSONDecodeError, OSError) as error:
+        raise RuntimeError(
+            "Confirmed planned subject failed: response is unreadable at "
+            f"{response_path}: {error}"
+        ) from error
+    if not isinstance(response, Mapping):
+        raise TypeError(
+            "Confirmed planned subject failed: response must be an object"
+        )
+    status = response.get("status")
+    if status == "system_exit":
+        raise _confirmed_subject_exit(SystemExit(response.get("code")))
+    if status == "error":
+        raise RuntimeError(
+            "Confirmed planned subject failed: "
+            f"{response.get('errorType')}: {response.get('errorMessage')}\n"
+            f"{response.get('traceback', '')}"
+        )
+    record = response.get("record")
+    if status != "ok" or not isinstance(record, Mapping):
+        raise TypeError(
+            "Confirmed planned subject failed: response has no result record"
+        )
+    return cast(Mapping[str, object], record)
+
+
+def _run_planned_subject_process(
+    cell: launch.ConfirmedSubjectCell,
+    task_root: Path,
+) -> Mapping[str, object]:
+    """Invoke the exact planned runner and adjacent harness in a child."""
+    helper_path = cell.subject_runner.with_name("confirmed_subject_process.py")
+    request = {
+        "arguments": _planned_subject_arguments(cell, task_root),
+        "config": cell.config_identity,
+        "runner": str(cell.subject_runner),
+        "subject": cell.subject,
+        "task": cell.task,
+    }
+    with tempfile.TemporaryDirectory(
+        prefix="deep-swe-confirmed-subject-"
+    ) as temporary_directory:
+        temporary_root = Path(temporary_directory)
+        request_path = temporary_root / "request.json"
+        response_path = temporary_root / "response.json"
+        request_path.write_text(
+            json.dumps(request, allow_nan=False, sort_keys=True) + "\n"
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(helper_path),
+                "--request",
+                str(request_path),
+                "--response",
+                str(response_path),
+            ],
+            check=False,
+        )
+        if completed.returncode != 0 and not response_path.is_file():
+            raise RuntimeError(
+                "Confirmed planned subject failed: helper exited "
+                f"{completed.returncode} without a response; "
+                f"helper={helper_path}"
+            )
+        return _read_planned_subject_response(response_path)
+
+
 class RepositoryConfirmedOmpRunner:
     """Run OMP with only behavior resolved by a confirmed launch plan."""
 
@@ -74,53 +196,7 @@ class RepositoryConfirmedOmpRunner:
         cell: launch.ConfirmedOmpCell,
     ) -> dict[str, object]:
         """Execute one plan-resolved OMP cell without raw result writes."""
-        from harness import run_omp as run_subject
-
-        binary_path = cell.subject_runtime_identity.get("binaryPath")
-        if not isinstance(binary_path, str):
-            raise TypeError(
-                "Confirmed OMP runtime invalid: binary path is missing"
-            )
-        subject_behavior = dict(cell.subject_behavior)
-        system_prompt = subject_behavior.get("systemPrompt")
-        if isinstance(system_prompt, str):
-            subject_behavior["systemPrompt"] = (
-                run_subject.render_omp_system_prompt_template(system_prompt)
-            )
-        try:
-            return run_subject.run_cell(
-                cell.config_identity,
-                cell.task,
-                model=cell.model,
-                thinking=cell.thinking,
-                rep=cell.rep,
-                agent_timeout=cell.agent_timeout_s,
-                keep=False,
-                pass_openai_codex_oauth=(
-                    "OPENAI_CODEX_OAUTH" in cell.credential_routes
-                ),
-                rpc_quiescence=cell.rpc_quiescence_s,
-                capture_initial_context=(
-                    cell.capture_initial_context
-                    and bool(
-                        cell.subject_behavior.get(
-                            "captureInitialContext",
-                            True,
-                        )
-                    )
-                ),
-                credential_routes=cell.credential_routes,
-                output_cell=cell.result_path.parent,
-                persist_result_file=False,
-                persist_result_index=False,
-                config_root=cell.config_root,
-                config_leaf=cell.config_leaf,
-                task_root=self.task_root,
-                subject_behavior=subject_behavior,
-                omp_binary_path=Path(binary_path),
-            )
-        except SystemExit as error:
-            raise _confirmed_subject_exit(error) from error
+        return dict(_run_planned_subject_process(cell, self.task_root))
 
 
 class RepositoryConfirmedPiRunner:
@@ -135,32 +211,7 @@ class RepositoryConfirmedPiRunner:
         cell: launch.ConfirmedPiCell,
     ) -> dict[str, object]:
         """Execute one plan-resolved Pi cell without persisting raw results."""
-        from harness import run as run_subject
-
-        try:
-            return run_subject.run_cell(
-                cell.config_identity,
-                cell.task,
-                model=cell.model,
-                thinking=cell.thinking,
-                rep=cell.rep,
-                agent_timeout=cell.agent_timeout_s,
-                keep=False,
-                pass_openai_codex_oauth=(
-                    "OPENAI_CODEX_OAUTH" in cell.credential_routes
-                ),
-                rpc_quiescence=cell.rpc_quiescence_s,
-                capture_initial_context=cell.capture_initial_context,
-                credential_routes=cell.credential_routes,
-                output_cell=cell.result_path.parent,
-                persist_result_file=False,
-                persist_result_index=False,
-                config_root=cell.config_root,
-                config_leaf=cell.config_leaf,
-                task_root=self.task_root,
-            )
-        except SystemExit as error:
-            raise _confirmed_subject_exit(error) from error
+        return dict(_run_planned_subject_process(cell, self.task_root))
 
 
 def all_task_ids() -> list[str]:
@@ -468,8 +519,12 @@ def preflight_plan(args, configs: list[str], ids: list[str]) -> list[dict]:
             task=task,
             config=config,
             rep=0,
-            result_path=repo_rel(result_path(args.model, args.thinking, config, task, 0)),
-            log_path=repo_rel(log_path(args.model, args.thinking, config, task, 0)),
+            result_path=repo_rel(
+                result_path(args.model, args.thinking, config, task, 0)
+            ),
+            log_path=repo_rel(
+                log_path(args.model, args.thinking, config, task, 0)
+            ),
             contract_path=repo_rel(resolved.smoke_contract),
         )
         plan.append(
@@ -486,11 +541,14 @@ def preflight_plan(args, configs: list[str], ids: list[str]) -> list[dict]:
 RESULTS_ROOT = REPO / "results"
 
 
-def _latest_transient_error_msg() -> str | None:
-    """Read ``transient_model_error`` from the most recently written sentinel."""
+def _latest_transient_error_msg(
+    results_root: Path | None = None,
+) -> str | None:
+    """Read the newest transient sentinel under the planned result root."""
+    search_root = results_root if results_root is not None else RESULTS_ROOT
     try:
         files = sorted(
-            RESULTS_ROOT.rglob("transient_error.json"),
+            search_root.rglob("transient_error.json"),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -507,28 +565,47 @@ def _latest_transient_error_msg() -> str | None:
     return None
 
 
+class QuotaWaitState(Protocol):
+    """Expose the structured stage transition needed during quota waits."""
+
+    def set_stage(self, stage: str) -> None:
+        """Record the current model-free wait stage."""
+
+
+class QuotaResumeDecision(TypedDict):
+    """Describe whether confirmed scheduling may retry after a wait."""
+
+    retry: bool
+    reason: str
+
+
 class QuotaResumer:
     """Decide whether to wait for a subscription quota reset and resume the batch.
 
     On a transient (exit 75) pause, this inspects the underlying error, queries
     the provider usage API (via :mod:`harness.quota`) for the reset time, sleeps
-    until the window resets, then tells the caller to re-launch the batch. Cells
-    with completed ``result.json`` are skipped on re-launch, so only the
-    interrupted work re-runs.
+    until the window resets, then tells the confirmed executor to retry the
+    same plan. Completed ``result.json`` files are provenance-checked and
+    skipped, so only interrupted work runs again.
     """
 
-    def __init__(self, args):
+    def __init__(self, args: argparse.Namespace) -> None:
+        """Bind quota waits to confirmed model, result, and timing policy."""
         self.args = args
+        self.results_root = Path(getattr(args, "results_root", RESULTS_ROOT))
         self.attempt = 0
 
-    def on_transient_pause(self, state) -> dict:
+    def on_transient_pause(
+        self,
+        state: QuotaWaitState,
+    ) -> QuotaResumeDecision:
         """Inspect the pause and optionally block until the quota resets.
 
         Returns ``{"retry": bool, "reason": str}``. When ``retry`` is true the
-        caller re-launches the batch; otherwise it exits 75.
+        confirmed executor retries the same plan; otherwise it exits 75.
         """
         self.attempt += 1
-        msg = _latest_transient_error_msg()
+        msg = _latest_transient_error_msg(self.results_root)
         kind = quota.classify_transient(msg)
 
         if kind == "rate_limit":
@@ -544,7 +621,11 @@ class QuotaResumer:
         print(f"[resume] {reason}", flush=True)
         return {"retry": False, "reason": reason}
 
-    def _wait_for_quota_reset(self, state, msg) -> dict:
+    def _wait_for_quota_reset(
+        self,
+        state: QuotaWaitState,
+        msg: str | None,
+    ) -> QuotaResumeDecision:
         windows, source = quota.codex_windows(self.args.model)
         if not windows:
             reason = f"quota limit but no usage data available (source={source}): {msg!r}"
@@ -584,6 +665,10 @@ class QuotaResumer:
         state.set_stage("quota_wait")
         print(f"[resume] quota exhausted ({desc}); sleeping ~{wait:.0f}s until reset, then resuming "
               f"[attempt {self.attempt}]", flush=True)
+        if reset is None:
+            raise RuntimeError(
+                "Quota resume invariant failed: finite wait has no reset"
+            )
         self._sleep_until_reset(reset)
         return {"retry": True, "reason": f"quota reset waited ({desc})"}
 
@@ -833,6 +918,30 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
         choices=["pause", "stop"],
         default="pause",
     )
+    plan_parser.add_argument(
+        "--no-auto-resume",
+        action="store_false",
+        dest="auto_resume",
+        default=True,
+    )
+    plan_parser.add_argument(
+        "--max-quota-wait",
+        type=float,
+        default=21600.0,
+        dest="max_quota_wait_s",
+    )
+    plan_parser.add_argument(
+        "--quota-poll",
+        type=float,
+        default=300.0,
+        dest="quota_poll_s",
+    )
+    plan_parser.add_argument(
+        "--rate-limit-backoff",
+        type=float,
+        default=60.0,
+        dest="rate_limit_backoff_s",
+    )
     plan_parser.add_argument("--cell-retries", type=int, default=1)
     plan_parser.add_argument("--agent-timeout", type=float)
     plan_parser.add_argument("--rpc-quiescence", type=float, default=2.0)
@@ -864,9 +973,7 @@ def _launch_task_selection(
     """Resolve the operator's task selector without running a subject."""
     if args.tasks:
         tasks = tuple(
-            task.strip()
-            for task in args.tasks.split(",")
-            if task.strip()
+            task.strip() for task in args.tasks.split(",") if task.strip()
         )
         return launch.LaunchTaskSelection(kind="tasks", tasks=tasks)
     if args.subset:
@@ -933,6 +1040,10 @@ def _plan_confirmed_launch(
             agent_timeout_s=args.agent_timeout,
             rpc_quiescence_s=args.rpc_quiescence,
             capture_initial_context=args.capture_initial_context,
+            auto_resume=args.auto_resume,
+            max_quota_wait_s=args.max_quota_wait_s,
+            quota_poll_s=args.quota_poll_s,
+            rate_limit_backoff_s=args.rate_limit_backoff_s,
         ),
     )
     compiled = launch.compile_launch_request(
@@ -978,6 +1089,21 @@ def main(
             task_root,
         )
     subject = document["subject"]["name"]
+    policies = document["policies"]
+    transient_resumer: launch.LaunchTransientResumer | None = None
+    if (
+        policies["transient_errors"] == "pause"
+        and policies["auto_resume"] is True
+    ):
+        transient_resumer = QuotaResumer(
+            argparse.Namespace(
+                max_quota_wait_s=policies["max_quota_wait_s"],
+                model=document["model"],
+                quota_poll_s=policies["quota_poll_s"],
+                rate_limit_backoff_s=policies["rate_limit_backoff_s"],
+                results_root=Path(document["paths"]["resultsRoot"]),
+            )
+        )
     if subject == "pi" and pi_runner is None:
         pi_runner = RepositoryConfirmedPiRunner(task_root)
     if subject == "omp" and omp_runner is None:
@@ -989,6 +1115,7 @@ def main(
             runtime_resolver=runtime_resolver,
             pi_runner=pi_runner,
             omp_runner=omp_runner,
+            transient_resumer=transient_resumer,
         )
     except launch.LaunchTransientModelError as error:
         print(str(error), file=sys.stderr)

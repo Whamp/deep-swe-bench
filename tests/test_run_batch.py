@@ -60,7 +60,10 @@ class RunnerSelectionTests(unittest.TestCase):
 
 
 class ConfirmedLaunchCommandTests(unittest.TestCase):
-    def test_raw_batch_arguments_cannot_start_canonical_execution(self):
+    """Exercise the canonical confirmed-launch command boundary."""
+
+    def test_raw_batch_arguments_cannot_start_canonical_execution(self) -> None:
+        """Raw batch arguments cannot bypass plan confirmation."""
         argv = [
             "run_batch.py",
             "--configs",
@@ -249,7 +252,10 @@ class RunOneCommandTests(unittest.TestCase):
 
 
 class ConfigLeafResolutionTests(unittest.TestCase):
-    def test_preflight_plan_rejects_ambiguous_config_leaf(self):
+    """Exercise shared config-leaf resolution through batch planning."""
+
+    def test_preflight_plan_rejects_ambiguous_config_leaf(self) -> None:
+        """Preflight planning never picks one ambiguous leaf by order."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             direct_leaf = root / "configs" / "cfg" / "model" / "low"
@@ -259,11 +265,15 @@ class ConfigLeafResolutionTests(unittest.TestCase):
             smoke_subset = root / "subsets" / "12_v0.txt"
             smoke_subset.parent.mkdir()
             smoke_subset.write_text("task-a\n")
-            args = type("Args", (), {
-                "model": "provider/model",
-                "thinking": "low",
-                "no_smoke_new_configs": False,
-            })()
+            args = type(
+                "Args",
+                (),
+                {
+                    "model": "provider/model",
+                    "thinking": "low",
+                    "no_smoke_new_configs": False,
+                },
+            )()
 
             with (
                 patch.object(run_batch, "REPO", root),
@@ -280,7 +290,8 @@ class ConfigLeafResolutionTests(unittest.TestCase):
         self.assertIn(str(direct_leaf), message)
         self.assertIn(str(advisor_leaf), message)
 
-    def test_preflight_plan_uses_leaf_local_smoke_contract(self):
+    def test_preflight_plan_uses_leaf_local_smoke_contract(self) -> None:
+        """A leaf-local smoke contract overrides the config fallback."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config_root = root / "configs" / "cfg"
@@ -292,11 +303,15 @@ class ConfigLeafResolutionTests(unittest.TestCase):
             smoke_subset = root / "subsets" / "12_v0.txt"
             smoke_subset.parent.mkdir()
             smoke_subset.write_text("task-a\n")
-            args = type("Args", (), {
-                "model": "provider/model",
-                "thinking": "low",
-                "no_smoke_new_configs": False,
-            })()
+            args = type(
+                "Args",
+                (),
+                {
+                    "model": "provider/model",
+                    "thinking": "low",
+                    "no_smoke_new_configs": False,
+                },
+            )()
 
             with (
                 patch.object(run_batch, "REPO", root),
@@ -309,7 +324,8 @@ class ConfigLeafResolutionTests(unittest.TestCase):
             "configs/cfg/model/low/smoke.json",
         )
 
-    def test_preflight_plan_preserves_config_root_smoke_fallback(self):
+    def test_preflight_plan_preserves_config_root_smoke_fallback(self) -> None:
+        """Legacy configs retain their root smoke-contract fallback."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config_root = root / "configs" / "cfg"
@@ -318,11 +334,15 @@ class ConfigLeafResolutionTests(unittest.TestCase):
             smoke_subset = root / "subsets" / "12_v0.txt"
             smoke_subset.parent.mkdir()
             smoke_subset.write_text("task-a\n")
-            args = type("Args", (), {
-                "model": "provider/model",
-                "thinking": "low",
-                "no_smoke_new_configs": False,
-            })()
+            args = type(
+                "Args",
+                (),
+                {
+                    "model": "provider/model",
+                    "thinking": "low",
+                    "no_smoke_new_configs": False,
+                },
+            )()
 
             with (
                 patch.object(run_batch, "REPO", root),

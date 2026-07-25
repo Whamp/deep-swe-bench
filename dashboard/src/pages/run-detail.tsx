@@ -8,7 +8,12 @@ import { Progress } from '@/components/ui/progress'
 import { StateBadge, OutcomeBadge, Badge } from '@/components/ui/badge'
 import { ErrorState } from '@/components/error-state'
 import {
-  Table, TableHeader, TableBody, TableRow, TableHead, TableCell,
+  Table,
+  TableHeader,
+  TableBody,
+  TableRow,
+  TableHead,
+  TableCell,
 } from '@/components/ui/table'
 import { fmtSeconds, fmtTokens, fmtCost } from '@/lib/metrics'
 
@@ -18,7 +23,11 @@ export default function RunDetail() {
   const { runId } = useParams<{ runId: string }>()
   const [detail, setDetail] = useState<DetailLevel>('operational')
 
-  const { data: run, isLoading, error } = useQuery({
+  const {
+    data: run,
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: ['run', runId, detail],
     queryFn: () => fetchRun(runId!, detail),
     enabled: !!runId,
@@ -42,7 +51,9 @@ export default function RunDetail() {
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-4">
-        <Link to="/" className="text-sm text-muted-foreground hover:text-foreground">← Overview</Link>
+        <Link to="/" className="text-sm text-muted-foreground hover:text-foreground">
+          ← Overview
+        </Link>
         <h2 className="text-xl font-bold break-all">{run.run_id}</h2>
         <StateBadge state={run.state} />
         <div className="ml-auto flex items-center gap-2 text-sm">
@@ -53,14 +64,20 @@ export default function RunDetail() {
             className="rounded-md border border-border bg-card px-2 py-1 text-sm"
           >
             {DETAIL_OPTIONS.map((d) => (
-              <option key={d} value={d}>{d}</option>
+              <option key={d} value={d}>
+                {d}
+              </option>
             ))}
           </select>
         </div>
       </div>
 
       <RunSummary run={run} />
-      <CellTable title="Preflight / smoke" cells={Object.values(run.preflight || {})} showAge={false} />
+      <CellTable
+        title="Preflight / smoke"
+        cells={Object.values(run.preflight || {})}
+        showAge={false}
+      />
       <CellTable title="Active cells" cells={run.active_cells || []} showAge={true} />
       <CellTable title="Recent finished" cells={run.recent_finished || []} showAge={false} />
 
@@ -75,13 +92,12 @@ function RunSummary({ run }: { run: RunDetailData }) {
     <Card>
       <CardContent className="space-y-4 p-4">
         <div className="text-sm text-muted-foreground">
-          {run.model || run.kind} {run.thinking || ''} · configs: {(run.configs || []).join(', ') || '—'}
+          {run.model || run.kind} {run.thinking || ''} · configs:{' '}
+          {(run.configs || []).join(', ') || '—'}
         </div>
         <div className="flex flex-wrap gap-2">
           <Badge>
-            {run.launch_plan_identity
-              ? `plan ${run.launch_plan_identity}`
-              : run.launch_metadata}
+            {run.launch_plan_identity ? `plan ${run.launch_plan_identity}` : run.launch_metadata}
           </Badge>
           <Badge variant={run.preflight_state === 'failed' ? 'failed' : 'default'}>
             preflight {run.preflight_state}
@@ -105,9 +121,11 @@ function RunSummary({ run }: { run: RunDetailData }) {
           <Metric label="ETA" value={fmtSeconds(run.eta_s)} />
           <Metric
             label="Stale / oldest"
-            value={run.stale_cell_count > 0
-              ? `${run.stale_cell_count} / ${fmtSeconds(run.max_cell_age_s)}`
-              : '0'}
+            value={
+              run.stale_cell_count > 0
+                ? `${run.stale_cell_count} / ${fmtSeconds(run.max_cell_age_s)}`
+                : '0'
+            }
           />
         </div>
         {run.paths && (
@@ -121,7 +139,9 @@ function RunSummary({ run }: { run: RunDetailData }) {
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-muted-foreground">Failures:</span>
             {Object.entries(run.failure_buckets).map(([k, v]) => (
-              <Badge key={k} variant="failed">{k}: {v}</Badge>
+              <Badge key={k} variant="failed">
+                {k}: {v}
+              </Badge>
             ))}
           </div>
         )}
@@ -158,7 +178,9 @@ function CellTable({ title, cells, showAge }: { title: string; cells: Cell[]; sh
   return (
     <Card>
       <CardHeader className="pb-2">
-        <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">{title}</CardTitle>
+        <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+          {title}
+        </CardTitle>
       </CardHeader>
       <CardContent>
         <Table>
@@ -180,10 +202,13 @@ function CellTable({ title, cells, showAge }: { title: string; cells: Cell[]; sh
               const bits: string[] = []
               if (s.reward_partial !== undefined) bits.push(`partial=${s.reward_partial}`)
               if (s.reward_binary !== undefined) bits.push(`binary=${s.reward_binary}`)
-              if (s.total_tokens !== undefined) bits.push(`tok=${fmtTokens(s.total_tokens as number)}`)
-              if (s.combined_total_tokens !== undefined) bits.push(`combined=${fmtTokens(s.combined_total_tokens as number)}`)
+              if (s.total_tokens !== undefined)
+                bits.push(`tok=${fmtTokens(s.total_tokens as number)}`)
+              if (s.combined_total_tokens !== undefined)
+                bits.push(`combined=${fmtTokens(s.combined_total_tokens as number)}`)
               if (s.cost_usd !== undefined) bits.push(`$=${fmtCost(s.cost_usd as number)}`)
-              if (s.agent_wall_s !== undefined) bits.push(`wall=${fmtSeconds(s.agent_wall_s as number)}`)
+              if (s.agent_wall_s !== undefined)
+                bits.push(`wall=${fmtSeconds(s.agent_wall_s as number)}`)
               return (
                 <TableRow key={`${cell.cell_id || 'cell'}-${i}`}>
                   <TableCell className="font-medium">{cell.task || '—'}</TableCell>
@@ -196,18 +221,38 @@ function CellTable({ title, cells, showAge }: { title: string; cells: Cell[]; sh
                         <Badge variant="stale">{fmtSeconds(cell.cell_age_s)}</Badge>
                       ) : cell.cell_age_s != null ? (
                         fmtSeconds(cell.cell_age_s)
-                      ) : '—'}
+                      ) : (
+                        '—'
+                      )}
                     </TableCell>
                   )}
-                  <TableCell><OutcomeBadge outcome={cell.outcome} /></TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{bits.join(' · ')}</TableCell>
+                  <TableCell>
+                    <OutcomeBadge outcome={cell.outcome} />
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {bits.join(' · ')}
+                  </TableCell>
                   <TableCell className="text-xs">
                     {cell.result_path && (
-                      <a href={`/api/file?path=${encodeURIComponent(cell.result_path)}&tail=50`} target="_blank" rel="noreferrer" className="text-primary hover:underline">result</a>
+                      <a
+                        href={`/api/file?path=${encodeURIComponent(cell.result_path)}&tail=50`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-primary hover:underline"
+                      >
+                        result
+                      </a>
                     )}
                     {cell.result_path && cell.log_path && ' · '}
                     {cell.log_path && (
-                      <a href={`/api/file?path=${encodeURIComponent(cell.log_path)}&tail=200`} target="_blank" rel="noreferrer" className="text-primary hover:underline">log</a>
+                      <a
+                        href={`/api/file?path=${encodeURIComponent(cell.log_path)}&tail=200`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-primary hover:underline"
+                      >
+                        log
+                      </a>
                     )}
                   </TableCell>
                 </TableRow>
@@ -225,7 +270,11 @@ function DiagnosticPanels({ run }: { run: RunDetailData }) {
     <>
       {run.events_tail && run.events_tail.length > 0 && (
         <Card>
-          <CardHeader><CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">Recent events</CardTitle></CardHeader>
+          <CardHeader>
+            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+              Recent events
+            </CardTitle>
+          </CardHeader>
           <CardContent>
             <pre className="max-h-96 overflow-auto rounded-md border border-border bg-background/80 p-3 text-xs">
               {run.events_tail.map((e) => JSON.stringify(e)).join('\n')}
@@ -235,7 +284,11 @@ function DiagnosticPanels({ run }: { run: RunDetailData }) {
       )}
       {run.status && (
         <Card>
-          <CardHeader><CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">status.json</CardTitle></CardHeader>
+          <CardHeader>
+            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+              status.json
+            </CardTitle>
+          </CardHeader>
           <CardContent>
             <pre className="max-h-96 overflow-auto rounded-md border border-border bg-background/80 p-3 text-xs">
               {JSON.stringify(run.status, null, 2)}
@@ -245,7 +298,11 @@ function DiagnosticPanels({ run }: { run: RunDetailData }) {
       )}
       {run.manifest && (
         <Card>
-          <CardHeader><CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">manifest.json</CardTitle></CardHeader>
+          <CardHeader>
+            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+              manifest.json
+            </CardTitle>
+          </CardHeader>
           <CardContent>
             <pre className="max-h-96 overflow-auto rounded-md border border-border bg-background/80 p-3 text-xs">
               {JSON.stringify(run.manifest, null, 2)}

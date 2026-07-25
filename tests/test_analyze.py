@@ -26,30 +26,34 @@ def _write_result(tree_root: Path, config: str, rep: int,
     cell = (tree_root / "results" / LEAF / "high" / config / "t1"
             / f"rep{rep}")
     cell.mkdir(parents=True, exist_ok=True)
-    (cell / "result.json").write_text(json.dumps({
-        "config": config,
-        "config_lock_identity": f"sha256:lock-{config}",
-        "subject": "pi",
-        "subject_version": "pi@fixture",
-        "model": MODEL,
-        "thinking_level": "high",
-        "task": "t1",
-        "rep": rep,
-        "harness_revision": "sha256:harness-fixture",
-        "task_revision": "sha256:task-fixture",
-        "verifier_identity": "sha256:verifier-t1",
-        "immutable_image_identities": {
-            "agent": "sha256:agent-t1",
-            "environment": "sha256:environment-t1",
-            "verifier": "sha256:verifier-image-t1",
-        },
-        "launch_plan_identity": f"sha256:plan-{config}-{rep}",
-        "reward_partial": reward_partial,
-        "reward_binary": 0,
-        "total_tokens": tokens,
-        "cost_usd": tokens * 0.00001,
-        "agent_timed_out": False,
-    }))
+    (cell / "result.json").write_text(
+        json.dumps(
+            {
+                "config": config,
+                "config_lock_identity": f"sha256:lock-{config}",
+                "subject": "pi",
+                "subject_version": "pi@fixture",
+                "model": MODEL,
+                "thinking_level": "high",
+                "task": "t1",
+                "rep": rep,
+                "harness_revision": "sha256:harness-fixture",
+                "task_revision": "sha256:task-fixture",
+                "verifier_identity": "sha256:verifier-t1",
+                "immutable_image_identities": {
+                    "agent": "sha256:agent-t1",
+                    "environment": "sha256:environment-t1",
+                    "verifier": "sha256:verifier-image-t1",
+                },
+                "launch_plan_identity": f"sha256:plan-{config}-{rep}",
+                "reward_partial": reward_partial,
+                "reward_binary": 0,
+                "total_tokens": tokens,
+                "cost_usd": tokens * 0.00001,
+                "agent_timed_out": False,
+            }
+        )
+    )
 
 
 @pytest.fixture
@@ -83,12 +87,20 @@ def test_load_results_reads_via_results_tree_module(monkeypatch, synth_tree):
 
 
 def test_load_results_rejects_incompatible_selected_provenance(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     synth_tree: Path,
 ) -> None:
     """A comparison cannot aggregate reps from different harness setups."""
-    incompatible_path = (synth_tree / "results" / LEAF / "high" / "alt"
-                         / "t1" / "rep2" / "result.json")
+    incompatible_path = (
+        synth_tree
+        / "results"
+        / LEAF
+        / "high"
+        / "alt"
+        / "t1"
+        / "rep2"
+        / "result.json"
+    )
     incompatible = json.loads(incompatible_path.read_text())
     incompatible["harness_revision"] = "sha256:other-harness"
     incompatible_path.write_text(json.dumps(incompatible))
@@ -102,6 +114,43 @@ def test_load_results_rejects_incompatible_selected_provenance(
 
     assert str(incompatible_path) in str(raised.value)
     assert "harness_revision" in str(raised.value)
+
+
+def test_load_results_rejects_mixed_omp_binary_identities(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An OMP comparison cannot combine results from different binaries."""
+    _write_result(tmp_path, "baseline@1.0.0", 0, 0.1, 100)
+    _write_result(tmp_path, "other@1.0.0", 0, 0.2, 200)
+    result_paths = sorted(tmp_path.glob("results/*/*/*/*/rep*/result.json"))
+    for index, result_path in enumerate(result_paths):
+        record = json.loads(result_path.read_text())
+        record.update(
+            {
+                "subject": "omp",
+                "subject_runtime_identity": {
+                    "binaryFingerprint": f"sha256:omp-binary-{index}",
+                    "binaryPath": "/fixture/bin/omp",
+                    "versionOutput": "omp 16.3.5",
+                },
+                "subject_version": "omp@16.3.5",
+            }
+        )
+        result_path.write_text(json.dumps(record))
+    monkeypatch.setattr(lib, "REPO", tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Comparison result provenance mismatch:",
+    ) as raised:
+        analyze.load_results(
+            MODEL,
+            "high",
+            ["baseline@1.0.0", "other@1.0.0"],
+        )
+
+    assert "subject_runtime_identity" in str(raised.value)
 
 
 def _remove_modern_result_provenance(result_path: Path) -> None:
@@ -209,7 +258,7 @@ def test_load_results_reports_corrupt_selected_result(
 
 
 def test_load_results_preserves_distinct_versioned_config_identities(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Different config releases remain separate comparison identities."""
@@ -227,8 +276,7 @@ def test_load_results_preserves_distinct_versioned_config_identities(
         "baseline@1.0.0",
         "baseline@2.0.0",
     ]
-    assert (rows[0]["config_lock_identity"]
-            != rows[1]["config_lock_identity"])
+    assert rows[0]["config_lock_identity"] != rows[1]["config_lock_identity"]
 
 
 def test_main_output_with_rep10_is_correct_and_int_ordered(monkeypatch, synth_tree, capsys):

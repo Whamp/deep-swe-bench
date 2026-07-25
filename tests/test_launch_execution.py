@@ -92,6 +92,15 @@ def _planned_launch_plan_path(compiled: CompiledLaunch) -> Path:
     return Path(state_path) / "launch-plan.json"
 
 
+def _install_confirmed_subject_helper(repository_root: Path) -> None:
+    """Install the production child-process loader in a fixture workspace."""
+    source_path = Path(run_batch.__file__).with_name(
+        "confirmed_subject_process.py"
+    )
+    helper_path = repository_root / "harness" / source_path.name
+    helper_path.write_text(source_path.read_text())
+
+
 def _registered_state_path(state_root: Path, run_id: str) -> Path:
     """Find one registered state directory by its public manifest run id."""
     matches: list[Path] = []
@@ -278,6 +287,7 @@ def _compile_existing_fixture(
     agent_timeout_s: float | None = None,
     rpc_quiescence_s: float = 2.0,
     capture_initial_context: bool = True,
+    auto_resume: bool = True,
 ) -> CompiledLaunch:
     """Compile an initialized launch fixture without changing its config."""
     repository_root = tmp_path / "repository"
@@ -302,6 +312,7 @@ def _compile_existing_fixture(
             agent_timeout_s=agent_timeout_s,
             rpc_quiescence_s=rpc_quiescence_s,
             capture_initial_context=capture_initial_context,
+            auto_resume=auto_resume,
         ),
         reuse_decisions=reuse_decisions,
     )
@@ -448,7 +459,41 @@ def _compile_single_omp_launch(
     )
     subject_runner = repository_root / "harness" / "run_omp.py"
     subject_runner.parent.mkdir(parents=True)
-    subject_runner.write_text("# fixture OMP runner\n")
+    subject_runner.write_text(
+        """from pathlib import Path
+
+
+def render_omp_system_prompt_template(template):
+    return template.replace("{{current_date}}", "2025-01-02")
+
+
+def run_cell(config, task, **kwargs):
+    return {
+        "agent_exit": 0,
+        "arm_advisor": {},
+        "arm_models": {},
+        "arm_pi_flags": [],
+        "arm_settings": {},
+        "fixture_capture_initial_context": kwargs["capture_initial_context"],
+        "fixture_config_leaf": str(kwargs["config_leaf"]),
+        "fixture_config_root": str(kwargs["config_root"]),
+        "fixture_credential_routes": list(kwargs["credential_routes"]),
+        "fixture_omp_binary_path": str(kwargs["omp_binary_path"]),
+        "fixture_output_cell": str(kwargs["output_cell"]),
+        "fixture_persist_result_file": kwargs["persist_result_file"],
+        "fixture_persist_result_index": kwargs["persist_result_index"],
+        "fixture_rpc_quiescence": kwargs["rpc_quiescence"],
+        "fixture_runner_path": str(Path(__file__).resolve()),
+        "fixture_subject_behavior": kwargs["subject_behavior"],
+        "fixture_timeout": kwargs["agent_timeout"],
+        "reward_binary": 1,
+        "reward_partial": 1.0,
+        "total_tokens": 10,
+        "verifier_exit": 0,
+    }
+"""
+    )
+    _install_confirmed_subject_helper(repository_root)
     task_root = tasks_root / "task-a"
     task_root.mkdir(parents=True)
     (task_root / "task.toml").write_text("[metadata]\n")
@@ -519,6 +564,7 @@ def _compile_single_cell_launch(
     agent_timeout_s: float | None = None,
     rpc_quiescence_s: float = 2.0,
     capture_initial_context: bool = True,
+    auto_resume: bool = True,
     config_lock_metadata: Mapping[str, object] | None = None,
 ) -> tuple[CompiledLaunch, Path, Path, Path, Path]:
     repository_root = tmp_path / "repository"
@@ -551,7 +597,35 @@ def _compile_single_cell_launch(
     )
     subject_runner = repository_root / "harness" / "run.py"
     subject_runner.parent.mkdir(parents=True)
-    subject_runner.write_text("# fixture subject runner\n")
+    subject_runner.write_text(
+        """from pathlib import Path
+
+
+def run_cell(config, task, **kwargs):
+    return {
+        "agent_exit": 0,
+        "arm_advisor": {},
+        "arm_models": {},
+        "arm_pi_flags": [],
+        "arm_settings": {},
+        "fixture_capture_initial_context": kwargs["capture_initial_context"],
+        "fixture_config_leaf": str(kwargs["config_leaf"]),
+        "fixture_config_root": str(kwargs["config_root"]),
+        "fixture_credential_routes": list(kwargs["credential_routes"]),
+        "fixture_output_cell": str(kwargs["output_cell"]),
+        "fixture_persist_result_file": kwargs["persist_result_file"],
+        "fixture_persist_result_index": kwargs["persist_result_index"],
+        "fixture_rpc_quiescence": kwargs["rpc_quiescence"],
+        "fixture_runner_path": str(Path(__file__).resolve()),
+        "fixture_timeout": kwargs["agent_timeout"],
+        "reward_binary": 1,
+        "reward_partial": 1.0,
+        "total_tokens": 10,
+        "verifier_exit": 0,
+    }
+"""
+    )
+    _install_confirmed_subject_helper(repository_root)
     for task_id in tasks:
         task_root = tasks_root / task_id
         task_root.mkdir(parents=True)
@@ -569,6 +643,7 @@ def _compile_single_cell_launch(
         agent_timeout_s=agent_timeout_s,
         rpc_quiescence_s=rpc_quiescence_s,
         capture_initial_context=capture_initial_context,
+        auto_resume=auto_resume,
     )
     return compiled, config_leaf, smoke_contract, results_root, state_root
 
@@ -674,10 +749,10 @@ def test_execute_command_consumes_only_reviewed_plan_and_confirmation(
     assert result["launch_plan_identity"] == compiled.plan.identity
 
 
-def test_execute_command_default_pi_runner_uses_plan_resolved_paths(
+def test_execute_command_default_pi_runner_uses_planned_workspace(
     tmp_path: Path,
 ) -> None:
-    """The real Pi adapter consumes all plan-resolved execution inputs."""
+    """The real Pi adapter executes the runner stored in the approved plan."""
     compiled, config_leaf, _, _, state_root = _compile_single_cell_launch(
         tmp_path,
         agent_timeout_s=321.0,
@@ -686,19 +761,11 @@ def test_execute_command_default_pi_runner_uses_plan_resolved_paths(
     )
     reviewed_plan_path = tmp_path / "reviewed-launch-plan.json"
     reviewed_plan_path.write_text(compiled.plan.canonical_json)
-    legacy_result = {
-        "agent_exit": 0,
-        "arm_advisor": {},
-        "arm_models": {},
-        "arm_pi_flags": [],
-        "arm_settings": {},
-        "reward_binary": 1,
-        "reward_partial": 1.0,
-        "total_tokens": 10,
-        "verifier_exit": 0,
-    }
 
-    with patch("harness.run.run_cell", return_value=legacy_result) as run_cell:
+    with patch(
+        "harness.run.run_cell",
+        side_effect=AssertionError("executing checkout runner was used"),
+    ) as current_checkout_runner:
         run_batch.main(
             [
                 "execute",
@@ -710,18 +777,21 @@ def test_execute_command_default_pi_runner_uses_plan_resolved_paths(
             runtime_resolver=_runtime_resolver_for(compiled),
         )
 
-    call = run_cell.call_args
-    assert call.kwargs["config_root"] == config_leaf.parents[1]
-    assert call.kwargs["config_leaf"] == config_leaf
-    result_path = compiled.plan.to_document()["batchCells"][0]["resultPath"]
+    current_checkout_runner.assert_not_called()
+    plan_document = compiled.plan.to_document()
+    result_path = plan_document["batchCells"][0]["resultPath"]
     assert isinstance(result_path, str)
-    assert call.kwargs["output_cell"] == Path(result_path).parent
-    assert call.kwargs["persist_result_file"] is False
-    assert call.kwargs["persist_result_index"] is False
-    assert call.kwargs["agent_timeout"] == 321.0
-    assert call.kwargs["rpc_quiescence"] == 4.5
-    assert call.kwargs["capture_initial_context"] is False
-    assert call.kwargs["credential_routes"] == ("FIXTURE_CREDENTIAL",)
+    result = json.loads(Path(result_path).read_text())
+    assert result["fixture_runner_path"] == plan_document["subject"]["runner"]
+    assert result["fixture_config_root"] == str(config_leaf.parents[1])
+    assert result["fixture_config_leaf"] == str(config_leaf)
+    assert result["fixture_output_cell"] == str(Path(result_path).parent)
+    assert result["fixture_persist_result_file"] is False
+    assert result["fixture_persist_result_index"] is False
+    assert result["fixture_timeout"] == 321.0
+    assert result["fixture_rpc_quiescence"] == 4.5
+    assert result["fixture_capture_initial_context"] is False
+    assert result["fixture_credential_routes"] == ["FIXTURE_CREDENTIAL"]
 
     manifest = json.loads(
         (
@@ -791,6 +861,65 @@ def test_confirmed_launch_resumes_after_transient_without_rerunning_rep(
     assert "run_resumed" in event_names
 
 
+def test_execute_command_automatically_resumes_confirmed_plan_after_transient(
+    tmp_path: Path,
+) -> None:
+    """Canonical execution waits and retries without changing the plan."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        transient_errors="pause",
+    )
+    reviewed_plan_path = tmp_path / "reviewed-launch-plan.json"
+    reviewed_plan_path.write_text(compiled.plan.canonical_json)
+
+    class PauseOnceRunner(FakeConfirmedPiRunner):
+        """Pause one attempt, then produce the approved cell result."""
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            """Raise one transient before delegating the retry."""
+            if not self.calls:
+                self.calls.append(cell)
+                raise LaunchTransientModelError("fixture quota window")
+            return super().run_confirmed_pi_cell(cell)
+
+    runner = PauseOnceRunner(_planned_launch_plan_path(compiled))
+    with patch.object(run_batch, "QuotaResumer") as resumer_class:
+        resumer_class.return_value.on_transient_pause.return_value = {
+            "reason": "fixture quota reset",
+            "retry": True,
+        }
+        run_batch.main(
+            [
+                "execute",
+                "--plan",
+                str(reviewed_plan_path),
+                "--confirm",
+                compiled.plan.identity,
+            ],
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+
+    assert len(runner.calls) == 2
+    assert all(
+        cell.launch_plan_identity == compiled.plan.identity
+        for cell in runner.calls
+    )
+    resumer_class.return_value.on_transient_pause.assert_called_once()
+    state_path = _registered_state_path(state_root, "confirmed-fixture")
+    status = json.loads((state_path / "status.json").read_text())
+    assert status["state"] == "completed"
+    event_names = [
+        json.loads(line)["event"]
+        for line in (state_path / "events.ndjson").read_text().splitlines()
+    ]
+    assert "run_paused" in event_names
+    assert "run_resumed" in event_names
+
+
 def test_confirmed_preflight_pause_resumes_with_one_terminal_verdict(
     tmp_path: Path,
 ) -> None:
@@ -811,9 +940,7 @@ def test_confirmed_preflight_pause_resumes_with_one_terminal_verdict(
             self.calls.append(cell)
             raise LaunchTransientModelError("fixture preflight quota window")
 
-    paused_runner = PausedPreflightRunner(
-        _planned_launch_plan_path(compiled)
-    )
+    paused_runner = PausedPreflightRunner(_planned_launch_plan_path(compiled))
     with pytest.raises(LaunchTransientModelError):
         execute_confirmed_launch(
             compiled.plan,
@@ -824,25 +951,24 @@ def test_confirmed_preflight_pause_resumes_with_one_terminal_verdict(
 
     state_path = _registered_state_path(state_root, "confirmed-fixture")
     paused_status = json.loads((state_path / "status.json").read_text())
-    paused_preflight = paused_status["preflight"][
-        "task-a/baseline@1.0.0/rep0"
-    ]
+    paused_preflight = paused_status["preflight"]["task-a/baseline@1.0.0/rep0"]
     assert paused_preflight["state"] == "pending"
     paused_events = [
         json.loads(line)
         for line in (state_path / "events.ndjson").read_text().splitlines()
     ]
-    assert sum(
-        event["event"] == "preflight_attempt_paused"
-        for event in paused_events
-    ) == 1
+    assert (
+        sum(
+            event["event"] == "preflight_attempt_paused"
+            for event in paused_events
+        )
+        == 1
+    )
     assert all(
         event["event"] != "preflight_finished" for event in paused_events
     )
 
-    resumed_runner = FakeConfirmedPiRunner(
-        _planned_launch_plan_path(compiled)
-    )
+    resumed_runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
     execute_confirmed_launch(
         compiled.plan,
         confirmation_identity=compiled.plan.identity,
@@ -854,13 +980,15 @@ def test_confirmed_preflight_pause_resumes_with_one_terminal_verdict(
         json.loads(line)
         for line in (state_path / "events.ndjson").read_text().splitlines()
     ]
-    assert sum(
-        event["event"] == "preflight_finished" for event in final_events
-    ) == 1
+    assert (
+        sum(event["event"] == "preflight_finished" for event in final_events)
+        == 1
+    )
     final_status = json.loads((state_path / "status.json").read_text())
-    assert final_status["preflight"][
-        "task-a/baseline@1.0.0/rep0"
-    ]["state"] == "passed"
+    assert (
+        final_status["preflight"]["task-a/baseline@1.0.0/rep0"]["state"]
+        == "passed"
+    )
 
 
 @pytest.mark.parametrize("preflight", ["disabled", "required"])
@@ -915,21 +1043,31 @@ def test_confirmed_launch_honors_transient_stop_policy(
     assert runner.calls
 
 
-def test_execute_command_reports_transient_pause_as_exit_75(
+def test_execute_command_reports_pause_when_auto_resume_is_disabled(
     tmp_path: Path,
 ) -> None:
-    """The canonical CLI preserves the established transient pause signal."""
+    """The canonical CLI preserves exit 75 when automatic resume is off."""
     compiled, _, _, _, state_root = _compile_single_cell_launch(
         tmp_path,
         transient_errors="pause",
+        auto_resume=False,
     )
     reviewed_plan_path = tmp_path / "reviewed-launch-plan.json"
     reviewed_plan_path.write_text(compiled.plan.canonical_json)
 
-    with (
-        patch("harness.run.run_cell", side_effect=SystemExit(75)),
-        pytest.raises(SystemExit) as raised,
-    ):
+    class PausingRunner(FakeConfirmedPiRunner):
+        """Emit a controlled transient for the disabled auto-resume path."""
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            """Stop every attempted cell with the established pause signal."""
+            self.calls.append(cell)
+            raise LaunchTransientModelError("fixture quota window")
+
+    runner = PausingRunner(_planned_launch_plan_path(compiled))
+    with pytest.raises(SystemExit) as raised:
         run_batch.main(
             [
                 "execute",
@@ -939,18 +1077,20 @@ def test_execute_command_reports_transient_pause_as_exit_75(
                 compiled.plan.identity,
             ],
             runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
         )
 
     assert raised.value.code == 75
+    assert len(runner.calls) == 1
     state_path = _registered_state_path(state_root, "confirmed-fixture")
     status = json.loads((state_path / "status.json").read_text())
     assert status["state"] == "paused"
 
 
-def test_execute_command_default_omp_runner_uses_plan_resolved_behavior(
+def test_execute_command_default_omp_runner_uses_planned_workspace(
     tmp_path: Path,
 ) -> None:
-    """The real OMP adapter consumes exact planned behavior and binary path."""
+    """The real OMP adapter executes planned behavior in the planned runner."""
     compiled, _ = _compile_single_omp_launch(
         tmp_path,
         preflight="disabled",
@@ -961,33 +1101,11 @@ def test_execute_command_default_omp_runner_uses_plan_resolved_behavior(
     )
     reviewed_plan_path = tmp_path / "reviewed-omp-launch-plan.json"
     reviewed_plan_path.write_text(compiled.plan.canonical_json)
-    legacy_result = {
-        "agent_exit": 0,
-        "arm_advisor": {},
-        "arm_models": {},
-        "arm_pi_flags": [],
-        "arm_settings": {},
-        "reward_binary": 1,
-        "reward_partial": 1.0,
-        "total_tokens": 10,
-        "verifier_exit": 0,
-    }
 
-    class FixedDate:
-        @classmethod
-        def today(cls) -> FixedDate:
-            return cls()
-
-        def isoformat(self) -> str:
-            return "2025-01-02"
-
-    with (
-        patch("harness.run_omp.date", FixedDate),
-        patch(
-            "harness.run_omp.run_cell",
-            return_value=legacy_result,
-        ) as run_cell,
-    ):
+    with patch(
+        "harness.run_omp.run_cell",
+        side_effect=AssertionError("executing checkout runner was used"),
+    ) as current_checkout_runner:
         run_batch.main(
             [
                 "execute",
@@ -999,26 +1117,31 @@ def test_execute_command_default_omp_runner_uses_plan_resolved_behavior(
             runtime_resolver=_runtime_resolver_for(compiled),
         )
 
+    current_checkout_runner.assert_not_called()
     plan_document = compiled.plan.to_document()
     planned_config = plan_document["configs"][0]
-    call = run_cell.call_args
-    assert call.kwargs["config_root"] == Path(planned_config["configRoot"])
-    assert call.kwargs["config_leaf"] == Path(planned_config["configLeaf"])
-    planned_behavior = plan_document["configs"][0]["subjectBehavior"]
+    result_path = plan_document["batchCells"][0]["resultPath"]
+    assert isinstance(result_path, str)
+    result = json.loads(Path(result_path).read_text())
+    assert result["fixture_runner_path"] == plan_document["subject"]["runner"]
+    assert result["fixture_config_root"] == planned_config["configRoot"]
+    assert result["fixture_config_leaf"] == planned_config["configLeaf"]
+    assert result["fixture_output_cell"] == str(Path(result_path).parent)
+    planned_behavior = planned_config["subjectBehavior"]
     assert planned_behavior["systemPrompt"] == (
         "date={{current_date}} cwd=/app\n"
     )
-    assert call.kwargs["subject_behavior"] == {
+    assert result["fixture_subject_behavior"] == {
         **planned_behavior,
         "systemPrompt": "date=2025-01-02 cwd=/app\n",
     }
-    assert call.kwargs["omp_binary_path"] == Path("/fixture/bin/omp")
-    assert call.kwargs["agent_timeout"] == 654.0
-    assert call.kwargs["rpc_quiescence"] == 3.5
-    assert call.kwargs["capture_initial_context"] is False
-    assert call.kwargs["credential_routes"] == ("OPENAI_CODEX_OAUTH",)
-    assert call.kwargs["persist_result_file"] is False
-    assert call.kwargs["persist_result_index"] is False
+    assert result["fixture_omp_binary_path"] == "/fixture/bin/omp"
+    assert result["fixture_timeout"] == 654.0
+    assert result["fixture_rpc_quiescence"] == 3.5
+    assert result["fixture_capture_initial_context"] is False
+    assert result["fixture_credential_routes"] == ["OPENAI_CODEX_OAUTH"]
+    assert result["fixture_persist_result_file"] is False
+    assert result["fixture_persist_result_index"] is False
 
 
 def test_confirmed_omp_preflight_executes_plan_resolved_subject_behavior(
@@ -1573,9 +1696,9 @@ def test_missing_secondary_role_trace_fails_confirmed_preflight(
             / "status.json"
         ).read_text()
     )
-    diagnostics = status["preflight"][
-        "task-a/baseline@1.0.0/rep0"
-    ]["diagnostics"]
+    diagnostics = status["preflight"]["task-a/baseline@1.0.0/rep0"][
+        "diagnostics"
+    ]
     assert [diagnostic["target"] for diagnostic in diagnostics] == [
         "tool-usage.jsonl:structured-records"
     ]
@@ -1822,11 +1945,9 @@ def test_preflight_verdict_controls_config_leaf_sealing(
     tmp_path: Path,
 ) -> None:
     """Only a passed preflight seals its referenced config lock."""
-    passed, _, _, passed_results, passed_state = (
-        _compile_single_cell_launch(
-            tmp_path / "passed",
-            preflight="required",
-        )
+    passed, _, _, passed_results, passed_state = _compile_single_cell_launch(
+        tmp_path / "passed",
+        preflight="required",
     )
     execute_confirmed_launch(
         passed.plan,
@@ -1859,11 +1980,9 @@ def test_preflight_verdict_controls_config_leaf_sealing(
             results_root=passed_results,
         )
 
-    failed, _, _, failed_results, failed_state = (
-        _compile_single_cell_launch(
-            tmp_path / "failed",
-            preflight="required",
-        )
+    failed, _, _, failed_results, failed_state = _compile_single_cell_launch(
+        tmp_path / "failed",
+        preflight="required",
     )
     with pytest.raises(LaunchPreflightError):
         execute_confirmed_launch(
@@ -1905,11 +2024,9 @@ def test_sealed_release_allows_only_leaves_with_unchanged_shared_behavior(
     tmp_path: Path,
 ) -> None:
     """A sealed release accepts new leaves only while shared inputs match."""
-    compiled, _, _, results_root, state_root = (
-        _compile_single_cell_launch(
-            tmp_path,
-            preflight="required",
-        )
+    compiled, _, _, results_root, state_root = _compile_single_cell_launch(
+        tmp_path,
+        preflight="required",
     )
     execute_confirmed_launch(
         compiled.plan,

@@ -373,7 +373,7 @@ def test_preflight_plan_rejects_versioned_config_without_creating_lock(
     with (
         patch.object(run_batch, "REPO", tmp_path),
         patch.object(run_batch, "SMOKE_SUBSET", smoke_subset),
-        pytest.raises(ValueError, match="^Config lock missing:"),
+        pytest.raises(ValueError, match=r"^Config lock missing:"),
     ):
         run_batch.preflight_plan(
             _preflight_args(),
@@ -472,7 +472,7 @@ def test_non_secret_token_setting_change_invalidates_config_lock(
     settings_path.write_text('{"maxOutputToken":200}\n')
 
     with pytest.raises(
-        ValueError, match="changed=\\['model/low/settings.json'\\]"
+        ValueError, match=r"changed=\['model/low/settings.json'\]"
     ):
         run_subject.load_config(
             config_identity,
@@ -553,7 +553,7 @@ def test_subject_config_loading_rejects_drift_without_refreshing_lock(
     original_lock = lock_path.read_bytes()
     settings_path.write_text('{"defaultThinkingLevel":"medium"}\n')
 
-    with pytest.raises(ValueError, match="^Config lock mismatch:"):
+    with pytest.raises(ValueError, match=r"^Config lock mismatch:"):
         run_subject.load_config(
             config_identity,
             "provider/model",
@@ -573,7 +573,7 @@ def test_config_resolution_rejects_unsafe_legacy_identity_segments(
     config_identity: str,
 ) -> None:
     """The public resolver rejects unsafe identities before path lookup."""
-    with pytest.raises(ValueError, match="^Config identity invalid:"):
+    with pytest.raises(ValueError, match=r"^Config identity invalid:"):
         config_resolution.resolve_config_leaf(
             tmp_path,
             config_identity,
@@ -609,7 +609,7 @@ def test_preflight_plan_rejects_invalid_versioned_config_identity(
     with (
         patch.object(run_batch, "REPO", tmp_path),
         patch.object(run_batch, "SMOKE_SUBSET", smoke_subset),
-        pytest.raises(ValueError, match="^Config identity invalid:"),
+        pytest.raises(ValueError, match=r"^Config identity invalid:"),
     ):
         run_batch.preflight_plan(
             _preflight_args(),

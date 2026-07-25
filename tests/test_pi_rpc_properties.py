@@ -10,6 +10,7 @@ import pytest
 from hypothesis import given, settings, strategies as st
 
 import harness.run as run
+from harness import pi_config
 from harness.pi_rpc_runner import (
     _advisor_usage_line,
     _auto_ui_response,
@@ -125,13 +126,24 @@ def test_advisor_usage_lines_preserve_only_raw_advisor_events_in_order(lines):
 
 safe_token_alphabet = string.ascii_letters + string.digits + "-_./:=+"
 plain_flag = st.text(safe_token_alphabet, min_size=1, max_size=30).filter(
-    lambda token: token not in run._RPC_OWNED_PI_FLAGS
-    and not token.startswith(run._RPC_OWNED_PI_FLAG_PREFIXES)
-    and token not in {"--no-skills", "--skill", "--no-extensions"}
+    lambda token: (
+        token not in pi_config._RPC_OWNED_PI_FLAGS
+        and not token.startswith(pi_config._RPC_OWNED_PI_FLAG_PREFIXES)
+        and token not in {"--no-skills", "--skill", "--no-extensions"}
+    )
 )
 owned_flag = st.one_of(
-    st.sampled_from(sorted(run._RPC_OWNED_PI_FLAGS)),
-    st.sampled_from(["--mode=json", "--mode=rpc", "--model=x", "--thinking=low", "--session-dir=/tmp/x", "--append-system-prompt=x"]),
+    st.sampled_from(sorted(pi_config._RPC_OWNED_PI_FLAGS)),
+    st.sampled_from(
+        [
+            "--mode=json",
+            "--mode=rpc",
+            "--model=x",
+            "--thinking=low",
+            "--session-dir=/tmp/x",
+            "--append-system-prompt=x",
+        ]
+    ),
 )
 flag_token = st.one_of(plain_flag, owned_flag)
 skill_name = st.from_regex(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,24}", fullmatch=True).filter(
@@ -142,7 +154,9 @@ thinking_level = st.sampled_from(["off", "low", "medium", "high", "xhigh"])
 
 
 def is_rpc_owned_flag(flag: str) -> bool:
-    return flag in run._RPC_OWNED_PI_FLAGS or flag.startswith(run._RPC_OWNED_PI_FLAG_PREFIXES)
+    return flag in pi_config._RPC_OWNED_PI_FLAGS or flag.startswith(
+        pi_config._RPC_OWNED_PI_FLAG_PREFIXES
+    )
 
 
 @settings(max_examples=120, deadline=None)
