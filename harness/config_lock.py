@@ -455,6 +455,20 @@ def require_matching_config_lock(
     return verification.lock_identity
 
 
+def read_matching_config_lock(
+    resolved: ResolvedConfigLeaf,
+    config_identity: str,
+) -> dict[str, object] | None:
+    """Read a verified release lock while preserving legacy config identity."""
+    lock_identity = require_matching_config_lock(resolved, config_identity)
+    if lock_identity is None:
+        return None
+    document = _load_config_lock(resolved.config_leaf / _CONFIG_LOCK_FILENAME)
+    if document.get("lockIdentity") != lock_identity:
+        raise ValueError("Config lock identity mismatch: lock changed during planning")
+    return document
+
+
 def _metadata_from_path(path: Path | None) -> Mapping[str, object]:
     if path is None:
         return {}
