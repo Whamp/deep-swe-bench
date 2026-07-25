@@ -331,6 +331,105 @@ def _document_identity(document: Mapping[str, object]) -> str:
     return _sha256_identity(canonical_config_lock_json(identity_input).encode())
 
 
+def sealed_config_lock_identities(
+    results_root: Path,
+    config_identity: str,
+) -> frozenset[str]:
+    """Return lock identities referenced by successful config preflights."""
+    lock_identities: set[str] = set()
+    pattern = f"*/*/{config_identity}/*/rep*/result.json"
+    for result_path in results_root.glob(pattern):
+        try:
+            result: object = json.loads(result_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(result, Mapping):
+            continue
+        lock_identity = result.get("config_lock_identity")
+        if (
+            result.get("preflight_passed") is True
+            and result.get("config") == config_identity
+            and isinstance(lock_identity, str)
+        ):
+            lock_identities.add(lock_identity)
+    return frozenset(lock_identities)
+
+
+def require_revisable_config_lock(
+    resolved: ResolvedConfigLeaf,
+    config_identity: str,
+    results_root: Path,
+) -> None:
+    """Reject maintenance writes after this exact config leaf is sealed."""
+    lock_path = resolved.config_leaf / _CONFIG_LOCK_FILENAME
+    if not lock_path.is_file():
+        return
+    document = _load_config_lock(lock_path)
+    lock_identity = document.get("lockIdentity")
+    if lock_identity in sealed_config_lock_identities(
+        results_root,
+        config_identity,
+    ):
+        raise ValueError(
+            "Config lock sealed: successful preflight already references "
+            f"config={config_identity!r}; lock={lock_identity!r}"
+        )
+
+
+def _shared_behavior_inputs(
+    lock_document: Mapping[str, object],
+) -> dict[str, object]:
+    """Index the shared behavior fingerprints stored in one config lock."""
+    inputs = lock_document.get("behaviorInputs")
+    if not isinstance(inputs, list):
+        raise TypeError("Config lock invalid: behaviorInputs must be a list")
+    shared: dict[str, object] = {}
+    for item in inputs:
+        if not isinstance(item, Mapping) or item.get("scope") != "shared":
+            continue
+        path = item.get("path")
+        if not isinstance(path, str):
+            raise TypeError(
+                "Config lock invalid: shared behavior input needs a string path"
+            )
+        shared[path] = item
+    return shared
+
+
+def require_shared_config_release_behavior(
+    config_root: Path,
+    config_identity: str,
+    proposed_lock: Mapping[str, object],
+    results_root: Path,
+) -> None:
+    """Keep new leaf shared behavior equal to sealed release locks."""
+    sealed_identities = sealed_config_lock_identities(
+        results_root,
+        config_identity,
+    )
+    if not sealed_identities:
+        return
+    lock_documents: dict[str, Mapping[str, object]] = {}
+    for lock_path in config_root.glob("*/*/config-lock.json"):
+        document = _load_config_lock(lock_path)
+        lock_identity = document.get("lockIdentity")
+        if isinstance(lock_identity, str):
+            lock_documents[lock_identity] = document
+    proposed_shared = _shared_behavior_inputs(proposed_lock)
+    for sealed_identity in sorted(sealed_identities):
+        sealed_lock = lock_documents.get(sealed_identity)
+        if sealed_lock is None:
+            raise ValueError(
+                "Config release seal evidence invalid: successful preflight "
+                f"references missing lock {sealed_identity!r}"
+            )
+        if _shared_behavior_inputs(sealed_lock) != proposed_shared:
+            raise ValueError(
+                "Config release shared behavior sealed: proposed leaf does not "
+                f"match successful-preflight lock {sealed_identity!r}"
+            )
+
+
 def write_config_lock(
     repository_root: Path,
     config_identity: str,
@@ -340,6 +439,7 @@ def write_config_lock(
     metadata: Mapping[str, object],
     *,
     replace: bool = False,
+    results_root: Path | None = None,
 ) -> Path:
     """Explicitly create or refresh one candidate leaf's config lock."""
     resolved = resolve_config_leaf(
@@ -349,6 +449,12 @@ def write_config_lock(
         thinking,
     )
     lock_path = resolved.config_leaf / _CONFIG_LOCK_FILENAME
+    if replace:
+        require_revisable_config_lock(
+            resolved,
+            config_identity,
+            results_root or repository_root / "results",
+        )
     if lock_path.exists() and not replace:
         raise FileExistsError(
             f"Config lock already exists: {lock_path}; use the explicit refresh operation"
@@ -358,6 +464,12 @@ def write_config_lock(
         config_identity,
         version_impact,
         metadata,
+    )
+    require_shared_config_release_behavior(
+        resolved.config_root,
+        config_identity,
+        document,
+        results_root or repository_root / "results",
     )
     lock_path.write_text(canonical_config_lock_json(document))
     return lock_path

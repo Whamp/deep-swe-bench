@@ -15,6 +15,7 @@ from typing import Protocol, TypedDict, cast
 from harness import (
     config_lock,
     config_resolution,
+    confirmed_preflight,
     lib,
     run_state,
     versioned_smoke_contract,
@@ -51,6 +52,10 @@ class LaunchClarificationRequired(ValueError):
             "Launch clarification required: "
             + json.dumps(self.details, sort_keys=True, separators=(",", ":"))
         )
+
+
+class LaunchPreflightError(RuntimeError):
+    """Stop batch fan-out after durable preflight diagnostics are recorded."""
 
 
 class LaunchConfigDocument(TypedDict):
@@ -1245,15 +1250,24 @@ def _preflight_cells(
     cells: list[dict[str, object]] = []
     for config in config_plans:
         config_identity = str(config["identity"])
-        has_results = any(
-            (
-                results_root
-                / lib.model_leaf(request.model)
-                / request.thinking
-                / config_identity
-            ).glob("*/rep*/result.json")
+        config_results = (
+            results_root
+            / lib.model_leaf(request.model)
+            / request.thinking
+            / config_identity
         )
-        if request.policies.preflight == "new-configs" and has_results:
+        if config["legacy"]:
+            has_release_evidence = any(
+                config_results.glob("*/rep*/result.json")
+            )
+        else:
+            has_release_evidence = config["lockIdentity"] in (
+                config_lock.sealed_config_lock_identities(
+                    results_root,
+                    config_identity,
+                )
+            )
+        if request.policies.preflight == "new-configs" and has_release_evidence:
             continue
         cells.append(
             {
@@ -1508,6 +1522,15 @@ def compile_launch_request(
         _config_plan(repository_root, request, config_identity)
         for config_identity in request.configs
     ]
+    for config_plan in config_plans:
+        if config_plan["legacy"]:
+            continue
+        config_lock.require_shared_config_release_behavior(
+            Path(config_plan["configRoot"]),
+            str(config_plan["identity"]),
+            {"behaviorInputs": config_plan["behaviorInputs"]},
+            results_root,
+        )
     if runtime_resolver is None:
         runtime_resolver = RepositoryLaunchRuntimeResolver(
             repository_root,
@@ -1606,8 +1629,9 @@ def _confirmed_plan_document(
     return parsed_plan.to_document()
 
 
-def _single_confirmed_pi_cell(
+def _confirmed_pi_cell(
     document: LaunchPlanDocument,
+    cell_document: Mapping[str, object],
 ) -> ConfirmedPiCell:
     subject = document["subject"]
     if subject["name"] != "pi":
@@ -1615,13 +1639,6 @@ def _single_confirmed_pi_cell(
             "Confirmed Pi execution subject mismatch: "
             f"expected 'pi', got {subject['name']!r}"
         )
-    batch_cells = document["batchCells"]
-    if len(batch_cells) != 1:
-        raise ValueError(
-            "Confirmed Pi execution cell count invalid: "
-            f"expected exactly one batch cell, got {len(batch_cells)}"
-        )
-    cell_document = batch_cells[0]
     config_identity = cell_document.get("config")
     task = cell_document.get("task")
     rep = cell_document.get("rep")
@@ -1691,6 +1708,32 @@ def _single_confirmed_pi_cell(
     )
 
 
+def _confirmed_pi_cells(
+    document: LaunchPlanDocument,
+    plan_field: str,
+) -> list[ConfirmedPiCell]:
+    """Materialize plan-resolved Pi cells without discovering launch inputs."""
+    planned_cells = document.get(plan_field)
+    if not isinstance(planned_cells, list):
+        raise TypeError(
+            f"Confirmed Pi execution cells invalid: {plan_field} must be a list"
+        )
+    cells: list[ConfirmedPiCell] = []
+    for index, cell_document in enumerate(planned_cells):
+        if not isinstance(cell_document, Mapping):
+            raise TypeError(
+                "Confirmed Pi execution cell invalid: "
+                f"{plan_field}[{index}] must be an object"
+            )
+        cells.append(
+            _confirmed_pi_cell(
+                document,
+                cast(Mapping[str, object], cell_document),
+            )
+        )
+    return cells
+
+
 def _confirmed_result_record(
     cell: ConfirmedPiCell,
     record: Mapping[str, object],
@@ -1726,34 +1769,56 @@ def _confirmed_result_record(
     return confirmed_record
 
 
-def _confirmed_run_manifest(
-    document: LaunchPlanDocument,
+def _confirmed_launch_log_path(state_path: Path) -> Path:
+    """Return the searchable structured-state log for a confirmed launch."""
+    return state_path / "logs" / "confirmed-pi-cell.log"
+
+
+def _confirmed_state_cell(
+    state_path: Path,
     cell: ConfirmedPiCell,
-    log_path: Path,
-) -> tuple[dict[str, object], dict[str, object]]:
-    state_cell = run_state.make_cell(
+) -> dict[str, object]:
+    """Project one plan-resolved cell into structured run state."""
+    return run_state.make_cell(
         task=cell.task,
         config=cell.config_identity,
         rep=cell.rep,
         result_path=cell.result_path,
-        log_path=log_path,
+        log_path=_confirmed_launch_log_path(state_path),
+        contract_path=(
+            str(cell.smoke_contract)
+            if cell.smoke_contract is not None
+            else None
+        ),
     )
+
+
+def _confirmed_run_manifest(
+    document: LaunchPlanDocument,
+    batch_cells: Sequence[ConfirmedPiCell],
+    preflight_cells: Sequence[ConfirmedPiCell],
+    state_path: Path,
+) -> dict[str, object]:
     manifest = run_state.base_manifest(
         run_id=document["runId"],
         command=["execute_confirmed_launch", document["planIdentity"]],
         cwd=document["paths"]["workspace"],
-        model=cell.model,
-        thinking=cell.thinking,
-        configs=[cell.config_identity],
+        model=document["model"],
+        thinking=document["thinking"],
+        configs=[config["identity"] for config in document["configs"]],
         selection=dict(document["selection"]),
-        runs=1,
-        workers=1,
+        runs=int(document["counts"]["reps"]),
+        workers=int(document["concurrency"]),
         agent="pi",
         agent_timeout_s=None,
         rpc_quiescence_s=None,
         progress_interval_s=None,
-        batch_cells=[state_cell],
-        preflight=[],
+        batch_cells=[
+            _confirmed_state_cell(state_path, cell) for cell in batch_cells
+        ],
+        preflight=[
+            _confirmed_state_cell(state_path, cell) for cell in preflight_cells
+        ],
     )
     manifest.update(
         {
@@ -1761,7 +1826,183 @@ def _confirmed_run_manifest(
             "launch_plan_path": "launch-plan.json",
         }
     )
-    return manifest, state_cell
+    return manifest
+
+
+def _append_confirmed_cell_log(
+    log_path: Path,
+    cell: ConfirmedPiCell,
+    message: str,
+) -> None:
+    """Append one cell-attributed message to the confirmed launch log."""
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(
+            f"cell={cell.task}/{cell.config_identity}/rep{cell.rep} {message}\n"
+        )
+
+
+def _run_confirmed_pi_cell(
+    cell: ConfirmedPiCell,
+    pi_runner: ConfirmedPiRunner,
+    log_path: Path,
+) -> dict[str, object]:
+    """Run one exact planned cell and persist its provenance-bearing result."""
+    cell.result_path.parent.mkdir(parents=True, exist_ok=True)
+    _append_confirmed_cell_log(log_path, cell, "started")
+    runner_record = pi_runner.run_confirmed_pi_cell(cell)
+    result_record = _confirmed_result_record(cell, runner_record)
+    run_state.atomic_write_json(cell.result_path, result_record)
+    _append_confirmed_cell_log(log_path, cell, "completed")
+    return result_record
+
+
+def _execute_confirmed_preflight_cell(
+    cell: ConfirmedPiCell,
+    state_path: Path,
+    state: run_state.RunStateWriter,
+    pi_runner: ConfirmedPiRunner,
+    log_path: Path,
+) -> bool:
+    """Run and atomically decide one confirmed preflight cell."""
+    state_cell = _confirmed_state_cell(state_path, cell)
+    state.preflight_started(state_cell)
+    diagnostics: list[confirmed_preflight.PreflightDiagnostic] = []
+    result_record: dict[str, object] = {}
+    exit_code: int | str | None = None
+    try:
+        result_record = _run_confirmed_pi_cell(cell, pi_runner, log_path)
+        raw_exit = result_record.get("agent_exit")
+        exit_code = raw_exit if isinstance(raw_exit, int | str) else None
+    except Exception as error:
+        exit_code = "exception"
+        diagnostics.append(
+            confirmed_preflight.preflight_diagnostic(
+                "subject_cell",
+                "runner",
+                f"{type(error).__name__}: {error}",
+            )
+        )
+        _append_confirmed_cell_log(
+            log_path,
+            cell,
+            f"failed: {type(error).__name__}: {error}",
+        )
+    cell_root = cell.result_path.parent
+    diagnostics.extend(
+        confirmed_preflight.evaluate_generic_preflight(cell_root, result_record)
+    )
+    diagnostics.extend(
+        confirmed_preflight.evaluate_config_preflight(
+            cell.config_root.parent.parent,
+            cell_root,
+            cell.smoke_contract,
+            result_record,
+        )
+    )
+    passed = not diagnostics
+    if passed:
+        result_record["preflight_passed"] = True
+        run_state.atomic_write_json(cell.result_path, result_record)
+    state.preflight_finished(
+        state_cell,
+        result_path=(cell.result_path if cell.result_path.is_file() else None),
+        log_path=log_path,
+        exit_code=exit_code,
+        diagnostics=[dict(diagnostic) for diagnostic in diagnostics],
+    )
+    return passed
+
+
+def _execute_confirmed_preflights(
+    cells: Sequence[ConfirmedPiCell],
+    state_path: Path,
+    state: run_state.RunStateWriter,
+    pi_runner: ConfirmedPiRunner,
+    log_path: Path,
+) -> set[Path]:
+    """Run every planned preflight and stop before batch on any failure."""
+    passed_paths: set[Path] = set()
+    failed_count = 0
+    for cell in cells:
+        if _execute_confirmed_preflight_cell(
+            cell,
+            state_path,
+            state,
+            pi_runner,
+            log_path,
+        ):
+            passed_paths.add(cell.result_path.resolve())
+        else:
+            failed_count += 1
+    if failed_count:
+        state.run_failed(
+            reason=(
+                "Confirmed launch preflight failed: "
+                f"{failed_count} cell(s) did not satisfy requirements"
+            )
+        )
+        raise LaunchPreflightError(
+            "Confirmed launch preflight failed: batch fan-out was not started"
+        )
+    return passed_paths
+
+
+def _execute_confirmed_batch_cell(
+    cell: ConfirmedPiCell,
+    state_path: Path,
+    state: run_state.RunStateWriter,
+    pi_runner: ConfirmedPiRunner,
+    log_path: Path,
+) -> None:
+    """Run one planned batch cell and record its durable outcome."""
+    state_cell = _confirmed_state_cell(state_path, cell)
+    state.cell_started(state_cell)
+    try:
+        result_record = _run_confirmed_pi_cell(cell, pi_runner, log_path)
+    except Exception as error:
+        _append_confirmed_cell_log(
+            log_path,
+            cell,
+            f"failed: {type(error).__name__}: {error}",
+        )
+        state.cell_finished(
+            state_cell,
+            log_path=log_path,
+            exit_code="exception",
+        )
+        state.run_failed(reason="Confirmed Pi cell execution failed")
+        raise
+    raw_exit = result_record.get("agent_exit")
+    exit_code = raw_exit if isinstance(raw_exit, int | str) else None
+    state.cell_finished(
+        state_cell,
+        result_path=cell.result_path,
+        log_path=log_path,
+        exit_code=exit_code,
+    )
+
+
+def _execute_confirmed_batch(
+    cells: Sequence[ConfirmedPiCell],
+    passed_preflight_paths: set[Path],
+    state_path: Path,
+    state: run_state.RunStateWriter,
+    pi_runner: ConfirmedPiRunner,
+    log_path: Path,
+) -> None:
+    """Fan out every planned batch cell once after atomic preflight."""
+    for cell in cells:
+        state_cell = _confirmed_state_cell(state_path, cell)
+        if cell.result_path.resolve() in passed_preflight_paths:
+            state.cell_skipped(state_cell, reason="successful_preflight")
+            continue
+        _execute_confirmed_batch_cell(
+            cell,
+            state_path,
+            state,
+            pi_runner,
+            log_path,
+        )
 
 
 def execute_confirmed_launch(
@@ -1770,9 +2011,12 @@ def execute_confirmed_launch(
     confirmation_identity: str | None,
     pi_runner: ConfirmedPiRunner,
 ) -> ConfirmedLaunchExecution:
-    """Execute one Pi cell only when its exact launch plan was confirmed."""
+    """Execute atomic preflight and conditional fan-out for one exact plan."""
     document = _confirmed_plan_document(plan, confirmation_identity)
-    cell = _single_confirmed_pi_cell(document)
+    batch_cells = _confirmed_pi_cells(document, "batchCells")
+    preflight_cells = _confirmed_pi_cells(document, "preflightCells")
+    if not batch_cells:
+        raise ValueError("Confirmed Pi execution cells invalid: batch is empty")
     state_path = Path(document["paths"]["statePath"])
     expected_state_path = (
         Path(document["paths"]["stateRoot"]) / document["runId"]
@@ -1784,53 +2028,39 @@ def execute_confirmed_launch(
             f"expected={str(expected_state_path)!r}"
         )
     log_path = state_path / "logs" / "confirmed-pi-cell.log"
-    manifest, state_cell = _confirmed_run_manifest(document, cell, log_path)
-    state = run_state.RunStateWriter(
-        document["paths"]["stateRoot"],
-        manifest,
+    manifest = _confirmed_run_manifest(
+        document,
+        batch_cells,
+        preflight_cells,
+        state_path,
     )
+    state = run_state.RunStateWriter(document["paths"]["stateRoot"], manifest)
     state.start()
-    plan_path = state_path / "launch-plan.json"
-    plan_path.write_text(plan.canonical_json)
+    (state_path / "launch-plan.json").write_text(plan.canonical_json)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(
         "Confirmed Pi cell execution\n"
-        f"launch_plan_identity={cell.launch_plan_identity}\n"
-        f"cell={cell.task}/{cell.config_identity}/rep{cell.rep}\n"
+        f"launch_plan_identity={document['planIdentity']}\n"
     )
-    state.cell_started(state_cell)
-    cell.result_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        runner_record = pi_runner.run_confirmed_pi_cell(cell)
-        result_record = _confirmed_result_record(cell, runner_record)
-        run_state.atomic_write_json(cell.result_path, result_record)
-    except Exception as error:
-        with log_path.open("a", encoding="utf-8") as log_file:
-            log_file.write(
-                "Confirmed Pi cell execution failed: "
-                f"{type(error).__name__}: {error}\n"
-            )
-        state.cell_finished(
-            state_cell,
-            log_path=log_path,
-            exit_code="exception",
-        )
-        state.run_failed(reason="Confirmed Pi cell execution failed")
-        raise
-    with log_path.open("a", encoding="utf-8") as log_file:
-        log_file.write("Confirmed Pi cell execution completed\n")
-    agent_exit = result_record.get("agent_exit")
-    if not isinstance(agent_exit, (int, str)):
-        agent_exit = None
-    state.cell_finished(
-        state_cell,
-        result_path=cell.result_path,
-        log_path=log_path,
-        exit_code=agent_exit,
+
+    passed_preflight_paths = _execute_confirmed_preflights(
+        preflight_cells,
+        state_path,
+        state,
+        pi_runner,
+        log_path,
+    )
+    _execute_confirmed_batch(
+        batch_cells,
+        passed_preflight_paths,
+        state_path,
+        state,
+        pi_runner,
+        log_path,
     )
     state.run_completed()
     return ConfirmedLaunchExecution(
-        result_path=cell.result_path,
+        result_path=batch_cells[0].result_path,
         state_path=state_path,
         log_path=log_path,
     )

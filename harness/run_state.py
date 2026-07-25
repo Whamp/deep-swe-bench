@@ -276,9 +276,18 @@ class RunStateWriter:
         log_path: str | Path | None = None,
         exit_code: int | str | None = None,
         transient_exit: int | None = None,
+        diagnostics: list[dict[str, object]] | None = None,
     ) -> None:
-        outcome, summary = summarize_result_path(result_path, exit_code=exit_code, transient_exit=transient_exit)
-        state = "passed" if outcome in {"ok", "empty"} else "failed"
+        outcome, summary = summarize_result_path(
+            result_path,
+            exit_code=exit_code,
+            transient_exit=transient_exit,
+        )
+        state = (
+            "passed"
+            if outcome in {"ok", "empty"} and not diagnostics
+            else "failed"
+        )
         self._finish_cell(
             "preflight",
             cell,
@@ -289,6 +298,7 @@ class RunStateWriter:
             result_path=result_path,
             log_path=log_path,
             exit_code=exit_code,
+            diagnostics=diagnostics,
         )
 
     def cell_started(self, cell: dict[str, Any]) -> None:
@@ -383,6 +393,7 @@ class RunStateWriter:
         log_path: str | Path | None = None,
         reason: str | None = None,
         exit_code: int | str | None = None,
+        diagnostics: list[dict[str, object]] | None = None,
     ) -> None:
         cid = cell["cell_id"]
         now = utc_now()
@@ -403,6 +414,8 @@ class RunStateWriter:
                 entry["reason"] = reason
             if exit_code is not None:
                 entry["exit_code"] = exit_code
+            if diagnostics is not None:
+                entry["diagnostics"] = diagnostics
             self._add_recent_locked(entry)
             self._refresh_active_locked()
             self._save_status_locked()
@@ -416,6 +429,7 @@ class RunStateWriter:
                 "log_path": log_path,
                 "reason": reason,
                 "exit_code": exit_code,
+                "diagnostics": diagnostics,
             }
             self._append_event_locked(event, **{k: v for k, v in payload.items() if v is not None})
 
