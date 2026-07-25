@@ -27,3 +27,9 @@
 ## 2026-07-11T16:49:40.91019527Z — medium
 
 > run_batch.py marked the workflow preflight cell passed, then set the run stage to failed with exit 1 but wrote no smoke-contract validation errors to batch.out or status.json. Diagnosing the failure required manually comparing result.json and isolation-audit.json against smoke.json. Current state: root cause found; future harness work should persist the exact smoke assertion failures in logs and structured run state.
+
+## 2026-07-25T22:54:06.950904652Z — high
+
+- Reporter: "pi"
+
+> Confirmed-launch planning accepted versioned config identity pi-check@1.0.0, but subject runners copied the identity into Docker container names without sanitizing '@'. The first real preflight failed before Docker start and model use. Fixed in c278293 with shared Pi/OMP name sanitization, exact regression coverage, property tests, and a Docker parser check. Planning should eventually validate all derived runtime identifiers before approval.
