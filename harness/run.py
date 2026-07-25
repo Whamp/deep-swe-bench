@@ -457,6 +457,16 @@ def pi_cmd(arm_cfg: dict, model: str, thinking: str, append_text: str,
     return cmd
 
 
+def require_explicit_cell_output(output_cell: Path | None) -> Path:
+    """Require a confirmed-plan or explicit draft-probe cell path."""
+    if output_cell is None:
+        raise ValueError(
+            "Confirmed launch or draft probe output required: run_cell cannot "
+            "select a canonical result cell implicitly"
+        )
+    return output_cell
+
+
 def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
              agent_timeout: float | None, keep: bool,
              pass_openai_codex_oauth: bool, rpc_quiescence: float,
@@ -480,12 +490,10 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
         if config_root is not None and config_leaf is not None
         else load_config(config, model, thinking)
     )
+    cell = require_explicit_cell_output(output_cell)
     ensure_env_image(task.env_image)
     pi_image = ensure_pi_image(task)
 
-    cell = output_cell or results_tree.Tree.of(
-        model, thinking, repo=REPO
-    ).cell(config, task_id, rep).dir
     cell.mkdir(parents=True, exist_ok=True)
     (cell / "artifacts").mkdir(exist_ok=True)
     (cell / "verifier").mkdir(exist_ok=True)

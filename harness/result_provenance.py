@@ -7,7 +7,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, cast
 
 RESULT_PROVENANCE_FIELDS = (
     "config",
@@ -35,6 +35,40 @@ _COMPARISON_TASK_FIELDS = (
     "immutable_image_identities",
     "verifier_identity",
 )
+_MODERN_PROVENANCE_MARKERS = frozenset(
+    {
+        "config_lock_identity",
+        "harness_revision",
+        "immutable_image_identities",
+        "subject",
+        "subject_version",
+        "task_revision",
+        "verifier_identity",
+    }
+)
+
+
+class ResultProvenance(TypedDict):
+    """Define modern setup identity shared by planning and result records."""
+
+    config: str
+    config_lock_identity: str | None
+    harness_revision: str
+    immutable_image_identities: dict[str, str]
+    model: str
+    rep: int
+    subject: str
+    subject_version: str
+    task: str
+    task_revision: str
+    thinking_level: str
+    verifier_identity: str
+
+
+class ConfirmedResultProvenance(ResultProvenance):
+    """Add the exact confirmed launch that wrote a canonical result."""
+
+    launch_plan_identity: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +129,11 @@ def result_provenance_mismatches(
     }
 
 
+def is_legacy_result_record(record: Mapping[str, object]) -> bool:
+    """Return whether a result predates every modern provenance marker."""
+    return not any(field in record for field in _MODERN_PROVENANCE_MARKERS)
+
+
 def _comparison_provenance_error(
     result_path: Path,
     mismatches: Mapping[str, object],
@@ -105,11 +144,114 @@ def _comparison_provenance_error(
     )
 
 
+def _comparison_path_mismatches(
+    selected: ComparisonResult,
+    model: str,
+    thinking: str,
+    *,
+    require_fields: bool,
+) -> dict[str, object]:
+    """Compare result fields represented by the canonical cell address."""
+    expected = {
+        "config": selected.config,
+        "model": model,
+        "rep": selected.rep,
+        "task": selected.task,
+        "thinking_level": thinking,
+    }
+    return {
+        field: {"expected": value, "recorded": selected.record.get(field)}
+        for field, value in expected.items()
+        if (require_fields or field in selected.record)
+        and selected.record.get(field) != value
+    }
+
+
+def _reference_field_mismatches(
+    current: Mapping[str, object],
+    reference: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        field: {"expected": expected, "recorded": current.get(field)}
+        for field, expected in reference.items()
+        if current.get(field) != expected
+    }
+
+
+def _comparison_shared_mismatches(
+    record: Mapping[str, object],
+    reference: Mapping[str, object] | None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Compare provenance fixed across every result in a comparison."""
+    current = {
+        field: record.get(field) for field in _COMPARISON_SHARED_FIELDS
+    }
+    mismatches = (
+        {}
+        if reference is None
+        else _reference_field_mismatches(current, reference)
+    )
+    return current, mismatches
+
+
+def _comparison_lock_mismatches(
+    selected: ComparisonResult,
+    config_locks: dict[str, object],
+) -> dict[str, object]:
+    """Compare one config release's lock across all selected reps."""
+    lock_identity = selected.record.get("config_lock_identity")
+    if selected.config not in config_locks:
+        config_locks[selected.config] = lock_identity
+        return {}
+    if config_locks[selected.config] == lock_identity:
+        return {}
+    return {
+        "config_lock_identity": {
+            "expected": config_locks[selected.config],
+            "recorded": lock_identity,
+        }
+    }
+
+
+def _comparison_task_mismatches(
+    selected: ComparisonResult,
+    task_provenance: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Compare verifier and image identity within one paired task."""
+    current = {
+        field: selected.record.get(field) for field in _COMPARISON_TASK_FIELDS
+    }
+    reference = task_provenance.setdefault(selected.task, current)
+    return _reference_field_mismatches(current, reference)
+
+
+def _require_compatible_legacy_comparison(
+    model: str,
+    thinking: str,
+    selected_results: Sequence[ComparisonResult],
+) -> None:
+    """Validate only address fields that historical records actually carry."""
+    for selected in selected_results:
+        mismatches = _comparison_path_mismatches(
+            selected,
+            model,
+            thinking,
+            require_fields=False,
+        )
+        if mismatches:
+            raise _comparison_provenance_error(
+                selected.result_path,
+                mismatches,
+            )
+
+
 def require_compatible_comparison_results(
     model: str,
     thinking: str,
     configs: Sequence[str],
     selected_results: list[ComparisonResult],
+    *,
+    allow_legacy_results: bool = False,
 ) -> None:
     """Reject selected comparison reps that do not share one exact setup."""
     config_order = {config: index for index, config in enumerate(configs)}
@@ -120,60 +262,55 @@ def require_compatible_comparison_results(
             result.rep,
         )
     )
+    legacy_results = [
+        selected
+        for selected in selected_results
+        if is_legacy_result_record(selected.record)
+    ]
+    if allow_legacy_results and legacy_results:
+        if len(legacy_results) != len(selected_results):
+            raise _comparison_provenance_error(
+                legacy_results[0].result_path,
+                {
+                    "legacy_provenance": (
+                        "mixed modern and legacy results are incompatible"
+                    )
+                },
+            )
+        _require_compatible_legacy_comparison(
+            model,
+            thinking,
+            selected_results,
+        )
+        return
+
     shared_reference: dict[str, object] | None = None
     config_locks: dict[str, object] = {}
     task_provenance: dict[str, dict[str, object]] = {}
     for selected in selected_results:
         record = selected.record
+        mismatches = _comparison_path_mismatches(
+            selected,
+            model,
+            thinking,
+            require_fields=True,
+        )
         missing = [
             field for field in RESULT_PROVENANCE_FIELDS if field not in record
         ]
-        expected_path_fields = {
-            "config": selected.config,
-            "model": model,
-            "rep": selected.rep,
-            "task": selected.task,
-            "thinking_level": thinking,
-        }
-        mismatches: dict[str, object] = {
-            field: {"expected": value, "recorded": record.get(field)}
-            for field, value in expected_path_fields.items()
-            if record.get(field) != value
-        }
         if missing:
             mismatches["missing_provenance"] = missing
-        current_shared = {
-            field: record.get(field) for field in _COMPARISON_SHARED_FIELDS
-        }
+        current_shared, shared_mismatches = _comparison_shared_mismatches(
+            record,
+            shared_reference,
+        )
         if shared_reference is None:
             shared_reference = current_shared
-        else:
-            for field, expected in shared_reference.items():
-                if current_shared[field] != expected:
-                    mismatches[field] = {
-                        "expected": expected,
-                        "recorded": current_shared[field],
-                    }
-        lock_identity = record.get("config_lock_identity")
-        if selected.config not in config_locks:
-            config_locks[selected.config] = lock_identity
-        elif config_locks[selected.config] != lock_identity:
-            mismatches["config_lock_identity"] = {
-                "expected": config_locks[selected.config],
-                "recorded": lock_identity,
-            }
-        current_task = {
-            field: record.get(field) for field in _COMPARISON_TASK_FIELDS
-        }
-        if selected.task not in task_provenance:
-            task_provenance[selected.task] = current_task
-        else:
-            for field, expected in task_provenance[selected.task].items():
-                if current_task[field] != expected:
-                    mismatches[field] = {
-                        "expected": expected,
-                        "recorded": current_task[field],
-                    }
+        mismatches.update(shared_mismatches)
+        mismatches.update(_comparison_lock_mismatches(selected, config_locks))
+        mismatches.update(
+            _comparison_task_mismatches(selected, task_provenance)
+        )
         if mismatches:
             raise _comparison_provenance_error(
                 selected.result_path,

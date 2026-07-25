@@ -13,9 +13,10 @@ import socket
 import threading
 import time
 from collections import deque
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 
 SCHEMA_VERSION = 1
@@ -242,27 +243,38 @@ class RunStateWriter:
         """Restart scheduling while preserving prior structured run events."""
         with self._lock:
             self.run_dir.mkdir(parents=True, exist_ok=True)
-            previous_status: dict[str, Any] = {}
+            previous_status: Mapping[str, object] = {}
             if self.status_path.is_file():
-                loaded_status = json.loads(self.status_path.read_text())
-                if isinstance(loaded_status, dict):
-                    previous_status = loaded_status
+                loaded_status: object = json.loads(
+                    self.status_path.read_text()
+                )
+                if isinstance(loaded_status, Mapping):
+                    previous_status = cast(
+                        Mapping[str, object],
+                        loaded_status,
+                    )
             if self.events_path.is_file():
                 for line in self.events_path.read_text().splitlines():
                     try:
-                        event = json.loads(line)
+                        event: object = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if isinstance(event, dict):
-                        self._seq = max(
-                            self._seq,
-                            int(event.get("seq") or 0),
-                        )
+                    if isinstance(event, Mapping):
+                        sequence = event.get("seq")
+                        if isinstance(sequence, int) and not isinstance(
+                            sequence, bool
+                        ):
+                            self._seq = max(self._seq, sequence)
             if previous_status.get("started_at"):
                 self.status["started_at"] = previous_status["started_at"]
-            self.status["resume_count"] = int(
-                previous_status.get("resume_count") or 0
-            ) + 1
+            previous_resume_count = previous_status.get("resume_count")
+            resume_count = (
+                previous_resume_count
+                if isinstance(previous_resume_count, int)
+                and not isinstance(previous_resume_count, bool)
+                else 0
+            )
+            self.status["resume_count"] = resume_count + 1
             atomic_write_json(self.manifest_path, self.manifest)
             self._save_status_locked()
             self._append_event_locked("run_resumed", kind="run")
@@ -299,6 +311,32 @@ class RunStateWriter:
 
     def preflight_started(self, cell: dict[str, Any]) -> None:
         self._start_cell("preflight", cell, event="preflight_started")
+
+    def preflight_attempt_paused(
+        self,
+        cell: dict[str, Any],
+        *,
+        reason: str,
+        log_path: str | Path | None = None,
+        exit_code: int = 75,
+    ) -> None:
+        """Record a nonterminal preflight attempt paused by a transient."""
+        outcome, summary = summarize_result_path(
+            None,
+            exit_code=exit_code,
+            transient_exit=exit_code,
+        )
+        self._finish_cell(
+            "preflight",
+            cell,
+            event="preflight_attempt_paused",
+            state="pending",
+            outcome=outcome,
+            summary=summary,
+            log_path=log_path,
+            reason=reason,
+            exit_code=exit_code,
+        )
 
     def preflight_finished(
         self,
@@ -716,22 +754,26 @@ def _enrich_active_cells(active_cells: list[dict[str, Any]]) -> tuple[list[dict[
     return enriched, max_age, stale
 
 
-def project_atomic_preflight_state(status: dict[str, Any]) -> str:
-    """Project the truthful run-level state of the complete preflight gate.
+def project_atomic_preflight_state(status: Mapping[str, object]) -> str:
+    """
+    Project the truthful run-level state of the complete preflight gate.
 
     Args:
         status: Durable structured-run status with per-config preflight cells.
 
     Returns:
         One aggregate state that cannot pass before every preflight passes.
+
     """
     preflight = status.get("preflight")
-    if not isinstance(preflight, dict) or not preflight:
+    if not isinstance(preflight, Mapping) or not preflight:
         return "not_required"
     states = {
-        cell.get("state")
+        state
         for cell in preflight.values()
-        if isinstance(cell, dict)
+        if isinstance(cell, Mapping)
+        for state in (cell.get("state"),)
+        if isinstance(state, str)
     }
     if "failed" in states:
         return "failed"

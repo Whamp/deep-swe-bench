@@ -134,15 +134,19 @@ python -m harness.config_lock create \
   --config '<name>@<major>.<minor>.<patch>' \
   --model '<provider/model>' \
   --thinking '<thinking>' \
+  --state-root "$DEEP_SWE_BENCH_STATE_ROOT" \
   --version-impact rerun \
   --metadata /path/to/release-metadata.json
 ```
 
 Release metadata is a JSON object. It may contain `declaredRoles`,
 `usageSources`, `requiredCapabilities`, `testedSubjectVersions`,
-`credentialRoutes`, and `previousRelease`. Use `refresh` instead of `create` only
-for an editable draft after failed review or preflight. Planning and subject
-execution only verify locks; they never write them.
+`credentialRoutes`, and `previousRelease`. Non-executor roles map their compact
+trace selector to call and token result fields as documented in
+[`confirmed-launch-role-declarations.md`](../docs/confirmed-launch-role-declarations.md).
+Use `refresh` instead of `create` only for an editable draft after failed review
+or preflight. The configured state root is also the cross-worktree seal registry;
+planning and subject execution verify locks read-only and never refresh them.
 
 Run the read-only check directly when diagnosing drift:
 

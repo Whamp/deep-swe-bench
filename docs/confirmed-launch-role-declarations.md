@@ -17,6 +17,8 @@ Each object in `declaredRoles` contains:
 - `credentialRoute`: a route name also listed in `credentialRoutes`.
 - `billingCategory`: `subscription quota`, `paid API`, or `local compute`.
 - `usageSource`: a `path` listed in `usageSources` and a compact `format`.
+  Every non-executor source also declares a structured `recordSelector` and a
+  `resultAccounting` mapping with `calls` and `totalTokens` result fields.
 - `callBehavior`: fixed or bounded calls per rep plus finite concurrency.
 
 The supported compact usage formats are `native-session`,
@@ -25,6 +27,32 @@ The supported compact usage formats are `native-session`,
 
 The executor is mandatory. Its fixed model and thinking must match the launch
 request.
+
+### Secondary usage accounting
+
+A secondary role must connect its compact trace to both preflight evidence and
+`result.json` accounting:
+
+```json
+{
+  "format": "filtered-tool-events",
+  "path": "tool-usage.jsonl",
+  "recordSelector": {
+    "type": "tool_execution_end",
+    "toolName": "advisor"
+  },
+  "resultAccounting": {
+    "calls": "advisor_calls",
+    "totalTokens": "advisor_total_tokens"
+  }
+}
+```
+
+The versioned smoke contract must contain a `requireUsageRecords` assertion for
+the same path and selector, plus positive `minResultValues` assertions for both
+mapped result fields. Planning rejects a secondary role when any link is
+missing. Preflight therefore cannot pass merely because executor-native session
+usage exists.
 
 ### Fixed model
 

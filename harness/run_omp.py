@@ -42,6 +42,7 @@ from run import (  # noqa: E402
     load_config,
     load_resolved_config,
     require_draft_probe_output,
+    require_explicit_cell_output,
     sh,
     strip_patch_paths,
     transient_model_error,
@@ -95,6 +96,14 @@ def omp_overlay_in_container(config_dir: Path) -> str | None:
     return "/arm/omp-overlay.yml" if (config_dir / "omp-overlay.yml").exists() else None
 
 
+def render_omp_system_prompt_template(template: str) -> str:
+    """Render approved OMP date and working-directory template variables."""
+    return template.replace(
+        "{{current_date}}",
+        date.today().isoformat(),
+    ).replace("{{cwd}}", "/app")
+
+
 def render_omp_system_prompt(config_dir: Path) -> str | None:
     """Return a config-local OMP system prompt override, if present.
 
@@ -106,10 +115,7 @@ def render_omp_system_prompt(config_dir: Path) -> str | None:
     path = config_dir / "omp-system-prompt.md"
     if not path.exists():
         return None
-    text = path.read_text()
-    return (text
-            .replace("{{current_date}}", date.today().isoformat())
-            .replace("{{cwd}}", "/app"))
+    return render_omp_system_prompt_template(path.read_text())
 
 
 def resolve_omp_extensions(config_dir: Path) -> list[str]:
@@ -300,12 +306,10 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     if cfg.get("models_json") or cfg.get("advisor_json") or cfg.get("settings_json"):
         sys.exit("baseline OMP configs must not define model/advisor/settings leaves")
 
+    cell = require_explicit_cell_output(output_cell)
     ensure_env_image(task.env_image)
     agent_image = ensure_pi_image(task)
 
-    cell = output_cell or results_tree.Tree.of(
-        model, thinking, repo=REPO
-    ).cell(config, task_id, rep).dir
     cell.mkdir(parents=True, exist_ok=True)
     (cell / "artifacts").mkdir(exist_ok=True)
     (cell / "verifier").mkdir(exist_ok=True)

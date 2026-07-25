@@ -46,7 +46,12 @@ class ResolvedConfigLeaf:
 def parse_versioned_config_identity(
     config: str,
 ) -> VersionedConfigIdentity | None:
-    """Parse a versioned config identity while preserving legacy names."""
+    """Parse a versioned config identity while preserving safe legacy names."""
+    if not config or any(separator in config for separator in ("/", ",", "\0")):
+        raise ValueError(
+            "Config identity invalid: expected a non-empty identity in one "
+            f"path segment; got {config!r}"
+        )
     if "@" not in config:
         return None
     match = _VERSIONED_CONFIG_IDENTITY.fullmatch(config)

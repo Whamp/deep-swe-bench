@@ -8,7 +8,6 @@ import sqlite3
 import tempfile
 from collections.abc import Mapping
 from dataclasses import replace
-from datetime import datetime
 from pathlib import Path
 from typing import cast
 
@@ -28,6 +27,31 @@ from harness.launch import (
     confirmed_launch_run_key,
     parse_launch_plan_json,
 )
+
+
+def _write_fixture_config_lock(
+    repository_root: Path,
+    config_identity: str,
+    model: str,
+    thinking: str,
+    version_impact: str,
+    metadata: Mapping[str, object],
+    *,
+    replace: bool = False,
+    results_root: Path | None = None,
+) -> Path:
+    """Write a lock against the fixture's configured central state root."""
+    return config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        model,
+        thinking,
+        version_impact,
+        metadata,
+        state_root=repository_root.parent / "central-state",
+        replace=replace,
+        results_root=results_root,
+    )
 
 
 class FakeLaunchRuntimeResolver:
@@ -68,7 +92,7 @@ def _create_locked_config(
     (config_leaf / "smoke.json").write_text(
         json.dumps(smoke_contract, sort_keys=True) + "\n"
     )
-    config_lock.write_config_lock(
+    _write_fixture_config_lock(
         repository_root,
         config_identity,
         "provider/model",
@@ -215,7 +239,7 @@ def _write_omp_launch_fixture(
     extension.write_text("export default function strip() {}\n")
     (config_root / "omp-extensions.txt").write_text("extensions/strip.js\n")
     (config_leaf / "smoke.json").write_text('{"requireFiles":[]}\n')
-    config_lock.write_config_lock(
+    _write_fixture_config_lock(
         repository_root,
         config_identity,
         "openai-codex/gpt-5.5",
@@ -428,8 +452,9 @@ def test_omp_runtime_resolution_uses_omp_provider_credential_and_binary(
 
 def test_omp_launch_planning_records_exact_resolved_subject_behavior(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OMP planning freezes binary and config behavior before confirmation."""
+    """OMP planning freezes templates without date-dependent plan identity."""
     request, repository_root, tasks_root, results_root, state_root = (
         _write_omp_launch_fixture(tmp_path)
     )
@@ -445,7 +470,44 @@ def test_omp_launch_planning_records_exact_resolved_subject_behavior(
         },
     )
 
+    def fixed_datetime(date_text: str) -> type:
+        class FixedDateTime:
+            @classmethod
+            def now(cls) -> FixedDateTime:
+                return cls()
+
+            def astimezone(self) -> FixedDateTime:
+                return self
+
+            def date(self) -> FixedDateTime:
+                return self
+
+            def isoformat(self) -> str:
+                return date_text
+
+        return FixedDateTime
+
+    monkeypatch.setattr(
+        launch,
+        "datetime",
+        fixed_datetime("2025-01-01"),
+        raising=False,
+    )
     compiled = compile_launch_request(
+        request,
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=FakeLaunchRuntimeResolver(runtime),
+    )
+    monkeypatch.setattr(
+        launch,
+        "datetime",
+        fixed_datetime("2025-01-02"),
+        raising=False,
+    )
+    next_day = compile_launch_request(
         request,
         repository_root=repository_root,
         tasks_root=tasks_root,
@@ -455,6 +517,8 @@ def test_omp_launch_planning_records_exact_resolved_subject_behavior(
     )
 
     document = compiled.plan.to_document()
+    assert compiled.plan.identity == next_day.plan.identity
+    assert compiled.plan.canonical_json == next_day.plan.canonical_json
     assert document["subject"] == {
         "name": "omp",
         "runner": str(repository_root / "harness" / "run_omp.py"),
@@ -472,9 +536,7 @@ def test_omp_launch_planning_records_exact_resolved_subject_behavior(
         "extensions": ["/arm/extensions/strip.js"],
         "modelRoute": "openai-codex",
         "overlay": "/arm/omp-overlay.yml",
-        "systemPrompt": (
-            f"date={datetime.now().astimezone().date().isoformat()} cwd=/app\n"
-        ),
+        "systemPrompt": "date={{current_date}} cwd=/app\n",
         "toolWhitelist": ["read", "bash", "edit", "write"],
     }
     assert "OPENAI_CODEX_OAUTH" in compiled.receipt
@@ -507,7 +569,7 @@ def _refresh_omp_fixture_lock(repository_root: Path) -> None:
         "testedSubjectVersions",
         "usageSources",
     )
-    config_lock.write_config_lock(
+    _write_fixture_config_lock(
         repository_root,
         config_identity,
         "openai-codex/gpt-5.5",
@@ -682,18 +744,23 @@ def test_launch_planning_rejects_newline_sensitive_smoke_gate(
     assert "newline placement" in message
 
 
-def test_launch_planning_rejects_character_count_smoke_gate(
+@pytest.mark.parametrize(
+    "field",
+    ["orchestration_chars", "responseLength", "output_line_count"],
+)
+def test_launch_planning_rejects_output_length_smoke_gate(
     tmp_path: Path,
+    field: str,
 ) -> None:
-    """Character counts cannot authorize a versioned launch."""
+    """Output lengths and line counts cannot authorize a versioned launch."""
     message = _reject_versioned_smoke_contract(
         tmp_path,
-        {"equalsResultValues": {"orchestration_chars": 973}},
+        {"equalsResultValues": {field: 973}},
     )
 
     assert "assertion_kind='equalsResultValues'" in message
-    assert "target='orchestration_chars'" in message
-    assert "character counts" in message
+    assert f"target={field!r}" in message
+    assert "output length" in message
 
 
 def test_launch_planning_rejects_unknown_smoke_assertion_kind(
@@ -848,7 +915,7 @@ def test_launch_planning_accepts_durable_versioned_smoke_gates(
     )
     previous_lock = json.loads(lock_path.read_text())
     lock_path.unlink()
-    config_lock.write_config_lock(
+    _write_fixture_config_lock(
         repository_root,
         config_identity,
         "provider/model",
@@ -1088,6 +1155,11 @@ def test_launch_plan_resolves_and_renders_declared_model_role_patterns(
             "usageSource": {
                 "format": "filtered-tool-events",
                 "path": "tool-usage.jsonl",
+                "recordSelector": {"role": "advisor"},
+                "resultAccounting": {
+                    "calls": "advisor_calls",
+                    "totalTokens": "advisor_total_tokens",
+                },
             },
         },
         {
@@ -1106,6 +1178,11 @@ def test_launch_plan_resolves_and_renders_declared_model_role_patterns(
                 "path": (
                     "pi-agent/observational-memory/worker-usage/usage.ndjson"
                 ),
+                "recordSelector": {"role": "memory-observer"},
+                "resultAccounting": {
+                    "calls": "om_observer_calls",
+                    "totalTokens": "om_observer_total_tokens",
+                },
             },
         },
         {
@@ -1122,6 +1199,11 @@ def test_launch_plan_resolves_and_renders_declared_model_role_patterns(
             "usageSource": {
                 "format": "compact-jsonl",
                 "path": "recursive-usage/usage.ndjson",
+                "recordSelector": {"role": "recursive-child"},
+                "resultAccounting": {
+                    "calls": "recursive_child_calls",
+                    "totalTokens": "recursive_child_total_tokens",
+                },
             },
         },
         {
@@ -1152,6 +1234,11 @@ def test_launch_plan_resolves_and_renders_declared_model_role_patterns(
             "usageSource": {
                 "format": "compact-jsonl",
                 "path": "workflow-usage/usage.ndjson",
+                "recordSelector": {"role": "workflow-worker"},
+                "resultAccounting": {
+                    "calls": "workflow_calls",
+                    "totalTokens": "workflow_total_tokens",
+                },
             },
         },
     ]
@@ -1160,9 +1247,50 @@ def test_launch_plan_resolves_and_renders_declared_model_role_patterns(
         extension_path = config_root / "extensions" / "roles.ts"
         extension_path.parent.mkdir()
         extension_path.write_text("export default {}\n")
+        smoke_path = config_root / "model" / "low" / "smoke.json"
+        smoke_path.write_text(
+            json.dumps(
+                {
+                    "minResultValues": {
+                        "advisor_calls": 1,
+                        "advisor_total_tokens": 1,
+                        "om_observer_calls": 1,
+                        "om_observer_total_tokens": 1,
+                        "recursive_child_calls": 1,
+                        "recursive_child_total_tokens": 1,
+                        "workflow_calls": 1,
+                        "workflow_total_tokens": 1,
+                    },
+                    "requireUsageRecords": [
+                        {
+                            "equals": {"role": role_name},
+                            "globs": [usage_path],
+                            "minimum": 1,
+                        }
+                        for role_name, usage_path in (
+                            ("advisor", "tool-usage.jsonl"),
+                            (
+                                "memory-observer",
+                                "pi-agent/observational-memory/worker-usage/"
+                                "usage.ndjson",
+                            ),
+                            (
+                                "recursive-child",
+                                "recursive-usage/usage.ndjson",
+                            ),
+                            (
+                                "workflow-worker",
+                                "workflow-usage/usage.ndjson",
+                            ),
+                        )
+                    ],
+                }
+            )
+            + "\n"
+        )
         lock_path = config_root / "model" / "low" / "config-lock.json"
         lock_path.unlink()
-        config_lock.write_config_lock(
+        _write_fixture_config_lock(
             repository_root,
             config_identity,
             "provider/model",
@@ -1304,7 +1432,7 @@ def test_launch_planning_rejects_missing_subject_capability(
     )
     previous_lock = json.loads(lock_path.read_text())
     lock_path.unlink()
-    config_lock.write_config_lock(
+    _write_fixture_config_lock(
         repository_root,
         config_identity,
         "provider/model",
@@ -1384,7 +1512,7 @@ def test_launch_planning_rejects_executor_role_mismatch(tmp_path: Path) -> None:
     selection["model"] = "provider/other-model"
     role["modelSelection"] = selection
     lock_path.unlink()
-    config_lock.write_config_lock(
+    _write_fixture_config_lock(
         repository_root,
         config_identity,
         "provider/model",
@@ -1438,7 +1566,7 @@ def test_launch_planning_rejects_incomplete_model_role_declaration(
     selection.pop("provider")
     role["modelSelection"] = selection
     lock_path.unlink()
-    config_lock.write_config_lock(
+    _write_fixture_config_lock(
         repository_root,
         config_identity,
         "provider/model",
@@ -1490,7 +1618,7 @@ def test_launch_planning_rejects_role_without_compact_usage_source(
     role = dict(previous_lock["declaredRoles"][0])
     role.pop("usageSource")
     lock_path.unlink()
-    config_lock.write_config_lock(
+    _write_fixture_config_lock(
         repository_root,
         config_identity,
         "provider/model",
@@ -1539,7 +1667,7 @@ def test_launch_planning_requires_clarification_for_undeclared_model_roles(
         / "config-lock.json"
     )
     lock_path.unlink()
-    config_lock.write_config_lock(
+    _write_fixture_config_lock(
         repository_root,
         config_identity,
         "provider/model",
@@ -1588,7 +1716,7 @@ def test_launch_planning_requires_clarification_for_unbounded_role_calls(
     role = dict(previous_lock["declaredRoles"][0])
     role["callBehavior"] = {"kind": "unbounded"}
     lock_path.unlink()
-    config_lock.write_config_lock(
+    _write_fixture_config_lock(
         repository_root,
         config_identity,
         "provider/model",
@@ -1641,7 +1769,7 @@ def test_launch_planning_requires_clarification_for_unbounded_model_selection(
         / "config-lock.json"
     )
     lock_path.unlink()
-    config_lock.write_config_lock(
+    _write_fixture_config_lock(
         repository_root,
         config_identity,
         "provider/model",
@@ -1709,7 +1837,7 @@ def test_launch_planning_requires_clarification_for_unknown_extension_behavior(
     extension_path.write_text("export default {}\n")
     lock_path = config_root / "model" / "low" / "config-lock.json"
     lock_path.unlink()
-    config_lock.write_config_lock(
+    _write_fixture_config_lock(
         repository_root,
         config_identity,
         "provider/model",
@@ -2159,7 +2287,7 @@ def test_launch_plan_and_receipt_exclude_config_secret_values(
         role["credentialRoute"] = "OPENAI_API_KEY"
         lock_path.unlink()
         (config_root / "env").write_text(f"OPENAI_API_KEY={secret}\n")
-        config_lock.write_config_lock(
+        _write_fixture_config_lock(
             repository_root,
             config_identity,
             "provider/model",

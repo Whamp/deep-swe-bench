@@ -247,6 +247,11 @@ python harness/analyze.py \
   --configs baseline,ponytail-extension
 ```
 
+Analysis requires complete compatible modern provenance by default. Historical
+comparisons may use `--allow-legacy-results` only as an explicit decision over an
+entirely legacy corpus; mixed modern/legacy provenance and unreadable selected
+results still fail visibly.
+
 Main success metric is `reward_partial` from DeepSWE `reward.json`. Binary
 `reward` is reported, but long-horizon tasks often show partial progress before
 full solve, so partial is the primary paired metric.

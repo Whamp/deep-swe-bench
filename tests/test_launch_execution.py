@@ -391,6 +391,7 @@ def _compile_single_omp_launch(
     agent_timeout_s: float | None = None,
     rpc_quiescence_s: float = 2.0,
     capture_initial_context: bool = True,
+    system_prompt_template: str | None = None,
 ) -> tuple[CompiledLaunch, Path]:
     """Compile one OMP preflight cell against temporary fixture inputs."""
     repository_root = tmp_path / "repository"
@@ -403,6 +404,10 @@ def _compile_single_omp_launch(
     config_leaf.mkdir(parents=True)
     (config_root / "orchestration.md").write_text("Fixture behavior.\n")
     (config_root / "omp-tools.txt").write_text("read,bash,edit,write\n")
+    if system_prompt_template is not None:
+        (config_root / "omp-system-prompt.md").write_text(
+            system_prompt_template
+        )
     (config_leaf / "smoke.json").write_text('{"requireFiles":[]}\n')
     config_lock.write_config_lock(
         repository_root,
@@ -439,6 +444,7 @@ def _compile_single_omp_launch(
             "testedSubjectVersions": ["omp@16.3.5"],
             "usageSources": ["session/*.jsonl"],
         },
+        state_root=state_root,
     )
     subject_runner = repository_root / "harness" / "run_omp.py"
     subject_runner.parent.mkdir(parents=True)
@@ -513,6 +519,7 @@ def _compile_single_cell_launch(
     agent_timeout_s: float | None = None,
     rpc_quiescence_s: float = 2.0,
     capture_initial_context: bool = True,
+    config_lock_metadata: Mapping[str, object] | None = None,
 ) -> tuple[CompiledLaunch, Path, Path, Path, Path]:
     repository_root = tmp_path / "repository"
     tasks_root = tmp_path / "tasks"
@@ -539,7 +546,8 @@ def _compile_single_cell_launch(
         "provider/model",
         "low",
         version_impact,
-        _config_lock_metadata(),
+        config_lock_metadata or _config_lock_metadata(),
+        state_root=state_root,
     )
     subject_runner = repository_root / "harness" / "run.py"
     subject_runner.parent.mkdir(parents=True)
@@ -783,6 +791,78 @@ def test_confirmed_launch_resumes_after_transient_without_rerunning_rep(
     assert "run_resumed" in event_names
 
 
+def test_confirmed_preflight_pause_resumes_with_one_terminal_verdict(
+    tmp_path: Path,
+) -> None:
+    """A transient attempt stays nonterminal until resumed preflight passes."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        preflight="required",
+        transient_errors="pause",
+    )
+
+    class PausedPreflightRunner(FakeConfirmedPiRunner):
+        """Pause the first preflight attempt before writing evidence."""
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            self.calls.append(cell)
+            raise LaunchTransientModelError("fixture preflight quota window")
+
+    paused_runner = PausedPreflightRunner(
+        _planned_launch_plan_path(compiled)
+    )
+    with pytest.raises(LaunchTransientModelError):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=paused_runner,
+        )
+
+    state_path = _registered_state_path(state_root, "confirmed-fixture")
+    paused_status = json.loads((state_path / "status.json").read_text())
+    paused_preflight = paused_status["preflight"][
+        "task-a/baseline@1.0.0/rep0"
+    ]
+    assert paused_preflight["state"] == "pending"
+    paused_events = [
+        json.loads(line)
+        for line in (state_path / "events.ndjson").read_text().splitlines()
+    ]
+    assert sum(
+        event["event"] == "preflight_attempt_paused"
+        for event in paused_events
+    ) == 1
+    assert all(
+        event["event"] != "preflight_finished" for event in paused_events
+    )
+
+    resumed_runner = FakeConfirmedPiRunner(
+        _planned_launch_plan_path(compiled)
+    )
+    execute_confirmed_launch(
+        compiled.plan,
+        confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
+        pi_runner=resumed_runner,
+    )
+
+    final_events = [
+        json.loads(line)
+        for line in (state_path / "events.ndjson").read_text().splitlines()
+    ]
+    assert sum(
+        event["event"] == "preflight_finished" for event in final_events
+    ) == 1
+    final_status = json.loads((state_path / "status.json").read_text())
+    assert final_status["preflight"][
+        "task-a/baseline@1.0.0/rep0"
+    ]["state"] == "passed"
+
+
 @pytest.mark.parametrize("preflight", ["disabled", "required"])
 def test_confirmed_launch_honors_transient_stop_policy(
     tmp_path: Path,
@@ -877,6 +957,7 @@ def test_execute_command_default_omp_runner_uses_plan_resolved_behavior(
         agent_timeout_s=654.0,
         rpc_quiescence_s=3.5,
         capture_initial_context=False,
+        system_prompt_template="date={{current_date}} cwd={{cwd}}\n",
     )
     reviewed_plan_path = tmp_path / "reviewed-omp-launch-plan.json"
     reviewed_plan_path.write_text(compiled.plan.canonical_json)
@@ -892,10 +973,21 @@ def test_execute_command_default_omp_runner_uses_plan_resolved_behavior(
         "verifier_exit": 0,
     }
 
-    with patch(
-        "harness.run_omp.run_cell",
-        return_value=legacy_result,
-    ) as run_cell:
+    class FixedDate:
+        @classmethod
+        def today(cls) -> FixedDate:
+            return cls()
+
+        def isoformat(self) -> str:
+            return "2025-01-02"
+
+    with (
+        patch("harness.run_omp.date", FixedDate),
+        patch(
+            "harness.run_omp.run_cell",
+            return_value=legacy_result,
+        ) as run_cell,
+    ):
         run_batch.main(
             [
                 "execute",
@@ -912,10 +1004,14 @@ def test_execute_command_default_omp_runner_uses_plan_resolved_behavior(
     call = run_cell.call_args
     assert call.kwargs["config_root"] == Path(planned_config["configRoot"])
     assert call.kwargs["config_leaf"] == Path(planned_config["configLeaf"])
-    assert (
-        call.kwargs["subject_behavior"]
-        == plan_document["configs"][0]["subjectBehavior"]
+    planned_behavior = plan_document["configs"][0]["subjectBehavior"]
+    assert planned_behavior["systemPrompt"] == (
+        "date={{current_date}} cwd=/app\n"
     )
+    assert call.kwargs["subject_behavior"] == {
+        **planned_behavior,
+        "systemPrompt": "date=2025-01-02 cwd=/app\n",
+    }
     assert call.kwargs["omp_binary_path"] == Path("/fixture/bin/omp")
     assert call.kwargs["agent_timeout"] == 654.0
     assert call.kwargs["rpc_quiescence"] == 3.5
@@ -1055,6 +1151,48 @@ def test_confirmed_omp_launch_stops_before_binary_identity_drifted_rep(
             },
         }
     ]
+
+
+def test_config_seal_blocks_refresh_from_another_result_root(
+    tmp_path: Path,
+) -> None:
+    """Central preflight evidence seals matching locks across worktrees."""
+    state_root = tmp_path / "central-state"
+    workspace_a = tmp_path / "worktree-a"
+    workspace_b = tmp_path / "worktree-b"
+    compiled_a, _, _, _, _ = _compile_single_cell_launch(
+        workspace_a,
+        preflight="required",
+        state_root=state_root,
+    )
+    _, config_leaf_b, _, results_b, _ = _compile_single_cell_launch(
+        workspace_b,
+        preflight="required",
+        state_root=state_root,
+    )
+    execute_confirmed_launch(
+        compiled_a.plan,
+        confirmation_identity=compiled_a.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled_a),
+        pi_runner=FakeConfirmedPiRunner(_planned_launch_plan_path(compiled_a)),
+    )
+    prompt_b = config_leaf_b.parents[1] / "orchestration.md"
+    prompt_b.write_text("Changed from another worktree.\n")
+
+    with pytest.raises(ValueError, match=r"^Config lock sealed:"):
+        config_lock.write_config_lock(
+            workspace_b / "repository",
+            "baseline@1.0.0",
+            "provider/model",
+            "low",
+            "rerun",
+            _config_lock_metadata(),
+            replace=True,
+            results_root=results_b,
+            state_root=state_root,
+        )
+
+    assert not results_b.exists()
 
 
 def test_confirmed_worktree_launches_register_centrally_with_provenance(
@@ -1326,6 +1464,124 @@ def test_confirmed_batch_honors_approved_missing_result_retries(
     assert "run_failed" not in event_names
 
 
+def _secondary_usage_config_lock_metadata() -> dict[str, object]:
+    """Declare one advisor with explicit trace and result accounting."""
+    metadata = _config_lock_metadata()
+    roles = cast(list[dict[str, object]], metadata["declaredRoles"])
+    roles.append(
+        {
+            "billingCategory": "paid API",
+            "callBehavior": {
+                "kind": "bounded",
+                "maxCallsPerRep": 2,
+                "maxConcurrency": 1,
+            },
+            "credentialRoute": "FIXTURE_CREDENTIAL",
+            "modelSelection": {
+                "kind": "fixed",
+                "model": "provider/advisor",
+                "provider": "provider",
+                "thinking": "medium",
+            },
+            "name": "advisor",
+            "roleKind": "advisor",
+            "usageSource": {
+                "format": "filtered-tool-events",
+                "path": "tool-usage.jsonl",
+                "recordSelector": {
+                    "toolName": "advisor",
+                    "type": "tool_execution_end",
+                },
+                "resultAccounting": {
+                    "calls": "advisor_calls",
+                    "totalTokens": "advisor_total_tokens",
+                },
+            },
+        }
+    )
+    surfaces = cast(list[dict[str, object]], metadata["launchSurfaces"])
+    surfaces[0]["modelRoles"] = ["executor", "advisor"]
+    metadata["usageSources"] = ["session/*.jsonl", "tool-usage.jsonl"]
+    return metadata
+
+
+def test_planning_rejects_secondary_role_without_usage_evidence_contract(
+    tmp_path: Path,
+) -> None:
+    """A declared secondary source must be enforceable by preflight."""
+    with pytest.raises(
+        ValueError,
+        match=r"^Launch model role usage evidence missing:",
+    ):
+        _compile_single_cell_launch(
+            tmp_path,
+            preflight="required",
+            config_lock_metadata=_secondary_usage_config_lock_metadata(),
+        )
+
+
+def test_missing_secondary_role_trace_fails_confirmed_preflight(
+    tmp_path: Path,
+) -> None:
+    """A fake runner cannot pass without the declared advisor trace."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        preflight="required",
+        config_lock_metadata=_secondary_usage_config_lock_metadata(),
+        smoke_contract_document={
+            "minResultValues": {
+                "advisor_calls": 1,
+                "advisor_total_tokens": 1,
+            },
+            "requireUsageRecords": [
+                {
+                    "equals": {
+                        "toolName": "advisor",
+                        "type": "tool_execution_end",
+                    },
+                    "globs": ["tool-usage.jsonl"],
+                    "minimum": 1,
+                }
+            ],
+        },
+    )
+
+    class MissingAdvisorTraceRunner(FakeConfirmedPiRunner):
+        """Return advisor totals but deliberately omit tool-usage.jsonl."""
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            record = super().run_confirmed_pi_cell(cell)
+            record.update({"advisor_calls": 1, "advisor_total_tokens": 10})
+            return record
+
+    runner = MissingAdvisorTraceRunner(_planned_launch_plan_path(compiled))
+    with pytest.raises(LaunchPreflightError):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+
+    assert len(runner.calls) == 1
+    status = json.loads(
+        (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "status.json"
+        ).read_text()
+    )
+    diagnostics = status["preflight"][
+        "task-a/baseline@1.0.0/rep0"
+    ]["diagnostics"]
+    assert [diagnostic["target"] for diagnostic in diagnostics] == [
+        "tool-usage.jsonl:structured-records"
+    ]
+    assert status["counts"]["batch_done"] == 0
+
+
 def test_passing_preflight_fans_out_exactly_once_without_second_confirmation(
     tmp_path: Path,
 ) -> None:
@@ -1405,6 +1661,48 @@ def test_passing_preflight_fans_out_exactly_once_without_second_confirmation(
         json.loads(execution.result_path.read_text())["preflight_passed"]
         is True
     )
+
+
+def test_reused_unsealed_result_creates_central_config_seal(
+    tmp_path: Path,
+) -> None:
+    """A successful required re-evaluation seals without rewriting a result."""
+    first, _, _, _, _ = _compile_single_cell_launch(
+        tmp_path,
+        preflight="disabled",
+    )
+    first_execution = execute_confirmed_launch(
+        first.plan,
+        confirmation_identity=first.plan.identity,
+        runtime_resolver=_runtime_resolver_for(first),
+        pi_runner=FakeConfirmedPiRunner(_planned_launch_plan_path(first)),
+    )
+    result_before = first_execution.result_path.read_bytes()
+    assert "preflight_passed" not in json.loads(result_before)
+
+    required = _compile_existing_fixture(
+        tmp_path,
+        preflight="required",
+        run_id="required-recheck",
+        existing_results="require-compatible",
+    )
+    runner = FakeConfirmedPiRunner(_planned_launch_plan_path(required))
+    execute_confirmed_launch(
+        required.plan,
+        confirmation_identity=required.plan.identity,
+        runtime_resolver=_runtime_resolver_for(required),
+        pi_runner=runner,
+    )
+
+    assert runner.calls == []
+    assert first_execution.result_path.read_bytes() == result_before
+    next_plan = _compile_existing_fixture(
+        tmp_path,
+        preflight="new-configs",
+        run_id="after-central-seal",
+        existing_results="require-compatible",
+    )
+    assert next_plan.plan.to_document()["preflightCells"] == []
 
 
 def test_required_preflight_reuses_compatible_result_without_writing(
@@ -1524,9 +1822,11 @@ def test_preflight_verdict_controls_config_leaf_sealing(
     tmp_path: Path,
 ) -> None:
     """Only a passed preflight seals its referenced config lock."""
-    passed, _, _, passed_results, _ = _compile_single_cell_launch(
-        tmp_path / "passed",
-        preflight="required",
+    passed, _, _, passed_results, passed_state = (
+        _compile_single_cell_launch(
+            tmp_path / "passed",
+            preflight="required",
+        )
     )
     execute_confirmed_launch(
         passed.plan,
@@ -1554,13 +1854,16 @@ def test_preflight_verdict_controls_config_leaf_sealing(
             "low",
             "rerun",
             _config_lock_metadata(),
+            state_root=passed_state,
             replace=True,
             results_root=passed_results,
         )
 
-    failed, _, _, failed_results, _ = _compile_single_cell_launch(
-        tmp_path / "failed",
-        preflight="required",
+    failed, _, _, failed_results, failed_state = (
+        _compile_single_cell_launch(
+            tmp_path / "failed",
+            preflight="required",
+        )
     )
     with pytest.raises(LaunchPreflightError):
         execute_confirmed_launch(
@@ -1582,6 +1885,7 @@ def test_preflight_verdict_controls_config_leaf_sealing(
         "low",
         "rerun",
         _config_lock_metadata(),
+        state_root=failed_state,
         replace=True,
         results_root=failed_results,
     )
@@ -1601,9 +1905,11 @@ def test_sealed_release_allows_only_leaves_with_unchanged_shared_behavior(
     tmp_path: Path,
 ) -> None:
     """A sealed release accepts new leaves only while shared inputs match."""
-    compiled, _, _, results_root, _ = _compile_single_cell_launch(
-        tmp_path,
-        preflight="required",
+    compiled, _, _, results_root, state_root = (
+        _compile_single_cell_launch(
+            tmp_path,
+            preflight="required",
+        )
     )
     execute_confirmed_launch(
         compiled.plan,
@@ -1624,6 +1930,7 @@ def test_sealed_release_allows_only_leaves_with_unchanged_shared_behavior(
         "low",
         "rerun",
         _config_lock_metadata(),
+        state_root=state_root,
         results_root=results_root,
     )
 
@@ -1644,6 +1951,7 @@ def test_sealed_release_allows_only_leaves_with_unchanged_shared_behavior(
             "low",
             "rerun",
             _config_lock_metadata(),
+            state_root=state_root,
             results_root=results_root,
         )
 

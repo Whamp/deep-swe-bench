@@ -7,9 +7,11 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from harness.config_resolution import (
     ResolvedConfigLeaf,
@@ -19,6 +21,8 @@ from harness.config_resolution import (
 
 _CONFIG_LOCK_FILENAME = "config-lock.json"
 _CONFIG_LOCK_SCHEMA_VERSION = 1
+_CONFIG_SEAL_SCHEMA_VERSION = 1
+_CONFIG_SEAL_REGISTRY_DIRECTORY = "_config-seals"
 _VERSION_IMPACTS = frozenset({"reuse", "recompute", "rerun"})
 _SHARED_BEHAVIOR_FILES = frozenset(
     {
@@ -67,6 +71,7 @@ _SECRET_KEY_SUFFIXES = frozenset(
         "sessiontoken",
     }
 )
+_SECRET_KEY_TERMINAL_WORDS = frozenset({"auth", "cookie", "key", "pat"})
 _CREDENTIAL_ROUTE = re.compile(
     r"^\$(?:\{(?P<braced>[A-Z][A-Z0-9_]*)\}|"
     r"(?P<plain>[A-Z][A-Z0-9_]*))$"
@@ -116,8 +121,12 @@ def _sha256_identity(content: bytes) -> str:
 
 def _is_secret_key(key: str) -> bool:
     normalized = re.sub(r"[^a-z0-9]", "", key.lower())
-    return normalized == "token" or any(
-        normalized.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES
+    word_separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+    terminal_word = re.split(r"[^a-z0-9]+", word_separated.lower())[-1]
+    return (
+        normalized == "token"
+        or terminal_word in _SECRET_KEY_TERMINAL_WORDS
+        or any(normalized.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES)
     )
 
 
@@ -216,30 +225,49 @@ def _behavior_input_kind(relative_path: Path) -> str:
     return "behavior-file"
 
 
-def _iter_behavior_files(resolved: ResolvedConfigLeaf) -> list[Path]:
-    files: set[Path] = set()
-    for name in _SHARED_BEHAVIOR_FILES:
-        path = resolved.config_root / name
-        if path.is_file() or path.is_symlink():
-            files.add(path)
+def _is_collectable_behavior_file(path: Path) -> bool:
+    return (
+        not any(
+            part in _IGNORED_BEHAVIOR_DIRECTORIES for part in path.parts
+        )
+        and (path.is_file() or path.is_symlink())
+    )
+
+
+def _collect_shared_behavior_files(
+    resolved: ResolvedConfigLeaf,
+) -> set[Path]:
+    files = {
+        path
+        for name in _SHARED_BEHAVIOR_FILES
+        for path in (resolved.config_root / name,)
+        if path.is_file() or path.is_symlink()
+    }
     for name in _SHARED_BEHAVIOR_DIRECTORIES:
         directory = resolved.config_root / name
-        if not directory.is_dir():
-            continue
-        for path in directory.rglob("*"):
-            if any(
-                part in _IGNORED_BEHAVIOR_DIRECTORIES for part in path.parts
-            ):
-                continue
-            if path.is_file() or path.is_symlink():
-                files.add(path)
-    for path in resolved.config_leaf.rglob("*"):
-        if path.name == _CONFIG_LOCK_FILENAME:
-            continue
-        if any(part in _IGNORED_BEHAVIOR_DIRECTORIES for part in path.parts):
-            continue
-        if path.is_file() or path.is_symlink():
-            files.add(path)
+        if directory.is_dir():
+            files.update(
+                path
+                for path in directory.rglob("*")
+                if _is_collectable_behavior_file(path)
+            )
+    return files
+
+
+def _collect_leaf_behavior_files(
+    resolved: ResolvedConfigLeaf,
+) -> set[Path]:
+    return {
+        path
+        for path in resolved.config_leaf.rglob("*")
+        if path.name != _CONFIG_LOCK_FILENAME
+        and _is_collectable_behavior_file(path)
+    }
+
+
+def _iter_behavior_files(resolved: ResolvedConfigLeaf) -> list[Path]:
+    files = _collect_shared_behavior_files(resolved)
+    files.update(_collect_leaf_behavior_files(resolved))
     return sorted(
         files,
         key=lambda path: path.relative_to(resolved.config_root).as_posix(),
@@ -348,20 +376,157 @@ def _document_identity(document: Mapping[str, object]) -> str:
     return _sha256_identity(canonical_config_lock_json(identity_input).encode())
 
 
+def _config_seal_registry_path(
+    state_root: Path,
+    config_identity: str,
+    lock_identity: str,
+) -> Path:
+    lock_key = hashlib.sha256(lock_identity.encode()).hexdigest()
+    return (
+        state_root
+        / _CONFIG_SEAL_REGISTRY_DIRECTORY
+        / config_identity
+        / f"{lock_key}.json"
+    )
+
+
+def _read_config_seal_document(seal_path: Path) -> Mapping[str, object]:
+    try:
+        document: object = json.loads(seal_path.read_text())
+    except (json.JSONDecodeError, OSError) as error:
+        raise ValueError(
+            "Config release seal evidence invalid: cannot read "
+            f"{seal_path}: {error}"
+        ) from error
+    if not isinstance(document, Mapping):
+        raise ValueError(
+            "Config release seal evidence invalid: expected object in "
+            f"{seal_path}"
+        )
+    required_string_fields = (
+        "configIdentity",
+        "launchPlanIdentity",
+        "lockIdentity",
+        "model",
+        "resultIdentity",
+        "resultPath",
+        "thinking",
+    )
+    if (
+        document.get("schemaVersion") != _CONFIG_SEAL_SCHEMA_VERSION
+        or document.get("preflightPassed") is not True
+        or any(
+            not isinstance(document.get(field), str)
+            or not document.get(field)
+            for field in required_string_fields
+        )
+    ):
+        raise ValueError(
+            "Config release seal evidence invalid: malformed registry record "
+            f"in {seal_path}"
+        )
+    return cast(Mapping[str, object], document)
+
+
+def record_successful_config_preflight(
+    state_root: Path,
+    *,
+    config_identity: str,
+    lock_identity: str,
+    model: str,
+    thinking: str,
+    launch_plan_identity: str,
+    result_path: Path,
+    result_identity: str,
+) -> Path:
+    """Record immutable successful-preflight evidence in central state."""
+    parse_versioned_config_identity(config_identity)
+    document = {
+        "schemaVersion": _CONFIG_SEAL_SCHEMA_VERSION,
+        "configIdentity": config_identity,
+        "launchPlanIdentity": launch_plan_identity,
+        "lockIdentity": lock_identity,
+        "model": model,
+        "preflightPassed": True,
+        "resultIdentity": result_identity,
+        "resultPath": str(result_path.resolve()),
+        "thinking": thinking,
+    }
+    seal_path = _config_seal_registry_path(
+        state_root,
+        config_identity,
+        lock_identity,
+    )
+    seal_path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = canonical_config_lock_json(document)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        dir=seal_path.parent,
+        prefix=f".{seal_path.name}.",
+        delete=False,
+    ) as temporary_file:
+        temporary_file.write(serialized)
+        temporary_path = Path(temporary_file.name)
+    try:
+        try:
+            os.link(temporary_path, seal_path)
+        except FileExistsError:
+            existing = _read_config_seal_document(seal_path)
+            if (
+                existing.get("configIdentity") != config_identity
+                or existing.get("lockIdentity") != lock_identity
+            ):
+                raise ValueError(
+                    "Config release seal evidence invalid: registry identity "
+                    f"mismatch in {seal_path}"
+                )
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return seal_path
+
+
 def sealed_config_lock_identities(
     results_root: Path,
     config_identity: str,
+    *,
+    state_root: Path,
 ) -> frozenset[str]:
-    """Return lock identities referenced by successful config preflights."""
+    """Return successful-preflight locks from results and central state."""
     lock_identities: set[str] = set()
+    registry_root = (
+        state_root / _CONFIG_SEAL_REGISTRY_DIRECTORY / config_identity
+    )
+    for seal_path in registry_root.glob("*.json"):
+        document = _read_config_seal_document(seal_path)
+        lock_identity = str(document["lockIdentity"])
+        expected_path = _config_seal_registry_path(
+            state_root,
+            config_identity,
+            lock_identity,
+        )
+        if (
+            document.get("configIdentity") != config_identity
+            or seal_path != expected_path
+        ):
+            raise ValueError(
+                "Config release seal evidence invalid: registry identity "
+                f"mismatch in {seal_path}"
+            )
+        lock_identities.add(lock_identity)
     pattern = f"*/*/{config_identity}/*/rep*/result.json"
     for result_path in results_root.glob(pattern):
         try:
             result: object = json.loads(result_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
+        except (json.JSONDecodeError, OSError) as error:
+            raise ValueError(
+                "Config release seal evidence invalid: cannot read "
+                f"{result_path}: {error}"
+            ) from error
         if not isinstance(result, Mapping):
-            continue
+            raise ValueError(
+                "Config release seal evidence invalid: expected object in "
+                f"{result_path}"
+            )
         lock_identity = result.get("config_lock_identity")
         if (
             result.get("preflight_passed") is True
@@ -376,6 +541,7 @@ def require_revisable_config_lock(
     resolved: ResolvedConfigLeaf,
     config_identity: str,
     results_root: Path,
+    state_root: Path,
 ) -> None:
     """Reject maintenance writes after this exact config leaf is sealed."""
     lock_path = resolved.config_leaf / _CONFIG_LOCK_FILENAME
@@ -386,6 +552,7 @@ def require_revisable_config_lock(
     if lock_identity in sealed_config_lock_identities(
         results_root,
         config_identity,
+        state_root=state_root,
     ):
         raise ValueError(
             "Config lock sealed: successful preflight already references "
@@ -418,11 +585,13 @@ def require_shared_config_release_behavior(
     config_identity: str,
     proposed_lock: Mapping[str, object],
     results_root: Path,
+    state_root: Path,
 ) -> None:
     """Keep new leaf shared behavior equal to sealed release locks."""
     sealed_identities = sealed_config_lock_identities(
         results_root,
         config_identity,
+        state_root=state_root,
     )
     if not sealed_identities:
         return
@@ -455,6 +624,7 @@ def write_config_lock(
     version_impact: str,
     metadata: Mapping[str, object],
     *,
+    state_root: Path,
     replace: bool = False,
     results_root: Path | None = None,
 ) -> Path:
@@ -471,6 +641,7 @@ def write_config_lock(
             resolved,
             config_identity,
             results_root or repository_root / "results",
+            state_root,
         )
     if lock_path.exists() and not replace:
         raise FileExistsError(
@@ -488,6 +659,7 @@ def write_config_lock(
         config_identity,
         document,
         results_root or repository_root / "results",
+        state_root,
     )
     lock_path.write_text(canonical_config_lock_json(document))
     return lock_path
@@ -632,6 +804,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         command.add_argument("--config", required=True)
         command.add_argument("--model", required=True)
         command.add_argument("--thinking", required=True)
+        command.add_argument("--state-root", type=Path, required=True)
         command.add_argument(
             "--version-impact",
             choices=sorted(_VERSION_IMPACTS),
@@ -678,6 +851,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.thinking,
         args.version_impact,
         _metadata_from_path(args.metadata),
+        state_root=args.state_root,
         replace=args.operation == "refresh",
     )
     print(lock_path)

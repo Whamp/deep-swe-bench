@@ -12,9 +12,8 @@ import shutil
 import sqlite3
 import subprocess
 import threading
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, Protocol, TypedDict, cast
 
@@ -608,7 +607,8 @@ def _launch_plan_identity(document: Mapping[str, object]) -> str:
 
 
 def confirmed_launch_run_key(run_id: str, plan_identity: str) -> str:
-    """Return a workspace-safe structured-state key for one confirmed run.
+    """
+    Return a workspace-safe structured-state key for one confirmed run.
 
     Args:
         run_id: Operator-supplied run identifier retained in the manifest.
@@ -616,6 +616,7 @@ def confirmed_launch_run_key(run_id: str, plan_identity: str) -> str:
 
     Returns:
         A safe directory key under the configured central state root.
+
     """
     key_input = f"{run_id}\0{plan_identity}".encode()
     registration_identity = hashlib.sha256(key_input).hexdigest()
@@ -1205,6 +1206,128 @@ def _validate_role_usage_sources(
             )
 
 
+def _smoke_usage_assertion_matches(
+    assertion: Mapping[str, object],
+    source_path: str,
+    record_selector: Mapping[str, object],
+) -> bool:
+    globs = assertion.get("globs")
+    expected = assertion.get("equals")
+    return (
+        isinstance(globs, list)
+        and source_path in globs
+        and isinstance(expected, Mapping)
+        and all(
+            expected.get(field) == value
+            for field, value in record_selector.items()
+        )
+    )
+
+
+def _has_positive_result_minimum(
+    result_minima: Mapping[str, object],
+    field: str,
+) -> bool:
+    minimum = result_minima.get(field)
+    return (
+        isinstance(minimum, int | float)
+        and not isinstance(minimum, bool)
+        and minimum > 0
+    )
+
+
+def _validate_secondary_role_usage_evidence(
+    config_identity: str,
+    roles: Sequence[Mapping[str, object]],
+    smoke_contract: Mapping[str, object] | None,
+) -> None:
+    """Require enforceable trace and result accounting for secondary roles."""
+    assertions = (
+        smoke_contract.get("requireUsageRecords", [])
+        if smoke_contract is not None
+        else []
+    )
+    result_minima_value = (
+        smoke_contract.get("minResultValues", {})
+        if smoke_contract is not None
+        else {}
+    )
+    usage_assertions = (
+        [
+            cast(Mapping[str, object], assertion)
+            for assertion in assertions
+            if isinstance(assertion, Mapping)
+        ]
+        if isinstance(assertions, list)
+        else []
+    )
+    result_minima = (
+        cast(Mapping[str, object], result_minima_value)
+        if isinstance(result_minima_value, Mapping)
+        else {}
+    )
+    for role in roles:
+        if role.get("roleKind") == "executor":
+            continue
+        role_name = str(role.get("name", ""))
+        usage_source = role.get("usageSource")
+        if not isinstance(usage_source, Mapping):
+            raise TypeError(
+                "Launch model role usage evidence missing: "
+                f"config={config_identity!r}; role={role_name!r}; "
+                "usageSource must be an object"
+            )
+        source_path = usage_source.get("path")
+        record_selector = usage_source.get("recordSelector")
+        result_accounting = usage_source.get("resultAccounting")
+        accounting_fields = (
+            [
+                field
+                for field in result_accounting.values()
+                if isinstance(field, str) and field
+            ]
+            if isinstance(result_accounting, Mapping)
+            else []
+        )
+        if (
+            not isinstance(source_path, str)
+            or not isinstance(record_selector, Mapping)
+            or not record_selector
+            or not isinstance(result_accounting, Mapping)
+            or set(result_accounting) != {"calls", "totalTokens"}
+            or len(accounting_fields) != 2
+            or len(set(accounting_fields)) != 2
+        ):
+            raise ValueError(
+                "Launch model role usage evidence missing: "
+                f"config={config_identity!r}; role={role_name!r}; "
+                "secondary usageSource requires recordSelector and "
+                "resultAccounting calls/totalTokens fields"
+            )
+        structured_selector = cast(Mapping[str, object], record_selector)
+        matching_assertion = any(
+            _smoke_usage_assertion_matches(
+                assertion,
+                source_path,
+                structured_selector,
+            )
+            for assertion in usage_assertions
+        )
+        missing_result_fields = [
+            field
+            for field in accounting_fields
+            if not _has_positive_result_minimum(result_minima, field)
+        ]
+        if not matching_assertion or missing_result_fields:
+            raise ValueError(
+                "Launch model role usage evidence missing: "
+                f"config={config_identity!r}; role={role_name!r}; "
+                f"source={source_path!r}; "
+                f"usage_assertion={matching_assertion!r}; "
+                f"missing_result_fields={missing_result_fields!r}"
+            )
+
+
 def _active_config_lines(path: Path) -> list[str]:
     if not path.is_file():
         return []
@@ -1299,13 +1422,9 @@ def _resolve_omp_subject_behavior(
     system_prompt_path = config_root / "omp-system-prompt.md"
     system_prompt: str | None = None
     if system_prompt_path.is_file():
-        system_prompt = (
-            system_prompt_path.read_text()
-            .replace(
-                "{{current_date}}",
-                datetime.now().astimezone().date().isoformat(),
-            )
-            .replace("{{cwd}}", "/app")
+        system_prompt = system_prompt_path.read_text().replace(
+            "{{cwd}}",
+            "/app",
         )
     return {
         "appendSystemPrompt": _config_append_system_prompt(config_root),
@@ -1419,10 +1538,13 @@ def _config_plan(
     versioned_identity = config_resolution.parse_versioned_config_identity(
         config_identity
     )
+    smoke_contract_document: Mapping[str, object] | None = None
     if versioned_identity is not None:
-        versioned_smoke_contract.validate_versioned_smoke_contract(
-            repository_root,
-            resolved.smoke_contract,
+        smoke_contract_document = (
+            versioned_smoke_contract.validate_versioned_smoke_contract(
+                repository_root,
+                resolved.smoke_contract,
+            )
         )
     lock_document = config_lock.read_matching_config_lock(
         resolved,
@@ -1458,6 +1580,11 @@ def _config_plan(
         usage_sources,
     )
     resolved_roles = _resolve_declared_roles(config_identity, declared_roles)
+    _validate_secondary_role_usage_evidence(
+        config_identity,
+        resolved_roles,
+        smoke_contract_document,
+    )
     _validate_executor_role(config_identity, resolved_roles, request)
     _validate_launch_surfaces(
         config_identity,
@@ -1622,7 +1749,7 @@ def _planned_result_provenance(
     config: LaunchConfigDocument,
     task: str,
     rep: int,
-) -> dict[str, object]:
+) -> result_provenance.ResultProvenance:
     """Build the exact modern provenance required for automatic reuse."""
     return {
         "config": config["identity"],
@@ -1662,7 +1789,7 @@ def _batch_cells(
                     task,
                     rep,
                 )
-                reuse_provenance: dict[str, object] | None = None
+                reuse_provenance: Mapping[str, object] | None = None
                 reuse_reason: str | None = None
                 reuse_result_identity: str | None = None
                 reuse_decision: dict[str, object] | None = None
@@ -1750,6 +1877,7 @@ def _preflight_task(repository_root: Path, tasks: tuple[str, ...]) -> str:
 def _preflight_cells(
     repository_root: Path,
     results_root: Path,
+    state_root: Path,
     request: LaunchRequest,
     tasks: tuple[str, ...],
     config_plans: Sequence[Mapping[str, object]],
@@ -1776,6 +1904,7 @@ def _preflight_cells(
                 config_lock.sealed_config_lock_identities(
                     results_root,
                     config_identity,
+                    state_root=state_root,
                 )
             )
         if request.policies.preflight == "new-configs" and has_release_evidence:
@@ -2085,6 +2214,7 @@ def compile_launch_request(
             str(config_plan["identity"]),
             {"behaviorInputs": config_plan["behaviorInputs"]},
             results_root,
+            state_root,
         )
     if runtime_resolver is None:
         runtime_resolver = RepositoryLaunchRuntimeResolver(
@@ -2108,6 +2238,7 @@ def compile_launch_request(
     preflight_cells = _preflight_cells(
         repository_root,
         results_root,
+        state_root,
         request,
         tasks,
         config_plans,
@@ -2366,6 +2497,27 @@ def _confirmed_subject_cells(
     return cells
 
 
+def _confirmed_cell_provenance(
+    cell: ConfirmedSubjectCell,
+) -> result_provenance.ConfirmedResultProvenance:
+    """Map one confirmed cell to the exact provenance written and resumed."""
+    return {
+        "config": cell.config_identity,
+        "config_lock_identity": cell.config_lock_identity,
+        "harness_revision": cell.harness_revision,
+        "immutable_image_identities": dict(cell.immutable_image_identities),
+        "launch_plan_identity": cell.launch_plan_identity,
+        "model": cell.model,
+        "rep": cell.rep,
+        "subject": cell.subject,
+        "subject_version": cell.subject_version,
+        "task": cell.task,
+        "task_revision": cell.task_revision,
+        "thinking_level": cell.thinking,
+        "verifier_identity": cell.verifier_identity,
+    }
+
+
 def _confirmed_result_record(
     cell: ConfirmedSubjectCell,
     record: Mapping[str, object],
@@ -2379,23 +2531,11 @@ def _confirmed_result_record(
             f"config={cell.config_identity!r}"
         )
     confirmed_record = dict(record)
+    confirmed_record.update(_confirmed_cell_provenance(cell))
     confirmed_record.update(
         {
-            "config": cell.config_identity,
-            "config_lock_identity": cell.config_lock_identity,
             "config_name": config_identity.name,
             "config_version": config_identity.version,
-            "harness_revision": cell.harness_revision,
-            "immutable_image_identities": dict(cell.immutable_image_identities),
-            "launch_plan_identity": cell.launch_plan_identity,
-            "model": cell.model,
-            "rep": cell.rep,
-            "subject": cell.subject,
-            "subject_version": cell.subject_version,
-            "task": cell.task,
-            "task_revision": cell.task_revision,
-            "thinking_level": cell.thinking,
-            "verifier_identity": cell.verifier_identity,
         }
     )
     if cell.subject_runtime_identity:
@@ -2851,6 +2991,43 @@ def _run_confirmed_subject_cell(
     return result_record
 
 
+def _record_successful_preflight_seal(
+    cell: ConfirmedSubjectCell,
+    context: _ConfirmedLaunchExecutionContext,
+    result_record: dict[str, object],
+    *,
+    reused_result: bool,
+) -> confirmed_preflight.PreflightDiagnostic | None:
+    """Persist result and central seal evidence as one recoverable step."""
+    original_result = cell.result_path.read_bytes()
+    if not reused_result:
+        result_record["preflight_passed"] = True
+        run_state.atomic_write_json(cell.result_path, result_record)
+    try:
+        config_lock.record_successful_config_preflight(
+            context.state.state_root,
+            config_identity=cell.config_identity,
+            lock_identity=cell.config_lock_identity,
+            model=cell.model,
+            thinking=cell.thinking,
+            launch_plan_identity=cell.launch_plan_identity,
+            result_path=cell.result_path,
+            result_identity=result_provenance.result_file_identity(
+                cell.result_path
+            ),
+        )
+    except (OSError, TypeError, ValueError) as error:
+        if not reused_result:
+            cell.result_path.write_bytes(original_result)
+            result_record.pop("preflight_passed", None)
+        return confirmed_preflight.preflight_diagnostic(
+            "config_seal_registry",
+            str(context.state.state_root),
+            f"{type(error).__name__}: {error}",
+        )
+    return None
+
+
 def _execute_confirmed_preflight_cell(
     cell: ConfirmedSubjectCell,
     context: _ConfirmedLaunchExecutionContext,
@@ -2890,6 +3067,14 @@ def _execute_confirmed_preflight_cell(
         raw_exit = result_record.get("agent_exit")
         exit_code = raw_exit if isinstance(raw_exit, int | str) else None
     except LaunchTransientModelError as error:
+        if context.policies.transient_errors == "pause":
+            state.preflight_attempt_paused(
+                state_cell,
+                log_path=context.log_path,
+                reason=str(error),
+            )
+            state.run_paused(reason=str(error))
+            raise
         state.preflight_finished(
             state_cell,
             log_path=context.log_path,
@@ -2904,16 +3089,13 @@ def _execute_confirmed_preflight_cell(
                 )
             ],
         )
-        if context.policies.transient_errors == "pause":
-            state.run_paused(reason=str(error))
-            raise
         state.run_failed(
             reason=f"Confirmed preflight stopped after transient: {error}"
         )
         raise RuntimeError(
             "Confirmed launch stopped after transient model error"
         ) from error
-    except Exception as error:  # noqa: BLE001 - runner boundary records failure
+    except Exception as error:
         exit_code = "exception"
         diagnostics.append(
             confirmed_preflight.preflight_diagnostic(
@@ -2940,9 +3122,16 @@ def _execute_confirmed_preflight_cell(
         )
     )
     passed = not diagnostics
-    if passed and not reused_result:
-        result_record["preflight_passed"] = True
-        run_state.atomic_write_json(cell.result_path, result_record)
+    if passed:
+        seal_diagnostic = _record_successful_preflight_seal(
+            cell,
+            context,
+            result_record,
+            reused_result=reused_result,
+        )
+        if seal_diagnostic is not None:
+            diagnostics.append(seal_diagnostic)
+            passed = False
     state.preflight_finished(
         state_cell,
         result_path=(cell.result_path if cell.result_path.is_file() else None),
@@ -3056,21 +3245,7 @@ def _require_confirmed_resume_result(
 ) -> Mapping[str, object]:
     """Require an exact compatible result created by this confirmed plan."""
     record = result_provenance.read_result_record(cell.result_path)
-    expected = {
-        "config": cell.config_identity,
-        "config_lock_identity": cell.config_lock_identity,
-        "harness_revision": cell.harness_revision,
-        "immutable_image_identities": dict(cell.immutable_image_identities),
-        "launch_plan_identity": cell.launch_plan_identity,
-        "model": cell.model,
-        "rep": cell.rep,
-        "subject": cell.subject,
-        "subject_version": cell.subject_version,
-        "task": cell.task,
-        "task_revision": cell.task_revision,
-        "thinking_level": cell.thinking,
-        "verifier_identity": cell.verifier_identity,
-    }
+    expected = _confirmed_cell_provenance(cell)
     mismatches = result_provenance.result_provenance_mismatches(
         record,
         expected,
@@ -3154,6 +3329,50 @@ def _execute_confirmed_batch_entry(
     _execute_confirmed_batch_cell(cell, context)
 
 
+def _submit_confirmed_batch_cell(
+    executor: concurrent.futures.ThreadPoolExecutor,
+    pending_cells: Iterator[ConfirmedSubjectCell],
+    futures: dict[
+        concurrent.futures.Future[None],
+        ConfirmedSubjectCell,
+    ],
+    passed_preflight_paths: set[Path],
+    context: _ConfirmedLaunchExecutionContext,
+) -> bool:
+    """Submit the next approved cell, returning false after exhaustion."""
+    try:
+        cell = next(pending_cells)
+    except StopIteration:
+        return False
+    future = executor.submit(
+        _execute_confirmed_batch_entry,
+        cell,
+        passed_preflight_paths,
+        context,
+    )
+    futures[future] = cell
+    return True
+
+
+def _completed_confirmed_batch_failure(
+    completed: Iterable[concurrent.futures.Future[None]],
+    futures: dict[
+        concurrent.futures.Future[None],
+        ConfirmedSubjectCell,
+    ],
+) -> Exception | None:
+    """Collect completed workers and return their first observed failure."""
+    first_failure: Exception | None = None
+    for future in completed:
+        futures.pop(future)
+        try:
+            future.result()
+        except Exception as error:
+            if first_failure is None:
+                first_failure = error
+    return first_failure
+
+
 def _execute_confirmed_batch(
     cells: Sequence[ConfirmedSubjectCell],
     passed_preflight_paths: set[Path],
@@ -3166,43 +3385,36 @@ def _execute_confirmed_batch(
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=concurrency,
     ) as executor:
-
-        def submit_next_cell() -> bool:
-            try:
-                cell = next(pending_cells)
-            except StopIteration:
-                return False
-            future = executor.submit(
-                _execute_confirmed_batch_entry,
-                cell,
+        for _ in range(concurrency):
+            if not _submit_confirmed_batch_cell(
+                executor,
+                pending_cells,
+                futures,
                 passed_preflight_paths,
                 context,
-            )
-            futures[future] = cell
-            return True
-
-        for _ in range(concurrency):
-            if not submit_next_cell():
+            ):
                 break
         while futures:
             completed, _ = concurrent.futures.wait(
                 tuple(futures),
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
-            first_failure: Exception | None = None
-            for future in completed:
-                futures.pop(future)
-                try:
-                    future.result()
-                except Exception as error:  # noqa: BLE001 - worker boundary
-                    if first_failure is None:
-                        first_failure = error
+            first_failure = _completed_confirmed_batch_failure(
+                completed,
+                futures,
+            )
             if first_failure is not None:
                 for future in futures:
                     future.cancel()
                 raise first_failure
             for _ in completed:
-                if not submit_next_cell():
+                if not _submit_confirmed_batch_cell(
+                    executor,
+                    pending_cells,
+                    futures,
+                    passed_preflight_paths,
+                    context,
+                ):
                     break
 
 

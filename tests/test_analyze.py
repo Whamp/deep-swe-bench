@@ -104,6 +104,110 @@ def test_load_results_rejects_incompatible_selected_provenance(
     assert "harness_revision" in str(raised.value)
 
 
+def _remove_modern_result_provenance(result_path: Path) -> None:
+    """Turn one fixture result into an honest pre-confirmed-launch record."""
+    record = json.loads(result_path.read_text())
+    for field in (
+        "config_lock_identity",
+        "harness_revision",
+        "immutable_image_identities",
+        "launch_plan_identity",
+        "subject",
+        "subject_version",
+        "task_revision",
+        "verifier_identity",
+    ):
+        record.pop(field)
+    result_path.write_text(json.dumps(record))
+
+
+def test_load_results_reads_legacy_corpus_only_after_explicit_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    synth_tree: Path,
+) -> None:
+    """An explicit flag keeps an entirely legacy comparison readable."""
+    for result_path in synth_tree.glob("results/*/*/*/*/rep*/result.json"):
+        _remove_modern_result_provenance(result_path)
+    monkeypatch.setattr(lib, "REPO", synth_tree)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Comparison result provenance mismatch:",
+    ):
+        analyze.load_results(MODEL, "high", ["baseline", "alt"])
+
+    with pytest.warns(UserWarning, match="legacy result provenance accepted"):
+        rows = analyze.load_results(
+            MODEL,
+            "high",
+            ["baseline", "alt"],
+            allow_legacy_results=True,
+        )
+
+    assert len(rows) == 6
+    assert all("config_lock_identity" not in row for row in rows)
+
+
+def test_load_results_rejects_mixed_modern_and_legacy_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    synth_tree: Path,
+) -> None:
+    """Legacy opt-in cannot silently mix provenanced and unknown setups."""
+    legacy_path = (
+        synth_tree
+        / "results"
+        / LEAF
+        / "high"
+        / "alt"
+        / "t1"
+        / "rep2"
+        / "result.json"
+    )
+    _remove_modern_result_provenance(legacy_path)
+    monkeypatch.setattr(lib, "REPO", synth_tree)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Comparison result provenance mismatch:",
+    ) as raised:
+        analyze.load_results(
+            MODEL,
+            "high",
+            ["baseline", "alt"],
+            allow_legacy_results=True,
+        )
+
+    assert "mixed modern and legacy" in str(raised.value)
+
+
+def test_load_results_reports_corrupt_selected_result(
+    monkeypatch: pytest.MonkeyPatch,
+    synth_tree: Path,
+) -> None:
+    """Unreadable selected cells fail visibly instead of changing the sample."""
+    corrupt_path = (
+        synth_tree
+        / "results"
+        / LEAF
+        / "high"
+        / "alt"
+        / "t1"
+        / "rep2"
+        / "result.json"
+    )
+    corrupt_path.write_text("{not-json\n")
+    monkeypatch.setattr(lib, "REPO", synth_tree)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Comparison result provenance mismatch:",
+    ) as raised:
+        analyze.load_results(MODEL, "high", ["baseline", "alt"])
+
+    assert str(corrupt_path) in str(raised.value)
+    assert isinstance(raised.value.__cause__, json.JSONDecodeError)
+
+
 def test_load_results_preserves_distinct_versioned_config_identities(
     monkeypatch,
     tmp_path: Path,

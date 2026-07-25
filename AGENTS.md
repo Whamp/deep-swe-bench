@@ -6,8 +6,9 @@ new **config** or touching the harness.
 ## Vocabulary
 
 Canonical nouns and retired terms live in [`CONTEXT.md`](./CONTEXT.md). Use them.
-The big ones: **config** (not arm/treatment), **comparison** (not study/run as a
-noun), **subset** (not subsample), and **run** as a verb only.
+The big ones: **config** (not arm/treatment), **comparison** (not study or run
+for an analytical view), **subset** (not subsample), and **run** as either the
+verb or one execution of a confirmed launch plan (never an individual rep).
 
 ## Repeatable workflows
 

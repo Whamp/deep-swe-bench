@@ -81,6 +81,12 @@ class RepositoryConfirmedOmpRunner:
             raise TypeError(
                 "Confirmed OMP runtime invalid: binary path is missing"
             )
+        subject_behavior = dict(cell.subject_behavior)
+        system_prompt = subject_behavior.get("systemPrompt")
+        if isinstance(system_prompt, str):
+            subject_behavior["systemPrompt"] = (
+                run_subject.render_omp_system_prompt_template(system_prompt)
+            )
         try:
             return run_subject.run_cell(
                 cell.config_identity,
@@ -110,7 +116,7 @@ class RepositoryConfirmedOmpRunner:
                 config_root=cell.config_root,
                 config_leaf=cell.config_leaf,
                 task_root=self.task_root,
-                subject_behavior=dict(cell.subject_behavior),
+                subject_behavior=subject_behavior,
                 omp_binary_path=Path(binary_path),
             )
         except SystemExit as error:
@@ -207,7 +213,7 @@ def smoke_task(requested_ids: list[str]) -> str:
 
 
 def smoke_contract_path(model: str, thinking: str, config: str) -> Path | None:
-    """Return the smoke contract from the authoritative config-leaf resolution."""
+    """Return the contract from authoritative config-leaf resolution."""
     resolved = config_resolution.resolve_config_leaf(
         REPO,
         config,
@@ -443,16 +449,21 @@ def preflight_plan(args, configs: list[str], ids: list[str]) -> list[dict]:
     for decision in decisions:
         config = decision["config"]
         if not isinstance(config, str):
-            raise TypeError(
-                f"Preflight plan invalid: config must be a string; got {config!r}"
+            detail = (
+                "Preflight plan invalid: config must be a string; "
+                f"got {config!r}"
             )
+            raise TypeError(detail)
         resolved = config_resolution.resolve_config_leaf(
             REPO,
             config,
             args.model,
             args.thinking,
         )
-        lock_identity = config_lock.require_matching_config_lock(resolved, config)
+        lock_identity = config_lock.require_matching_config_lock(
+            resolved,
+            config,
+        )
         cell = make_cell(
             task=task,
             config=config,

@@ -58,6 +58,10 @@ or alter config-authored prompt text without approval of the exact wording.
    - Config-level Pi hooks may not see extension-internal `agentLoop` calls.
      Recursive/subagent configs must prove child sessions have intended tools and
      no structural tool failures; extension registration alone is insufficient.
+   - Each non-executor `usageSource` declares a structured `recordSelector` and
+     `resultAccounting` mappings for call and total-token fields. The smoke
+     contract must require matching records at that path and positive values for
+     both result fields; planning rejects any missing link.
    - Completion: every declared role has one compact usage source copied into the
      result cell and represented in `result.json` accounting.
 
@@ -99,6 +103,7 @@ or alter config-authored prompt text without approval of the exact wording.
        --config '<name>@<version>' \
        --model '<provider/model>' \
        --thinking '<thinking>' \
+       --state-root "$DEEP_SWE_BENCH_STATE_ROOT" \
        --version-impact {reuse,recompute,rerun} \
        --metadata <release-metadata.json>
      ```
@@ -106,7 +111,9 @@ or alter config-authored prompt text without approval of the exact wording.
    - `refresh` is allowed only for an editable draft after investigation and
      renewed agreement. Planning and execution verify locks read-only and never
      create, refresh, or rewrite them.
-   - A successful preflight seals the leaf and shared release behavior. A later
+   - A successful preflight writes immutable seal evidence under the configured
+     central state root. Lock maintenance and planning consult that registry, so
+     another worktree or empty result root cannot revise the release. A later
      leaf may join only when shared fingerprints remain unchanged.
    - Completion: `python -m harness.config_lock verify ...` matches exactly and
      secret values are excluded.

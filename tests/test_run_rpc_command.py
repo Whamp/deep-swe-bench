@@ -153,6 +153,66 @@ class SubjectRunnerConfigResolutionTests(unittest.TestCase):
 
 
 class ProbeCommandTests(unittest.TestCase):
+    def test_pi_library_call_requires_explicit_output_cell(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "configs" / "cfg" / "model" / "low").mkdir(
+                parents=True
+            )
+            task = type("Task", (), {"agent_timeout_s": 30.0})()
+            with (
+                patch.object(run, "REPO", root),
+                patch.object(run, "load_task", return_value=task),
+                patch.object(run, "ensure_env_image") as ensure_image,
+                self.assertRaisesRegex(
+                    ValueError,
+                    "Confirmed launch or draft probe output required",
+                ),
+            ):
+                run.run_cell(
+                    "cfg",
+                    "task-a",
+                    model="provider/model",
+                    thinking="low",
+                    rep=0,
+                    agent_timeout=1,
+                    keep=False,
+                    pass_openai_codex_oauth=False,
+                    rpc_quiescence=0,
+                )
+
+        ensure_image.assert_not_called()
+
+    def test_omp_library_call_requires_explicit_output_cell(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "configs" / "cfg" / "model" / "low").mkdir(
+                parents=True
+            )
+            task = type("Task", (), {"agent_timeout_s": 30.0})()
+            with (
+                patch.object(run_omp, "REPO", root),
+                patch.object(run_omp, "load_task", return_value=task),
+                patch.object(run_omp, "ensure_env_image") as ensure_image,
+                self.assertRaisesRegex(
+                    ValueError,
+                    "Confirmed launch or draft probe output required",
+                ),
+            ):
+                run_omp.run_cell(
+                    "cfg",
+                    "task-a",
+                    model="openai-codex/model",
+                    thinking="low",
+                    rep=0,
+                    agent_timeout=1,
+                    keep=False,
+                    pass_openai_codex_oauth=True,
+                    rpc_quiescence=0,
+                )
+
+        ensure_image.assert_not_called()
+
     def test_pi_direct_debugging_requires_scratch_probe_output(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

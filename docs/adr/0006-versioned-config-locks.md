@@ -48,6 +48,7 @@ python -m harness.config_lock create \
   --config <name>@<version> \
   --model <provider/model> \
   --thinking <level> \
+  --state-root "$DEEP_SWE_BENCH_STATE_ROOT" \
   --version-impact {reuse,recompute,rerun} \
   --metadata <release-metadata.json>
 ```
@@ -57,10 +58,15 @@ while the leaf remains a draft. Planning and subject execution call the
 read-only verifier and cannot create or refresh a lock.
 
 A successful preflight that references a lock seals that leaf. The lock does not
-carry mutable sealed state; the preflight result is the seal evidence. After the
-first leaf is sealed, shared behavior is immutable for the release. A new leaf
-may join the release only if its shared fingerprints match the sealed leaf.
-Changing sealed leaf or shared behavior requires a new config version.
+carry mutable sealed state. Execution records immutable seal evidence under the
+configured central state root at `_config-seals/<config-identity>/`, while a new
+preflight result also retains `preflight_passed` for cell-local diagnosis. Lock
+maintenance and planning consult both the central registry and compatible local
+result evidence. This makes sealing independent of the originating worktree or
+result root. After the first leaf is sealed, shared behavior is immutable for
+the release. A new leaf may join the release only if its shared fingerprints
+match the sealed leaf. Changing sealed leaf or shared behavior requires a new
+config version.
 
 Unversioned configs remain readable as legacy configs. The resolver does not
 fabricate locks for them, and this ADR does not migrate historical results.
@@ -89,6 +95,8 @@ fabricate locks for them, and this ADR does not migrate historical results.
   drift without comparing opaque aggregate hashes.
 - Candidate maintenance stays possible after failed preflight through an explicit
   refresh and renewed review.
+- Central immutable seal evidence prevents another worktree with an empty result
+  root from refreshing a released lock.
 - Shared behavior cannot change after release without invalidating every locked
   leaf, making a new version the only valid path forward.
 - Legacy configs continue to run through existing paths until maintainers adopt

@@ -34,8 +34,9 @@ _SUPPORTED_ASSERTION_KINDS = frozenset(
     }
 )
 _EXTENSION_MACHINE_MARKER = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]*$")
-_CHARACTER_COUNT_FIELD = re.compile(
-    r"(?:^|[._])(?:chars?|characters?|char_count|character_count)$"
+_BRITTLE_OUTPUT_LENGTH_FIELD = re.compile(
+    r"(?:chars?|characters?|char_count|character_count|length|"
+    r"line_count|linecount)$"
 )
 
 
@@ -93,9 +94,9 @@ def _is_json_number(value: object) -> bool:
     )
 
 
-def _is_character_count_field(field: str) -> bool:
-    """Return whether a result field encodes brittle character counts."""
-    return _CHARACTER_COUNT_FIELD.search(field.lower()) is not None
+def _is_brittle_output_length_field(field: str) -> bool:
+    """Return whether a result field encodes brittle output dimensions."""
+    return _BRITTLE_OUTPUT_LENGTH_FIELD.search(field.lower()) is not None
 
 
 def _validate_structured_result_assertions(
@@ -123,12 +124,13 @@ def _validate_structured_result_assertions(
                 )
             normalized_assertions[field] = expected
         for field, expected in normalized_assertions.items():
-            if _is_character_count_field(field):
+            if _is_brittle_output_length_field(field):
                 _reject_smoke_assertion(
                     location,
                     assertion_kind,
                     field,
-                    "character counts are not durable launch gates",
+                    "output length and line counts are not durable launch "
+                    "gates",
                     pointer=f"/{assertion_kind}/{field}",
                 )
             if assertion_kind == "minResultValues" and not _is_json_number(
@@ -363,7 +365,7 @@ def _reject_prohibited_text_assertions(
 def validate_versioned_smoke_contract(
     repository_root: Path,
     contract_path: Path | None,
-) -> None:
+) -> Mapping[str, object] | None:
     """
     Validate durable assertions before a versioned launch can be approved.
 
@@ -416,3 +418,4 @@ def validate_versioned_smoke_contract(
         location,
         document,
     )
+    return document

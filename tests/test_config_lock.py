@@ -43,6 +43,8 @@ def _write_config_lock(
             "provider/model",
             "--thinking",
             "low",
+            "--state-root",
+            str(repository_root / "results" / "_runs"),
             "--version-impact",
             "rerun",
             "--metadata",
@@ -97,7 +99,12 @@ def test_config_lock_excludes_secret_values_from_identity(
         first_secret = f"first-secret-{secret_suffix}"
         second_secret = f"second-secret-{secret_suffix}"
         env_path.write_text(
-            f"FEATURE_MODE=review\nOPENAI_API_KEY={first_secret}\n"
+            "FEATURE_MODE=review\n"
+            f"OPENAI_API_KEY={first_secret}\n"
+            f"SESSION_COOKIE={first_secret}\n"
+            f"GITHUB_PAT={first_secret}\n"
+            f"INTERNAL_AUTH={first_secret}\n"
+            f"CUSTOM_KEY={first_secret}\n"
         )
         models_path.write_text(
             json.dumps(
@@ -129,7 +136,12 @@ def test_config_lock_excludes_secret_values_from_identity(
         )
 
         env_path.write_text(
-            f"FEATURE_MODE=review\nOPENAI_API_KEY={second_secret}\n"
+            "FEATURE_MODE=review\n"
+            f"OPENAI_API_KEY={second_secret}\n"
+            f"SESSION_COOKIE={second_secret}\n"
+            f"GITHUB_PAT={second_secret}\n"
+            f"INTERNAL_AUTH={second_secret}\n"
+            f"CUSTOM_KEY={second_secret}\n"
         )
         models_path.write_text(
             json.dumps(
@@ -470,6 +482,60 @@ def test_non_secret_token_setting_change_invalidates_config_lock(
         )
 
 
+def test_config_lock_refresh_rejects_unreadable_seal_evidence(
+    tmp_path: Path,
+) -> None:
+    """Unreadable result evidence cannot make a release appear revisable."""
+    config_identity = "review-assistant@1.0.0"
+    config_root = tmp_path / "configs" / config_identity
+    config_leaf = config_root / "model" / "low"
+    config_leaf.mkdir(parents=True)
+    prompt_path = config_root / "orchestration.md"
+    prompt_path.write_text("Original behavior.\n")
+    results_root = tmp_path / "other-results"
+    state_root = tmp_path / "central-state"
+    config_lock.write_config_lock(
+        tmp_path,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {},
+        state_root=state_root,
+    )
+    result_path = (
+        results_root
+        / "model"
+        / "low"
+        / config_identity
+        / "task-a"
+        / "rep0"
+        / "result.json"
+    )
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text("{not-json\n")
+    prompt_path.write_text("Changed behavior.\n")
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Config release seal evidence invalid:",
+    ) as raised:
+        config_lock.write_config_lock(
+            tmp_path,
+            config_identity,
+            "provider/model",
+            "low",
+            "rerun",
+            {},
+            state_root=state_root,
+            replace=True,
+            results_root=results_root,
+        )
+
+    assert str(result_path) in str(raised.value)
+    assert isinstance(raised.value.__cause__, json.JSONDecodeError)
+
+
 def test_subject_config_loading_rejects_drift_without_refreshing_lock(
     tmp_path: Path,
 ) -> None:
@@ -496,6 +562,24 @@ def test_subject_config_loading_rejects_drift_without_refreshing_lock(
         )
 
     assert lock_path.read_bytes() == original_lock
+
+
+@pytest.mark.parametrize(
+    "config_identity",
+    ["", "config/other", "config,other", "config\0other"],
+)
+def test_config_resolution_rejects_unsafe_legacy_identity_segments(
+    tmp_path: Path,
+    config_identity: str,
+) -> None:
+    """The public resolver rejects unsafe identities before path lookup."""
+    with pytest.raises(ValueError, match="^Config identity invalid:"):
+        config_resolution.resolve_config_leaf(
+            tmp_path,
+            config_identity,
+            "provider/model",
+            "low",
+        )
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import statistics as st
+import warnings
 from collections import defaultdict
 
 from harness import result_provenance, results_tree
@@ -23,8 +24,10 @@ def load_results(
     model: str,
     thinking: str,
     configs: list[str],
+    *,
+    allow_legacy_results: bool = False,
 ) -> list[dict[str, object]]:
-    """Load only provenance-compatible results for one comparison."""
+    """Load provenance-compatible results, with explicit legacy opt-in."""
     tree = results_tree.Tree.of(model, thinking)
     loaded: list[result_provenance.ComparisonResult] = []
     for cell in tree.cells(configs=configs):
@@ -48,7 +51,21 @@ def load_results(
         thinking,
         configs,
         loaded,
+        allow_legacy_results=allow_legacy_results,
     )
+    if (
+        allow_legacy_results
+        and loaded
+        and all(
+            result_provenance.is_legacy_result_record(selected.record)
+            for selected in loaded
+        )
+    ):
+        warnings.warn(
+            "Comparison legacy result provenance accepted by explicit "
+            "operator decision; setup compatibility cannot be proven",
+            stacklevel=2,
+        )
     return [selected.record for selected in loaded]
 
 
@@ -106,10 +123,24 @@ def main():
     ap.add_argument("--thinking", required=True)
     ap.add_argument("--comparison", required=True, help="label for the output analysis")
     ap.add_argument("--configs", required=True, help="baseline,ponytail-full")
+    ap.add_argument(
+        "--allow-legacy-results",
+        action="store_true",
+        help="explicitly analyze an entirely legacy, unprovenanced corpus",
+    )
     args = ap.parse_args()
     configs = [a.strip() for a in args.configs.split(",")]
     baseline = configs[0]
-    rows = [r for r in load_results(args.model, args.thinking, configs) if r.get("config") in configs]
+    rows = [
+        record
+        for record in load_results(
+            args.model,
+            args.thinking,
+            configs,
+            allow_legacy_results=args.allow_legacy_results,
+        )
+        if record.get("config") in configs
+    ]
     if not rows:
         raise SystemExit(f"no results found for {args.model}/{args.thinking}/{args.configs}")
 
