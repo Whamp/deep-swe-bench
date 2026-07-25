@@ -2076,6 +2076,10 @@ def test_launch_receipt_shows_review_information_and_baseline_differences(
     assert "Tasks: 1; configs: 2; reps: 2; concurrency: 1" in receipt
     assert "Cells: 2 preflight; 4 batch" in receipt
     assert (
+        "Preflight-covered batch entries: 2; successful preflight makes no "
+        "second subject call" in receipt
+    )
+    assert (
         "executor | executor | fixed | provider | provider/model | low"
         in receipt
     )
@@ -2225,9 +2229,7 @@ def test_compile_launch_request_resolves_local_runtime(
     harness_root = repository_root / "harness"
     harness_root.mkdir(exist_ok=True)
     (harness_root / "run.py").write_text("# fixture subject runner\n")
-    (repository_root / "Dockerfile.pi-agent").write_text(
-        "ARG PI_VERSION=0.81.1\n"
-    )
+    (harness_root / "Dockerfile.pi-agent").write_text("ARG PI_VERSION=0.81.1\n")
     task_root = tasks_root / "task-a"
     (task_root / "task.toml").write_text(
         """[metadata]

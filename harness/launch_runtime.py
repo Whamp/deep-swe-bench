@@ -55,7 +55,7 @@ class RepositoryLaunchRuntimeResolver:
         self.tasks_root = tasks_root
 
     def _pi_subject_version(self) -> str:
-        dockerfile = self.repository_root / "Dockerfile.pi-agent"
+        dockerfile = self.repository_root / "harness" / "Dockerfile.pi-agent"
         if not dockerfile.is_file():
             raise ValueError(
                 "Launch runtime identity unresolved: Pi Dockerfile missing at "
@@ -142,7 +142,7 @@ class RepositoryLaunchRuntimeResolver:
     def _harness_revision(self) -> str:
         paths = [
             self.repository_root / "harness",
-            self.repository_root / "Dockerfile.pi-agent",
+            self.repository_root / "harness" / "Dockerfile.pi-agent",
             self.repository_root / "pyproject.toml",
             self.repository_root / "uv.lock",
         ]

@@ -1642,6 +1642,10 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
     warnings = _receipt_warnings(document)
     subject_behavior_lines = _render_subject_behavior_lines(configs)
     policies = document["policies"]
+    preflight_result_paths = {cell["resultPath"] for cell in document["preflightCells"]}
+    preflight_overlap_count = sum(
+        cell["resultPath"] in preflight_result_paths for cell in document["batchCells"]
+    )
     lines = ["LAUNCH RECEIPT", "WARNINGS"]
     lines.extend(f"- {warning}" for warning in warnings)
     if not warnings:
@@ -1661,6 +1665,11 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
             (
                 f"Cells: {counts['preflightCells']} preflight; "
                 f"{counts['batchCells']} batch"
+            ),
+            (
+                "Preflight-covered batch entries: "
+                f"{preflight_overlap_count}; successful preflight makes no "
+                "second subject call"
             ),
             (
                 "Execution: "
