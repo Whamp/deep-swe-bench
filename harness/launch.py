@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
-from harness import config_lock, config_resolution, lib
+from harness import config_lock, config_resolution, lib, run_state
 from harness.run_state import sanitize_run_id
 
 _LAUNCH_PLAN_SCHEMA_VERSION = 1
@@ -351,6 +351,48 @@ class CompiledLaunch:
 
     plan: LaunchPlan
     receipt: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedPiCell:
+    """Supply one Pi runner with only behavior resolved by a confirmed plan."""
+
+    config_identity: str
+    config_lock_identity: str
+    config_root: Path
+    config_leaf: Path
+    smoke_contract: Path | None
+    task: str
+    rep: int
+    model: str
+    thinking: str
+    result_path: Path
+    subject_runner: Path
+    subject_version: str
+    harness_revision: str
+    task_revision: str
+    verifier_identity: str
+    immutable_image_identities: Mapping[str, str]
+    launch_plan_identity: str
+
+
+class ConfirmedPiRunner(Protocol):
+    """Execute one plan-resolved Pi cell without resolving launch inputs."""
+
+    def run_confirmed_pi_cell(
+        self,
+        cell: ConfirmedPiCell,
+    ) -> Mapping[str, object]:
+        """Return one complete result record without writing result.json."""
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedLaunchExecution:
+    """Identify durable artifacts produced by one confirmed cell execution."""
+
+    result_path: Path
+    state_path: Path
+    log_path: Path
 
 
 def canonical_launch_plan_json(document: Mapping[str, object]) -> str:
@@ -1527,3 +1569,254 @@ def compile_launch_request(
         canonical_json=canonical_json,
     )
     return CompiledLaunch(plan=plan, receipt=_render_launch_receipt(document))
+
+
+def _confirmed_plan_document(
+    plan: LaunchPlan,
+    confirmation_identity: str | None,
+) -> LaunchPlanDocument:
+    parsed_plan = parse_launch_plan_json(plan.canonical_json)
+    if parsed_plan.identity != plan.identity:
+        raise ValueError(
+            "Launch plan mismatch: supplied plan identity does not match its "
+            "canonical document"
+        )
+    if confirmation_identity is None:
+        raise ValueError("Launch confirmation missing: plan was not confirmed")
+    if confirmation_identity != parsed_plan.identity:
+        raise ValueError(
+            "Launch confirmation mismatch: "
+            f"confirmed={confirmation_identity!r}, "
+            f"plan={parsed_plan.identity!r}"
+        )
+    return parsed_plan.to_document()
+
+
+def _single_confirmed_pi_cell(
+    document: LaunchPlanDocument,
+) -> ConfirmedPiCell:
+    subject = document["subject"]
+    if subject["name"] != "pi":
+        raise ValueError(
+            "Confirmed Pi execution subject mismatch: "
+            f"expected 'pi', got {subject['name']!r}"
+        )
+    batch_cells = document["batchCells"]
+    if len(batch_cells) != 1:
+        raise ValueError(
+            "Confirmed Pi execution cell count invalid: "
+            f"expected exactly one batch cell, got {len(batch_cells)}"
+        )
+    cell_document = batch_cells[0]
+    config_identity = cell_document.get("config")
+    task = cell_document.get("task")
+    rep = cell_document.get("rep")
+    result_path = cell_document.get("resultPath")
+    if (
+        not isinstance(config_identity, str)
+        or not isinstance(task, str)
+        or not isinstance(rep, int)
+        or not isinstance(result_path, str)
+    ):
+        raise TypeError(
+            "Confirmed Pi execution cell invalid: config, task, rep, and "
+            "resultPath must be resolved"
+        )
+    config_document = next(
+        (
+            config
+            for config in document["configs"]
+            if config["identity"] == config_identity
+        ),
+        None,
+    )
+    if config_document is None:
+        raise ValueError(
+            "Confirmed Pi execution config missing: "
+            f"plan has no config document for {config_identity!r}"
+        )
+    lock_identity = config_document["lockIdentity"]
+    if not isinstance(lock_identity, str):
+        raise TypeError(
+            "Confirmed Pi execution config provenance missing: "
+            f"config={config_identity!r}"
+        )
+    verifier_identity = document["runtime"]["verifierIdentities"].get(task)
+    image_identities = document["runtime"]["immutableImageIdentities"].get(task)
+    if not isinstance(verifier_identity, str) or not isinstance(
+        image_identities,
+        dict,
+    ):
+        raise TypeError(
+            f"Confirmed Pi execution runtime missing: task={task!r}"
+        )
+    smoke_contract = config_document["smokeContract"]
+    return ConfirmedPiCell(
+        config_identity=config_identity,
+        config_lock_identity=lock_identity,
+        config_root=Path(config_document["configRoot"]),
+        config_leaf=Path(config_document["configLeaf"]),
+        smoke_contract=(
+            Path(smoke_contract) if smoke_contract is not None else None
+        ),
+        task=task,
+        rep=rep,
+        model=document["model"],
+        thinking=document["thinking"],
+        result_path=Path(result_path),
+        subject_runner=Path(subject["runner"]),
+        subject_version=subject["version"],
+        harness_revision=document["runtime"]["harnessRevision"],
+        task_revision=document["runtime"]["taskRevision"],
+        verifier_identity=verifier_identity,
+        immutable_image_identities={
+            str(name): str(identity)
+            for name, identity in image_identities.items()
+        },
+        launch_plan_identity=document["planIdentity"],
+    )
+
+
+def _confirmed_result_record(
+    cell: ConfirmedPiCell,
+    record: Mapping[str, object],
+) -> dict[str, object]:
+    config_identity = config_resolution.parse_versioned_config_identity(
+        cell.config_identity
+    )
+    if config_identity is None:
+        raise ValueError(
+            "Confirmed Pi execution config version missing: "
+            f"config={cell.config_identity!r}"
+        )
+    confirmed_record = dict(record)
+    confirmed_record.update(
+        {
+            "config": cell.config_identity,
+            "config_lock_identity": cell.config_lock_identity,
+            "config_name": config_identity.name,
+            "config_version": config_identity.version,
+            "harness_revision": cell.harness_revision,
+            "immutable_image_identities": dict(cell.immutable_image_identities),
+            "launch_plan_identity": cell.launch_plan_identity,
+            "model": cell.model,
+            "rep": cell.rep,
+            "subject": "pi",
+            "subject_version": cell.subject_version,
+            "task": cell.task,
+            "task_revision": cell.task_revision,
+            "thinking_level": cell.thinking,
+            "verifier_identity": cell.verifier_identity,
+        }
+    )
+    return confirmed_record
+
+
+def _confirmed_run_manifest(
+    document: LaunchPlanDocument,
+    cell: ConfirmedPiCell,
+    log_path: Path,
+) -> tuple[dict[str, object], dict[str, object]]:
+    state_cell = run_state.make_cell(
+        task=cell.task,
+        config=cell.config_identity,
+        rep=cell.rep,
+        result_path=cell.result_path,
+        log_path=log_path,
+    )
+    manifest = run_state.base_manifest(
+        run_id=document["runId"],
+        command=["execute_confirmed_launch", document["planIdentity"]],
+        cwd=document["paths"]["workspace"],
+        model=cell.model,
+        thinking=cell.thinking,
+        configs=[cell.config_identity],
+        selection=dict(document["selection"]),
+        runs=1,
+        workers=1,
+        agent="pi",
+        agent_timeout_s=None,
+        rpc_quiescence_s=None,
+        progress_interval_s=None,
+        batch_cells=[state_cell],
+        preflight=[],
+    )
+    manifest.update(
+        {
+            "launch_plan_identity": document["planIdentity"],
+            "launch_plan_path": "launch-plan.json",
+        }
+    )
+    return manifest, state_cell
+
+
+def execute_confirmed_launch(
+    plan: LaunchPlan,
+    *,
+    confirmation_identity: str | None,
+    pi_runner: ConfirmedPiRunner,
+) -> ConfirmedLaunchExecution:
+    """Execute one Pi cell only when its exact launch plan was confirmed."""
+    document = _confirmed_plan_document(plan, confirmation_identity)
+    cell = _single_confirmed_pi_cell(document)
+    state_path = Path(document["paths"]["statePath"])
+    expected_state_path = (
+        Path(document["paths"]["stateRoot"]) / document["runId"]
+    ).resolve()
+    if state_path.resolve() != expected_state_path:
+        raise ValueError(
+            "Confirmed launch state path mismatch: "
+            f"planned={str(state_path)!r}, "
+            f"expected={str(expected_state_path)!r}"
+        )
+    log_path = state_path / "logs" / "confirmed-pi-cell.log"
+    manifest, state_cell = _confirmed_run_manifest(document, cell, log_path)
+    state = run_state.RunStateWriter(
+        document["paths"]["stateRoot"],
+        manifest,
+    )
+    state.start()
+    plan_path = state_path / "launch-plan.json"
+    plan_path.write_text(plan.canonical_json)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "Confirmed Pi cell execution\n"
+        f"launch_plan_identity={cell.launch_plan_identity}\n"
+        f"cell={cell.task}/{cell.config_identity}/rep{cell.rep}\n"
+    )
+    state.cell_started(state_cell)
+    cell.result_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        runner_record = pi_runner.run_confirmed_pi_cell(cell)
+        result_record = _confirmed_result_record(cell, runner_record)
+        run_state.atomic_write_json(cell.result_path, result_record)
+    except Exception as error:
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write(
+                "Confirmed Pi cell execution failed: "
+                f"{type(error).__name__}: {error}\n"
+            )
+        state.cell_finished(
+            state_cell,
+            log_path=log_path,
+            exit_code="exception",
+        )
+        state.run_failed(reason="Confirmed Pi cell execution failed")
+        raise
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write("Confirmed Pi cell execution completed\n")
+    agent_exit = result_record.get("agent_exit")
+    if not isinstance(agent_exit, (int, str)):
+        agent_exit = None
+    state.cell_finished(
+        state_cell,
+        result_path=cell.result_path,
+        log_path=log_path,
+        exit_code=agent_exit,
+    )
+    state.run_completed()
+    return ConfirmedLaunchExecution(
+        result_path=cell.result_path,
+        state_path=state_path,
+        log_path=log_path,
+    )
