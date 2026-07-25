@@ -21,7 +21,12 @@ configs/<config>/                       # constant files
 New releases render the config directory as `<name>@<major>.<minor>.<patch>`,
 for example `pi-recursive@2.0.0`. The full identity remains one path segment, so
 it occupies the existing config axis in `configs/` and `results/`. Existing
-unversioned directories remain readable legacy configs.
+unversioned directories remain readable legacy configs, but they have no modern
+lock provenance. Confirmed planning warns about that limitation, confirmed
+execution requires a versioned locked release, and any legacy reuse decision
+for a new release must name
+the exact prior config identity, recorded provenance, result identity, and a
+rationale. The harness never fabricates a lock for old evidence.
 
 `<model-leaf>` is `lib.model_leaf(model)` (the last `/`-segment of the model id);
 advisor configs use `<exec>+<advisor>` here (e.g. `deepseek-v4-flash+glm-5.2`).
@@ -155,17 +160,19 @@ credential names and environment-variable routes remain reviewable. See
 [ADR-0006](../docs/adr/0006-versioned-config-locks.md) for sealing and shared
 immutability rules.
 
-`harness/run.py --config <identity> --model <m> --thinking <t> --task <id>` picks
-up the release. No harness changes.
+Canonical batches select the release through `python -m harness.run_batch plan`;
+the resulting receipt and plan identity must be reviewed before `execute`.
+Direct `harness/run.py` and `run_omp.py` calls are draft probes only and require
+`--probe-output` outside `results/`.
 
 ## Smoke tests and contracts
 
-`harness/run_batch.py` has an automatic smoke gate for configs that have no
-existing results for the selected executor model + thinking leaf. Before it fans
-out a full batch, it runs one `rep0` cell. It prefers the first requested task
-that appears in `subsets/12_v0.txt`; if the requested batch has no `12_v0`
-overlap, it uses the first requested task so the smoke result is still reusable
-for that comparison instead of becoming a throwaway cell.
+A confirmed launch with preflight policy `new-configs` plans one preflight for
+each config without compatible existing evidence; policy `required` plans one
+for every selected config. The receipt shows those cells and the conditional
+batch fan-out before confirmation. Preflight prefers the first requested task
+that appears in `subsets/12_v0.txt`; without overlap, it uses the first requested
+task so passing evidence remains reusable for that comparison.
 
 The default smoke check is deliberately generic. It only verifies that the
 harness produced a normal cell:
@@ -229,5 +236,6 @@ config-level request hooks may not see them. Put required mutation/audit logic i
 the nested worker path itself (or otherwise prove the hook fires there), then
 require the copied audit artifact in `smoke.json`.
 
-You can bypass the automatic gate with `--no-smoke-new-configs`, but only do that
-when you have separate evidence that the config already works.
+The `disabled` preflight policy is an explicit launch-plan decision, visible in
+the receipt and covered by the same plan identity. Do not select it unless exact
+compatible evidence justifies omitting a new paid preflight.

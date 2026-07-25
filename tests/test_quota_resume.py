@@ -201,7 +201,7 @@ class TestMainResumeLoop:
                     ResumerCls.return_value.attempt = 1
                     out = io.StringIO()
                     with contextlib.redirect_stdout(out):
-                        run_batch.main()  # should return normally (code 0)
+                        run_batch._legacy_main()  # compatibility scheduler
                 # _execute_batch called twice: first 75 (resume), then 0
                 assert exec_mock.call_count == 2
                 assert "re-launching batch (attempt 1)" in out.getvalue()
@@ -227,7 +227,7 @@ class TestMainResumeLoop:
                      mock.patch.object(run_batch, "_execute_batch", return_value=run_batch.TRANSIENT_EXIT) as exec_mock, \
                      mock.patch.object(run_batch, "QuotaResumer") as ResumerCls:
                     with pytest.raises(SystemExit) as ei:
-                        run_batch.main()
+                        run_batch._legacy_main()
                     assert ei.value.code == run_batch.TRANSIENT_EXIT
                 # only called once — no resume loop
                 assert exec_mock.call_count == 1

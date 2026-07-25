@@ -12,9 +12,9 @@ The agent works in the real task container so it can run the project's own tests
 with the correct toolchain; the reward is always measured in a pristine verifier
 container (separate-env grading), exactly as DeepSWE/Pier define it.
 
-Usage:
-  python run.py --config baseline --task abs-module-cache-flags
-  python run.py --config ponytail-full --task <id> --agent-timeout 600
+Usage (draft probe only):
+  python run.py --config baseline --task abs-module-cache-flags \\
+    --probe-output scratch/probes/baseline-abs-module
 """
 from __future__ import annotations
 
@@ -254,8 +254,13 @@ def load_config(
         repository_root = REPO
     resolved = resolve_config_leaf(repository_root, config, model, thinking)
     require_matching_config_lock(resolved, config)
-    cdir = resolved.config_root
-    leafdir = resolved.config_leaf
+    return load_resolved_config(resolved.config_root, resolved.config_leaf)
+
+
+def load_resolved_config(config_root: Path, config_leaf: Path) -> dict:
+    """Load one exact config leaf already approved by a launch plan."""
+    cdir = config_root
+    leafdir = config_leaf
     leaf_rel = leafdir.relative_to(cdir).as_posix()
     skill_dirs = []
     sd = cdir / "skills"
@@ -432,14 +437,33 @@ def pi_cmd(arm_cfg: dict, model: str, thinking: str, append_text: str,
 
 
 def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
-             agent_timeout: float, keep: bool, pass_openai_codex_oauth: bool,
-             rpc_quiescence: float, capture_initial_context: bool = True) -> dict:
-    task = load_task(task_id)
-    arm_cfg = load_config(config, model, thinking)
+             agent_timeout: float | None, keep: bool,
+             pass_openai_codex_oauth: bool, rpc_quiescence: float,
+             capture_initial_context: bool = True,
+             output_cell: Path | None = None,
+             persist_result_file: bool = True,
+             persist_result_index: bool = True,
+             config_root: Path | None = None,
+             config_leaf: Path | None = None,
+             task_root: Path | None = None) -> dict:
+    task = load_task(task_id, root=task_root)
+    agent_timeout = agent_timeout or task.agent_timeout_s
+    if (config_root is None) != (config_leaf is None):
+        raise ValueError(
+            "Confirmed config paths invalid: config root and leaf must be "
+            "provided together"
+        )
+    arm_cfg = (
+        load_resolved_config(config_root, config_leaf)
+        if config_root is not None and config_leaf is not None
+        else load_config(config, model, thinking)
+    )
     ensure_env_image(task.env_image)
     pi_image = ensure_pi_image(task)
 
-    cell = results_tree.Tree.of(model, thinking, repo=REPO).cell(config, task_id, rep).dir
+    cell = output_cell or results_tree.Tree.of(
+        model, thinking, repo=REPO
+    ).cell(config, task_id, rep).dir
     cell.mkdir(parents=True, exist_ok=True)
     (cell / "artifacts").mkdir(exist_ok=True)
     (cell / "verifier").mkdir(exist_ok=True)
@@ -651,16 +675,40 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
         agent_wall_s=status.get("agent_wall_s"),
         **usage,
     )
-    (cell / "result.json").write_text(json.dumps(rec, indent=2))
-    rl = results_tree.Tree.of(model, thinking, repo=REPO).results_jsonl
-    rl.parent.mkdir(parents=True, exist_ok=True)
-    with open(rl, "a") as f:
-        f.write(json.dumps(rec) + "\n")
+    if persist_result_file:
+        (cell / "result.json").write_text(json.dumps(rec, indent=2))
+    if persist_result_index:
+        rl = results_tree.Tree.of(model, thinking, repo=REPO).results_jsonl
+        rl.parent.mkdir(parents=True, exist_ok=True)
+        with open(rl, "a") as f:
+            f.write(json.dumps(rec) + "\n")
     print(f"[done] {task_id}/{config}#{rep}: partial={rec['reward_partial']:.3f} "
           f"binary={rec['reward_binary']} tok={rec['total_tokens']} "
           f"cost=${rec['cost_usd']:.4f} wall={rec['agent_wall_s']}s "
           f"patch={rec['patch_bytes']}B", flush=True)
     return rec
+
+
+def require_draft_probe_output(
+    probe_output: Path | None,
+    canonical_results: Path,
+) -> Path:
+    """Return a resolved scratch probe cell outside canonical results."""
+    if probe_output is None:
+        raise SystemExit(
+            "Draft probe required: direct one-cell debugging needs "
+            "--probe-output outside canonical results"
+        )
+    resolved_output = probe_output.resolve()
+    canonical_root = canonical_results.resolve()
+    if resolved_output == canonical_root or resolved_output.is_relative_to(
+        canonical_root
+    ):
+        raise SystemExit(
+            "Draft probe output invalid: scratch output must be outside "
+            f"canonical results at {canonical_root}"
+        )
+    return resolved_output
 
 
 def main():
@@ -680,7 +728,17 @@ def main():
                     help="seconds Pi RPC must remain idle with no pending messages before the cell stops")
     ap.add_argument("--no-initial-context-capture", action="store_true",
                     help="disable initial system/context/provider-request capture under result initial_context/")
+    ap.add_argument(
+        "--probe-output",
+        type=Path,
+        help="required scratch cell for direct draft/probe debugging",
+    )
     args = ap.parse_args()
+
+    probe_output = require_draft_probe_output(
+        args.probe_output,
+        REPO / "results",
+    )
 
     task = load_task(args.task)
     to = args.agent_timeout or task.agent_timeout_s
@@ -688,7 +746,9 @@ def main():
                    rep=args.rep, agent_timeout=to, keep=args.keep,
                    pass_openai_codex_oauth=args.pass_openai_codex_oauth,
                    rpc_quiescence=args.rpc_quiescence,
-                   capture_initial_context=not args.no_initial_context_capture)
+                   capture_initial_context=not args.no_initial_context_capture,
+                   output_cell=probe_output,
+                   persist_result_index=False)
     print(json.dumps({"ok": True, "reward_partial": rec["reward_partial"],
                       "total_tokens": rec["total_tokens"]}))
 

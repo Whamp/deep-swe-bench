@@ -1,3 +1,4 @@
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -123,6 +124,86 @@ class SubjectRunnerConfigResolutionTests(unittest.TestCase):
         self.assertIn("Config leaf ambiguous:", message)
         self.assertIn(str(direct_leaf), message)
         self.assertIn(str(worker_leaf), message)
+
+
+class ProbeCommandTests(unittest.TestCase):
+    def test_pi_direct_debugging_requires_scratch_probe_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            argv = [
+                "run.py",
+                "--config",
+                "cfg",
+                "--task",
+                "task-a",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(run, "REPO", root),
+                patch.object(run, "run_cell") as run_cell,
+                self.assertRaisesRegex(SystemExit, "Draft probe required"),
+            ):
+                run.main()
+
+        run_cell.assert_not_called()
+
+    def test_pi_probe_writes_only_to_explicit_scratch_cell(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            probe_output = root / "scratch" / "probe-cell"
+            argv = [
+                "run.py",
+                "--config",
+                "cfg",
+                "--task",
+                "task-a",
+                "--probe-output",
+                str(probe_output),
+            ]
+            task = type("Task", (), {"agent_timeout_s": 30.0})()
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(run, "REPO", root),
+                patch.object(run, "load_task", return_value=task),
+                patch.object(
+                    run,
+                    "run_cell",
+                    return_value={"reward_partial": 0.0, "total_tokens": 1},
+                ) as run_cell,
+            ):
+                run.main()
+
+        self.assertEqual(run_cell.call_args.kwargs["output_cell"], probe_output)
+        self.assertFalse(run_cell.call_args.kwargs["persist_result_index"])
+
+    def test_omp_probe_writes_only_to_explicit_scratch_cell(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            probe_output = root / "scratch" / "omp-probe-cell"
+            argv = [
+                "run_omp.py",
+                "--config",
+                "cfg",
+                "--task",
+                "task-a",
+                "--probe-output",
+                str(probe_output),
+            ]
+            task = type("Task", (), {"agent_timeout_s": 30.0})()
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(run_omp, "REPO", root),
+                patch.object(run_omp, "load_task", return_value=task),
+                patch.object(
+                    run_omp,
+                    "run_cell",
+                    return_value={"reward_partial": 0.0, "total_tokens": 1},
+                ) as run_cell,
+            ):
+                run_omp.main()
+
+        self.assertEqual(run_cell.call_args.kwargs["output_cell"], probe_output)
+        self.assertFalse(run_cell.call_args.kwargs["persist_result_index"])
 
 
 class RunPiCommandTests(unittest.TestCase):

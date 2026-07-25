@@ -238,6 +238,35 @@ class RunStateWriter:
             self._save_status_locked()
             self._append_event_locked("run_started", kind="run")
 
+    def resume(self) -> None:
+        """Restart scheduling while preserving prior structured run events."""
+        with self._lock:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            previous_status: dict[str, Any] = {}
+            if self.status_path.is_file():
+                loaded_status = json.loads(self.status_path.read_text())
+                if isinstance(loaded_status, dict):
+                    previous_status = loaded_status
+            if self.events_path.is_file():
+                for line in self.events_path.read_text().splitlines():
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, dict):
+                        self._seq = max(
+                            self._seq,
+                            int(event.get("seq") or 0),
+                        )
+            if previous_status.get("started_at"):
+                self.status["started_at"] = previous_status["started_at"]
+            self.status["resume_count"] = int(
+                previous_status.get("resume_count") or 0
+            ) + 1
+            atomic_write_json(self.manifest_path, self.manifest)
+            self._save_status_locked()
+            self._append_event_locked("run_resumed", kind="run")
+
     def start_heartbeat(self, interval_s: float | None) -> None:
         if not interval_s or interval_s <= 0:
             return

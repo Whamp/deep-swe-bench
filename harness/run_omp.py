@@ -5,6 +5,7 @@ This runner intentionally mirrors ``harness/run.py`` for sandbox setup,
 patch capture, verifier execution, usage parsing, and result.json shape. The
 only executor difference is the command inside the task container: ``omp`` in
 RPC mode with skills/extensions/rules disabled and a restricted basic tool set.
+Direct CLI use is a draft probe and requires scratch ``--probe-output``.
 """
 from __future__ import annotations
 
@@ -24,12 +25,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import parse_usage  # noqa: E402
-from lib import load_task, read_reward, result_record, REPO  # noqa: E402
 import results_tree  # noqa: E402
+from lib import REPO, load_task, read_reward, result_record  # noqa: E402
 from pi_rpc_runner import run_pi_rpc  # noqa: E402
 from run import (  # noqa: E402
     TRANSIENT_EXIT,
     compact_verifier_stdout,
+    config_append_text,
     ensure_env_image,
     ensure_pi_image,
     ensure_verifier_image,
@@ -37,7 +39,8 @@ from run import (  # noqa: E402
     initial_context_capture_flags,
     initial_context_capture_mount,
     load_config,
-    config_append_text,
+    load_resolved_config,
+    require_draft_probe_output,
     sh,
     strip_patch_paths,
     transient_model_error,
@@ -227,24 +230,67 @@ def omp_cmd(model: str, thinking: str, append_text: str, tools: str,
 
 
 def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
-             agent_timeout: float, keep: bool, pass_openai_codex_oauth: bool,
-             rpc_quiescence: float, capture_initial_context: bool = True) -> dict:
+             agent_timeout: float | None, keep: bool,
+             pass_openai_codex_oauth: bool, rpc_quiescence: float,
+             capture_initial_context: bool = True,
+             output_cell: Path | None = None,
+             persist_result_file: bool = True,
+             persist_result_index: bool = True,
+             config_root: Path | None = None,
+             config_leaf: Path | None = None,
+             task_root: Path | None = None,
+             subject_behavior: dict[str, object] | None = None,
+             omp_binary_path: Path | None = None) -> dict:
     if not model.startswith("openai-codex/"):
         sys.exit("OMP benchmark runner currently requires explicit openai-codex/<model> model ids")
     if not pass_openai_codex_oauth:
         sys.exit("OMP openai-codex models require --pass-openai-codex-oauth")
 
-    task = load_task(task_id)
-    cfg = load_config(
-        config,
-        model,
-        thinking,
-        repository_root=REPO,
+    task = load_task(task_id, root=task_root)
+    agent_timeout = agent_timeout or task.agent_timeout_s
+    if (config_root is None) != (config_leaf is None):
+        raise ValueError(
+            "Confirmed config paths invalid: config root and leaf must be "
+            "provided together"
+        )
+    cfg = (
+        load_resolved_config(config_root, config_leaf)
+        if config_root is not None and config_leaf is not None
+        else load_config(
+            config,
+            model,
+            thinking,
+            repository_root=REPO,
+        )
     )
-    tools = resolve_omp_tools(cfg["dir"])
-    overlay = omp_overlay_in_container(cfg["dir"])
-    system_prompt = render_omp_system_prompt(cfg["dir"])
-    omp_extensions = resolve_omp_extensions(cfg["dir"])
+    if subject_behavior is None:
+        tools = resolve_omp_tools(cfg["dir"])
+        overlay = omp_overlay_in_container(cfg["dir"])
+        system_prompt = render_omp_system_prompt(cfg["dir"])
+        omp_extensions = resolve_omp_extensions(cfg["dir"])
+        append_text = config_append_text(cfg)
+    else:
+        tool_values = subject_behavior.get("toolWhitelist")
+        if not isinstance(tool_values, list):
+            raise TypeError(
+                "Confirmed OMP behavior invalid: tool whitelist must be a list"
+            )
+        tools = ",".join(str(tool) for tool in tool_values)
+        overlay_value = subject_behavior.get("overlay")
+        overlay = str(overlay_value) if overlay_value is not None else None
+        system_prompt_value = subject_behavior.get("systemPrompt")
+        system_prompt = (
+            str(system_prompt_value)
+            if system_prompt_value is not None
+            else None
+        )
+        extension_values = subject_behavior.get("extensions", [])
+        if not isinstance(extension_values, list):
+            raise TypeError(
+                "Confirmed OMP behavior invalid: extensions must be a list"
+            )
+        omp_extensions = [str(path) for path in extension_values]
+        append_text = str(subject_behavior.get("appendSystemPrompt", ""))
     if cfg["skill_dirs"]:
         sys.exit("baseline OMP configs must not define skills")
     if cfg["pi_flags"]:
@@ -255,14 +301,14 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     ensure_env_image(task.env_image)
     agent_image = ensure_pi_image(task)
 
-    cell = results_tree.Tree.of(model, thinking, repo=REPO).cell(config, task_id, rep).dir
+    cell = output_cell or results_tree.Tree.of(
+        model, thinking, repo=REPO
+    ).cell(config, task_id, rep).dir
     cell.mkdir(parents=True, exist_ok=True)
     (cell / "artifacts").mkdir(exist_ok=True)
     (cell / "verifier").mkdir(exist_ok=True)
     (cell / "logs").mkdir(exist_ok=True)
     (cell / "transient_error.json").unlink(missing_ok=True)
-
-    append_text = config_append_text(cfg)
 
     suffix = f"{config}-{task_id}-r{rep}-{os.getpid()}"
     cname = f"dsw-{suffix}"
@@ -272,7 +318,7 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     shutil.copy2(task.dir / "instruction.md", Path(task_public) / "instruction.md")
     shutil.copy2(task.dir / "pre_artifacts.sh", Path(task_public) / "pre_artifacts.sh")
     create_filtered_omp_agent_db(Path(auth_tmp) / "agent" / "agent.db")
-    omp_path = omp_binary()
+    omp_path = omp_binary_path or omp_binary()
 
     env_flag = ["-e", "PI_CODING_AGENT_DIR=/root/.omp/agent"]
     for k, v in cfg["env"].items():
@@ -408,11 +454,13 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
         agent_wall_s=status.get("agent_wall_s"),
         **usage,
     )
-    (cell / "result.json").write_text(json.dumps(rec, indent=2))
-    rl = results_tree.Tree.of(model, thinking, repo=REPO).results_jsonl
-    rl.parent.mkdir(parents=True, exist_ok=True)
-    with open(rl, "a") as f:
-        f.write(json.dumps(rec) + "\n")
+    if persist_result_file:
+        (cell / "result.json").write_text(json.dumps(rec, indent=2))
+    if persist_result_index:
+        rl = results_tree.Tree.of(model, thinking, repo=REPO).results_jsonl
+        rl.parent.mkdir(parents=True, exist_ok=True)
+        with open(rl, "a") as f:
+            f.write(json.dumps(rec) + "\n")
     print(f"[done] {task_id}/{config}#{rep}: partial={rec['reward_partial']:.3f} "
           f"binary={rec['reward_binary']} tok={rec['total_tokens']} "
           f"cost=${rec['cost_usd']:.4f} wall={rec['agent_wall_s']}s "
@@ -437,14 +485,25 @@ def main() -> None:
                     help="copy only OMP's host openai-codex OAuth entry into each agent container")
     ap.add_argument("--no-initial-context-capture", action="store_true",
                     help="disable initial system/context/provider-request capture under result initial_context/")
+    ap.add_argument(
+        "--probe-output",
+        type=Path,
+        help="required scratch cell for direct draft/probe debugging",
+    )
     args = ap.parse_args()
+    probe_output = require_draft_probe_output(
+        args.probe_output,
+        REPO / "results",
+    )
     task = load_task(args.task)
     timeout = args.agent_timeout or task.agent_timeout_s
     rec = run_cell(args.config, args.task, model=args.model, thinking=args.thinking,
                    rep=args.rep, agent_timeout=timeout, keep=args.keep,
                    pass_openai_codex_oauth=args.pass_openai_codex_oauth,
                    rpc_quiescence=args.rpc_quiescence,
-                   capture_initial_context=not args.no_initial_context_capture)
+                   capture_initial_context=not args.no_initial_context_capture,
+                   output_cell=probe_output,
+                   persist_result_index=False)
     print(json.dumps(rec))
 
 

@@ -59,6 +59,26 @@ class RunnerSelectionTests(unittest.TestCase):
         self.assertEqual(run_batch.runner_script(args).name, "run_omp.py")
 
 
+class ConfirmedLaunchCommandTests(unittest.TestCase):
+    def test_raw_batch_arguments_cannot_start_canonical_execution(self):
+        argv = [
+            "run_batch.py",
+            "--configs",
+            "baseline@1.0.0",
+            "--tasks",
+            "task-a",
+        ]
+
+        with (
+            patch.object(sys, "argv", argv),
+            self.assertRaisesRegex(SystemExit, "Confirmed launch required"),
+            patch.object(run_batch, "run_one") as run_one,
+        ):
+            run_batch.main()
+
+        run_one.assert_not_called()
+
+
 class StructuredStateIntegrationTests(unittest.TestCase):
     def test_main_writes_structured_state_for_skipped_existing_cell_without_changing_stdout(self):
         with tempfile.TemporaryDirectory() as td:
@@ -90,7 +110,7 @@ class StructuredStateIntegrationTests(unittest.TestCase):
             out = io.StringIO()
             try:
                 with patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
-                    run_batch.main()
+                    run_batch._legacy_main()
             finally:
                 run_batch.REPO = old_repo
                 run_batch.STATE_ROOT = old_state_root

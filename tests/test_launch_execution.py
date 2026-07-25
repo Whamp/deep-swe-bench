@@ -8,10 +8,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 
-from harness import config_lock, launch
+from harness import config_lock, launch, run_batch
 from harness.launch import (
     CompiledLaunch,
     ConfirmedOmpCell,
@@ -21,6 +22,7 @@ from harness.launch import (
     LaunchRequest,
     LaunchRuntimeIdentity,
     LaunchTaskSelection,
+    LaunchTransientModelError,
     compile_launch_request,
     execute_confirmed_launch,
 )
@@ -522,6 +524,283 @@ def _compile_single_cell_launch(
         state_root=state_root,
     )
     return compiled, config_leaf, smoke_contract, results_root, state_root
+
+
+def test_confirmed_execution_rejects_legacy_config_before_subject_call(
+    tmp_path: Path,
+) -> None:
+    """Legacy configs stay readable but cannot create canonical results."""
+    repository_root = tmp_path / "repository"
+    tasks_root = tmp_path / "tasks"
+    results_root = tmp_path / "canonical-results"
+    state_root = tmp_path / "central-state"
+    (repository_root / "configs" / "legacy" / "model" / "low").mkdir(
+        parents=True
+    )
+    runner_path = repository_root / "harness" / "run.py"
+    runner_path.parent.mkdir()
+    runner_path.write_text("# fixture runner\n")
+    task_root = tasks_root / "task-a"
+    task_root.mkdir(parents=True)
+    (task_root / "task.toml").write_text("[metadata]\n")
+    request = LaunchRequest(
+        subject="pi",
+        model="provider/model",
+        thinking="low",
+        configs=("legacy",),
+        baseline_config="legacy",
+        task_selection=LaunchTaskSelection(kind="tasks", tasks=("task-a",)),
+        reps=1,
+        concurrency=1,
+        run_id="legacy-plan",
+        policies=LaunchExecutionPolicies(
+            preflight="disabled",
+            existing_results="rerun",
+            transient_errors="stop",
+            cell_retries=0,
+        ),
+    )
+    runtime = LaunchRuntimeIdentity(
+        subject_version="pi@0.81.1",
+        harness_revision="sha256:harness-fixture",
+        task_revision="sha256:task-fixture",
+        verifier_identities={"task-a": "sha256:verifier-fixture"},
+        immutable_image_identities={
+            "task-a": {
+                "agent": "sha256:agent-image",
+                "environment": "sha256:environment-image",
+                "verifier": "sha256:verifier-image",
+            }
+        },
+    )
+    resolver = StaticLaunchRuntimeResolver(runtime)
+    compiled = compile_launch_request(
+        request,
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=resolver,
+    )
+    runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Confirmed config release required:",
+    ):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=resolver,
+            pi_runner=runner,
+        )
+
+    assert runner.calls == []
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def test_execute_command_consumes_only_reviewed_plan_and_confirmation(
+    tmp_path: Path,
+) -> None:
+    """Canonical CLI execution consumes no repeated launch arguments."""
+    compiled, _, _, _, _ = _compile_single_cell_launch(tmp_path)
+    reviewed_plan_path = tmp_path / "reviewed-launch-plan.json"
+    reviewed_plan_path.write_text(compiled.plan.canonical_json)
+    runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
+
+    run_batch.main(
+        [
+            "execute",
+            "--plan",
+            str(reviewed_plan_path),
+            "--confirm",
+            compiled.plan.identity,
+        ],
+        runtime_resolver=_runtime_resolver_for(compiled),
+        pi_runner=runner,
+    )
+
+    assert len(runner.calls) == 1
+    assert runner.calls[0].launch_plan_identity == compiled.plan.identity
+    result = json.loads(runner.calls[0].result_path.read_text())
+    assert result["launch_plan_identity"] == compiled.plan.identity
+
+
+def test_execute_command_default_pi_runner_uses_plan_resolved_paths(
+    tmp_path: Path,
+) -> None:
+    """The real Pi adapter does not rediscover config or result paths."""
+    compiled, config_leaf, _, _, _ = _compile_single_cell_launch(tmp_path)
+    reviewed_plan_path = tmp_path / "reviewed-launch-plan.json"
+    reviewed_plan_path.write_text(compiled.plan.canonical_json)
+    legacy_result = {
+        "agent_exit": 0,
+        "arm_advisor": {},
+        "arm_models": {},
+        "arm_pi_flags": [],
+        "arm_settings": {},
+        "reward_binary": 1,
+        "reward_partial": 1.0,
+        "total_tokens": 10,
+        "verifier_exit": 0,
+    }
+
+    with patch("harness.run.run_cell", return_value=legacy_result) as run_cell:
+        run_batch.main(
+            [
+                "execute",
+                "--plan",
+                str(reviewed_plan_path),
+                "--confirm",
+                compiled.plan.identity,
+            ],
+            runtime_resolver=_runtime_resolver_for(compiled),
+        )
+
+    call = run_cell.call_args
+    assert call.kwargs["config_root"] == config_leaf.parents[1]
+    assert call.kwargs["config_leaf"] == config_leaf
+    result_path = compiled.plan.to_document()["batchCells"][0]["resultPath"]
+    assert isinstance(result_path, str)
+    assert call.kwargs["output_cell"] == Path(result_path).parent
+    assert call.kwargs["persist_result_file"] is False
+    assert call.kwargs["persist_result_index"] is False
+
+
+def test_confirmed_launch_resumes_after_transient_without_rerunning_rep(
+    tmp_path: Path,
+) -> None:
+    """The same confirmed plan resumes read-only after a quota transient."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        preflight="required",
+        reps=2,
+    )
+
+    class PauseOnSecondRepRunner(FakeConfirmedPiRunner):
+        """Produce rep0, then emulate a provider transient on rep1."""
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            if cell.rep == 1:
+                self.calls.append(cell)
+                raise LaunchTransientModelError("fixture quota window")
+            return super().run_confirmed_pi_cell(cell)
+
+    first_runner = PauseOnSecondRepRunner(_planned_launch_plan_path(compiled))
+    with pytest.raises(LaunchTransientModelError):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=first_runner,
+        )
+
+    state_path = _registered_state_path(state_root, "confirmed-fixture")
+    first_status = json.loads((state_path / "status.json").read_text())
+    assert first_status["state"] == "paused"
+    assert [cell.rep for cell in first_runner.calls] == [0, 1]
+
+    resumed_runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
+    execute_confirmed_launch(
+        compiled.plan,
+        confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
+        pi_runner=resumed_runner,
+    )
+
+    assert [cell.rep for cell in resumed_runner.calls] == [1]
+    resumed_status = json.loads((state_path / "status.json").read_text())
+    assert resumed_status["state"] == "completed"
+    assert resumed_status["counts"]["batch_skipped"] == 1
+    event_names = [
+        json.loads(line)["event"]
+        for line in (state_path / "events.ndjson").read_text().splitlines()
+    ]
+    assert "run_paused" in event_names
+    assert "run_resumed" in event_names
+
+
+def test_execute_command_reports_transient_pause_as_exit_75(
+    tmp_path: Path,
+) -> None:
+    """The canonical CLI preserves the established transient pause signal."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(tmp_path)
+    reviewed_plan_path = tmp_path / "reviewed-launch-plan.json"
+    reviewed_plan_path.write_text(compiled.plan.canonical_json)
+
+    with (
+        patch("harness.run.run_cell", side_effect=SystemExit(75)),
+        pytest.raises(SystemExit) as raised,
+    ):
+        run_batch.main(
+            [
+                "execute",
+                "--plan",
+                str(reviewed_plan_path),
+                "--confirm",
+                compiled.plan.identity,
+            ],
+            runtime_resolver=_runtime_resolver_for(compiled),
+        )
+
+    assert raised.value.code == 75
+    state_path = _registered_state_path(state_root, "confirmed-fixture")
+    status = json.loads((state_path / "status.json").read_text())
+    assert status["state"] == "paused"
+
+
+def test_execute_command_default_omp_runner_uses_plan_resolved_behavior(
+    tmp_path: Path,
+) -> None:
+    """The real OMP adapter consumes exact planned behavior and binary path."""
+    compiled, _ = _compile_single_omp_launch(
+        tmp_path,
+        preflight="disabled",
+    )
+    reviewed_plan_path = tmp_path / "reviewed-omp-launch-plan.json"
+    reviewed_plan_path.write_text(compiled.plan.canonical_json)
+    legacy_result = {
+        "agent_exit": 0,
+        "arm_advisor": {},
+        "arm_models": {},
+        "arm_pi_flags": [],
+        "arm_settings": {},
+        "reward_binary": 1,
+        "reward_partial": 1.0,
+        "total_tokens": 10,
+        "verifier_exit": 0,
+    }
+
+    with patch(
+        "harness.run_omp.run_cell",
+        return_value=legacy_result,
+    ) as run_cell:
+        run_batch.main(
+            [
+                "execute",
+                "--plan",
+                str(reviewed_plan_path),
+                "--confirm",
+                compiled.plan.identity,
+            ],
+            runtime_resolver=_runtime_resolver_for(compiled),
+        )
+
+    plan_document = compiled.plan.to_document()
+    planned_config = plan_document["configs"][0]
+    call = run_cell.call_args
+    assert call.kwargs["config_root"] == Path(planned_config["configRoot"])
+    assert call.kwargs["config_leaf"] == Path(planned_config["configLeaf"])
+    assert call.kwargs["subject_behavior"] == plan_document["configs"][0][
+        "subjectBehavior"
+    ]
+    assert call.kwargs["omp_binary_path"] == Path("/fixture/bin/omp")
+    assert call.kwargs["persist_result_file"] is False
+    assert call.kwargs["persist_result_index"] is False
 
 
 def test_confirmed_omp_preflight_executes_plan_resolved_subject_behavior(

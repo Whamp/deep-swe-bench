@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Run a paired DeepSWE/pi comparison over configs × tasks × reps.
+"""Prepare and execute canonical batches through confirmed launch plans.
 
-Examples:
-  python harness/run_batch.py --configs baseline,ponytail-full --tasks adaptix-name-mapping-aliases --agent-timeout 150
-  python harness/run_batch.py --configs baseline,ponytail-full --range 0:10 --workers 2
-
-Use baseline-preamble-orchestration or baseline-preamble-orchestration-wf only
-when intentionally comparing against the historical DeepSWE prompt-scaffolded
-controls.
+``plan`` accepts unresolved operator intent and writes model-free review
+artifacts. ``execute`` accepts only the stored plan and its exact confirmation
+identity. Raw repeated batch arguments cannot create canonical result cells.
 """
 from __future__ import annotations
 
@@ -17,10 +13,18 @@ import json
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from harness import config_lock, config_resolution, lib, quota, results_tree
+from harness import (
+    config_lock,
+    config_resolution,
+    launch,
+    lib,
+    quota,
+    results_tree,
+)
 
 try:
     from harness.run_state import (
@@ -45,6 +49,100 @@ TASKS = Path.home() / "evals" / "deep-swe" / "tasks"
 TRANSIENT_EXIT = 75
 SMOKE_SUBSET = REPO / "subsets" / "12_v0.txt"
 STATE_ROOT = REPO / "results" / "_runs"
+
+
+def _confirmed_subject_exit(error: SystemExit) -> RuntimeError:
+    """Translate subject CLI exits into confirmed-launch domain failures."""
+    if error.code == TRANSIENT_EXIT:
+        return launch.LaunchTransientModelError(
+            "Transient model pause: subject exited 75"
+        )
+    return RuntimeError(
+        f"Confirmed subject execution failed: exit={error.code!r}"
+    )
+
+
+class RepositoryConfirmedOmpRunner:
+    """Run OMP with only behavior resolved by a confirmed launch plan."""
+
+    def __init__(self, task_root: Path) -> None:
+        """Bind confirmed OMP execution to the planned task corpus."""
+        self.task_root = task_root
+
+    def run_confirmed_omp_cell(
+        self,
+        cell: launch.ConfirmedOmpCell,
+    ) -> dict[str, object]:
+        """Execute one plan-resolved OMP cell without raw result writes."""
+        from harness import run_omp as run_subject
+
+        binary_path = cell.subject_runtime_identity.get("binaryPath")
+        if not isinstance(binary_path, str):
+            raise TypeError(
+                "Confirmed OMP runtime invalid: binary path is missing"
+            )
+        try:
+            return run_subject.run_cell(
+                cell.config_identity,
+                cell.task,
+                model=cell.model,
+                thinking=cell.thinking,
+                rep=cell.rep,
+                agent_timeout=None,
+                keep=False,
+                pass_openai_codex_oauth=True,
+                rpc_quiescence=2.0,
+                capture_initial_context=bool(
+                    cell.subject_behavior.get("captureInitialContext", True)
+                ),
+                output_cell=cell.result_path.parent,
+                persist_result_file=False,
+                persist_result_index=False,
+                config_root=cell.config_root,
+                config_leaf=cell.config_leaf,
+                task_root=self.task_root,
+                subject_behavior=dict(cell.subject_behavior),
+                omp_binary_path=Path(binary_path),
+            )
+        except SystemExit as error:
+            raise _confirmed_subject_exit(error) from error
+
+
+class RepositoryConfirmedPiRunner:
+    """Run Pi with only config and cell paths resolved by a confirmed plan."""
+
+    def __init__(self, task_root: Path) -> None:
+        """Bind confirmed subject execution to the planned task corpus."""
+        self.task_root = task_root
+
+    def run_confirmed_pi_cell(
+        self,
+        cell: launch.ConfirmedPiCell,
+    ) -> dict[str, object]:
+        """Execute one plan-resolved Pi cell without persisting raw results."""
+        from harness import run as run_subject
+
+        try:
+            return run_subject.run_cell(
+                cell.config_identity,
+                cell.task,
+                model=cell.model,
+                thinking=cell.thinking,
+                rep=cell.rep,
+                agent_timeout=None,
+                keep=False,
+                pass_openai_codex_oauth=cell.model.startswith("openai-codex/"),
+                rpc_quiescence=2.0,
+                capture_initial_context=True,
+                output_cell=cell.result_path.parent,
+                persist_result_file=False,
+                persist_result_index=False,
+                config_root=cell.config_root,
+                config_leaf=cell.config_leaf,
+                task_root=self.task_root,
+            )
+        except SystemExit as error:
+            raise _confirmed_subject_exit(error) from error
 
 
 def all_task_ids() -> list[str]:
@@ -570,7 +668,7 @@ def _execute_batch(args, state, configs, ids, specs, batch_cells_by_spec, smoke_
         return 1
 
 
-def main():
+def _legacy_main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--configs", required=True, help="comma list, e.g. baseline,ponytail-full")
     ap.add_argument("--tasks", help="comma list of task ids")
@@ -668,6 +766,201 @@ def main():
         raise SystemExit(code if isinstance(code, int) else 1)
     finally:
         state.stop_heartbeat()
+
+
+def _confirmed_launch_parser() -> argparse.ArgumentParser:
+    """Build the canonical plan/execute batch command parser."""
+    parser = argparse.ArgumentParser(
+        description="Prepare or execute one confirmed benchmark launch"
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    plan_parser = commands.add_parser(
+        "plan",
+        help="compile a model-free launch plan and review receipt",
+    )
+    plan_parser.add_argument("--subject", choices=["pi", "omp"], required=True)
+    plan_parser.add_argument("--model", required=True)
+    plan_parser.add_argument(
+        "--thinking",
+        choices=["off", "minimal", "low", "medium", "high", "xhigh"],
+        required=True,
+    )
+    plan_parser.add_argument("--configs", required=True)
+    plan_parser.add_argument("--baseline-config", required=True)
+    selection = plan_parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--tasks")
+    selection.add_argument("--subset")
+    selection.add_argument("--range")
+    selection.add_argument("--all-tasks", action="store_true")
+    plan_parser.add_argument("--reps", type=int, required=True)
+    plan_parser.add_argument("--workers", type=int, required=True)
+    plan_parser.add_argument("--run-id", required=True)
+    plan_parser.add_argument(
+        "--preflight",
+        choices=["disabled", "new-configs", "required"],
+        default="new-configs",
+    )
+    plan_parser.add_argument(
+        "--existing-results",
+        choices=["require-compatible", "rerun"],
+        default="require-compatible",
+    )
+    plan_parser.add_argument(
+        "--transient-errors",
+        choices=["pause", "stop"],
+        default="pause",
+    )
+    plan_parser.add_argument("--cell-retries", type=int, default=1)
+    plan_parser.add_argument("--repository", type=Path, default=REPO)
+    plan_parser.add_argument("--tasks-root", type=Path, default=TASKS)
+    plan_parser.add_argument("--results-root", type=Path)
+    plan_parser.add_argument("--state-root", type=Path, required=True)
+    plan_parser.add_argument("--plan-out", type=Path, required=True)
+    plan_parser.add_argument("--receipt-out", type=Path, required=True)
+
+    execute_parser = commands.add_parser(
+        "execute",
+        help="execute only the exact reviewed plan identity",
+    )
+    execute_parser.add_argument("--plan", type=Path, required=True)
+    execute_parser.add_argument("--confirm", required=True)
+    return parser
+
+
+def _launch_task_selection(
+    args: argparse.Namespace,
+) -> launch.LaunchTaskSelection:
+    """Resolve the operator's task selector without running a subject."""
+    if args.tasks:
+        tasks = tuple(
+            task.strip()
+            for task in args.tasks.split(",")
+            if task.strip()
+        )
+        return launch.LaunchTaskSelection(kind="tasks", tasks=tasks)
+    if args.subset:
+        subset_path = args.repository / "subsets" / f"{args.subset}.txt"
+        if not subset_path.is_file():
+            raise ValueError(
+                f"Launch task selection invalid: missing {subset_path}"
+            )
+        tasks = tuple(
+            line.strip()
+            for line in subset_path.read_text().splitlines()
+            if line.strip()
+        )
+        return launch.LaunchTaskSelection(
+            kind="subset",
+            tasks=tasks,
+            name=args.subset,
+        )
+    all_tasks = sorted(
+        path.name
+        for path in args.tasks_root.iterdir()
+        if path.is_dir() and (path / "task.toml").is_file()
+    )
+    if args.range:
+        selected = parse_range(args.range, all_tasks)
+        return launch.LaunchTaskSelection(
+            kind="range",
+            tasks=tuple(selected),
+            name=args.range,
+        )
+    return launch.LaunchTaskSelection(kind="all", tasks=tuple(all_tasks))
+
+
+def _plan_confirmed_launch(
+    args: argparse.Namespace,
+    runtime_resolver: launch.LaunchRuntimeResolver | None,
+) -> None:
+    """Compile and persist review artifacts without starting a subject."""
+    repository_root = args.repository.resolve()
+    results_root = (
+        args.results_root.resolve()
+        if args.results_root is not None
+        else repository_root / "results"
+    )
+    request = launch.LaunchRequest(
+        subject=args.subject,
+        model=args.model,
+        thinking=args.thinking,
+        configs=tuple(
+            config.strip()
+            for config in args.configs.split(",")
+            if config.strip()
+        ),
+        baseline_config=args.baseline_config,
+        task_selection=_launch_task_selection(args),
+        reps=args.reps,
+        concurrency=args.workers,
+        run_id=args.run_id,
+        policies=launch.LaunchExecutionPolicies(
+            preflight=args.preflight,
+            existing_results=args.existing_results,
+            transient_errors=args.transient_errors,
+            cell_retries=args.cell_retries,
+        ),
+    )
+    compiled = launch.compile_launch_request(
+        request,
+        repository_root=repository_root,
+        tasks_root=args.tasks_root.resolve(),
+        results_root=results_root,
+        state_root=args.state_root.resolve(),
+        runtime_resolver=runtime_resolver,
+    )
+    args.plan_out.parent.mkdir(parents=True, exist_ok=True)
+    args.receipt_out.parent.mkdir(parents=True, exist_ok=True)
+    args.plan_out.write_text(compiled.plan.canonical_json)
+    args.receipt_out.write_text(compiled.receipt)
+    print(compiled.receipt, end="" if compiled.receipt.endswith("\n") else "\n")
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    runtime_resolver: launch.LaunchRuntimeResolver | None = None,
+    pi_runner: launch.ConfirmedPiRunner | None = None,
+    omp_runner: launch.ConfirmedOmpRunner | None = None,
+) -> None:
+    """Prepare or execute canonical batches through the confirmed-plan seam."""
+    arguments = list(argv) if argv is not None else sys.argv[1:]
+    command = arguments[0] if arguments else None
+    if command not in {"plan", "execute"}:
+        raise SystemExit(
+            "Confirmed launch required: prepare a compiled plan, review its "
+            "receipt, then execute that plan with its matching identity"
+        )
+    args = _confirmed_launch_parser().parse_args(arguments)
+    if args.command == "plan":
+        _plan_confirmed_launch(args, runtime_resolver)
+        return
+    plan = launch.parse_launch_plan_json(args.plan.read_text())
+    document = plan.to_document()
+    task_root = Path(document["paths"]["tasksRoot"])
+    if runtime_resolver is None:
+        runtime_resolver = launch.RepositoryLaunchRuntimeResolver(
+            Path(document["paths"]["workspace"]),
+            task_root,
+        )
+    subject = document["subject"]["name"]
+    if subject == "pi" and pi_runner is None:
+        pi_runner = RepositoryConfirmedPiRunner(task_root)
+    if subject == "omp" and omp_runner is None:
+        omp_runner = RepositoryConfirmedOmpRunner(task_root)
+    try:
+        execution = launch.execute_confirmed_launch(
+            plan,
+            confirmation_identity=args.confirm,
+            runtime_resolver=runtime_resolver,
+            pi_runner=pi_runner,
+            omp_runner=omp_runner,
+        )
+    except launch.LaunchTransientModelError as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(TRANSIENT_EXIT) from error
+    print(f"Confirmed launch result: {execution.result_path}")
+    print(f"Confirmed launch state: {execution.state_path}")
 
 
 if __name__ == "__main__":

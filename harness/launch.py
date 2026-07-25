@@ -88,6 +88,10 @@ class LaunchInputDriftError(RuntimeError):
     """Stop a confirmed run before changed launch inputs start another rep."""
 
 
+class LaunchTransientModelError(RuntimeError):
+    """Pause a confirmed run after a transient provider or quota failure."""
+
+
 class LaunchConfigDocument(TypedDict):
     """Resolved config fields stored in a canonical launch plan."""
 
@@ -119,11 +123,12 @@ class LaunchCountsDocument(TypedDict):
 
 
 class LaunchPathsDocument(TypedDict):
-    """Exact workspace, result, and structured-state launch paths."""
+    """Exact workspace, task, result, and structured-state launch paths."""
 
     resultsRoot: str
     statePath: str
     stateRoot: str
+    tasksRoot: str
     workspace: str
 
 
@@ -1765,7 +1770,8 @@ def _receipt_warnings(document: Mapping[str, object]) -> list[str]:
         ]
         if legacy:
             warnings.append(
-                "legacy configs have no config-lock provenance: "
+                "legacy configs are readable for diagnosis but require a "
+                "versioned release before confirmed execution: "
                 + ", ".join(legacy)
             )
     policies = document.get("policies")
@@ -1985,6 +1991,7 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
             "",
             "PATHS",
             f"Workspace: {paths['workspace']}",
+            f"Tasks root: {paths['tasksRoot']}",
             f"Results root: {paths['resultsRoot']}",
             f"Structured state: {paths['statePath']}",
         ]
@@ -2080,6 +2087,7 @@ def compile_launch_request(
             "resultsRoot": str(results_root.resolve()),
             "statePath": str((state_root / request.run_id).resolve()),
             "stateRoot": str(state_root.resolve()),
+            "tasksRoot": str(tasks_root.resolve()),
             "workspace": str(repository_root.resolve()),
         },
         "planIdentity": "",
@@ -2135,7 +2143,19 @@ def _confirmed_plan_document(
             f"confirmed={confirmation_identity!r}, "
             f"plan={parsed_plan.identity!r}"
         )
-    return parsed_plan.to_document()
+    document = parsed_plan.to_document()
+    legacy_configs = [
+        config["identity"]
+        for config in document["configs"]
+        if config["legacy"]
+    ]
+    if legacy_configs:
+        raise ValueError(
+            "Confirmed config release required: legacy configs are "
+            "diagnostic-only until versioned and locked; configs="
+            f"{legacy_configs!r}"
+        )
+    return document
 
 
 def _confirmed_subject_cell(
@@ -2704,14 +2724,25 @@ def _execute_confirmed_preflight_cell(
     diagnostics: list[confirmed_preflight.PreflightDiagnostic] = []
     result_record: dict[str, object] = {}
     exit_code: int | str | None = None
-    reused_result = cell.reuse_reason is not None
+    resumed_preflight = False
+    reused_result = False
     try:
-        if reused_result:
+        if cell.result_path.is_file() and cell.reuse_reason is None:
+            resumed_record = _require_confirmed_resume_result(cell)
+            if resumed_record.get("preflight_passed") is not True:
+                raise ValueError(
+                    f"Result provenance mismatch: path={cell.result_path}; "
+                    "confirmed resume preflight evidence is not sealed"
+                )
+            result_record = dict(resumed_record)
+            resumed_preflight = True
+        reused_result = cell.reuse_reason is not None or resumed_preflight
+        if cell.reuse_reason is not None:
             _require_planned_result_reuse(cell)
             result_record = dict(
                 result_provenance.read_result_record(cell.result_path)
             )
-        else:
+        elif not resumed_preflight:
             result_record = _run_confirmed_subject_cell(
                 cell,
                 subject_runner,
@@ -2719,6 +2750,23 @@ def _execute_confirmed_preflight_cell(
             )
         raw_exit = result_record.get("agent_exit")
         exit_code = raw_exit if isinstance(raw_exit, int | str) else None
+    except LaunchTransientModelError as error:
+        state.preflight_finished(
+            state_cell,
+            log_path=log_path,
+            exit_code=75,
+            diagnostics=[
+                dict(
+                    confirmed_preflight.preflight_diagnostic(
+                        "subject_cell",
+                        "runner",
+                        str(error),
+                    )
+                )
+            ],
+        )
+        state.run_paused(reason=str(error))
+        raise
     except Exception as error:  # noqa: BLE001 - runner boundary records failure
         exit_code = "exception"
         diagnostics.append(
@@ -2785,12 +2833,12 @@ def _execute_confirmed_preflights(
     if failed_count:
         state.run_failed(
             reason=(
-                "Confirmed launch preflight failed: "
+                "Preflight assertion failure: "
                 f"{failed_count} cell(s) did not satisfy requirements"
             )
         )
         raise LaunchPreflightError(
-            "Confirmed launch preflight failed: batch fan-out was not started"
+            "Preflight assertion failure: batch fan-out was not started"
         )
     return passed_paths
 
@@ -2813,6 +2861,20 @@ def _execute_confirmed_batch_cell(
             subject_runner,
             log_path,
         )
+    except LaunchTransientModelError as error:
+        _append_confirmed_cell_log(
+            log_path,
+            cell,
+            f"paused: {error}",
+        )
+        state.cell_finished(
+            state_cell,
+            log_path=log_path,
+            exit_code=75,
+            transient_exit=75,
+        )
+        state.run_paused(reason=str(error))
+        raise
     except Exception as error:
         _append_confirmed_cell_log(
             log_path,
@@ -2836,6 +2898,38 @@ def _execute_confirmed_batch_cell(
         log_path=log_path,
         exit_code=exit_code,
     )
+
+
+def _require_confirmed_resume_result(
+    cell: ConfirmedSubjectCell,
+) -> Mapping[str, object]:
+    """Require an exact compatible result created by this confirmed plan."""
+    record = result_provenance.read_result_record(cell.result_path)
+    expected = {
+        "config": cell.config_identity,
+        "config_lock_identity": cell.config_lock_identity,
+        "harness_revision": cell.harness_revision,
+        "immutable_image_identities": dict(cell.immutable_image_identities),
+        "launch_plan_identity": cell.launch_plan_identity,
+        "model": cell.model,
+        "rep": cell.rep,
+        "subject": cell.subject,
+        "subject_version": cell.subject_version,
+        "task": cell.task,
+        "task_revision": cell.task_revision,
+        "thinking_level": cell.thinking,
+        "verifier_identity": cell.verifier_identity,
+    }
+    mismatches = result_provenance.result_provenance_mismatches(
+        record,
+        expected,
+    )
+    if mismatches:
+        raise ValueError(
+            f"Result provenance mismatch: path={cell.result_path}; "
+            f"incompatible fields={mismatches!r}"
+        )
+    return record
 
 
 def _require_planned_result_reuse(cell: ConfirmedSubjectCell) -> None:
@@ -2883,6 +2977,19 @@ def _execute_confirmed_batch(
         state_cell = _confirmed_state_cell(state_path, cell)
         if cell.result_path.resolve() in passed_preflight_paths:
             state.cell_skipped(state_cell, reason="successful_preflight")
+            continue
+        if cell.result_path.is_file() and cell.reuse_reason is None:
+            try:
+                _require_confirmed_resume_result(cell)
+            except (OSError, TypeError, ValueError) as error:
+                _append_confirmed_cell_log(
+                    log_path,
+                    cell,
+                    f"failed: {type(error).__name__}: {error}",
+                )
+                state.run_failed(reason=str(error))
+                raise
+            state.cell_skipped(state_cell, reason="confirmed_plan_resume")
             continue
         if cell.reuse_reason is not None:
             try:
@@ -2962,8 +3069,18 @@ def execute_confirmed_launch(
         state_path,
     )
     state = run_state.RunStateWriter(document["paths"]["stateRoot"], manifest)
-    state.start()
-    (state_path / "launch-plan.json").write_text(plan.canonical_json)
+    stored_plan_path = state_path / "launch-plan.json"
+    if stored_plan_path.is_file():
+        stored_plan = parse_launch_plan_json(stored_plan_path.read_text())
+        if stored_plan.identity != plan.identity:
+            raise ValueError(
+                "Launch plan mismatch: registered state belongs to "
+                f"{stored_plan.identity}, not {plan.identity}"
+            )
+        state.resume()
+    else:
+        state.start()
+    stored_plan_path.write_text(plan.canonical_json)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     subject_label = "Pi" if subject == "pi" else "OMP"
     log_path.write_text(

@@ -65,7 +65,10 @@ are held constant.
 - `observational-memory` — `pi-observational-memory` extension; memory workers
   are pinned per model leaf (`settings.json` carries the worker model).
 
-## Run one cell
+## Run one draft probe
+
+Direct one-cell debugging is an explicit draft/probe path. It cannot write a
+canonical result cell:
 
 ```sh
 source ~/.bashrc   # provides OPENROUTER_API_KEY
@@ -73,55 +76,64 @@ python3 harness/run.py \
   --config baseline \
   --task adaptix-name-mapping-aliases \
   --thinking high \
-  --agent-timeout 150
+  --agent-timeout 150 \
+  --probe-output scratch/probes/baseline-adaptix
 ```
 
-Run the matched Ponytail extension cell:
+OMP uses the same required `--probe-output` contract. Scratch probes are
+diagnostic only and are not reusable benchmark reps.
+
+## Confirmed batch
+
+Canonical results can be created only from a compiled launch plan and its exact
+confirmation identity. First prepare model-free review artifacts:
 
 ```sh
-python3 harness/run.py \
-  --config ponytail-extension \
-  --task adaptix-name-mapping-aliases \
+export DEEP_SWE_BENCH_STATE_ROOT=/home/will/evals/deep-swe-bench/results/_runs
+python3 -m harness.run_batch plan \
+  --subject pi \
+  --configs 'baseline@1.0.0,ponytail-extension@1.0.0' \
+  --baseline-config 'baseline@1.0.0' \
+  --model openrouter/deepseek/deepseek-v4-flash \
   --thinking high \
-  --agent-timeout 150
-```
-
-Output lands at `results/<model-leaf>/<thinking>/<config>/<task>/rep<N>/`.
-
-## Batch
-
-```sh
-python3 harness/run_batch.py \
-  --configs baseline,ponytail-extension \
   --range 0:10 \
-  --thinking high \
-  --workers 2
+  --reps 1 \
+  --workers 2 \
+  --run-id ponytail-review \
+  --state-root "$DEEP_SWE_BENCH_STATE_ROOT" \
+  --plan-out runs/launch-plans/ponytail-review.json \
+  --receipt-out runs/launch-plans/ponytail-review.txt
 ```
 
-Use `--tasks a,b,c` for an explicit paired set, or `--subset 36_v1` to read
-`subsets/36_v1.txt`. The batch runner resumes existing `result.json` files
-unless `--force` is passed (resume is by `(task, rep)` existence).
+Review the receipt, including warnings, model roles, credential and billing
+routes, tested subject versions, preflight cells, conditional batch fan-out,
+behavior differences, and exact paths. After explicitly approving the printed
+plan identity, execute only that stored plan:
 
-For a config with no existing results for the selected model+thinking leaf,
-`run_batch.py` first runs one reusable smoke cell before batch fan-out. It
-prefers a requested task from `subsets/12_v0.txt`, then falls back to the first
-requested task. The default smoke check is generic; config-specific expectations
-belong in an optional `smoke.json` contract. See
+```sh
+python3 -m harness.run_batch execute \
+  --plan runs/launch-plans/ponytail-review.json \
+  --confirm 'sha256:<exact-reviewed-plan-identity>'
+```
+
+Repeating raw config/model/task arguments is not confirmation and is rejected.
+Resume uses the same plan file and identity; compatible completed reps are read
+without rewriting, while provenance mismatch or launch-input drift stops the
+run. A required or new-config preflight remains atomic until generic health and
+the config-owned `smoke.json` assertions pass, then the approved fan-out starts
+without a second confirmation. See
 [`configs/README.md#smoke-tests-and-contracts`](configs/README.md#smoke-tests-and-contracts).
 
 ### Live dashboard
 
-Every future `run_batch.py` execution writes structured state under
-`results/_runs/<run-id>/` while preserving the existing stdout progress lines:
+Every confirmed execution writes structured state under its configured central
+state root:
 
 - `manifest.json` — command, selection, configs, planned reps, and preflight cells
 - `status.json` — live counts, active cells, heartbeat, outcomes, compact metrics
 - `events.ndjson` — append-only lifecycle events
 
-Use `--run-id my-id` to choose the directory name, or let the runner generate one.
-`--progress-interval` controls heartbeat refreshes.
-
-Confirmed launch plans use their configured central state root. Their directory
+The plan's stable `--run-id` remains visible to operators. The directory
 key combines the requested run id with the confirmed plan identity, so plans
 from separate worktrees cannot overwrite each other. `manifest.json` retains
 the requested run id and records the run key, originating workspace, result
@@ -174,54 +186,25 @@ For `openai-codex/*` models, pass only the host Pi `openai-codex` OAuth entry
 into each container (`--pass-openai-codex-oauth` is **required** for these
 models or the cell exits early):
 
-```sh
-python3 harness/run_batch.py \
-  --configs baseline \
-  --model openai-codex/gpt-5.3-codex-spark \
-  --thinking high \
-  --workers 2 \
-  --pass-openai-codex-oauth
-```
+Declare `OPENAI_CODEX_OAUTH` on the executor role in the config lock and use
+the confirmed `plan` command above with
+`--model openai-codex/gpt-5.3-codex-spark`. Planning verifies the named route
+without putting its value in the plan or receipt. Confirmed execution copies
+only the `openai-codex` credential; it does not mount the whole host Pi agent
+directory.
 
-The runner copies only `openai-codex` from `~/.pi/agent/auth.json`; it does not
-mount the whole host Pi agent directory.
-
-#### Subscription quota limits & auto-resume
+#### Subscription quota limits and confirmed resume
 
 The OpenAI Codex subscription has 5-hour and weekly usage windows that can
-exhaust mid-batch. When a cell hits a usage-limit error, `run.py` writes a
-`transient_error.json` sentinel and exits 75; `run_batch.py` treats exit 75 as a
-pause signal.
+exhaust mid-batch. A detected transient writes its cell sentinel, records the
+confirmed run as paused, and makes `harness.run_batch execute` exit 75.
 
-By default `run_batch.py` now **auto-resumes**: on a pause it queries the live
-Codex usage API (`chatgpt.com/backend-api/wham/usage`, same endpoint as
-`@marckrenn/pi-sub-core`) to find which window is exhausted and when it resets,
-sleeps until the reset (re-checking every 5m so an early reset is caught), then
-re-launches the batch. Completed cells are skipped, so only the interrupted
-work re-runs. The dashboard stage shows `quota_wait` during the sleep.
-
-The pause log names the exact reason, e.g.:
-
-```
-[pause] transient model/subscription limit detected; waiting for the window reset before auto-resume
-[resume] quota exhausted (5h @ 100% resets in 47m); sleeping ~2880s until reset, then resuming [attempt 1]
-[resume] waiting for quota reset: 46m remaining (re-check in 300s)
-...
-[resume] re-launching batch (attempt 1)
-```
-
-GPT-5.3-Codex-Spark has its own separate quota pool; the checker filters to the
-windows that govern the model being run. Tunable flags:
-
-| flag | default | meaning |
-|------|---------|---------|
-| `--no-auto-resume` | off | exit 75 immediately on any transient (old behavior) |
-| `--max-quota-wait` | `21600` (6h) | give up if the reset is further away than this |
-| `--quota-poll` | `300` (5m) | re-check interval while waiting for a reset |
-| `--rate-limit-backoff` | `60` | backoff before retrying a short (non-subscription) rate-limit |
-
-Short rate-limits (HTTP 429) get a brief backoff then retry; unclassified
-transients exit 75 for manual resume.
+After the provider window resets, resume by running the same `execute` command
+with the same stored plan and confirmation identity. Before another rep starts,
+the harness rechecks launch inputs. Completed results created by that exact plan
+are provenance-checked and skipped read-only; incompatible occupants or drift
+stop instead of being overwritten. Never recompile or repeat raw launch
+arguments merely to resume.
 
 ### Local Qwen on server60
 
@@ -236,14 +219,10 @@ local servers. Both `baseline` and `observational-memory` load the vendored
 `local-vllm-preserve-thinking.ts` shim — a symmetric local-vLLM workaround, not a
 config advantage.
 
-```sh
-MODEL=local-vllm/cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4
-python3 harness/run_batch.py \
-  --configs baseline,observational-memory \
-  --model "$MODEL" \
-  --thinking high \
-  --workers 4
-```
+Use the confirmed `plan` command with model
+`local-vllm/cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4`, the versioned baseline and
+observational-memory config identities, and `--workers 4`; review the local
+compute role and credential route in the receipt before confirming.
 
 (For local Qwen, ~4 workers is the server's sweet spot; 8 gets slow. Codex /
 OpenAI-codex models use separate remote subscriptions with no local contention.)
@@ -306,17 +285,10 @@ see [`docs/result-quarantine.md`](docs/result-quarantine.md).
 
 For memory-content isolation, use the explicit 4-arm design:
 
-```sh
-source ~/.bashrc   # provides OPENROUTER_API_KEY
-python3 harness/run_batch.py \
-  --configs baseline,recall-placebo,observational-memory,projected-om \
-  --subset 12_v2 \
-  --model openrouter/deepseek/deepseek-v4-flash \
-  --thinking high \
-  --runs 3 \
-  --workers 2 \
-  --run-id om-isolation-12v2
-```
+Prepare this comparison with the confirmed `plan` command using the released,
+versioned identities for baseline, recall-placebo, observational-memory, and
+projected-om, `--subset 12_v2`, `--reps 3`, and `--workers 2`. The receipt must
+show every OM worker role and compact usage source before confirmation.
 
 Delta interpretation:
 
@@ -333,13 +305,12 @@ reps. The OM configs vendor extension source under `configs/` and seed model lea
 
 ## Advisor eval
 
+Prepare and confirm the advisor comparison through `harness.run_batch plan`
+and `execute`; the receipt must show both executor and advisor roles, their
+credential routes, billing categories, bounded calls, and usage sources. Analyze
+the resulting compatible reps with:
+
 ```sh
-source ~/.bashrc   # provides OPENROUTER_API_KEY and ZAI_API_KEY
-python3 harness/run_batch.py \
-  --configs baseline,advisor \
-  --model openrouter/deepseek/deepseek-v4-flash \
-  --thinking high \
-  --workers 2
 python harness/analyze.py \
   --model openrouter/deepseek/deepseek-v4-flash \
   --thinking high \
@@ -369,7 +340,7 @@ Completed run summaries and social-card graphics are under `reports/`.
 ## Files
 
 - `harness/run.py` — one `(config, task, rep)` cell.
-- `harness/run_batch.py` — scheduler with resume and structured run-state output.
+- `harness/run_batch.py` — confirmed plan/execute CLI and subject-runner adapters.
 - `harness/run_state.py` — structured `results/_runs/<run_id>/` manifest/status/events writer.
 - `harness/analyze.py` — paired summaries + Wilcoxon/Holm where enough pairs exist.
 - `harness/parse_usage.py` — native-session token/cost parser (+ advisor tool-usage path).

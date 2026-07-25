@@ -15,7 +15,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from harness import config_lock, launch
+from harness import config_lock, launch, run_batch
 from harness.launch import (
     LaunchExecutionPolicies,
     LaunchRequest,
@@ -271,6 +271,72 @@ def _write_omp_launch_fixture(
         ),
     )
     return request, repository_root, tasks_root, results_root, state_root
+
+
+def test_plan_command_writes_review_artifacts_without_execution(
+    tmp_path: Path,
+) -> None:
+    """Preparing a launch writes only its immutable plan and receipt."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    runtime_resolver = FakeLaunchRuntimeResolver(_runtime_identity())
+    plan_path = tmp_path / "review" / "launch-plan.json"
+    receipt_path = tmp_path / "review" / "launch-receipt.txt"
+
+    run_batch.main(
+        [
+            "plan",
+            "--subject",
+            "pi",
+            "--model",
+            "provider/model",
+            "--thinking",
+            "low",
+            "--configs",
+            "baseline@1.0.0,review-assistant@1.0.0",
+            "--baseline-config",
+            "baseline@1.0.0",
+            "--tasks",
+            "task-a",
+            "--reps",
+            "2",
+            "--workers",
+            "1",
+            "--run-id",
+            "fixture-run",
+            "--preflight",
+            "required",
+            "--existing-results",
+            "require-compatible",
+            "--transient-errors",
+            "pause",
+            "--cell-retries",
+            "1",
+            "--repository",
+            str(repository_root),
+            "--tasks-root",
+            str(tasks_root),
+            "--results-root",
+            str(results_root),
+            "--state-root",
+            str(state_root),
+            "--plan-out",
+            str(plan_path),
+            "--receipt-out",
+            str(receipt_path),
+        ],
+        runtime_resolver=runtime_resolver,
+    )
+
+    plan = parse_launch_plan_json(plan_path.read_text())
+    assert plan.identity.startswith("sha256:")
+    receipt = receipt_path.read_text()
+    assert f"Plan: {plan.identity}" in receipt
+    assert "MODEL ROLES" in receipt
+    assert len(runtime_resolver.requests) == 1
+    assert not results_root.exists()
+    assert not state_root.exists()
 
 
 def _reject_versioned_smoke_contract(
@@ -851,8 +917,10 @@ def test_launch_planning_preserves_legacy_smoke_contract_readability(
     legacy_config = compiled.plan.to_document()["configs"][1]
     assert legacy_config["legacy"] is True
     assert legacy_config["smokeContract"] == str(legacy_contract)
-    assert "legacy configs have no config-lock provenance: legacy-review" in (
-        compiled.receipt
+    assert (
+        "legacy configs are readable for diagnosis but require a versioned "
+        "release before confirmed execution: legacy-review"
+        in compiled.receipt
     )
 
 

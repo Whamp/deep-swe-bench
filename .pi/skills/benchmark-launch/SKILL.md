@@ -1,62 +1,128 @@
 ---
 name: benchmark-launch
-description: Use before launching harness/run_batch.py for a benchmark, especially when configs use advisor, observational-memory workers, subagents, local-vllm shims, or any model beyond the main executor; use before claiming a benchmark launch is working.
+description: Use before preparing or executing a confirmed deep-swe-bench launch, especially when configs use advisor, observational-memory workers, subagents, local-vLLM shims, or any model beyond the main executor; use before claiming a launch is working.
 ---
 
 # Benchmark Launch
 
-A launch that uses more than the main executor model must stop for user confirmation.
+Canonical benchmark results require a compiled launch plan and explicit approval
+of that exact plan identity. Repeating raw model/config/task arguments is not
+confirmation and must not execute canonical reps.
 
 ## Process
 
-1. **Resolve the launch.**
-   - Write the exact `harness/run_batch.py` command.
-   - For new batch runs, include a stable `--run-id <run_id>` and explicit `--progress-interval <seconds>` so structured state is written under `results/_runs/<run_id>/` for the dashboard.
-   - List the copied config leaf files: `models.json`, `settings.json`, `advisor.json`, and `pi-flags`.
-   - State the resolved result path and structured state path.
-   - Completion: command, config files, result path, and state path are concrete.
+1. **Prepare the model-free plan.**
+   - Use `python -m harness.run_batch plan`, never raw batch execution arguments.
+   - Supply the exact subject, model, thinking, versioned config identities,
+     baseline identity, task selector, reps, workers, stable run id, execution
+     policies, central `--state-root`, `--plan-out`, and `--receipt-out`.
+   - Keep the result root in the originating workspace when intended; point the
+     state root at the configured central dashboard location.
+   - Planning may inspect committed files, local subject versions, credential
+     route availability, and already-present image identities. It must not start
+     a subject, pull/run a container, make a model call, or write a canonical
+     result cell.
+   - Completion: the canonical plan and receipt exist and the plan command made
+     no subject call.
 
-2. **Make the role table.**
-   - Include every LLM role: main executor, advisor worker, observational-memory observer/reflector/dropper workers, subagents, local-vLLM shims, and any other worker model.
-   - For each role list provider, model id, thinking level, and credential path.
-   - Ask if any worker model, provider, count, or thinking level is ambiguous.
-   - Completion: every LLM call path is named.
+2. **Resolve clarification before approval.**
+   - `Launch clarification required:` means launch-relevant extension behavior,
+     model roles, model selection, usage accounting, or bounds are unresolved.
+   - Investigate code, config, lock metadata, documentation, and harmless local
+     probes first. Do not edit the config or make a benchmark model call.
+   - For a broad investigation, propose an appropriate workflow and use it only
+     after the user approves that scope. Keep workflows outside the harness.
+   - Grill only decisions that remain unresolved after evidence gathering. Reach
+     mutual understanding before changing the candidate, refreshing its lock,
+     or compiling again.
+   - Completion: every clarification item is resolved by evidence or an explicit
+     operator decision; the harness remains non-interactive.
 
-3. **Preflight credentials.**
-   - Check credentials are available to the agent container path, not just the host shell.
-   - For OpenAI Codex models, require Codex OAuth and `--pass-openai-codex-oauth`.
-   - The host OAuth at `~/.pi/agent/auth.json` also drives subscription auto-resume: on a usage-limit pause `run_batch.py` queries `chatgpt.com/backend-api/wham/usage` to find the window reset time, sleeps until it, then re-launches (skipping completed cells). Opt out with `--no-auto-resume`; cap the wait with `--max-quota-wait`. GPT-5.3-Codex-Spark has a separate pool.
-   - For GLM models, prefer direct ZAI through `ZAI_API_KEY`.
-   - Never default to OpenRouter unless the user explicitly permits it; the standing exception is `openrouter/deepseek/deepseek-v4-flash`.
-   - Completion: no role has an assumed or missing credential.
+3. **Review warnings and exact behavior.**
+   - Read the receipt from the top. Resolve every warning before approval.
+   - Verify the config identities and lock identities, tested subject versions,
+     required capabilities, exact behavior differences from the baseline, task
+     selection, reps, concurrency, preflight cells, conditional batch cells,
+     result root, central state path, and originating workspace.
+   - Treat legacy config/result warnings as limitations, not modern provenance.
+     Legacy evidence is reusable only through an explicit decision naming the
+     exact earlier identity, recorded provenance, result identity, and rationale.
+   - Completion: the receipt describes the intended run without relying on raw
+     command arguments or operator memory.
 
-4. **Prove thinking semantics.**
-   - `pi --list-models` or accepted `--thinking` flags are not enough.
-   - Reconcile the requested level with provider docs, Pi request shape, and live/provider response evidence.
-   - Use the model notes when relevant:
-     - `docs/openai-codex-thinking.md`
-     - `docs/zai-glm52-thinking.md`
-     - `docs/zai-glm51-thinking.md`
-     - `docs/zai-glm5v-turbo.md`
-   - Completion: every requested thinking level is a real provider condition or an explicitly documented Pi mapping.
+4. **Review every model role and resource route.**
+   - The receipt role table must include the executor and every advisor,
+     observational-memory observer/reflector/dropper, recursive child, workflow
+     worker, subagent, local-vLLM shim, or other LLM call path.
+   - For each role verify role kind, fixed/inherited/bounded-dynamic selection,
+     provider, model, thinking, credential route, billing category, compact usage
+     source, calls per rep or finite bound, and max concurrency.
+   - Billing categories are `subscription quota`, `paid API`, or `local compute`;
+     do not invent token or dollar estimates.
+   - Completion: no model call path, provider, credential, usage source, or bound
+     is assumed or hidden.
 
-5. **Plan host resource protection.**
-   - For long or high-concurrency batches, decide whether to run `scripts/container_memory_watchdog.py`.
-   - Default conservative policy is a sustained 12 GiB cap on `dsw-*` containers: `--cap-gb 12 --interval 5 --consecutive 3 --grace 10`.
-   - The watchdog kills only the largest non-protected child process; if `pi` is the largest process, it logs alert-only.
-   - It writes separate logs under `runs/container-memory-watchdog/` and must not mutate official `result.json` artifacts.
-   - Completion: launch plan says either watchdog is already running, will be started after confirmation, or is intentionally skipped.
+5. **Verify credential and thinking evidence.**
+   - Planning checks credential route names without reading secret values into
+     the plan or receipt. Verify each route reaches the subject container, not
+     merely the host shell.
+   - OpenAI Codex roles require `OPENAI_CODEX_OAUTH`; GLM roles should prefer
+     direct ZAI through `ZAI_API_KEY`. Never default to OpenRouter without
+     explicit permission except the standing
+     `openrouter/deepseek/deepseek-v4-flash` route.
+   - Reconcile requested thinking with provider documentation, Pi/OMP request
+     shape, and the applicable evidence note. `--list-models` or accepted flags
+     alone are insufficient.
+   - Completion: every role has an available declared credential route and a
+     proven thinking condition.
 
-6. **Ask before launching.**
-   - Show the command, role table, leaf files, result path, `results/_runs/<run_id>` state path, dashboard URL/command, credential preflight, thinking evidence, and watchdog decision.
-   - Do not start until the user explicitly confirms.
-   - Completion: user confirmation is present in the current conversation.
+6. **Review the atomic preflight and host safety plan.**
+   - One confirmation covers the receipt's preflight cells and only the stated
+     conditional fan-out. No second approval is requested after preflight.
+   - Confirm each config's durable smoke contract covers generic subject health,
+     native session evidence, compact usage evidence for every role, RPC
+     transport, and config-owned structured assertions or stable machine markers.
+   - For long or high-concurrency launches, decide whether to run
+     `scripts/container_memory_watchdog.py`. The conservative policy remains
+     `--cap-gb 12 --interval 5 --consecutive 3 --grace 10`; its logs stay outside
+     official result artifacts.
+   - Completion: preflight, conditional fan-out, and watchdog decision are
+     explicit before any paid call.
 
-7. **Verify before claiming it works.**
-   - “Working” means the relevant smoke gate passed and left evidence in the result tree.
-   - Check the master log for fan-out after smoke, inspect required `smoke.json` artifacts, and verify tracker/result counts in the same turn.
-   - For new batch runs, verify `results/_runs/<run_id>/manifest.json`, `status.json`, and `events.ndjson` exist and that `scripts/run_dashboard.py --state-root results/_runs` can read the run. A dashboard heartbeat is monitoring evidence, not correctness evidence.
-   - If the watchdog is part of the launch plan, verify its pidfile/log in the same turn.
-   - Do not claim success because a process is alive, a dashboard heartbeat exists, a cell exited `ok`, or source code looks correct.
-   - Avoid broad `pgrep` patterns that match the shell command doing the check.
-   - Completion: smoke evidence, fan-out evidence, structured state, counts, and any watchdog evidence all agree.
+7. **Ask for exact-plan confirmation.**
+   - Present the receipt, plan file, receipt file, plan identity, role table,
+     credentials, thinking evidence, preflight contract, paths, dashboard
+     command/URL, and watchdog decision.
+   - Ask the operator to approve the exact `sha256:...` plan identity. Do not
+     execute until that approval appears in the current conversation.
+   - Any changed behavior or plan identity requires a new receipt and renewed
+     approval.
+   - Completion: explicit approval names the current plan identity.
+
+8. **Execute only the stored plan.**
+   - Run:
+
+     ```sh
+     python -m harness.run_batch execute \
+       --plan <reviewed-launch-plan.json> \
+       --confirm 'sha256:<exact-reviewed-plan-identity>'
+     ```
+
+   - Do not repeat subject/model/config/task arguments on execution.
+   - Resume with the same plan file and confirmation identity. Compatible reps
+     remain read-only; result-provenance mismatch or launch-input drift requires
+     operator action rather than overwrite.
+   - Completion: execution consumes the reviewed plan and central registration
+     exists before the first subject call.
+
+9. **Verify before claiming it works.**
+   - “Working” means every required preflight assertion passed and left evidence,
+     then the approved fan-out began (when batch cells remain).
+   - Inspect `launch-plan.json`, `manifest.json`, `status.json`, `events.ndjson`,
+     preflight diagnostics, result provenance, native sessions, role usage
+     evidence, transport logs, result counts, and dashboard projection in the
+     same turn. Verify watchdog pid/log evidence when selected.
+   - Process liveness, heartbeat, a subject exit of zero, or source inspection is
+     not correctness evidence.
+   - Completion: plan, state, smoke evidence, provenance, fan-out, counts, and
+     dashboard all agree.
