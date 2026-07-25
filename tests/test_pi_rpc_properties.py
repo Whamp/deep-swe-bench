@@ -1,4 +1,5 @@
 import json
+import re
 import string
 import sys
 import tempfile
@@ -7,10 +8,11 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
-from hypothesis import given, settings, strategies as st
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
-import harness.run as run
-from harness import pi_config
+from harness import lib as harness_lib
+from harness import pi_config, run
 from harness.pi_rpc_runner import (
     _advisor_usage_line,
     _auto_ui_response,
@@ -19,7 +21,6 @@ from harness.pi_rpc_runner import (
     _json_line,
     run_pi_rpc,
 )
-
 
 json_scalar = st.one_of(
     st.none(),
@@ -37,6 +38,38 @@ json_value = st.recursive(
     max_leaves=25,
 )
 json_object = st.dictionaries(st.text(max_size=20), json_value, max_size=8)
+
+
+def test_subject_container_name_sanitizes_versioned_config_identity():
+    """A released config identity must produce a Docker-valid name."""
+    assert harness_lib.subject_container_name(
+        "pi-check@1.0.0",
+        "fd-deterministic-multi-key-sorting",
+        rep=0,
+        process_id=2138599,
+    ) == ("dsw-pi-check-1.0.0-fd-deterministic-multi-key-sorting-r0-2138599")
+
+
+@settings(max_examples=100, deadline=None)
+@given(
+    config=st.text(min_size=1, max_size=40),
+    task=st.text(min_size=1, max_size=80),
+    rep=st.integers(min_value=0, max_value=1000),
+    process_id=st.integers(min_value=1, max_value=2**31 - 1),
+)
+def test_subject_container_name_always_uses_docker_name_characters(
+    config, task, rep, process_id
+):
+    """Arbitrary identity characters cannot escape Docker's name alphabet."""
+    name = harness_lib.subject_container_name(
+        config,
+        task,
+        rep=rep,
+        process_id=process_id,
+    )
+
+    assert re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name)
+    assert name.startswith("dsw-")
 
 
 def parsed_json_line(line: str):

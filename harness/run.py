@@ -37,7 +37,13 @@ import parse_usage  # noqa: E402
 import results_tree  # noqa: E402
 from config_lock import require_matching_config_lock  # noqa: E402
 from config_resolution import resolve_config_leaf  # noqa: E402
-from lib import REPO, load_task, read_reward, result_record  # noqa: E402
+from lib import (  # noqa: E402
+    REPO,
+    load_task,
+    read_reward,
+    result_record,
+    subject_container_name,
+)
 from pi_config import read_config_pi_flags, validate_pi_flags  # noqa: E402
 from pi_rpc_runner import run_pi_rpc  # noqa: E402
 
@@ -487,8 +493,12 @@ def run_cell(
 
     append_text = config_append_text(arm_cfg)
 
-    suffix = f"{config}-{task_id}-r{rep}-{os.getpid()}"
-    cname = f"dsw-{suffix}"
+    cname = subject_container_name(
+        config,
+        task_id,
+        rep=rep,
+        process_id=os.getpid(),
+    )
     if model.startswith("openai-codex/") and not pass_openai_codex_oauth:
         sys.exit("openai-codex models require --pass-openai-codex-oauth")
 

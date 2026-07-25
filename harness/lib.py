@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 import tomllib
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 
 # Canonical repo root. Single source of truth so every harness module derives
@@ -49,6 +49,19 @@ class Task:
     @property
     def verifier_image(self) -> str:
         return f"deep-swe-verifier:{self.id}"
+
+
+def subject_container_name(
+    config_identity: str,
+    task_id: str,
+    *,
+    rep: int,
+    process_id: int,
+) -> str:
+    """Build a Docker-compatible subject container name from cell identity."""
+    cell_identity = f"{config_identity}-{task_id}-r{rep}-{process_id}"
+    docker_safe_identity = re.sub(r"[^a-zA-Z0-9_.-]", "-", cell_identity)
+    return f"dsw-{docker_safe_identity}"
 
 
 def load_task(task_id: str, root: Path | None = None) -> Task:

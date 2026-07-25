@@ -26,7 +26,13 @@ sys.path.insert(0, str(HERE))
 
 import parse_usage  # noqa: E402
 import results_tree  # noqa: E402
-from lib import REPO, load_task, read_reward, result_record  # noqa: E402
+from lib import (  # noqa: E402
+    REPO,
+    load_task,
+    read_reward,
+    result_record,
+    subject_container_name,
+)
 from pi_rpc_runner import run_pi_rpc  # noqa: E402
 from run import (  # noqa: E402
     TRANSIENT_EXIT,
@@ -326,8 +332,12 @@ def run_cell(
     (cell / "logs").mkdir(exist_ok=True)
     (cell / "transient_error.json").unlink(missing_ok=True)
 
-    suffix = f"{config}-{task_id}-r{rep}-{os.getpid()}"
-    cname = f"dsw-{suffix}"
+    cname = subject_container_name(
+        config,
+        task_id,
+        rep=rep,
+        process_id=os.getpid(),
+    )
 
     task_public = tempfile.mkdtemp(prefix="dsw-task-public-")
     auth_tmp = tempfile.mkdtemp(prefix="dsw-omp-auth-")
