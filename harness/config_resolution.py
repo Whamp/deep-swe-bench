@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +11,27 @@ try:
 except ModuleNotFoundError:
     # Direct harness script execution adds harness/ to sys.path.
     from lib import model_leaf
+
+
+_VERSIONED_CONFIG_IDENTITY = re.compile(
+    r"^(?P<name>[a-z][a-z0-9]*(?:-[a-z0-9]+)*)@"
+    r"(?P<version>(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*))$"
+)
+_VAGUE_CONFIG_NAME_SUFFIX = re.compile(r"-(?:v[0-9]+|new|latest)$")
+
+
+@dataclass(frozen=True, slots=True)
+class VersionedConfigIdentity:
+    """A canonical config name and semantic release version."""
+
+    name: str
+    version: str
+
+    @property
+    def rendered(self) -> str:
+        """Render the release identity as one config path segment."""
+        return f"{self.name}@{self.version}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +43,27 @@ class ResolvedConfigLeaf:
     smoke_contract: Path | None
 
 
+def parse_versioned_config_identity(
+    config: str,
+) -> VersionedConfigIdentity | None:
+    """Parse a versioned config identity while preserving legacy names."""
+    if "@" not in config:
+        return None
+    match = _VERSIONED_CONFIG_IDENTITY.fullmatch(config)
+    if match is None:
+        raise ValueError(
+            "Config identity invalid: expected "
+            f"<name>@<major>.<minor>.<patch> in one path segment; got {config!r}"
+        )
+    name = match.group("name")
+    if _VAGUE_CONFIG_NAME_SUFFIX.search(name):
+        raise ValueError(
+            "Config identity invalid: config names cannot end in vague lineage "
+            f"suffixes -v<number>, -new, or -latest; got {config!r}"
+        )
+    return VersionedConfigIdentity(name=name, version=match.group("version"))
+
+
 def resolve_config_leaf(
     repository_root: Path,
     config: str,
@@ -28,6 +71,7 @@ def resolve_config_leaf(
     thinking: str,
 ) -> ResolvedConfigLeaf:
     """Resolve exactly one config leaf or raise a searchable request error."""
+    parse_versioned_config_identity(config)
     config_root = repository_root / "configs" / config
     requested_model_leaf = model_leaf(model)
     candidates = []

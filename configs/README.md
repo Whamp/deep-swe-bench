@@ -15,7 +15,13 @@ configs/<config>/                       # constant files
   pi-flags, env, skills/, extensions/   # optional, config-wide
   <model-leaf>/<thinking>/              # model leaf — the immutable variant dir
     models.json, advisor.json, settings.json   # model-identity files (optional)
+    config-lock.json                           # versioned release lock
 ```
+
+New releases render the config directory as `<name>@<major>.<minor>.<patch>`,
+for example `pi-recursive@2.0.0`. The full identity remains one path segment, so
+it occupies the existing config axis in `configs/` and `results/`. Existing
+unversioned directories remain readable legacy configs.
 
 `<model-leaf>` is `lib.model_leaf(model)` (the last `/`-segment of the model id);
 advisor configs use `<exec>+<advisor>` here (e.g. `deepseek-v4-flash+glm-5.2`).
@@ -109,15 +115,48 @@ README.
 ## Adding a config + model leaf
 
 ```sh
-mkdir -p configs/<name>
-$EDITOR configs/<name>/orchestration.md                       # required
-# add a model leaf when you first run it on a given model+thinking:
-mkdir -p configs/<name>/<model-leaf>/<thinking>
-# optional leaf files: models.json, advisor.json, settings.json, smoke.json
+mkdir -p 'configs/<name>@<major>.<minor>.<patch>'
+# Add reviewed behavior files. Do not invent prompt text without approval.
+mkdir -p 'configs/<name>@<major>.<minor>.<patch>/<model-leaf>/<thinking>'
+# Optional leaf files: models.json, advisor.json, settings.json, smoke.json.
 ```
 
-`harness/run.py --config <name> --model <m> --thinking <t> --task <id>` picks it
-up. No harness changes.
+Create the leaf lock only after the shared and leaf behavior is ready for review:
+
+```sh
+python -m harness.config_lock create \
+  --repository . \
+  --config '<name>@<major>.<minor>.<patch>' \
+  --model '<provider/model>' \
+  --thinking '<thinking>' \
+  --version-impact rerun \
+  --metadata /path/to/release-metadata.json
+```
+
+Release metadata is a JSON object. It may contain `declaredRoles`,
+`usageSources`, `requiredCapabilities`, `testedSubjectVersions`,
+`credentialRoutes`, and `previousRelease`. Use `refresh` instead of `create` only
+for an editable draft after failed review or preflight. Planning and subject
+execution only verify locks; they never write them.
+
+Run the read-only check directly when diagnosing drift:
+
+```sh
+python -m harness.config_lock verify \
+  --repository . \
+  --config '<name>@<major>.<minor>.<patch>' \
+  --model '<provider/model>' \
+  --thinking '<thinking>'
+```
+
+Verification reports added, removed, and changed behavior inputs. Secret values
+from environment and JSON credential fields are excluded before fingerprinting;
+credential names and environment-variable routes remain reviewable. See
+[ADR-0006](../docs/adr/0006-versioned-config-locks.md) for sealing and shared
+immutability rules.
+
+`harness/run.py --config <identity> --model <m> --thinking <t> --task <id>` picks
+up the release. No harness changes.
 
 ## Smoke tests and contracts
 

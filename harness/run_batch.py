@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from harness import config_resolution, lib, quota, results_tree
+from harness import config_lock, config_resolution, lib, quota, results_tree
 
 try:
     from harness.run_state import (
@@ -332,16 +332,33 @@ def preflight_plan(args, configs: list[str], ids: list[str]) -> list[dict]:
     plan = []
     for decision in decisions:
         config = decision["config"]
-        contract = smoke_contract_path(args.model, args.thinking, config)
+        if not isinstance(config, str):
+            raise TypeError(
+                f"Preflight plan invalid: config must be a string; got {config!r}"
+            )
+        resolved = config_resolution.resolve_config_leaf(
+            REPO,
+            config,
+            args.model,
+            args.thinking,
+        )
+        lock_identity = config_lock.require_matching_config_lock(resolved, config)
         cell = make_cell(
             task=task,
             config=config,
             rep=0,
             result_path=repo_rel(result_path(args.model, args.thinking, config, task, 0)),
             log_path=repo_rel(log_path(args.model, args.thinking, config, task, 0)),
-            contract_path=repo_rel(contract),
+            contract_path=repo_rel(resolved.smoke_contract),
         )
-        plan.append({"cell": cell, "run": decision["run"], "reason": decision["reason"]})
+        plan.append(
+            {
+                "cell": cell,
+                "run": decision["run"],
+                "reason": decision["reason"],
+                "config_lock_identity": lock_identity,
+            }
+        )
     return plan
 
 

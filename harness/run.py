@@ -32,8 +32,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))
 import parse_usage  # noqa: E402
 import results_tree  # noqa: E402
+from config_lock import require_matching_config_lock  # noqa: E402
 from config_resolution import resolve_config_leaf  # noqa: E402
 from lib import REPO, load_task, read_reward, result_record  # noqa: E402
 from pi_rpc_runner import run_pi_rpc  # noqa: E402
@@ -251,6 +253,7 @@ def load_config(
     if repository_root is None:
         repository_root = REPO
     resolved = resolve_config_leaf(repository_root, config, model, thinking)
+    require_matching_config_lock(resolved, config)
     cdir = resolved.config_root
     leafdir = resolved.config_leaf
     leaf_rel = leafdir.relative_to(cdir).as_posix()
