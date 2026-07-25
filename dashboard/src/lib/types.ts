@@ -83,6 +83,20 @@ export interface RunSummary {
   model?: string | null
   thinking?: string | null
   configs?: string[]
+  launch_metadata: 'confirmed_plan' | 'legacy_structured' | 'legacy_track'
+  launch_plan_identity?: string | null
+  preflight_state:
+    | 'not_required'
+    | 'pending'
+    | 'running'
+    | 'passed'
+    | 'failed'
+    | 'skipped'
+    | 'incomplete'
+    | 'unknown'
+  results_root?: string | null
+  state_root?: string | null
+  workspace?: string | null
   selection?: Record<string, unknown>
   workers?: number | null
   counts: Counts

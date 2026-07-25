@@ -99,9 +99,10 @@ def append_ndjson(path: Path, record: dict[str, Any]) -> None:
 
 def load_json(path: Path) -> dict[str, Any] | None:
     try:
-        return json.loads(path.read_text())
+        document = json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
+    return document if isinstance(document, dict) else None
 
 
 def cell_id(task: str, config: str, rep: int) -> str:
@@ -178,14 +179,16 @@ class RunStateWriter:
 
     def __init__(self, state_root: str | Path, manifest: dict[str, Any]):
         run_id = sanitize_run_id(str(manifest["run_id"]))
+        run_key = sanitize_run_id(str(manifest.get("run_key") or run_id))
         self.state_root = Path(state_root)
-        self.run_dir = self.state_root / run_id
+        self.run_dir = self.state_root / run_key
         self.manifest_path = self.run_dir / "manifest.json"
         self.status_path = self.run_dir / "status.json"
         self.events_path = self.run_dir / "events.ndjson"
         self.manifest = dict(manifest)
         self.manifest.setdefault("schema_version", SCHEMA_VERSION)
         self.manifest["run_id"] = run_id
+        self.manifest["run_key"] = run_key
         self._lock = threading.Lock()
         self._seq = 0
         self._stop_heartbeat = threading.Event()
@@ -684,6 +687,40 @@ def _enrich_active_cells(active_cells: list[dict[str, Any]]) -> tuple[list[dict[
     return enriched, max_age, stale
 
 
+def project_atomic_preflight_state(status: dict[str, Any]) -> str:
+    """Project the truthful run-level state of the complete preflight gate.
+
+    Args:
+        status: Durable structured-run status with per-config preflight cells.
+
+    Returns:
+        One aggregate state that cannot pass before every preflight passes.
+    """
+    preflight = status.get("preflight")
+    if not isinstance(preflight, dict) or not preflight:
+        return "not_required"
+    states = {
+        cell.get("state")
+        for cell in preflight.values()
+        if isinstance(cell, dict)
+    }
+    if "failed" in states:
+        return "failed"
+    if "running" in states:
+        return "running"
+    if states == {"passed"}:
+        return "passed"
+    if states == {"skipped"}:
+        return "skipped"
+    if states == {"pending"}:
+        return "pending"
+    if "pending" in states and states <= {"pending", "passed", "skipped"}:
+        return "running"
+    if states <= {"passed", "skipped"}:
+        return "incomplete"
+    return "unknown"
+
+
 def project_structured_run(run_dir: Path, *, detail: str = "summary") -> dict[str, Any]:
     if detail not in DETAIL_LEVELS:
         detail = "summary"
@@ -702,6 +739,12 @@ def project_structured_run(run_dir: Path, *, detail: str = "summary") -> dict[st
     # run_key is the unique directory name — always unique even when two runs
     # share the same manifest run_id (e.g. a smoke-failed rerun).  The frontend
     # routes on run_key so every discovered run is individually addressable.
+    launch_plan_identity = manifest.get("launch_plan_identity")
+    launch_metadata = (
+        "confirmed_plan"
+        if isinstance(launch_plan_identity, str)
+        else "legacy_structured"
+    )
     projected = {
         "kind": "structured",
         "run_id": run_id,
@@ -715,9 +758,17 @@ def project_structured_run(run_dir: Path, *, detail: str = "summary") -> dict[st
         "eta_s": _estimate_eta_s(status),
         "model": manifest.get("model"),
         "thinking": manifest.get("thinking"),
-        "configs": manifest.get("configs") or [],
+        "configs": manifest.get("config_identities")
+        or manifest.get("configs")
+        or [],
+        "launch_metadata": launch_metadata,
+        "launch_plan_identity": launch_plan_identity,
+        "preflight_state": project_atomic_preflight_state(status),
+        "results_root": manifest.get("results_root"),
         "selection": manifest.get("selection") or {},
+        "state_root": manifest.get("state_root"),
         "workers": manifest.get("workers"),
+        "workspace": manifest.get("workspace") or manifest.get("cwd"),
         "counts": counts,
         "active_count": len(active_cells),
         "max_cell_age_s": round(max_cell_age_s, 1) if max_cell_age_s is not None else None,
@@ -820,8 +871,14 @@ def project_legacy_track(track_path: Path, *, detail: str = "summary") -> dict[s
         "model": None,
         "thinking": None,
         "configs": [],
+        "launch_metadata": "legacy_track",
+        "launch_plan_identity": None,
+        "preflight_state": "not_required",
+        "results_root": None,
         "selection": {},
+        "state_root": None,
         "workers": None,
+        "workspace": None,
         "counts": counts,
         "active_count": 0,
         "failure_buckets": {k: v for k, v in buckets.items() if k not in {"ok", "empty"} and v},

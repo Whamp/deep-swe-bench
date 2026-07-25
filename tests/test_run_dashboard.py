@@ -59,7 +59,30 @@ def test_dashboard_discovers_structured_and_incomplete_runs(tmp_path):
     assert {"dash-test", "incomplete"} <= ids
     dash = next(run for run in runs if run["run_id"] == "dash-test")
     assert dash["counts"]["batch_done"] == 1
+    assert dash["launch_metadata"] == "legacy_structured"
+    assert dash["launch_plan_identity"] is None
+    assert dash["preflight_state"] == "not_required"
     assert "active_cells" not in dash
+
+
+def test_dashboard_ignores_malformed_run_without_hiding_healthy_run(
+    tmp_path: Path,
+) -> None:
+    """Malformed abandoned state does not break central run discovery."""
+    state_root = make_state(tmp_path, "healthy-run")
+    malformed = state_root / "abandoned-run"
+    malformed.mkdir()
+    (malformed / "manifest.json").write_text('[{"not":"a manifest"}]\n')
+    (malformed / "status.json").write_text('[{"not":"a status"}]\n')
+
+    runs = run_dashboard.load_dashboard_runs(
+        state_root,
+        detail="summary",
+        include_legacy=False,
+        legacy_root=None,
+    )
+
+    assert "healthy-run" in {run["run_id"] for run in runs}
 
 
 def test_dashboard_detail_projection_and_legacy_track(tmp_path):

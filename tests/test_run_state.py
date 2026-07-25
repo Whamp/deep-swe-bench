@@ -95,6 +95,65 @@ def test_run_state_writer_keeps_preflight_and_batch_counts_separate(tmp_path):
     assert all("seq" in event for event in events)
 
 
+def test_project_structured_run_keeps_multi_config_preflight_atomic(
+    tmp_path: Path,
+) -> None:
+    """The dashboard shows one in-progress gate until every preflight passes."""
+    state_root = tmp_path / "central-state"
+    result_a = write_result(tmp_path / "result-a.json")
+    result_b = write_result(tmp_path / "result-b.json")
+    preflight_a = make_cell(
+        task="task-a",
+        config="baseline@1.0.0",
+        rep=0,
+        result_path=result_a,
+    )
+    preflight_b = make_cell(
+        task="task-a",
+        config="review@1.0.0",
+        rep=0,
+        result_path=result_b,
+    )
+    manifest = base_manifest(
+        run_id="atomic-preflight",
+        command=["execute_confirmed_launch"],
+        cwd=tmp_path,
+        model="model",
+        thinking="high",
+        configs=["baseline@1.0.0", "review@1.0.0"],
+        selection={"kind": "tasks", "tasks": ["task-a"]},
+        runs=1,
+        workers=1,
+        agent_timeout_s=None,
+        rpc_quiescence_s=None,
+        progress_interval_s=None,
+        batch_cells=[],
+        preflight=[preflight_a, preflight_b],
+    )
+    writer = RunStateWriter(state_root, manifest)
+    writer.start()
+    writer.preflight_started(preflight_a)
+    writer.preflight_finished(
+        preflight_a,
+        result_path=result_a,
+        exit_code=0,
+        diagnostics=[],
+    )
+
+    midway = project_structured_run(writer.run_dir, detail="summary")
+
+    assert midway["preflight_state"] == "running"
+    writer.preflight_started(preflight_b)
+    writer.preflight_finished(
+        preflight_b,
+        result_path=result_b,
+        exit_code=0,
+        diagnostics=[],
+    )
+    finished = project_structured_run(writer.run_dir, detail="operational")
+    assert finished["preflight_state"] == "passed"
+
+
 def test_project_structured_run_detail_levels_do_not_inline_logs(tmp_path):
     state_root = tmp_path / "results" / "_runs"
     result = write_result(tmp_path / "result.json")

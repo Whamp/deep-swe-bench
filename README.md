@@ -121,6 +121,12 @@ Every future `run_batch.py` execution writes structured state under
 Use `--run-id my-id` to choose the directory name, or let the runner generate one.
 `--progress-interval` controls heartbeat refreshes.
 
+Confirmed launch plans use their configured central state root. Their directory
+key combines the requested run id with the confirmed plan identity, so plans
+from separate worktrees cannot overwrite each other. `manifest.json` retains
+the requested run id and records the run key, originating workspace, result
+root, state root, versioned config identities, and launch-plan identity.
+
 Serve the polling dashboard without starting or stopping any benchmark work:
 
 ```sh

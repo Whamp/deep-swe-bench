@@ -63,6 +63,17 @@ function RunCard({ run }: { run: RunSummary }) {
           <div className="text-xs text-muted-foreground">
             {run.model || run.kind} {run.thinking || ''}
           </div>
+          <div className="flex flex-wrap gap-1">
+            <Badge>{(run.configs || []).join(', ') || 'no config identity'}</Badge>
+            <Badge>
+              {run.launch_plan_identity
+                ? `plan ${run.launch_plan_identity.slice(0, 19)}`
+                : run.launch_metadata}
+            </Badge>
+            <Badge variant={run.preflight_state === 'failed' ? 'failed' : 'default'}>
+              preflight {run.preflight_state}
+            </Badge>
+          </div>
           <div>
             <Progress value={done} max={total || 1} />
             <div className="mt-1 text-xs text-muted-foreground">

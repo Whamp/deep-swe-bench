@@ -20,6 +20,7 @@ from harness.launch import (
     LaunchTaskSelection,
     canonical_launch_plan_json,
     compile_launch_request,
+    confirmed_launch_run_key,
     parse_launch_plan_json,
 )
 
@@ -637,7 +638,10 @@ def test_compile_launch_request_is_deterministic_without_execution(
     }
     assert plan["paths"]["resultsRoot"] == str(results_root.resolve())
     assert plan["paths"]["statePath"] == str(
-        (state_root / "fixture-run").resolve()
+        (
+            state_root
+            / confirmed_launch_run_key("fixture-run", first.plan.identity)
+        ).resolve()
     )
     assert len(plan["batchCells"]) == 4
     assert len(runtime_resolver.requests) == 2
@@ -1403,9 +1407,8 @@ def test_launch_receipt_shows_review_information_and_baseline_differences(
     assert "review-assistant@1.0.0" in receipt
     assert "changed prompt: orchestration.md" in receipt
     assert f"Results root: {results_root.resolve()}" in receipt
-    assert (
-        f"Structured state: {(state_root / 'fixture-run').resolve()}" in receipt
-    )
+    planned_state_path = compiled.plan.to_document()["paths"]["statePath"]
+    assert f"Structured state: {planned_state_path}\n" in receipt
 
 
 def test_launch_plan_identity_excludes_volatile_run_registration_metadata(

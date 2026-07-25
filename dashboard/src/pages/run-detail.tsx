@@ -77,6 +77,16 @@ function RunSummary({ run }: { run: RunDetailData }) {
         <div className="text-sm text-muted-foreground">
           {run.model || run.kind} {run.thinking || ''} · configs: {(run.configs || []).join(', ') || '—'}
         </div>
+        <div className="flex flex-wrap gap-2">
+          <Badge>
+            {run.launch_plan_identity
+              ? `plan ${run.launch_plan_identity}`
+              : run.launch_metadata}
+          </Badge>
+          <Badge variant={run.preflight_state === 'failed' ? 'failed' : 'default'}>
+            preflight {run.preflight_state}
+          </Badge>
+        </div>
         <div className="text-xs text-muted-foreground">
           updated {run.updated_at || 'unknown'} · heartbeat {fmtSeconds(run.heartbeat_age_s)}
         </div>

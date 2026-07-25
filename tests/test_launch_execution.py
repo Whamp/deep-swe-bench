@@ -21,6 +21,7 @@ from harness.launch import (
     compile_launch_request,
     execute_confirmed_launch,
 )
+from scripts import run_dashboard
 
 
 class StaticLaunchRuntimeResolver:
@@ -74,6 +75,23 @@ class InvalidPreflightEvidenceRunner:
             "total_tokens": 0,
             "verifier_exit": 0,
         }
+
+
+def _planned_launch_plan_path(compiled: CompiledLaunch) -> Path:
+    """Return the launch-plan artifact path declared by the public plan."""
+    state_path = compiled.plan.to_document()["paths"]["statePath"]
+    return Path(state_path) / "launch-plan.json"
+
+
+def _registered_state_path(state_root: Path, run_id: str) -> Path:
+    """Find one registered state directory by its public manifest run id."""
+    matches: list[Path] = []
+    for manifest_path in state_root.glob("*/manifest.json"):
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("run_id") == run_id:
+            matches.append(manifest_path.parent)
+    assert len(matches) == 1
+    return matches[0]
 
 
 class FakeConfirmedPiRunner:
@@ -184,12 +202,13 @@ def _compile_existing_fixture(
     run_id: str = "confirmed-fixture",
     existing_results: str = "rerun",
     reuse_decisions: tuple[launch.ExplicitResultReuseDecision, ...] = (),
+    state_root: Path | None = None,
 ) -> CompiledLaunch:
     """Compile an initialized launch fixture without changing its config."""
     repository_root = tmp_path / "repository"
     tasks_root = tmp_path / "tasks"
     results_root = tmp_path / "canonical-results"
-    state_root = tmp_path / "central-state"
+    state_root = state_root or tmp_path / "central-state"
     request = LaunchRequest(
         subject="pi",
         model="provider/model",
@@ -281,11 +300,13 @@ def _compile_single_cell_launch(
     tasks: tuple[str, ...] = ("task-a",),
     smoke_contract_document: dict[str, object] | None = None,
     version_impact: str = "rerun",
+    run_id: str = "confirmed-fixture",
+    state_root: Path | None = None,
 ) -> tuple[CompiledLaunch, Path, Path, Path, Path]:
     repository_root = tmp_path / "repository"
     tasks_root = tmp_path / "tasks"
     results_root = tmp_path / "canonical-results"
-    state_root = tmp_path / "central-state"
+    state_root = state_root or tmp_path / "central-state"
     config_identity = "baseline@1.0.0"
     config_root = repository_root / "configs" / config_identity
     config_leaf = config_root / "model" / "low"
@@ -321,8 +342,77 @@ def _compile_single_cell_launch(
         preflight=preflight,
         reps=reps,
         tasks=tasks,
+        run_id=run_id,
+        state_root=state_root,
     )
     return compiled, config_leaf, smoke_contract, results_root, state_root
+
+
+def test_confirmed_worktree_launches_register_centrally_with_provenance(
+    tmp_path: Path,
+) -> None:
+    """One dashboard discovers confirmed runs from two workspaces."""
+    state_root = tmp_path / "central-state"
+    compiled_launches = [
+        _compile_single_cell_launch(
+            tmp_path / workspace,
+            preflight="required",
+            run_id="shared-run",
+            state_root=state_root,
+        )[0]
+        for workspace in ("worktree-a", "worktree-b")
+    ]
+
+    for compiled in compiled_launches:
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=FakeConfirmedPiRunner(
+                _planned_launch_plan_path(compiled)
+            ),
+        )
+
+    runs = run_dashboard.load_dashboard_runs(
+        state_root,
+        detail="summary",
+        include_legacy=False,
+        legacy_root=None,
+    )
+
+    assert len(runs) == 2
+    assert {run["run_id"] for run in runs} == {"shared-run"}
+    assert len({run["run_key"] for run in runs}) == 2
+    assert {
+        run["workspace"] for run in runs
+    } == {
+        str((tmp_path / workspace / "repository").resolve())
+        for workspace in ("worktree-a", "worktree-b")
+    }
+    assert all(run["configs"] == ["baseline@1.0.0"] for run in runs)
+    assert all(run["launch_plan_identity"] for run in runs)
+    assert all(run["launch_metadata"] == "confirmed_plan" for run in runs)
+    assert all(run["preflight_state"] == "passed" for run in runs)
+
+    for summary in runs:
+        detail = run_dashboard.load_dashboard_run(
+            summary["run_key"],
+            state_root,
+            detail="operational",
+            legacy_root=None,
+        )
+        assert detail is not None
+        manifest = detail["manifest"] if "manifest" in detail else json.loads(
+            Path(detail["paths"]["manifest"]).read_text()
+        )
+        assert manifest["workspace"] == summary["workspace"]
+        assert manifest["results_root"]
+        assert manifest["state_root"] == str(state_root.resolve())
+        assert manifest["config_identities"] == ["baseline@1.0.0"]
+        assert manifest["launch_plan_identity"] == summary[
+            "launch_plan_identity"
+        ]
+        assert detail["preflight_state"] == "passed"
 
 
 def test_passing_preflight_fans_out_exactly_once_without_second_confirmation(
@@ -365,7 +455,7 @@ def test_passing_preflight_fans_out_exactly_once_without_second_confirmation(
             ],
         },
     )
-    plan_path = state_root / "confirmed-fixture" / "launch-plan.json"
+    plan_path = _planned_launch_plan_path(compiled)
     fake_runner = FakeConfirmedPiRunner(plan_path)
 
     execution = execute_confirmed_launch(
@@ -410,7 +500,7 @@ def test_required_preflight_reuses_compatible_result_without_writing(
     tmp_path: Path,
 ) -> None:
     """Required preflight checks existing evidence without a subject call."""
-    first, _, _, _, first_state_root = _compile_single_cell_launch(
+    first, _, _, _, _ = _compile_single_cell_launch(
         tmp_path,
         preflight="required",
     )
@@ -419,7 +509,7 @@ def test_required_preflight_reuses_compatible_result_without_writing(
         confirmation_identity=first.plan.identity,
         runtime_resolver=_runtime_resolver_for(first),
         pi_runner=FakeConfirmedPiRunner(
-            first_state_root / "confirmed-fixture" / "launch-plan.json"
+            _planned_launch_plan_path(first)
         ),
     )
     result_before = first_execution.result_path.read_bytes()
@@ -429,10 +519,7 @@ def test_required_preflight_reuses_compatible_result_without_writing(
         run_id="confirmed-preflight-reuse",
         existing_results="require-compatible",
     )
-    state_root = tmp_path / "central-state"
-    runner = FakeConfirmedPiRunner(
-        state_root / "confirmed-preflight-reuse" / "launch-plan.json"
-    )
+    runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
 
     execution = execute_confirmed_launch(
         compiled.plan,
@@ -485,7 +572,10 @@ def test_failed_preflight_records_all_diagnostics_without_batch_fan_out(
 
     assert len(runner.calls) == 1
     status = json.loads(
-        (state_root / "confirmed-fixture" / "status.json").read_text()
+        (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "status.json"
+        ).read_text()
     )
     preflight = status["preflight"]["task-a/baseline@1.0.0/rep0"]
     assert preflight["state"] == "failed"
@@ -507,7 +597,10 @@ def test_failed_preflight_records_all_diagnostics_without_batch_fan_out(
     assert status["state"] == "failed"
     events = [
         json.loads(line)
-        for line in (state_root / "confirmed-fixture" / "events.ndjson")
+        for line in (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "events.ndjson"
+        )
         .read_text()
         .splitlines()
     ]
@@ -522,7 +615,7 @@ def test_preflight_verdict_controls_config_leaf_sealing(
     tmp_path: Path,
 ) -> None:
     """Only a passed preflight seals its referenced config lock."""
-    passed, _, _, passed_results, passed_state = _compile_single_cell_launch(
+    passed, _, _, passed_results, _ = _compile_single_cell_launch(
         tmp_path / "passed",
         preflight="required",
     )
@@ -531,7 +624,7 @@ def test_preflight_verdict_controls_config_leaf_sealing(
         confirmation_identity=passed.plan.identity,
         runtime_resolver=_runtime_resolver_for(passed),
         pi_runner=FakeConfirmedPiRunner(
-            passed_state / "confirmed-fixture" / "launch-plan.json"
+            _planned_launch_plan_path(passed)
         ),
     )
     sealed_recompile = _compile_existing_fixture(
@@ -610,7 +703,7 @@ def test_sealed_release_allows_only_leaves_with_unchanged_shared_behavior(
         confirmation_identity=compiled.plan.identity,
         runtime_resolver=_runtime_resolver_for(compiled),
         pi_runner=FakeConfirmedPiRunner(
-            state_root / "confirmed-fixture" / "launch-plan.json"
+            _planned_launch_plan_path(compiled)
         ),
     )
     repository_root = tmp_path / "repository"
@@ -656,9 +749,9 @@ def test_confirmed_launch_reuses_compatible_result_without_writing(
     tmp_path: Path,
 ) -> None:
     """A compatible cell is reused without runner or artifact writes."""
-    first, _, _, _, first_state_root = _compile_single_cell_launch(tmp_path)
+    first, _, _, _, _ = _compile_single_cell_launch(tmp_path)
     first_runner = FakeConfirmedPiRunner(
-        first_state_root / "confirmed-fixture" / "launch-plan.json"
+        _planned_launch_plan_path(first)
     )
     first_execution = execute_confirmed_launch(
         first.plan,
@@ -676,9 +769,8 @@ def test_confirmed_launch_reuses_compatible_result_without_writing(
         run_id="confirmed-reuse",
         existing_results="require-compatible",
     )
-    reuse_state_root = tmp_path / "central-state"
     reuse_runner = FakeConfirmedPiRunner(
-        reuse_state_root / "confirmed-reuse" / "launch-plan.json"
+        _planned_launch_plan_path(compiled)
     )
 
     execution = execute_confirmed_launch(
@@ -734,9 +826,7 @@ def test_launch_planning_rejects_each_incompatible_result_provenance_field(
         first.plan,
         confirmation_identity=first.plan.identity,
         runtime_resolver=_runtime_resolver_for(first),
-        pi_runner=FakeConfirmedPiRunner(
-            state_root / "confirmed-fixture" / "launch-plan.json"
-        ),
+        pi_runner=FakeConfirmedPiRunner(_planned_launch_plan_path(first)),
     )
     result = json.loads(execution.result_path.read_text())
     result[field] = incompatible_value
@@ -761,13 +851,13 @@ def test_execute_confirmed_launch_rejects_reuse_changed_after_confirmation(
     tmp_path: Path,
 ) -> None:
     """Confirmed reuse stops if the reviewed result changes before execution."""
-    first, _, _, _, first_state_root = _compile_single_cell_launch(tmp_path)
+    first, _, _, _, _ = _compile_single_cell_launch(tmp_path)
     first_execution = execute_confirmed_launch(
         first.plan,
         confirmation_identity=first.plan.identity,
         runtime_resolver=_runtime_resolver_for(first),
         pi_runner=FakeConfirmedPiRunner(
-            first_state_root / "confirmed-fixture" / "launch-plan.json"
+            _planned_launch_plan_path(first)
         ),
     )
     compiled = _compile_existing_fixture(
@@ -781,7 +871,7 @@ def test_execute_confirmed_launch_rejects_reuse_changed_after_confirmation(
     first_execution.result_path.write_text(json.dumps(changed) + "\n")
     state_root = tmp_path / "central-state"
     runner = FakeConfirmedPiRunner(
-        state_root / "confirmed-reuse-drift" / "launch-plan.json"
+        _planned_launch_plan_path(compiled)
     )
 
     with pytest.raises(
@@ -799,12 +889,18 @@ def test_execute_confirmed_launch_rejects_reuse_changed_after_confirmation(
     assert str(first_execution.result_path) in str(raised.value)
     assert runner.calls == []
     status = json.loads(
-        (state_root / "confirmed-reuse-drift" / "status.json").read_text()
+        (
+            _registered_state_path(state_root, "confirmed-reuse-drift")
+            / "status.json"
+        ).read_text()
     )
     assert status["state"] == "failed"
     events = [
         json.loads(line)
-        for line in (state_root / "confirmed-reuse-drift" / "events.ndjson")
+        for line in (
+            _registered_state_path(state_root, "confirmed-reuse-drift")
+            / "events.ndjson"
+        )
         .read_text()
         .splitlines()
     ]
@@ -847,7 +943,7 @@ def test_execute_confirmed_launch_honors_exact_explicit_legacy_reuse(
         reuse_decisions=(decision,),
     )
     runner = FakeConfirmedPiRunner(
-        state_root / "confirmed-legacy-reuse" / "launch-plan.json"
+        _planned_launch_plan_path(approved)
     )
 
     execution = execute_confirmed_launch(
@@ -952,13 +1048,13 @@ def test_launch_planning_rejects_incompatible_occupied_rerun_path(
     tmp_path: Path,
 ) -> None:
     """Rerun policy cannot overwrite an incompatible canonical occupant."""
-    first, _, _, _, first_state_root = _compile_single_cell_launch(tmp_path)
+    first, _, _, _, _ = _compile_single_cell_launch(tmp_path)
     first_execution = execute_confirmed_launch(
         first.plan,
         confirmation_identity=first.plan.identity,
         runtime_resolver=_runtime_resolver_for(first),
         pi_runner=FakeConfirmedPiRunner(
-            first_state_root / "confirmed-fixture" / "launch-plan.json"
+            _planned_launch_plan_path(first)
         ),
     )
     result = json.loads(first_execution.result_path.read_text())
@@ -990,7 +1086,7 @@ def test_execute_confirmed_launch_runs_exact_planned_pi_cell(
     compiled, config_leaf, smoke_contract, results_root, state_root = (
         _compile_single_cell_launch(tmp_path)
     )
-    plan_path = state_root / "confirmed-fixture" / "launch-plan.json"
+    plan_path = _planned_launch_plan_path(compiled)
     fake_runner = FakeConfirmedPiRunner(plan_path)
     assert not results_root.exists()
     assert fake_runner.calls == []
@@ -1043,7 +1139,10 @@ def test_execute_confirmed_launch_runs_exact_planned_pi_cell(
         == compiled.plan.identity
     )
     status = json.loads(
-        (state_root / "confirmed-fixture" / "status.json").read_text()
+        (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "status.json"
+        ).read_text()
     )
     assert status["state"] == "completed"
     assert status["counts"]["batch_done"] == 1
@@ -1059,7 +1158,7 @@ def test_execute_confirmed_launch_rejects_missing_or_stale_confirmation(
         tmp_path
     )
     fake_runner = FakeConfirmedPiRunner(
-        state_root / "confirmed-fixture" / "launch-plan.json"
+        _planned_launch_plan_path(compiled)
     )
 
     with pytest.raises(ValueError, match="Launch confirmation"):
@@ -1107,7 +1206,7 @@ def test_execute_confirmed_launch_stops_before_config_input_drifted_rep(
             behavior_path.write_text(changed_content)
 
     runner = FakeConfirmedPiRunner(
-        state_root / "confirmed-fixture" / "launch-plan.json",
+        _planned_launch_plan_path(compiled),
         after_call=change_behavior_after_first_rep,
     )
 
@@ -1122,7 +1221,10 @@ def test_execute_confirmed_launch_stops_before_config_input_drifted_rep(
     assert [cell.rep for cell in runner.calls] == [0]
     events = [
         json.loads(line)
-        for line in (state_root / "confirmed-fixture" / "events.ndjson")
+        for line in (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "events.ndjson"
+        )
         .read_text()
         .splitlines()
     ]
@@ -1159,7 +1261,7 @@ def test_execute_confirmed_launch_stops_before_config_lock_drifted_rep(
         lock_path.write_text(json.dumps(lock_document) + "\n")
 
     runner = FakeConfirmedPiRunner(
-        state_root / "confirmed-fixture" / "launch-plan.json",
+        _planned_launch_plan_path(compiled),
         after_call=change_lock_after_first_rep,
     )
 
@@ -1174,7 +1276,10 @@ def test_execute_confirmed_launch_stops_before_config_lock_drifted_rep(
     assert [cell.rep for cell in runner.calls] == [0]
     events = [
         json.loads(line)
-        for line in (state_root / "confirmed-fixture" / "events.ndjson")
+        for line in (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "events.ndjson"
+        )
         .read_text()
         .splitlines()
     ]
@@ -1249,7 +1354,7 @@ def test_execute_confirmed_launch_stops_before_runtime_drifted_rep(
         )
 
     runner = FakeConfirmedPiRunner(
-        state_root / "confirmed-fixture" / "launch-plan.json",
+        _planned_launch_plan_path(compiled),
         after_call=change_runtime_after_first_rep,
     )
 
@@ -1264,7 +1369,10 @@ def test_execute_confirmed_launch_stops_before_runtime_drifted_rep(
     assert [cell.rep for cell in runner.calls] == [0]
     events = [
         json.loads(line)
-        for line in (state_root / "confirmed-fixture" / "events.ndjson")
+        for line in (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "events.ndjson"
+        )
         .read_text()
         .splitlines()
     ]
@@ -1319,7 +1427,7 @@ def test_execute_confirmed_launch_records_every_changed_input(
         )
 
     runner = FakeConfirmedPiRunner(
-        state_root / "confirmed-fixture" / "launch-plan.json",
+        _planned_launch_plan_path(compiled),
         after_call=change_all_inputs_after_first_rep,
     )
 
@@ -1333,7 +1441,10 @@ def test_execute_confirmed_launch_records_every_changed_input(
 
     events = [
         json.loads(line)
-        for line in (state_root / "confirmed-fixture" / "events.ndjson")
+        for line in (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "events.ndjson"
+        )
         .read_text()
         .splitlines()
     ]
@@ -1389,7 +1500,7 @@ def test_execute_confirmed_launch_records_runtime_resolution_drift(
             runtime_resolver.available = False
 
     runner = FakeConfirmedPiRunner(
-        state_root / "confirmed-fixture" / "launch-plan.json",
+        _planned_launch_plan_path(compiled),
         after_call=lose_runtime_identity_after_first_rep,
     )
 
@@ -1403,7 +1514,10 @@ def test_execute_confirmed_launch_records_runtime_resolution_drift(
 
     events = [
         json.loads(line)
-        for line in (state_root / "confirmed-fixture" / "events.ndjson")
+        for line in (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "events.ndjson"
+        )
         .read_text()
         .splitlines()
     ]
@@ -1432,7 +1546,7 @@ def test_execute_confirmed_launch_ignores_routine_host_state_changes(
             host_state_path.write_text('{"freeDiskBytes":1,"quota":"wait"}\n')
 
     runner = FakeConfirmedPiRunner(
-        state_root / "confirmed-fixture" / "launch-plan.json",
+        _planned_launch_plan_path(compiled),
         after_call=change_host_state_after_first_rep,
     )
 
@@ -1466,7 +1580,7 @@ def test_execute_confirmed_launch_failure_keeps_plan_cell_state_and_log(
     assert len(failing_runner.calls) == 1
     cell = failing_runner.calls[0]
     assert not cell.result_path.exists()
-    run_state_root = state_root / "confirmed-fixture"
+    run_state_root = _registered_state_path(state_root, "confirmed-fixture")
     plan = json.loads((run_state_root / "launch-plan.json").read_text())
     assert plan["planIdentity"] == compiled.plan.identity
     status = json.loads((run_state_root / "status.json").read_text())

@@ -453,6 +453,21 @@ def _launch_plan_identity(document: Mapping[str, object]) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
+def confirmed_launch_run_key(run_id: str, plan_identity: str) -> str:
+    """Return a workspace-safe structured-state key for one confirmed run.
+
+    Args:
+        run_id: Operator-supplied run identifier retained in the manifest.
+        plan_identity: Content identity that distinguishes originating plans.
+
+    Returns:
+        A safe directory key under the configured central state root.
+    """
+    key_input = f"{run_id}\0{plan_identity}".encode()
+    registration_identity = hashlib.sha256(key_input).hexdigest()
+    return sanitize_run_id(f"{run_id[:48]}--{registration_identity}")
+
+
 def parse_launch_plan_json(serialized: str) -> LaunchPlan:
     """Parse a plan and reject changed identity-bearing data."""
     document = json.loads(serialized)
@@ -1778,6 +1793,13 @@ def compile_launch_request(
         "thinking": request.thinking,
     }
     document["planIdentity"] = _launch_plan_identity(document)
+    run_key = confirmed_launch_run_key(
+        request.run_id,
+        document["planIdentity"],
+    )
+    document["paths"]["statePath"] = str(
+        (state_root / run_key).resolve()
+    )
     canonical_json = canonical_launch_plan_json(document)
     plan = LaunchPlan(
         identity=str(document["planIdentity"]),
@@ -2015,8 +2037,15 @@ def _confirmed_run_manifest(
     )
     manifest.update(
         {
+            "config_identities": [
+                config["identity"] for config in document["configs"]
+            ],
             "launch_plan_identity": document["planIdentity"],
             "launch_plan_path": "launch-plan.json",
+            "results_root": document["paths"]["resultsRoot"],
+            "run_key": state_path.name,
+            "state_root": document["paths"]["stateRoot"],
+            "workspace": document["paths"]["workspace"],
         }
     )
     return manifest
@@ -2537,7 +2566,11 @@ def execute_confirmed_launch(
         raise ValueError("Confirmed Pi execution cells invalid: batch is empty")
     state_path = Path(document["paths"]["statePath"])
     expected_state_path = (
-        Path(document["paths"]["stateRoot"]) / document["runId"]
+        Path(document["paths"]["stateRoot"])
+        / confirmed_launch_run_key(
+            document["runId"],
+            document["planIdentity"],
+        )
     ).resolve()
     if state_path.resolve() != expected_state_path:
         raise ValueError(

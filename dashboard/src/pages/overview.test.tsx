@@ -6,7 +6,7 @@ import Overview from '@/pages/overview'
 import type { RunSummary } from '@/lib/types'
 
 function mockFetch(data: { runs: RunSummary[] }) {
-  global.fetch = vi.fn().mockResolvedValue({
+  globalThis.fetch = vi.fn().mockResolvedValue({
     ok: true,
     status: 200,
     json: () => Promise.resolve(data),
@@ -46,6 +46,10 @@ describe('Overview page', () => {
         stale_cell_count: 0,
         model: 'test-model',
         thinking: 'low',
+        configs: ['baseline@1.0.0'],
+        launch_metadata: 'confirmed_plan',
+        launch_plan_identity: 'sha256:1234567890abcdef',
+        preflight_state: 'passed',
       },
     ]
     mockFetch({ runs })
@@ -53,6 +57,9 @@ describe('Overview page', () => {
 
     expect(await screen.findByText('test-run-1')).toBeInTheDocument()
     expect(screen.getByText(/test-model/i)).toBeInTheDocument()
+    expect(screen.getByText('baseline@1.0.0')).toBeInTheDocument()
+    expect(screen.getByText('plan sha256:1234567890ab')).toBeInTheDocument()
+    expect(screen.getByText('preflight passed')).toBeInTheDocument()
     expect(screen.getByText(/10\/10 done/i)).toBeInTheDocument()
   })
 
@@ -84,6 +91,8 @@ describe('Overview stale cell badge', () => {
         active_count: 3,
         stale_cell_count: 2,
         max_cell_age_s: 2400,
+        launch_metadata: 'legacy_structured',
+        preflight_state: 'running',
       },
     ]
     mockFetch({ runs })
