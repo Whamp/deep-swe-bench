@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import harness.run as run
 import harness.run_omp as run_omp
@@ -11,7 +12,9 @@ class ConfigPromptLayerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             old_repo = run.REPO
             root = Path(td)
-            (root / "configs" / "baseline").mkdir(parents=True)
+            (root / "configs" / "baseline" / "model" / "low").mkdir(
+                parents=True
+            )
             try:
                 run.REPO = root
                 cfg = run.load_config("baseline", "openrouter/example/model", "low")
@@ -27,7 +30,7 @@ class ConfigPromptLayerTests(unittest.TestCase):
             old_repo = run.REPO
             root = Path(td)
             cdir = root / "configs" / "baseline-preamble-orchestration"
-            cdir.mkdir(parents=True)
+            (cdir / "model" / "low").mkdir(parents=True)
             (cdir / "system_preamble.md").write_text("preamble\n")
             (cdir / "orchestration.md").write_text("orchestration\n")
             try:
@@ -37,6 +40,89 @@ class ConfigPromptLayerTests(unittest.TestCase):
                 run.REPO = old_repo
 
         self.assertEqual(run.config_append_text(cfg), "preamble\n\norchestration")
+
+    def test_advisor_config_keeps_effective_leaf_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config_root = root / "configs" / "advisor-config"
+            config_leaf = config_root / "model+advisor" / "low"
+            config_leaf.mkdir(parents=True)
+            expected_files = {}
+            for filename in ("models.json", "advisor.json", "settings.json"):
+                path = config_leaf / filename
+                path.write_text("{}")
+                expected_files[filename] = path
+
+            cfg = run.load_config(
+                "advisor-config",
+                "provider/model",
+                "low",
+                repository_root=root,
+            )
+
+        self.assertEqual(cfg["dir"], config_root)
+        self.assertEqual(cfg["leaf_rel"], "model+advisor/low")
+        self.assertEqual(cfg["models_json"], expected_files["models.json"])
+        self.assertEqual(cfg["advisor_json"], expected_files["advisor.json"])
+        self.assertEqual(cfg["settings_json"], expected_files["settings.json"])
+
+
+class SubjectRunnerConfigResolutionTests(unittest.TestCase):
+    def test_pi_run_cell_rejects_missing_config_leaf(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "configs" / "cfg").mkdir(parents=True)
+            with (
+                patch.object(run, "REPO", root),
+                patch.object(run, "load_task", return_value=object()),
+                self.assertRaises(ValueError) as raised,
+            ):
+                run.run_cell(
+                    "cfg",
+                    "task-a",
+                    model="openrouter/example/model",
+                    thinking="low",
+                    rep=0,
+                    agent_timeout=1,
+                    keep=False,
+                    pass_openai_codex_oauth=False,
+                    rpc_quiescence=0,
+                )
+
+        message = str(raised.exception)
+        self.assertIn("Config leaf missing:", message)
+        self.assertIn("config='cfg'", message)
+        self.assertIn("model_leaf='model'", message)
+        self.assertIn("thinking='low'", message)
+
+    def test_omp_run_cell_rejects_ambiguous_config_leaf(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            direct_leaf = root / "configs" / "cfg" / "model" / "low"
+            worker_leaf = root / "configs" / "cfg" / "model+worker" / "low"
+            direct_leaf.mkdir(parents=True)
+            worker_leaf.mkdir(parents=True)
+            with (
+                patch.object(run_omp, "REPO", root),
+                patch.object(run_omp, "load_task", return_value=object()),
+                self.assertRaises(ValueError) as raised,
+            ):
+                run_omp.run_cell(
+                    "cfg",
+                    "task-a",
+                    model="openai-codex/model",
+                    thinking="low",
+                    rep=0,
+                    agent_timeout=1,
+                    keep=False,
+                    pass_openai_codex_oauth=True,
+                    rpc_quiescence=0,
+                )
+
+        message = str(raised.exception)
+        self.assertIn("Config leaf ambiguous:", message)
+        self.assertIn(str(direct_leaf), message)
+        self.assertIn(str(worker_leaf), message)
 
 
 class RunPiCommandTests(unittest.TestCase):

@@ -32,9 +32,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from lib import load_task, read_reward, result_record, model_leaf, REPO  # noqa: E402
-import results_tree  # noqa: E402
 import parse_usage  # noqa: E402
+import results_tree  # noqa: E402
+from config_resolution import resolve_config_leaf  # noqa: E402
+from lib import REPO, load_task, read_reward, result_record  # noqa: E402
 from pi_rpc_runner import run_pi_rpc  # noqa: E402
 
 DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-flash"
@@ -231,22 +232,27 @@ def ensure_verifier_image(task) -> str:
     return img
 
 
-def load_config(config: str, model: str, thinking: str) -> dict:
+def load_config(
+    config: str,
+    model: str,
+    thinking: str,
+    *,
+    repository_root: Path | None = None,
+) -> dict:
     """Load a config's constants (from configs/<config>/) and its model leaf
     (from configs/<config>/<model-leaf>/<thinking>/).
 
-    The leaf dir matches the executor model-leaf, optionally with a +advisor
-    suffix (advisor configs): glob `<exec-leaf>*/<thinking>` catches both.
+    The leaf dir matches the exact executor model-leaf, optionally followed by
+    a ``+<secondary-role>`` suffix for configs with additional model roles.
     Returns 'leaf_rel' = the leaf path relative to the config dir, so the
     in-container cp sources are /arm/<leaf_rel>/{models,advisor,settings}.json
     (the config dir is mounted as /arm:ro, preserving /arm/extensions/).
     """
-    cdir = REPO / "configs" / config
-    if not cdir.exists():
-        sys.exit(f"config not found: {cdir}")
-    exec_leaf = model_leaf(model)
-    candidates = sorted(p for p in cdir.glob(f"{exec_leaf}*/{thinking}") if p.is_dir())
-    leafdir = candidates[0] if candidates else cdir / exec_leaf / thinking
+    if repository_root is None:
+        repository_root = REPO
+    resolved = resolve_config_leaf(repository_root, config, model, thinking)
+    cdir = resolved.config_root
+    leafdir = resolved.config_leaf
     leaf_rel = leafdir.relative_to(cdir).as_posix()
     skill_dirs = []
     sd = cdir / "skills"

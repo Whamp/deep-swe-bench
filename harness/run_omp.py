@@ -235,7 +235,12 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
         sys.exit("OMP openai-codex models require --pass-openai-codex-oauth")
 
     task = load_task(task_id)
-    cfg = load_config(config, model, thinking)
+    cfg = load_config(
+        config,
+        model,
+        thinking,
+        repository_root=REPO,
+    )
     tools = resolve_omp_tools(cfg["dir"])
     overlay = omp_overlay_in_container(cfg["dir"])
     system_prompt = render_omp_system_prompt(cfg["dir"])

@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from harness import lib, quota, results_tree
+from harness import config_resolution, lib, quota, results_tree
 
 try:
     from harness.run_state import (
@@ -97,19 +97,14 @@ def smoke_task(requested_ids: list[str]) -> str:
 
 
 def smoke_contract_path(model: str, thinking: str, config: str) -> Path | None:
-    """Return an optional config-authored smoke contract.
-
-    Contracts are intentionally generic. A new skill/extension can define what
-    "working" means without teaching run_batch.py about that feature.
-    Leaf-local smoke.json wins over config-level smoke.json.
-    """
-    cfg_dir = REPO / "configs" / config
-    leaf = lib.model_leaf(model)
-    candidates = sorted(p for p in cfg_dir.glob(f"{leaf}*/{thinking}/smoke.json") if p.is_file())
-    if candidates:
-        return candidates[0]
-    p = cfg_dir / "smoke.json"
-    return p if p.is_file() else None
+    """Return the smoke contract from the authoritative config-leaf resolution."""
+    resolved = config_resolution.resolve_config_leaf(
+        REPO,
+        config,
+        model,
+        thinking,
+    )
+    return resolved.smoke_contract
 
 
 def _result_value(rec: dict, dotted_key: str):

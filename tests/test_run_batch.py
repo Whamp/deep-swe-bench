@@ -71,6 +71,9 @@ class StructuredStateIntegrationTests(unittest.TestCase):
             run_batch.SMOKE_SUBSET = root / "subsets" / "12_v0.txt"
             run_batch.SMOKE_SUBSET.parent.mkdir(parents=True)
             run_batch.SMOKE_SUBSET.write_text("task-a\n")
+            (root / "configs" / "cfg" / "deepseek-v4-flash" / "high").mkdir(
+                parents=True
+            )
             result = root / "results" / "deepseek-v4-flash" / "high" / "cfg" / "task-a" / "rep0" / "result.json"
             result.parent.mkdir(parents=True)
             result.write_text(json.dumps({"agent_exit": 0, "verifier_exit": 0, "total_tokens": 1}))
@@ -223,6 +226,94 @@ class RunOneCommandTests(unittest.TestCase):
 
         cmd = run_mock.call_args[0][0]
         self.assertIn("--no-initial-context-capture", cmd)
+
+
+class ConfigLeafResolutionTests(unittest.TestCase):
+    def test_preflight_plan_rejects_ambiguous_config_leaf(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            direct_leaf = root / "configs" / "cfg" / "model" / "low"
+            advisor_leaf = root / "configs" / "cfg" / "model+advisor" / "low"
+            direct_leaf.mkdir(parents=True)
+            advisor_leaf.mkdir(parents=True)
+            smoke_subset = root / "subsets" / "12_v0.txt"
+            smoke_subset.parent.mkdir()
+            smoke_subset.write_text("task-a\n")
+            args = type("Args", (), {
+                "model": "provider/model",
+                "thinking": "low",
+                "no_smoke_new_configs": False,
+            })()
+
+            with (
+                patch.object(run_batch, "REPO", root),
+                patch.object(run_batch, "SMOKE_SUBSET", smoke_subset),
+                self.assertRaises(ValueError) as raised,
+            ):
+                run_batch.preflight_plan(args, ["cfg"], ["task-a"])
+
+        message = str(raised.exception)
+        self.assertIn("Config leaf ambiguous:", message)
+        self.assertIn("config='cfg'", message)
+        self.assertIn("model_leaf='model'", message)
+        self.assertIn("thinking='low'", message)
+        self.assertIn(str(direct_leaf), message)
+        self.assertIn(str(advisor_leaf), message)
+
+    def test_preflight_plan_uses_leaf_local_smoke_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config_root = root / "configs" / "cfg"
+            config_leaf = config_root / "model" / "low"
+            config_leaf.mkdir(parents=True)
+            (config_root / "smoke.json").write_text("{}")
+            leaf_contract = config_leaf / "smoke.json"
+            leaf_contract.write_text("{}")
+            smoke_subset = root / "subsets" / "12_v0.txt"
+            smoke_subset.parent.mkdir()
+            smoke_subset.write_text("task-a\n")
+            args = type("Args", (), {
+                "model": "provider/model",
+                "thinking": "low",
+                "no_smoke_new_configs": False,
+            })()
+
+            with (
+                patch.object(run_batch, "REPO", root),
+                patch.object(run_batch, "SMOKE_SUBSET", smoke_subset),
+            ):
+                plan = run_batch.preflight_plan(args, ["cfg"], ["task-a"])
+
+        self.assertEqual(
+            plan[0]["cell"]["contract_path"],
+            "configs/cfg/model/low/smoke.json",
+        )
+
+    def test_preflight_plan_preserves_config_root_smoke_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config_root = root / "configs" / "cfg"
+            (config_root / "model" / "low").mkdir(parents=True)
+            (config_root / "smoke.json").write_text("{}")
+            smoke_subset = root / "subsets" / "12_v0.txt"
+            smoke_subset.parent.mkdir()
+            smoke_subset.write_text("task-a\n")
+            args = type("Args", (), {
+                "model": "provider/model",
+                "thinking": "low",
+                "no_smoke_new_configs": False,
+            })()
+
+            with (
+                patch.object(run_batch, "REPO", root),
+                patch.object(run_batch, "SMOKE_SUBSET", smoke_subset),
+            ):
+                plan = run_batch.preflight_plan(args, ["cfg"], ["task-a"])
+
+        self.assertEqual(
+            plan[0]["cell"]["contract_path"],
+            "configs/cfg/smoke.json",
+        )
 
 
 class SmokeTaskTests(unittest.TestCase):

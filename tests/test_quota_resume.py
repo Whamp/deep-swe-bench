@@ -173,6 +173,9 @@ class TestMainResumeLoop:
         run_batch.SMOKE_SUBSET = root / "subsets" / "12_v0.txt"
         run_batch.SMOKE_SUBSET.parent.mkdir(parents=True)
         run_batch.SMOKE_SUBSET.write_text("task-a\n")
+        (root / "configs" / "cfg" / "deepseek-v4-flash" / "high").mkdir(
+            parents=True
+        )
 
     def test_resumes_after_quota_pause_then_completes(self):
         """main() loops: _execute_batch returns 75, resumer retries, then 0."""
