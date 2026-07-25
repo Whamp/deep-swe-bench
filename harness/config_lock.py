@@ -76,6 +76,24 @@ _CREDENTIAL_ROUTE = re.compile(
     r"^\$(?:\{(?P<braced>[A-Z][A-Z0-9_]*)\}|"
     r"(?P<plain>[A-Z][A-Z0-9_]*))$"
 )
+_BEHAVIOR_KIND_BY_FILENAME = {
+    "env": "environment",
+    "orchestration.md": "prompt",
+    "package-lock.json": "package-identity",
+    "package.json": "package-identity",
+    "pi-flags": "flags",
+    "smoke.json": "smoke-contract",
+    "system_preamble.md": "prompt",
+}
+_BEHAVIOR_KIND_BY_DIRECTORY = {
+    "extensions": "extension",
+    "skills": "skill",
+}
+_LEAF_BEHAVIOR_KIND_BY_FILENAME = {
+    "advisor.json": "leaf-settings",
+    "models.json": "leaf-settings",
+    "settings.json": "leaf-settings",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,26 +221,19 @@ def _input_content(path: Path) -> bytes:
 
 
 def _behavior_input_kind(relative_path: Path) -> str:
-    parts = relative_path.parts
-    if parts[0] == "bin":
+    """Classify a behavior file using ordered directory and filename rules."""
+    if relative_path.parts[0] == "bin":
         return "generated-tool"
-    if relative_path.name in {"package.json", "package-lock.json"}:
-        return "package-identity"
-    if relative_path.name == "env":
-        return "environment"
-    if relative_path.name == "smoke.json":
-        return "smoke-contract"
-    if relative_path.name in {"system_preamble.md", "orchestration.md"}:
-        return "prompt"
-    if relative_path.name == "pi-flags":
-        return "flags"
-    if parts[0] == "skills":
-        return "skill"
-    if parts[0] == "extensions":
-        return "extension"
-    if relative_path.name in {"settings.json", "models.json", "advisor.json"}:
-        return "leaf-settings"
-    return "behavior-file"
+    filename_kind = _BEHAVIOR_KIND_BY_FILENAME.get(relative_path.name)
+    if filename_kind is not None:
+        return filename_kind
+    directory_kind = _BEHAVIOR_KIND_BY_DIRECTORY.get(relative_path.parts[0])
+    if directory_kind is not None:
+        return directory_kind
+    return _LEAF_BEHAVIOR_KIND_BY_FILENAME.get(
+        relative_path.name,
+        "behavior-file",
+    )
 
 
 def _is_collectable_behavior_file(path: Path) -> bool:
@@ -396,7 +407,7 @@ def _read_config_seal_document(seal_path: Path) -> Mapping[str, object]:
             f"{seal_path}: {error}"
         ) from error
     if not isinstance(document, Mapping):
-        raise ValueError(
+        raise ValueError(  # noqa: TRY004 - all malformed seal evidence is invalid.
             "Config release seal evidence invalid: expected object in "
             f"{seal_path}"
         )
@@ -519,7 +530,7 @@ def sealed_config_lock_identities(
                 f"{result_path}: {error}"
             ) from error
         if not isinstance(result, Mapping):
-            raise ValueError(
+            raise ValueError(  # noqa: TRY004 - preserve seal diagnostic type.
                 "Config release seal evidence invalid: expected object in "
                 f"{result_path}"
             )

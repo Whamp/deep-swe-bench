@@ -175,6 +175,36 @@ def test_config_lock_excludes_secret_values_from_identity(
         assert first_lock["lockIdentity"] == second_lock["lockIdentity"]
 
 
+def test_config_behavior_kinds_preserve_directory_precedence(
+    tmp_path: Path,
+) -> None:
+    """Skill and extension ownership wins over nested settings filenames."""
+    config_root = tmp_path / "configs" / "review-assistant@1.0.0"
+    config_leaf = config_root / "model" / "low"
+    skill_settings = config_root / "skills" / "review" / "settings.json"
+    extension_models = config_root / "extensions" / "review" / "models.json"
+    leaf_settings = config_leaf / "settings.json"
+    for path in (skill_settings, extension_models, leaf_settings):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    resolved = config_resolution.ResolvedConfigLeaf(
+        config_root=config_root,
+        config_leaf=config_leaf,
+        smoke_contract=None,
+    )
+
+    kinds_by_path = {
+        str(item["path"]): item["kind"]
+        for item in config_lock.collect_config_behavior_inputs(resolved)
+    }
+
+    assert kinds_by_path == {
+        "extensions/review/models.json": "extension",
+        "model/low/settings.json": "leaf-settings",
+        "skills/review/settings.json": "skill",
+    }
+
+
 @given(
     st.dictionaries(
         st.text(
