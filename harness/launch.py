@@ -58,6 +58,10 @@ class LaunchPreflightError(RuntimeError):
     """Stop batch fan-out after durable preflight diagnostics are recorded."""
 
 
+class LaunchInputDriftError(RuntimeError):
+    """Stop a confirmed run before changed launch inputs start another rep."""
+
+
 class LaunchConfigDocument(TypedDict):
     """Resolved config fields stored in a canonical launch plan."""
 
@@ -1841,6 +1845,271 @@ def _append_confirmed_cell_log(
         )
 
 
+def _config_lock_drift_changes(
+    document: LaunchPlanDocument,
+) -> list[dict[str, object]]:
+    """Compare every approved config lock with its current document."""
+    changes: list[dict[str, object]] = []
+    for config in document["configs"]:
+        approved_identity = config["lockIdentity"]
+        lock_path = Path(config["configLeaf"]) / "config-lock.json"
+        resolved = config_resolution.ResolvedConfigLeaf(
+            config_root=Path(config["configRoot"]),
+            config_leaf=Path(config["configLeaf"]),
+            smoke_contract=(
+                Path(config["smokeContract"])
+                if config["smokeContract"] is not None
+                else None
+            ),
+        )
+        observed_identity: object = None
+        try:
+            verification = config_lock.verify_config_lock(
+                resolved,
+                config["identity"],
+            )
+            observed_identity = verification.lock_identity
+            if observed_identity == approved_identity:
+                continue
+        except (OSError, TypeError, ValueError):
+            if lock_path.is_file():
+                observed_identity = (
+                    "sha256:"
+                    + hashlib.sha256(lock_path.read_bytes()).hexdigest()
+                )
+        changes.append(
+            {
+                "approvedIdentity": approved_identity,
+                "category": "config-lock",
+                "input": config["identity"],
+                "observedIdentity": observed_identity,
+            }
+        )
+    return changes
+
+
+def _launch_input_mapping_identity(
+    value: Mapping[str, object] | None,
+) -> str | None:
+    """Identify a complete structured launch input, including file mode."""
+    if value is None:
+        return None
+    digest = hashlib.sha256(canonical_launch_plan_json(value).encode())
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _config_input_drift_changes(
+    document: LaunchPlanDocument,
+) -> list[dict[str, object]]:
+    """Compare every approved config input with its current fingerprint."""
+    changes: list[dict[str, object]] = []
+    for config in document["configs"]:
+        resolved = config_resolution.ResolvedConfigLeaf(
+            config_root=Path(config["configRoot"]),
+            config_leaf=Path(config["configLeaf"]),
+            smoke_contract=(
+                Path(config["smokeContract"])
+                if config["smokeContract"] is not None
+                else None
+            ),
+        )
+        approved_by_path = {
+            str(item["path"]): item for item in config["behaviorInputs"]
+        }
+        observed_by_path = {
+            str(item["path"]): item
+            for item in config_lock.collect_config_behavior_inputs(resolved)
+        }
+        all_input_paths = sorted(set(approved_by_path) | set(observed_by_path))
+        for input_path in all_input_paths:
+            approved = approved_by_path.get(input_path)
+            observed = observed_by_path.get(input_path)
+            approved_identity = _launch_input_mapping_identity(approved)
+            observed_identity = _launch_input_mapping_identity(observed)
+            if approved != observed:
+                changes.append(
+                    {
+                        "approvedIdentity": approved_identity,
+                        "category": "config-input",
+                        "config": config["identity"],
+                        "input": input_path,
+                        "observedIdentity": observed_identity,
+                    }
+                )
+    return changes
+
+
+def _confirmed_launch_request(
+    document: LaunchPlanDocument,
+) -> LaunchRequest:
+    """Reconstruct only the resolved request needed for runtime observation."""
+    selection = document["selection"]
+    policies = document["policies"]
+    selected_tasks = selection.get("tasks")
+    selection_kind = selection.get("kind")
+    selection_name = selection.get("name")
+    if not isinstance(selected_tasks, list) or not all(
+        isinstance(task, str) for task in selected_tasks
+    ):
+        raise TypeError(
+            "Confirmed launch selection invalid: tasks must be strings"
+        )
+    if not isinstance(selection_kind, str):
+        raise TypeError(
+            "Confirmed launch selection invalid: kind must be a string"
+        )
+    if selection_name is not None and not isinstance(selection_name, str):
+        raise TypeError(
+            "Confirmed launch selection invalid: name must be a string"
+        )
+    preflight = policies.get("preflight")
+    existing_results = policies.get("existing_results")
+    transient_errors = policies.get("transient_errors")
+    cell_retries = policies.get("cell_retries")
+    if not all(
+        isinstance(policy, str)
+        for policy in (preflight, existing_results, transient_errors)
+    ) or not isinstance(cell_retries, int):
+        raise TypeError(
+            "Confirmed launch policies invalid: expected resolved values"
+        )
+    return LaunchRequest(
+        subject=document["subject"]["name"],
+        model=document["model"],
+        thinking=document["thinking"],
+        configs=tuple(config["identity"] for config in document["configs"]),
+        baseline_config=document["baselineConfig"],
+        task_selection=LaunchTaskSelection(
+            kind=selection_kind,
+            tasks=tuple(cast(list[str], selected_tasks)),
+            name=selection_name,
+        ),
+        reps=document["counts"]["reps"],
+        concurrency=document["concurrency"],
+        run_id=document["runId"],
+        policies=LaunchExecutionPolicies(
+            preflight=cast(str, preflight),
+            existing_results=cast(str, existing_results),
+            transient_errors=cast(str, transient_errors),
+            cell_retries=cell_retries,
+        ),
+    )
+
+
+def _runtime_input_drift_changes(
+    document: LaunchPlanDocument,
+    runtime_resolver: LaunchRuntimeResolver,
+) -> list[dict[str, object]]:
+    """Resolve and compare every runtime identity approved by the plan."""
+    request = _confirmed_launch_request(document)
+    tasks = request.task_selection.tasks
+    approved = document["runtime"]
+    try:
+        observed = runtime_resolver.resolve_launch_runtime(request, tasks)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        approved_identity = hashlib.sha256(
+            canonical_launch_plan_json(approved).encode()
+        ).hexdigest()
+        return [
+            {
+                "approvedIdentity": f"sha256:{approved_identity}",
+                "category": "runtime-identity-resolution",
+                "detail": f"{type(error).__name__}: {error}",
+                "input": "runtime-identities",
+                "observedIdentity": None,
+            }
+        ]
+    changes: list[dict[str, object]] = []
+
+    def compare(
+        category: str,
+        input_name: str,
+        approved_identity: object,
+        observed_identity: object,
+    ) -> None:
+        if approved_identity != observed_identity:
+            changes.append(
+                {
+                    "approvedIdentity": approved_identity,
+                    "category": category,
+                    "input": input_name,
+                    "observedIdentity": observed_identity,
+                }
+            )
+
+    compare(
+        "subject-version",
+        document["subject"]["name"],
+        document["subject"]["version"],
+        observed.subject_version,
+    )
+    compare(
+        "harness-revision",
+        document["paths"]["workspace"],
+        approved["harnessRevision"],
+        observed.harness_revision,
+    )
+    compare(
+        "task-revision",
+        "selected-tasks",
+        approved["taskRevision"],
+        observed.task_revision,
+    )
+    for task in sorted(tasks):
+        compare(
+            "verifier-identity",
+            task,
+            approved["verifierIdentities"].get(task),
+            observed.verifier_identities.get(task),
+        )
+        approved_images = approved["immutableImageIdentities"].get(task, {})
+        observed_images = observed.immutable_image_identities.get(task, {})
+        for image_name in sorted(set(approved_images) | set(observed_images)):
+            compare(
+                "immutable-image-identity",
+                f"{task}:{image_name}",
+                approved_images.get(image_name),
+                observed_images.get(image_name),
+            )
+    return changes
+
+
+class _ApprovedLaunchInputVerifier:
+    """Stop runner submissions when current inputs differ from the plan."""
+
+    def __init__(
+        self,
+        document: LaunchPlanDocument,
+        state: run_state.RunStateWriter,
+        runtime_resolver: LaunchRuntimeResolver,
+    ) -> None:
+        self.document = document
+        self.state = state
+        self.runtime_resolver = runtime_resolver
+
+    def require_unchanged_before_rep(self, cell: ConfirmedPiCell) -> None:
+        """Recheck before every submission, including resumed or retried reps."""
+        changes = _config_input_drift_changes(self.document)
+        changes.extend(_config_lock_drift_changes(self.document))
+        changes.extend(
+            _runtime_input_drift_changes(
+                self.document,
+                self.runtime_resolver,
+            )
+        )
+        if not changes:
+            return
+        state_cell = _confirmed_state_cell(self.state.run_dir, cell)
+        self.state.launch_input_drift(
+            pending_cell_id=str(state_cell["cell_id"]),
+            changes=changes,
+        )
+        raise LaunchInputDriftError(
+            "Launch input drift: approved inputs changed before "
+            f"{state_cell['cell_id']}"
+        )
+
+
 def _run_confirmed_pi_cell(
     cell: ConfirmedPiCell,
     pi_runner: ConfirmedPiRunner,
@@ -1860,11 +2129,13 @@ def _execute_confirmed_preflight_cell(
     cell: ConfirmedPiCell,
     state_path: Path,
     state: run_state.RunStateWriter,
+    input_verifier: _ApprovedLaunchInputVerifier,
     pi_runner: ConfirmedPiRunner,
     log_path: Path,
 ) -> bool:
     """Run and atomically decide one confirmed preflight cell."""
     state_cell = _confirmed_state_cell(state_path, cell)
+    input_verifier.require_unchanged_before_rep(cell)
     state.preflight_started(state_cell)
     diagnostics: list[confirmed_preflight.PreflightDiagnostic] = []
     result_record: dict[str, object] = {}
@@ -1917,6 +2188,7 @@ def _execute_confirmed_preflights(
     cells: Sequence[ConfirmedPiCell],
     state_path: Path,
     state: run_state.RunStateWriter,
+    input_verifier: _ApprovedLaunchInputVerifier,
     pi_runner: ConfirmedPiRunner,
     log_path: Path,
 ) -> set[Path]:
@@ -1928,6 +2200,7 @@ def _execute_confirmed_preflights(
             cell,
             state_path,
             state,
+            input_verifier,
             pi_runner,
             log_path,
         ):
@@ -1951,11 +2224,13 @@ def _execute_confirmed_batch_cell(
     cell: ConfirmedPiCell,
     state_path: Path,
     state: run_state.RunStateWriter,
+    input_verifier: _ApprovedLaunchInputVerifier,
     pi_runner: ConfirmedPiRunner,
     log_path: Path,
 ) -> None:
     """Run one planned batch cell and record its durable outcome."""
     state_cell = _confirmed_state_cell(state_path, cell)
+    input_verifier.require_unchanged_before_rep(cell)
     state.cell_started(state_cell)
     try:
         result_record = _run_confirmed_pi_cell(cell, pi_runner, log_path)
@@ -1987,6 +2262,7 @@ def _execute_confirmed_batch(
     passed_preflight_paths: set[Path],
     state_path: Path,
     state: run_state.RunStateWriter,
+    input_verifier: _ApprovedLaunchInputVerifier,
     pi_runner: ConfirmedPiRunner,
     log_path: Path,
 ) -> None:
@@ -2000,6 +2276,7 @@ def _execute_confirmed_batch(
             cell,
             state_path,
             state,
+            input_verifier,
             pi_runner,
             log_path,
         )
@@ -2009,6 +2286,7 @@ def execute_confirmed_launch(
     plan: LaunchPlan,
     *,
     confirmation_identity: str | None,
+    runtime_resolver: LaunchRuntimeResolver,
     pi_runner: ConfirmedPiRunner,
 ) -> ConfirmedLaunchExecution:
     """Execute atomic preflight and conditional fan-out for one exact plan."""
@@ -2042,11 +2320,17 @@ def execute_confirmed_launch(
         "Confirmed Pi cell execution\n"
         f"launch_plan_identity={document['planIdentity']}\n"
     )
+    input_verifier = _ApprovedLaunchInputVerifier(
+        document,
+        state,
+        runtime_resolver,
+    )
 
     passed_preflight_paths = _execute_confirmed_preflights(
         preflight_cells,
         state_path,
         state,
+        input_verifier,
         pi_runner,
         log_path,
     )
@@ -2055,6 +2339,7 @@ def execute_confirmed_launch(
         passed_preflight_paths,
         state_path,
         state,
+        input_verifier,
         pi_runner,
         log_path,
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,23 @@ from harness.launch import (
     compile_launch_request,
     execute_confirmed_launch,
 )
+
+
+class StaticLaunchRuntimeResolver:
+    """Return mutable model-free runtime identities for launch fixtures."""
+
+    def __init__(self, identity: LaunchRuntimeIdentity) -> None:
+        """Store the runtime identity observed by the next drift check."""
+        self.identity = identity
+
+    def resolve_launch_runtime(
+        self,
+        request: LaunchRequest,
+        tasks: tuple[str, ...],
+    ) -> LaunchRuntimeIdentity:
+        """Return current fixture runtime identity without host inspection."""
+        del request, tasks
+        return self.identity
 
 
 class FailingConfirmedPiRunner:
@@ -60,9 +78,14 @@ class InvalidPreflightEvidenceRunner:
 class FakeConfirmedPiRunner:
     """Produce controlled Pi results without a subject or model call."""
 
-    def __init__(self, expected_plan_path: Path) -> None:
+    def __init__(
+        self,
+        expected_plan_path: Path,
+        after_call: Callable[[ConfirmedPiCell], None] | None = None,
+    ) -> None:
         """Record calls and require durable plan state before execution."""
         self.expected_plan_path = expected_plan_path
+        self.after_call = after_call
         self.calls: list[ConfirmedPiCell] = []
         self.preflight_was_running = False
 
@@ -97,6 +120,8 @@ class FakeConfirmedPiRunner:
         (cell_root / "logs" / "extension-markers.log").write_text(
             "__FIXTURE_READY__\n"
         )
+        if self.after_call is not None:
+            self.after_call(cell)
         return {
             "agent_exit": 0,
             "arm_advisor": {"model": "fixture-advisor"},
@@ -225,6 +250,25 @@ def _compile_existing_fixture(
     )
 
 
+def _runtime_resolver_for(
+    compiled: CompiledLaunch,
+) -> StaticLaunchRuntimeResolver:
+    """Build a mutable fake resolver from approved plan runtime fields."""
+    document = compiled.plan.to_document()
+    runtime = document["runtime"]
+    return StaticLaunchRuntimeResolver(
+        LaunchRuntimeIdentity(
+            subject_version=document["subject"]["version"],
+            harness_revision=runtime["harnessRevision"],
+            task_revision=runtime["taskRevision"],
+            verifier_identities=runtime["verifierIdentities"],
+            immutable_image_identities=runtime["immutableImageIdentities"],
+            subject_capabilities=frozenset({"pi-rpc"}),
+            available_credential_routes=frozenset({"FIXTURE_CREDENTIAL"}),
+        )
+    )
+
+
 def _compile_single_cell_launch(
     tmp_path: Path,
     *,
@@ -245,6 +289,9 @@ def _compile_single_cell_launch(
     extension_owner.parent.mkdir()
     extension_owner.write_text("export default {};\n")
     (config_root / "orchestration.md").write_text("Fixture behavior.\n")
+    (config_leaf / "settings.json").write_text(
+        '{"defaultThinkingLevel":"low"}\n'
+    )
     smoke_contract = config_leaf / "smoke.json"
     smoke_contract.write_text(
         json.dumps(smoke_contract_document or {"requireFiles": []}) + "\n"
@@ -319,6 +366,7 @@ def test_passing_preflight_fans_out_exactly_once_without_second_confirmation(
     execution = execute_confirmed_launch(
         compiled.plan,
         confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
         pi_runner=fake_runner,
     )
 
@@ -383,6 +431,7 @@ def test_failed_preflight_records_all_diagnostics_without_batch_fan_out(
         execute_confirmed_launch(
             compiled.plan,
             confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
             pi_runner=runner,
         )
 
@@ -432,6 +481,7 @@ def test_preflight_verdict_controls_config_leaf_sealing(
     execute_confirmed_launch(
         passed.plan,
         confirmation_identity=passed.plan.identity,
+        runtime_resolver=_runtime_resolver_for(passed),
         pi_runner=FakeConfirmedPiRunner(
             passed_state / "confirmed-fixture" / "launch-plan.json"
         ),
@@ -468,6 +518,7 @@ def test_preflight_verdict_controls_config_leaf_sealing(
         execute_confirmed_launch(
             failed.plan,
             confirmation_identity=failed.plan.identity,
+            runtime_resolver=_runtime_resolver_for(failed),
             pi_runner=InvalidPreflightEvidenceRunner(),
         )
     failed_repository = tmp_path / "failed" / "repository"
@@ -507,6 +558,7 @@ def test_sealed_release_allows_only_leaves_with_unchanged_shared_behavior(
     execute_confirmed_launch(
         compiled.plan,
         confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
         pi_runner=FakeConfirmedPiRunner(
             state_root / "confirmed-fixture" / "launch-plan.json"
         ),
@@ -565,6 +617,7 @@ def test_execute_confirmed_launch_runs_exact_planned_pi_cell(
     execution = execute_confirmed_launch(
         compiled.plan,
         confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
         pi_runner=fake_runner,
     )
 
@@ -632,12 +685,386 @@ def test_execute_confirmed_launch_rejects_missing_or_stale_confirmation(
         execute_confirmed_launch(
             compiled.plan,
             confirmation_identity=confirmation_identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
             pi_runner=fake_runner,
         )
 
     assert fake_runner.calls == []
     assert not results_root.exists()
     assert not state_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "changed_content"),
+    [
+        ("orchestration.md", "Drifted fixture behavior.\n"),
+        ("extensions/machine-markers.ts", "export default {drift: true};\n"),
+        ("model/low/settings.json", '{"defaultThinkingLevel":"high"}\n'),
+        ("model/low/smoke.json", '{"minResultValues":{"worker_calls":2}}\n'),
+    ],
+)
+def test_execute_confirmed_launch_stops_before_config_input_drifted_rep(
+    tmp_path: Path,
+    relative_path: str,
+    changed_content: str,
+) -> None:
+    """Config input drift records both identities before the next rep."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        reps=2,
+    )
+    behavior_path = (
+        tmp_path
+        / "repository"
+        / "configs"
+        / "baseline@1.0.0"
+        / relative_path
+    )
+
+    def change_behavior_after_first_rep(cell: ConfirmedPiCell) -> None:
+        if cell.rep == 0:
+            behavior_path.write_text(changed_content)
+
+    runner = FakeConfirmedPiRunner(
+        state_root / "confirmed-fixture" / "launch-plan.json",
+        after_call=change_behavior_after_first_rep,
+    )
+
+    with pytest.raises(RuntimeError, match=r"^Launch input drift:"):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+
+    assert [cell.rep for cell in runner.calls] == [0]
+    events = [
+        json.loads(line)
+        for line in (state_root / "confirmed-fixture" / "events.ndjson")
+        .read_text()
+        .splitlines()
+    ]
+    drift_event = next(
+        event for event in events if event["event"] == "launch_input_drift"
+    )
+    assert drift_event["pending_cell_id"].endswith("/rep1")
+    assert drift_event["active_cell_ids"] == []
+    assert drift_event["active_preflight_ids"] == []
+    assert len(drift_event["changes"]) == 1
+    change = drift_event["changes"][0]
+    assert change["category"] == "config-input"
+    assert change["config"] == "baseline@1.0.0"
+    assert change["input"] == relative_path
+    assert change["approvedIdentity"].startswith("sha256:")
+    assert change["observedIdentity"] != change["approvedIdentity"]
+
+
+def test_execute_confirmed_launch_stops_before_config_lock_drifted_rep(
+    tmp_path: Path,
+) -> None:
+    """Config lock drift is distinct from behavior-file drift."""
+    compiled, config_leaf, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        reps=2,
+    )
+    lock_path = config_leaf / "config-lock.json"
+
+    def change_lock_after_first_rep(cell: ConfirmedPiCell) -> None:
+        if cell.rep != 0:
+            return
+        lock_document = json.loads(lock_path.read_text())
+        lock_document["versionImpact"] = "recompute"
+        lock_path.write_text(json.dumps(lock_document) + "\n")
+
+    runner = FakeConfirmedPiRunner(
+        state_root / "confirmed-fixture" / "launch-plan.json",
+        after_call=change_lock_after_first_rep,
+    )
+
+    with pytest.raises(RuntimeError, match=r"^Launch input drift:"):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+
+    assert [cell.rep for cell in runner.calls] == [0]
+    events = [
+        json.loads(line)
+        for line in (state_root / "confirmed-fixture" / "events.ndjson")
+        .read_text()
+        .splitlines()
+    ]
+    drift_event = next(
+        event for event in events if event["event"] == "launch_input_drift"
+    )
+    assert drift_event["changes"][0]["category"] == "config-lock"
+    assert drift_event["changes"][0]["input"] == "baseline@1.0.0"
+    assert (
+        drift_event["changes"][0]["approvedIdentity"]
+        == compiled.plan.to_document()["configs"][0]["lockIdentity"]
+    )
+    assert (
+        drift_event["changes"][0]["observedIdentity"]
+        != drift_event["changes"][0]["approvedIdentity"]
+    )
+
+
+@pytest.mark.parametrize(
+    "changed_category",
+    [
+        "subject-version",
+        "harness-revision",
+        "task-revision",
+        "verifier-identity",
+        "immutable-image-identity",
+    ],
+)
+def test_execute_confirmed_launch_stops_before_runtime_drifted_rep(
+    tmp_path: Path,
+    changed_category: str,
+) -> None:
+    """Runtime identity drift is re-resolved before another rep starts."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        reps=2,
+    )
+    runtime_resolver = _runtime_resolver_for(compiled)
+
+    def change_runtime_after_first_rep(cell: ConfirmedPiCell) -> None:
+        if cell.rep != 0:
+            return
+        approved = runtime_resolver.identity
+        verifier_identities = dict(approved.verifier_identities)
+        image_identities = {
+            task: dict(identities)
+            for task, identities in approved.immutable_image_identities.items()
+        }
+        subject_version = approved.subject_version
+        harness_revision = approved.harness_revision
+        task_revision = approved.task_revision
+        if changed_category == "subject-version":
+            subject_version = "pi@drifted-fixture"
+        elif changed_category == "harness-revision":
+            harness_revision = "sha256:drifted-harness"
+        elif changed_category == "task-revision":
+            task_revision = "sha256:drifted-task"
+        elif changed_category == "verifier-identity":
+            verifier_identities["task-a"] = "sha256:drifted-verifier"
+        else:
+            image_identities["task-a"]["agent"] = "sha256:drifted-image"
+        runtime_resolver.identity = LaunchRuntimeIdentity(
+            subject_version=subject_version,
+            harness_revision=harness_revision,
+            task_revision=task_revision,
+            verifier_identities=verifier_identities,
+            immutable_image_identities=image_identities,
+            subject_capabilities=approved.subject_capabilities,
+            available_credential_routes=(
+                approved.available_credential_routes
+            ),
+        )
+
+    runner = FakeConfirmedPiRunner(
+        state_root / "confirmed-fixture" / "launch-plan.json",
+        after_call=change_runtime_after_first_rep,
+    )
+
+    with pytest.raises(RuntimeError, match=r"^Launch input drift:"):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=runtime_resolver,
+            pi_runner=runner,
+        )
+
+    assert [cell.rep for cell in runner.calls] == [0]
+    events = [
+        json.loads(line)
+        for line in (state_root / "confirmed-fixture" / "events.ndjson")
+        .read_text()
+        .splitlines()
+    ]
+    drift_event = next(
+        event for event in events if event["event"] == "launch_input_drift"
+    )
+    assert len(drift_event["changes"]) == 1
+    change = drift_event["changes"][0]
+    assert change["category"] == changed_category
+    expected_inputs = {
+        "subject-version": "pi",
+        "harness-revision": str((tmp_path / "repository").resolve()),
+        "task-revision": "selected-tasks",
+        "verifier-identity": "task-a",
+        "immutable-image-identity": "task-a:agent",
+    }
+    assert change["input"] == expected_inputs[changed_category]
+    assert change["observedIdentity"] != change["approvedIdentity"]
+
+
+def test_execute_confirmed_launch_records_every_changed_input(
+    tmp_path: Path,
+) -> None:
+    """One drift event reports all config and runtime identity changes."""
+    compiled, config_leaf, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        reps=2,
+    )
+    runtime_resolver = _runtime_resolver_for(compiled)
+    prompt_path = config_leaf.parent.parent / "orchestration.md"
+    lock_path = config_leaf / "config-lock.json"
+
+    def change_all_inputs_after_first_rep(cell: ConfirmedPiCell) -> None:
+        if cell.rep != 0:
+            return
+        prompt_path.write_text("All inputs drifted.\n")
+        lock_document = json.loads(lock_path.read_text())
+        lock_document["versionImpact"] = "recompute"
+        lock_path.write_text(json.dumps(lock_document) + "\n")
+        runtime_resolver.identity = LaunchRuntimeIdentity(
+            subject_version="pi@drifted-fixture",
+            harness_revision="sha256:drifted-harness",
+            task_revision="sha256:drifted-task",
+            verifier_identities={"task-a": "sha256:drifted-verifier"},
+            immutable_image_identities={
+                "task-a": {
+                    "agent": "sha256:drifted-agent",
+                    "environment": "sha256:drifted-environment",
+                    "verifier": "sha256:drifted-verifier-image",
+                }
+            },
+        )
+
+    runner = FakeConfirmedPiRunner(
+        state_root / "confirmed-fixture" / "launch-plan.json",
+        after_call=change_all_inputs_after_first_rep,
+    )
+
+    with pytest.raises(RuntimeError, match=r"^Launch input drift:"):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=runtime_resolver,
+            pi_runner=runner,
+        )
+
+    events = [
+        json.loads(line)
+        for line in (state_root / "confirmed-fixture" / "events.ndjson")
+        .read_text()
+        .splitlines()
+    ]
+    drift_event = next(
+        event for event in events if event["event"] == "launch_input_drift"
+    )
+    assert len(drift_event["changes"]) == 9
+    assert {change["category"] for change in drift_event["changes"]} == {
+        "config-input",
+        "config-lock",
+        "subject-version",
+        "harness-revision",
+        "task-revision",
+        "verifier-identity",
+        "immutable-image-identity",
+    }
+    assert all(
+        change["approvedIdentity"] != change["observedIdentity"]
+        for change in drift_event["changes"]
+    )
+    assert [cell.rep for cell in runner.calls] == [0]
+
+
+def test_execute_confirmed_launch_records_runtime_resolution_drift(
+    tmp_path: Path,
+) -> None:
+    """A newly unresolved runtime identity stops before another rep."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        reps=2,
+    )
+    approved_resolver = _runtime_resolver_for(compiled)
+
+    class FailingRuntimeResolver:
+        """Become unresolved only after the first fake rep."""
+
+        def __init__(self) -> None:
+            self.available = True
+
+        def resolve_launch_runtime(
+            self,
+            request: LaunchRequest,
+            tasks: tuple[str, ...],
+        ) -> LaunchRuntimeIdentity:
+            if not self.available:
+                raise ValueError("fixture image identity unavailable")
+            return approved_resolver.resolve_launch_runtime(request, tasks)
+
+    runtime_resolver = FailingRuntimeResolver()
+
+    def lose_runtime_identity_after_first_rep(cell: ConfirmedPiCell) -> None:
+        if cell.rep == 0:
+            runtime_resolver.available = False
+
+    runner = FakeConfirmedPiRunner(
+        state_root / "confirmed-fixture" / "launch-plan.json",
+        after_call=lose_runtime_identity_after_first_rep,
+    )
+
+    with pytest.raises(RuntimeError, match=r"^Launch input drift:"):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=runtime_resolver,
+            pi_runner=runner,
+        )
+
+    events = [
+        json.loads(line)
+        for line in (state_root / "confirmed-fixture" / "events.ndjson")
+        .read_text()
+        .splitlines()
+    ]
+    drift_event = next(
+        event for event in events if event["event"] == "launch_input_drift"
+    )
+    assert drift_event["changes"][0]["category"] == (
+        "runtime-identity-resolution"
+    )
+    assert drift_event["changes"][0]["observedIdentity"] is None
+    assert [cell.rep for cell in runner.calls] == [0]
+
+
+def test_execute_confirmed_launch_ignores_routine_host_state_changes(
+    tmp_path: Path,
+) -> None:
+    """Undeclared volatile host state does not invalidate a launch plan."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        reps=2,
+    )
+    host_state_path = tmp_path / "host-state.json"
+
+    def change_host_state_after_first_rep(cell: ConfirmedPiCell) -> None:
+        if cell.rep == 0:
+            host_state_path.write_text('{"freeDiskBytes":1,"quota":"wait"}\n')
+
+    runner = FakeConfirmedPiRunner(
+        state_root / "confirmed-fixture" / "launch-plan.json",
+        after_call=change_host_state_after_first_rep,
+    )
+
+    execution = execute_confirmed_launch(
+        compiled.plan,
+        confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
+        pi_runner=runner,
+    )
+
+    assert [cell.rep for cell in runner.calls] == [0, 1]
+    status = json.loads((execution.state_path / "status.json").read_text())
+    assert status["state"] == "completed"
 
 
 def test_execute_confirmed_launch_failure_keeps_plan_cell_state_and_log(
@@ -651,6 +1078,7 @@ def test_execute_confirmed_launch_failure_keeps_plan_cell_state_and_log(
         execute_confirmed_launch(
             compiled.plan,
             confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
             pi_runner=failing_runner,
         )
 

@@ -351,6 +351,33 @@ class RunStateWriter:
             self._save_status_locked()
             self._append_event_locked("run_paused", kind="run", reason=reason)
 
+    def launch_input_drift(
+        self,
+        *,
+        pending_cell_id: str,
+        changes: list[dict[str, object]],
+    ) -> None:
+        """Fail a run and record every changed approved launch input."""
+        with self._lock:
+            active_cell_ids = list(self.status["active_cell_ids"])
+            active_preflight_ids = list(self.status["active_preflight_ids"])
+            drift = {
+                "pending_cell_id": pending_cell_id,
+                "active_cell_ids": active_cell_ids,
+                "active_preflight_ids": active_preflight_ids,
+                "changes": [dict(change) for change in changes],
+            }
+            self.status["state"] = "failed"
+            self.status["stage"] = "failed"
+            self.status["failed_at"] = utc_now()
+            self.status["launch_input_drift"] = drift
+            self._save_status_locked()
+            self._append_event_locked(
+                "launch_input_drift",
+                kind="run",
+                **drift,
+            )
+
     def run_completed(self) -> None:
         with self._lock:
             self.status["state"] = "completed"
