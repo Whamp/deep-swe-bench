@@ -5,13 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from harness import config_lock, launch
 from harness.launch import (
     CompiledLaunch,
+    ConfirmedOmpCell,
     ConfirmedPiCell,
     LaunchExecutionPolicies,
     LaunchPreflightError,
@@ -92,6 +95,65 @@ def _registered_state_path(state_root: Path, run_id: str) -> Path:
             matches.append(manifest_path.parent)
     assert len(matches) == 1
     return matches[0]
+
+
+class FakeConfirmedOmpRunner:
+    """Produce controlled OMP results without a subject or model call."""
+
+    def __init__(
+        self,
+        expected_plan_path: Path,
+        after_call: Callable[[ConfirmedOmpCell], None] | None = None,
+    ) -> None:
+        """Require durable confirmed-plan state before fake execution."""
+        self.expected_plan_path = expected_plan_path
+        self.after_call = after_call
+        self.calls: list[ConfirmedOmpCell] = []
+        self.preflight_was_running = False
+
+    def run_confirmed_omp_cell(
+        self,
+        cell: ConfirmedOmpCell,
+    ) -> dict[str, object]:
+        """Return OMP evidence through the same public launch lifecycle."""
+        assert self.expected_plan_path.is_file()
+        status = json.loads(
+            (self.expected_plan_path.parent / "status.json").read_text()
+        )
+        preflight = status["preflight"].get(
+            f"{cell.task}/{cell.config_identity}/rep{cell.rep}"
+        )
+        if preflight is not None:
+            self.preflight_was_running = preflight["state"] == "running"
+        self.calls.append(cell)
+        cell_root = cell.result_path.parent
+        (cell_root / "artifacts").mkdir(parents=True, exist_ok=True)
+        (cell_root / "artifacts" / "model.patch").write_text("fixture patch\n")
+        (cell_root / "session").mkdir(exist_ok=True)
+        (cell_root / "session" / "fixture.jsonl").write_text(
+            '{"message":{"usage":{"total":10}}}\n'
+        )
+        (cell_root / "logs").mkdir(exist_ok=True)
+        (cell_root / "logs" / "pi-rpc-runner.jsonl").write_text(
+            '{"event":"prompt_sent","transport":"rpc"}\n'
+            '{"event":"quiescent","transport":"rpc"}\n'
+        )
+        if self.after_call is not None:
+            self.after_call(cell)
+        return {
+            "agent_exit": 0,
+            "arm_advisor": {},
+            "arm_models": {},
+            "arm_pi_flags": [],
+            "arm_settings": {},
+            "omp_tools": ",".join(
+                cast(list[str], cell.subject_behavior["toolWhitelist"])
+            ),
+            "reward_binary": 1,
+            "reward_partial": 1.0,
+            "total_tokens": 10,
+            "verifier_exit": 0,
+        }
 
 
 class FakeConfirmedPiRunner:
@@ -287,9 +349,123 @@ def _runtime_resolver_for(
             verifier_identities=runtime["verifierIdentities"],
             immutable_image_identities=runtime["immutableImageIdentities"],
             subject_capabilities=frozenset({"pi-rpc"}),
-            available_credential_routes=frozenset({"FIXTURE_CREDENTIAL"}),
+            available_credential_routes=frozenset(
+                {"FIXTURE_CREDENTIAL", "OPENAI_CODEX_OAUTH"}
+            ),
+            subject_runtime_identity=document["subject"].get(
+                "runtimeIdentity",
+                {},
+            ),
         )
     )
+
+
+def _compile_single_omp_launch(
+    tmp_path: Path,
+    *,
+    preflight: str = "required",
+    reps: int = 1,
+) -> tuple[CompiledLaunch, Path]:
+    """Compile one OMP preflight cell against temporary fixture inputs."""
+    repository_root = tmp_path / "repository"
+    tasks_root = tmp_path / "tasks"
+    results_root = tmp_path / "canonical-results"
+    state_root = tmp_path / "central-state"
+    config_identity = "baseline-omp@1.0.0"
+    config_root = repository_root / "configs" / config_identity
+    config_leaf = config_root / "gpt-5.5" / "low"
+    config_leaf.mkdir(parents=True)
+    (config_root / "orchestration.md").write_text("Fixture behavior.\n")
+    (config_root / "omp-tools.txt").write_text("read,bash,edit,write\n")
+    (config_leaf / "smoke.json").write_text('{"requireFiles":[]}\n')
+    config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        "openai-codex/gpt-5.5",
+        "low",
+        "rerun",
+        {
+            "credentialRoutes": ["OPENAI_CODEX_OAUTH"],
+            "declaredRoles": [
+                {
+                    "billingCategory": "subscription quota",
+                    "callBehavior": {
+                        "callsPerRep": 1,
+                        "kind": "fixed",
+                        "maxConcurrency": 1,
+                    },
+                    "credentialRoute": "OPENAI_CODEX_OAUTH",
+                    "modelSelection": {
+                        "kind": "fixed",
+                        "model": "openai-codex/gpt-5.5",
+                        "provider": "openai-codex",
+                        "thinking": "low",
+                    },
+                    "name": "executor",
+                    "roleKind": "executor",
+                    "usageSource": {
+                        "format": "native-session",
+                        "path": "session/*.jsonl",
+                    },
+                }
+            ],
+            "requiredCapabilities": ["omp-rpc"],
+            "testedSubjectVersions": ["omp@16.3.5"],
+            "usageSources": ["session/*.jsonl"],
+        },
+    )
+    subject_runner = repository_root / "harness" / "run_omp.py"
+    subject_runner.parent.mkdir(parents=True)
+    subject_runner.write_text("# fixture OMP runner\n")
+    task_root = tasks_root / "task-a"
+    task_root.mkdir(parents=True)
+    (task_root / "task.toml").write_text("[metadata]\n")
+    request = LaunchRequest(
+        subject="omp",
+        model="openai-codex/gpt-5.5",
+        thinking="low",
+        configs=(config_identity,),
+        baseline_config=config_identity,
+        task_selection=LaunchTaskSelection(kind="tasks", tasks=("task-a",)),
+        reps=reps,
+        concurrency=1,
+        run_id="confirmed-omp-fixture",
+        policies=LaunchExecutionPolicies(
+            preflight=preflight,
+            existing_results="rerun",
+            transient_errors="stop",
+            cell_retries=0,
+        ),
+    )
+    runtime = LaunchRuntimeIdentity(
+        subject_version="omp@16.3.5",
+        harness_revision="sha256:harness-fixture",
+        task_revision="sha256:task-fixture",
+        verifier_identities={"task-a": "sha256:verifier-fixture"},
+        immutable_image_identities={
+            "task-a": {
+                "agent": "sha256:agent-image",
+                "environment": "sha256:environment-image",
+                "verifier": "sha256:verifier-image",
+            }
+        },
+        subject_capabilities=frozenset({"omp-rpc"}),
+        available_credential_routes=frozenset({"OPENAI_CODEX_OAUTH"}),
+        subject_runtime_identity={
+            "binaryFingerprint": "sha256:omp-binary-fixture",
+            "binaryPath": "/fixture/bin/omp",
+            "versionOutput": "omp 16.3.5",
+        },
+    )
+    compiled = compile_launch_request(
+        request,
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=StaticLaunchRuntimeResolver(runtime),
+    )
+    return compiled, state_root
 
 
 def _compile_single_cell_launch(
@@ -346,6 +522,139 @@ def _compile_single_cell_launch(
         state_root=state_root,
     )
     return compiled, config_leaf, smoke_contract, results_root, state_root
+
+
+def test_confirmed_omp_preflight_executes_plan_resolved_subject_behavior(
+    tmp_path: Path,
+) -> None:
+    """OMP uses the confirmed one-cell and atomic preflight contract."""
+    compiled, state_root = _compile_single_omp_launch(tmp_path)
+    runner = FakeConfirmedOmpRunner(_planned_launch_plan_path(compiled))
+
+    execution = execute_confirmed_launch(
+        compiled.plan,
+        confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
+        omp_runner=runner,
+    )
+
+    assert runner.preflight_was_running is True
+    assert len(runner.calls) == 1
+    cell = runner.calls[0]
+    assert cell.subject == "omp"
+    assert cell.subject_runner.name == "run_omp.py"
+    assert cell.subject_behavior == {
+        "appendSystemPrompt": "Fixture behavior.",
+        "captureInitialContext": True,
+        "credentialRoute": "OPENAI_CODEX_OAUTH",
+        "extensions": [],
+        "modelRoute": "openai-codex",
+        "overlay": None,
+        "systemPrompt": None,
+        "toolWhitelist": ["read", "bash", "edit", "write"],
+    }
+    assert cell.subject_runtime_identity == {
+        "binaryFingerprint": "sha256:omp-binary-fixture",
+        "binaryPath": "/fixture/bin/omp",
+        "versionOutput": "omp 16.3.5",
+    }
+    result = json.loads(execution.result_path.read_text())
+    assert result["config"] == "baseline-omp@1.0.0"
+    assert result["config_lock_identity"].startswith("sha256:")
+    assert result["subject"] == "omp"
+    assert result["subject_version"] == "omp@16.3.5"
+    assert result["subject_runtime_identity"] == (
+        cell.subject_runtime_identity
+    )
+    assert result["model"] == "openai-codex/gpt-5.5"
+    assert result["thinking_level"] == "low"
+    assert result["harness_revision"] == "sha256:harness-fixture"
+    assert result["task_revision"] == "sha256:task-fixture"
+    assert result["verifier_identity"] == "sha256:verifier-fixture"
+    assert result["immutable_image_identities"] == (
+        cell.immutable_image_identities
+    )
+    assert result["launch_plan_identity"] == compiled.plan.identity
+    assert result["arm_advisor"] == {}
+    assert result["arm_models"] == {}
+    assert result["arm_pi_flags"] == []
+    assert result["arm_settings"] == {}
+    status_path = (
+        _registered_state_path(state_root, "confirmed-omp-fixture")
+        / "status.json"
+    )
+    status = json.loads(status_path.read_text())
+    assert status["state"] == "completed"
+    assert status["preflight"][
+        "task-a/baseline-omp@1.0.0/rep0"
+    ]["state"] == "passed"
+
+
+def test_confirmed_omp_launch_stops_before_binary_identity_drifted_rep(
+    tmp_path: Path,
+) -> None:
+    """Changed OMP binary identity stops the next confirmed rep."""
+    compiled, state_root = _compile_single_omp_launch(
+        tmp_path,
+        preflight="disabled",
+        reps=2,
+    )
+    runtime_resolver = _runtime_resolver_for(compiled)
+
+    def change_binary_after_first_rep(cell: ConfirmedOmpCell) -> None:
+        if cell.rep != 0:
+            return
+        runtime_resolver.identity = replace(
+            runtime_resolver.identity,
+            subject_runtime_identity={
+                "binaryFingerprint": "sha256:drifted-omp-binary",
+                "binaryPath": "/fixture/bin/omp",
+                "versionOutput": "omp 16.3.5",
+            },
+        )
+
+    runner = FakeConfirmedOmpRunner(
+        _planned_launch_plan_path(compiled),
+        after_call=change_binary_after_first_rep,
+    )
+
+    with pytest.raises(RuntimeError, match=r"^Launch input drift:"):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=runtime_resolver,
+            omp_runner=runner,
+        )
+
+    assert [cell.rep for cell in runner.calls] == [0]
+    events = [
+        json.loads(line)
+        for line in (
+            _registered_state_path(state_root, "confirmed-omp-fixture")
+            / "events.ndjson"
+        )
+        .read_text()
+        .splitlines()
+    ]
+    drift_event = next(
+        event for event in events if event["event"] == "launch_input_drift"
+    )
+    assert drift_event["changes"] == [
+        {
+            "approvedIdentity": {
+                "binaryFingerprint": "sha256:omp-binary-fixture",
+                "binaryPath": "/fixture/bin/omp",
+                "versionOutput": "omp 16.3.5",
+            },
+            "category": "subject-runtime-identity",
+            "input": "omp",
+            "observedIdentity": {
+                "binaryFingerprint": "sha256:drifted-omp-binary",
+                "binaryPath": "/fixture/bin/omp",
+                "versionOutput": "omp 16.3.5",
+            },
+        }
+    ]
 
 
 def test_confirmed_worktree_launches_register_centrally_with_provenance(
@@ -419,7 +728,7 @@ def test_passing_preflight_fans_out_exactly_once_without_second_confirmation(
     tmp_path: Path,
 ) -> None:
     """One confirmation covers atomic preflight and its conditional batch."""
-    compiled, _, _, _, state_root = _compile_single_cell_launch(
+    compiled, _, _, _, _ = _compile_single_cell_launch(
         tmp_path,
         preflight="required",
         reps=2,
@@ -694,7 +1003,7 @@ def test_sealed_release_allows_only_leaves_with_unchanged_shared_behavior(
     tmp_path: Path,
 ) -> None:
     """A sealed release accepts new leaves only while shared inputs match."""
-    compiled, _, _, results_root, state_root = _compile_single_cell_launch(
+    compiled, _, _, results_root, _ = _compile_single_cell_launch(
         tmp_path,
         preflight="required",
     )
@@ -821,7 +1130,7 @@ def test_launch_planning_rejects_each_incompatible_result_provenance_field(
     incompatible_value: object,
 ) -> None:
     """Automatic reuse requires every behavior-defining identity to match."""
-    first, _, _, _, state_root = _compile_single_cell_launch(tmp_path)
+    first, _, _, _, _ = _compile_single_cell_launch(tmp_path)
     execution = execute_confirmed_launch(
         first.plan,
         confirmation_identity=first.plan.identity,
@@ -912,7 +1221,7 @@ def test_execute_confirmed_launch_honors_exact_explicit_legacy_reuse(
     tmp_path: Path,
 ) -> None:
     """An exact legacy decision reuses bytes without fabricating provenance."""
-    compiled, _, _, _, state_root = _compile_single_cell_launch(tmp_path)
+    compiled, _, _, _, _ = _compile_single_cell_launch(tmp_path)
     result_path_value = compiled.plan.to_document()["batchCells"][0][
         "resultPath"
     ]
@@ -1535,7 +1844,7 @@ def test_execute_confirmed_launch_ignores_routine_host_state_changes(
     tmp_path: Path,
 ) -> None:
     """Undeclared volatile host state does not invalidate a launch plan."""
-    compiled, _, _, _, state_root = _compile_single_cell_launch(
+    compiled, _, _, _, _ = _compile_single_cell_launch(
         tmp_path,
         reps=2,
     )

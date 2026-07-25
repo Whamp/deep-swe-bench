@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 
@@ -18,6 +21,7 @@ from harness.launch import (
     LaunchRequest,
     LaunchRuntimeIdentity,
     LaunchTaskSelection,
+    RepositoryLaunchRuntimeResolver,
     canonical_launch_plan_json,
     compile_launch_request,
     confirmed_launch_run_key,
@@ -180,6 +184,95 @@ def _write_launch_fixture(
     return repository_root, tasks_root, results_root, state_root
 
 
+def _write_omp_launch_fixture(
+    tmp_path: Path,
+) -> tuple[LaunchRequest, Path, Path, Path, Path]:
+    """Create one locked OMP config without invoking the real subject."""
+    repository_root = tmp_path / "repository"
+    tasks_root = tmp_path / "tasks"
+    results_root = tmp_path / "canonical-results"
+    state_root = tmp_path / "central-state"
+    config_identity = "baseline-omp@1.0.0"
+    config_root = repository_root / "configs" / config_identity
+    config_leaf = config_root / "gpt-5.5" / "low"
+    config_leaf.mkdir(parents=True)
+    (repository_root / "harness").mkdir()
+    (repository_root / "harness" / "run_omp.py").write_text(
+        "# fixture OMP runner\n"
+    )
+    task_root = tasks_root / "task-a"
+    task_root.mkdir(parents=True)
+    (task_root / "task.toml").write_text("[metadata]\n")
+    (config_root / "orchestration.md").write_text("Fixture behavior.\n")
+    (config_root / "omp-tools.txt").write_text("read,bash,edit,write\n")
+    (config_root / "omp-overlay.yml").write_text("astGrep:\n  enabled: false\n")
+    (config_root / "omp-system-prompt.md").write_text(
+        "date={{current_date}} cwd={{cwd}}\n"
+    )
+    extension = config_root / "extensions" / "strip.js"
+    extension.parent.mkdir()
+    extension.write_text("export default function strip() {}\n")
+    (config_root / "omp-extensions.txt").write_text("extensions/strip.js\n")
+    (config_leaf / "smoke.json").write_text('{"requireFiles":[]}\n')
+    config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        "openai-codex/gpt-5.5",
+        "low",
+        "rerun",
+        {
+            "credentialRoutes": ["OPENAI_CODEX_OAUTH"],
+            "declaredRoles": [
+                {
+                    "billingCategory": "subscription quota",
+                    "callBehavior": {
+                        "callsPerRep": 1,
+                        "kind": "fixed",
+                        "maxConcurrency": 1,
+                    },
+                    "credentialRoute": "OPENAI_CODEX_OAUTH",
+                    "modelSelection": {
+                        "kind": "fixed",
+                        "model": "openai-codex/gpt-5.5",
+                        "provider": "openai-codex",
+                        "thinking": "low",
+                    },
+                    "name": "executor",
+                    "roleKind": "executor",
+                    "usageSource": {
+                        "format": "native-session",
+                        "path": "session/*.jsonl",
+                    },
+                }
+            ],
+            "launchSurfaces": [
+                {"modelRoles": ["executor"], "path": "extensions/strip.js"}
+            ],
+            "requiredCapabilities": ["omp-rpc"],
+            "testedSubjectVersions": ["omp@16.3.5"],
+            "usageSources": ["session/*.jsonl"],
+        },
+    )
+    request = LaunchRequest(
+        subject="omp",
+        model="openai-codex/gpt-5.5",
+        thinking="low",
+        configs=(config_identity,),
+        baseline_config=config_identity,
+        task_selection=LaunchTaskSelection(kind="tasks", tasks=("task-a",)),
+        reps=1,
+        concurrency=1,
+        run_id="confirmed-omp-fixture",
+        policies=LaunchExecutionPolicies(
+            preflight="required",
+            existing_results="rerun",
+            transient_errors="stop",
+            cell_retries=0,
+        ),
+    )
+    return request, repository_root, tasks_root, results_root, state_root
+
+
 def _reject_versioned_smoke_contract(
     tmp_path: Path,
     contract: Mapping[str, object],
@@ -210,6 +303,225 @@ def _reject_versioned_smoke_contract(
     assert not results_root.exists()
     assert not state_root.exists()
     return str(raised.value)
+
+
+def test_omp_runtime_resolution_uses_omp_provider_credential_and_binary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMP runtime identity uses its own provider credential and binary."""
+    request, repository_root, tasks_root, _, _ = _write_omp_launch_fixture(
+        tmp_path
+    )
+    omp_binary = tmp_path / "bin" / "omp"
+    omp_binary.parent.mkdir()
+    omp_binary.write_text("#!/bin/sh\nprintf 'omp 16.3.5\\n'\n")
+    omp_binary.chmod(0o755)
+    omp_database = tmp_path / "home" / ".omp" / "agent" / "agent.db"
+    omp_database.parent.mkdir(parents=True)
+    with sqlite3.connect(omp_database) as connection:
+        connection.execute(
+            "create table auth_credentials (provider text, secret text)"
+        )
+        connection.execute(
+            "insert into auth_credentials values (?, ?)",
+            ("openai-codex", "fixture-secret-must-not-escape"),
+        )
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OMP_BINARY", str(omp_binary))
+
+    runtime = RepositoryLaunchRuntimeResolver(
+        repository_root,
+        tasks_root,
+    ).resolve_launch_runtime(request, ())
+
+    assert runtime.subject_version == "omp@16.3.5"
+    assert runtime.subject_runtime_identity == {
+        "binaryFingerprint": (
+            "sha256:" + hashlib.sha256(omp_binary.read_bytes()).hexdigest()
+        ),
+        "binaryPath": str(omp_binary.resolve()),
+        "versionOutput": "omp 16.3.5",
+    }
+    assert "OPENAI_CODEX_OAUTH" in runtime.available_credential_routes
+    assert "fixture-secret-must-not-escape" not in repr(runtime)
+
+
+def test_omp_launch_planning_records_exact_resolved_subject_behavior(
+    tmp_path: Path,
+) -> None:
+    """OMP planning freezes binary and config behavior before confirmation."""
+    request, repository_root, tasks_root, results_root, state_root = (
+        _write_omp_launch_fixture(tmp_path)
+    )
+    runtime = _runtime_identity()
+    runtime = replace(
+        runtime,
+        subject_version="omp@16.3.5",
+        subject_capabilities=frozenset({"omp-rpc"}),
+        subject_runtime_identity={
+            "binaryFingerprint": "sha256:omp-binary-fixture",
+            "binaryPath": "/fixture/bin/omp",
+            "versionOutput": "omp 16.3.5",
+        },
+    )
+
+    compiled = compile_launch_request(
+        request,
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=FakeLaunchRuntimeResolver(runtime),
+    )
+
+    document = compiled.plan.to_document()
+    assert document["subject"] == {
+        "name": "omp",
+        "runner": str(repository_root / "harness" / "run_omp.py"),
+        "runtimeIdentity": {
+            "binaryFingerprint": "sha256:omp-binary-fixture",
+            "binaryPath": "/fixture/bin/omp",
+            "versionOutput": "omp 16.3.5",
+        },
+        "version": "omp@16.3.5",
+    }
+    assert document["configs"][0]["subjectBehavior"] == {
+        "appendSystemPrompt": "Fixture behavior.",
+        "captureInitialContext": True,
+        "credentialRoute": "OPENAI_CODEX_OAUTH",
+        "extensions": ["/arm/extensions/strip.js"],
+        "modelRoute": "openai-codex",
+        "overlay": "/arm/omp-overlay.yml",
+        "systemPrompt": (
+            "date="
+            f"{datetime.now().astimezone().date().isoformat()} cwd=/app\n"
+        ),
+        "toolWhitelist": ["read", "bash", "edit", "write"],
+    }
+    assert "OPENAI_CODEX_OAUTH" in compiled.receipt
+    assert "/arm/omp-overlay.yml" in compiled.receipt
+    assert '\"toolWhitelist\":[\"read\",\"bash\",\"edit\",\"write\"]' in (
+        compiled.receipt
+    )
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def _refresh_omp_fixture_lock(repository_root: Path) -> None:
+    """Refresh the temporary OMP lock after an intentional invalid mutation."""
+    config_identity = "baseline-omp@1.0.0"
+    lock_path = (
+        repository_root
+        / "configs"
+        / config_identity
+        / "gpt-5.5"
+        / "low"
+        / "config-lock.json"
+    )
+    previous = json.loads(lock_path.read_text())
+    lock_path.unlink()
+    metadata_fields = (
+        "credentialRoutes",
+        "declaredRoles",
+        "launchSurfaces",
+        "requiredCapabilities",
+        "testedSubjectVersions",
+        "usageSources",
+    )
+    config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        "openai-codex/gpt-5.5",
+        "low",
+        "rerun",
+        {field: previous[field] for field in metadata_fields},
+    )
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "content", "expected_detail"),
+    [
+        ("skills/example/SKILL.md", "fixture\n", "must not define skills"),
+        ("pi-flags", "-e /arm/example.ts\n", "must not define Pi flags"),
+        (
+            "gpt-5.5/low/settings.json",
+            '{"defaultThinkingLevel":"low"}\n',
+            "settings leaf files are not supported",
+        ),
+        ("omp-tools.txt", "unknown_fixture_tool\n", "unknown tool ids"),
+    ],
+)
+def test_omp_launch_restrictions_fail_during_model_free_planning(
+    tmp_path: Path,
+    relative_path: str,
+    content: str,
+    expected_detail: str,
+) -> None:
+    """OMP-invalid config behavior stops before runtime or subject execution."""
+    request, repository_root, tasks_root, results_root, state_root = (
+        _write_omp_launch_fixture(tmp_path)
+    )
+    invalid_path = (
+        repository_root / "configs" / "baseline-omp@1.0.0" / relative_path
+    )
+    invalid_path.parent.mkdir(parents=True, exist_ok=True)
+    invalid_path.write_text(content)
+    _refresh_omp_fixture_lock(repository_root)
+    runtime_resolver = FakeLaunchRuntimeResolver(
+        replace(
+            _runtime_identity(),
+            subject_version="omp@16.3.5",
+            subject_capabilities=frozenset({"omp-rpc"}),
+            subject_runtime_identity={
+                "binaryFingerprint": "sha256:omp-binary-fixture"
+            },
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^OMP launch restriction:",
+    ) as raised:
+        compile_launch_request(
+            request,
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=runtime_resolver,
+        )
+
+    assert expected_detail in str(raised.value)
+    assert runtime_resolver.requests == []
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def test_omp_launch_rejects_non_codex_model_route_before_runtime_resolution(
+    tmp_path: Path,
+) -> None:
+    """OMP cannot defer an incompatible model route to paid execution."""
+    request, repository_root, tasks_root, results_root, state_root = (
+        _write_omp_launch_fixture(tmp_path)
+    )
+    request = replace(request, model="openrouter/gpt-5.5")
+    runtime_resolver = FakeLaunchRuntimeResolver(_runtime_identity())
+
+    with pytest.raises(
+        ValueError,
+        match=r"^OMP launch restriction: model must use explicit openai-codex",
+    ):
+        compile_launch_request(
+            request,
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=runtime_resolver,
+        )
+
+    assert runtime_resolver.requests == []
 
 
 def test_launch_planning_rejects_readme_prose_smoke_gate(

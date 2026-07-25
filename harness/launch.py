@@ -6,11 +6,14 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import sqlite3
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import NotRequired, Protocol, TypedDict, cast
 
 from harness import (
     config_lock,
@@ -39,6 +42,28 @@ _COMPACT_USAGE_FORMATS = frozenset(
         "compact-worker-trace",
         "filtered-tool-events",
         "native-session",
+    }
+)
+_OMP_BASIC_TOOLS = ("read", "bash", "edit", "write", "grep", "glob")
+_OMP_KNOWN_TOOLS = frozenset(
+    {
+        "ask",
+        "ast_edit",
+        "ast_grep",
+        "bash",
+        "browser",
+        "edit",
+        "glob",
+        "grep",
+        "inspect_image",
+        "lsp",
+        "notebook",
+        "python",
+        "read",
+        "task",
+        "todo",
+        "web_search",
+        "write",
     }
 )
 
@@ -77,6 +102,7 @@ class LaunchConfigDocument(TypedDict):
     lockIdentity: str | None
     requiredCapabilities: list[str]
     smokeContract: str | None
+    subjectBehavior: NotRequired[dict[str, object]]
     testedSubjectVersions: list[str]
     usageSources: list[str]
     versionImpact: str | None
@@ -115,6 +141,7 @@ class LaunchSubjectDocument(TypedDict):
 
     name: str
     runner: str
+    runtimeIdentity: NotRequired[dict[str, object]]
     version: str
 
 
@@ -198,6 +225,7 @@ class LaunchRuntimeIdentity:
     immutable_image_identities: Mapping[str, Mapping[str, str]]
     subject_capabilities: frozenset[str] = frozenset()
     available_credential_routes: frozenset[str] = frozenset()
+    subject_runtime_identity: Mapping[str, object] = field(default_factory=dict)
 
 
 class LaunchRuntimeResolver(Protocol):
@@ -290,6 +318,49 @@ class RepositoryLaunchRuntimeResolver:
             )
         return identity
 
+    def _omp_subject_identity(self) -> tuple[str, dict[str, object]]:
+        configured_binary = os.environ.get("OMP_BINARY")
+        binary = Path(configured_binary) if configured_binary else None
+        if binary is None:
+            discovered_binary = shutil.which("omp")
+            if discovered_binary is not None:
+                binary = Path(discovered_binary)
+        if binary is None or not binary.is_file():
+            raise ValueError(
+                "Launch runtime identity unresolved: OMP binary missing; "
+                "set OMP_BINARY or install omp on PATH"
+            )
+        resolved_binary = binary.resolve()
+        completed = subprocess.run(
+            [str(resolved_binary), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        version_output = (completed.stdout + completed.stderr).strip()
+        if completed.returncode != 0 or not version_output:
+            raise ValueError(
+                "Launch runtime identity unresolved: OMP version probe "
+                f"failed for {resolved_binary}"
+            )
+        version_match = re.search(r"\d+\.\d+\.\d+", version_output)
+        if version_match is None:
+            raise ValueError(
+                "Launch runtime identity unresolved: OMP version output "
+                f"has no semantic version: {version_output!r}"
+            )
+        return (
+            f"omp@{version_match.group(0)}",
+            {
+                "binaryFingerprint": (
+                    "sha256:"
+                    + hashlib.sha256(resolved_binary.read_bytes()).hexdigest()
+                ),
+                "binaryPath": str(resolved_binary),
+                "versionOutput": version_output,
+            },
+        )
+
     def _harness_revision(self) -> str:
         paths = [
             self.repository_root / "harness",
@@ -315,12 +386,34 @@ class RepositoryLaunchRuntimeResolver:
         return _file_set_identity(self.tasks_root, [verifier_root])
 
     @staticmethod
-    def _available_credential_routes() -> frozenset[str]:
+    def _omp_codex_credential_available() -> bool:
+        database_path = Path.home() / ".omp" / "agent" / "agent.db"
+        if not database_path.is_file():
+            return False
+        try:
+            with sqlite3.connect(
+                f"file:{database_path}?mode=ro",
+                uri=True,
+            ) as connection:
+                credential = connection.execute(
+                    "select 1 from auth_credentials where provider=? limit 1",
+                    ("openai-codex",),
+                ).fetchone()
+        except sqlite3.Error:
+            return False
+        return credential is not None
+
+    @classmethod
+    def _available_credential_routes(cls, subject: str) -> frozenset[str]:
         routes = frozenset(
             name for name, value in os.environ.items() if value.strip()
         )
-        oauth_path = Path.home() / ".pi" / "agent" / "auth.json"
-        if oauth_path.is_file():
+        if subject == "omp":
+            credential_available = cls._omp_codex_credential_available()
+        else:
+            oauth_path = Path.home() / ".pi" / "agent" / "auth.json"
+            credential_available = oauth_path.is_file()
+        if credential_available:
             return routes | {"OPENAI_CODEX_OAUTH"}
         return routes
 
@@ -330,10 +423,33 @@ class RepositoryLaunchRuntimeResolver:
         tasks: tuple[str, ...],
     ) -> LaunchRuntimeIdentity:
         """Resolve repository, task, verifier, subject, and image identity."""
-        if request.subject != "pi":
+        if request.subject == "pi":
+            subject_version = self._pi_subject_version()
+            subject_capabilities = frozenset(
+                {
+                    "native-session-usage",
+                    "pi-extensions",
+                    "pi-rpc",
+                    "pi-skills",
+                }
+            )
+            subject_runtime_identity: dict[str, object] = {}
+        elif request.subject == "omp":
+            subject_version, subject_runtime_identity = (
+                self._omp_subject_identity()
+            )
+            subject_capabilities = frozenset(
+                {
+                    "native-session-usage",
+                    "omp-extensions",
+                    "omp-rpc",
+                    "omp-tools",
+                }
+            )
+        else:
             raise ValueError(
-                "Launch runtime identity unresolved: OMP confirmed-launch "
-                "runtime resolution is not implemented; see issue #20"
+                "Launch runtime identity unresolved: unsupported subject "
+                f"{request.subject!r}"
             )
         verifier_identities: dict[str, str] = {}
         image_identities: dict[str, dict[str, str]] = {}
@@ -346,15 +462,16 @@ class RepositoryLaunchRuntimeResolver:
                 "verifier": self._image_identity(task.verifier_image),
             }
         return LaunchRuntimeIdentity(
-            subject_version=self._pi_subject_version(),
+            subject_version=subject_version,
             harness_revision=self._harness_revision(),
             task_revision=self._task_revision(tasks),
             verifier_identities=verifier_identities,
             immutable_image_identities=image_identities,
-            subject_capabilities=frozenset(
-                {"native-session-usage", "pi-extensions", "pi-rpc", "pi-skills"}
+            subject_capabilities=subject_capabilities,
+            available_credential_routes=self._available_credential_routes(
+                request.subject
             ),
-            available_credential_routes=self._available_credential_routes(),
+            subject_runtime_identity=subject_runtime_identity,
         )
 
 
@@ -382,8 +499,8 @@ class CompiledLaunch:
 
 
 @dataclass(frozen=True, slots=True)
-class ConfirmedPiCell:
-    """Supply one Pi runner with only behavior resolved by a confirmed plan."""
+class ConfirmedSubjectCell:
+    """Supply one subject runner with only confirmed, plan-resolved behavior."""
 
     config_identity: str
     config_lock_identity: str
@@ -395,7 +512,10 @@ class ConfirmedPiCell:
     model: str
     thinking: str
     result_path: Path
+    subject: str
+    subject_behavior: Mapping[str, object]
     subject_runner: Path
+    subject_runtime_identity: Mapping[str, object]
     subject_version: str
     harness_revision: str
     task_revision: str
@@ -407,6 +527,10 @@ class ConfirmedPiCell:
     reuse_result_identity: str | None
 
 
+ConfirmedPiCell = ConfirmedSubjectCell
+ConfirmedOmpCell = ConfirmedSubjectCell
+
+
 class ConfirmedPiRunner(Protocol):
     """Execute one plan-resolved Pi cell without resolving launch inputs."""
 
@@ -415,6 +539,19 @@ class ConfirmedPiRunner(Protocol):
         cell: ConfirmedPiCell,
     ) -> Mapping[str, object]:
         """Return one complete result record without writing result.json."""
+
+
+class ConfirmedOmpRunner(Protocol):
+    """Execute one plan-resolved OMP cell without resolving launch inputs."""
+
+    def run_confirmed_omp_cell(
+        self,
+        cell: ConfirmedOmpCell,
+    ) -> Mapping[str, object]:
+        """Return one complete result record without writing result.json."""
+
+
+_ConfirmedSubjectRunner = ConfirmedPiRunner | ConfirmedOmpRunner
 
 
 @dataclass(frozen=True, slots=True)
@@ -1014,11 +1151,130 @@ def _validate_role_usage_sources(
             )
 
 
+def _active_config_lines(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    return [
+        line
+        for raw_line in path.read_text().splitlines()
+        if (line := raw_line.split("#", 1)[0].strip())
+    ]
+
+
+def _resolve_omp_tool_whitelist(config_root: Path) -> list[str]:
+    tool_path = config_root / "omp-tools.txt"
+    tools = list(_OMP_BASIC_TOOLS)
+    if tool_path.is_file():
+        tools = [
+            tool
+            for line in _active_config_lines(tool_path)
+            for tool in (item.strip() for item in line.split(","))
+            if tool
+        ]
+    unknown_tools = sorted(set(tools) - _OMP_KNOWN_TOOLS)
+    if unknown_tools:
+        raise ValueError(
+            "OMP launch restriction: unknown tool ids "
+            f"in {tool_path}: {unknown_tools!r}"
+        )
+    if not tools:
+        raise ValueError(
+            f"OMP launch restriction: empty tool whitelist in {tool_path}"
+        )
+    return tools
+
+
+def _resolve_omp_extension_paths(config_root: Path) -> list[str]:
+    extension_list = config_root / "omp-extensions.txt"
+    extensions: list[str] = []
+    for relative_text in _active_config_lines(extension_list):
+        relative_path = Path(relative_text)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError(
+                "OMP launch restriction: invalid extension path "
+                f"in {extension_list}: {relative_text!r}"
+            )
+        if not (config_root / relative_path).is_file():
+            raise ValueError(
+                "OMP launch restriction: extension missing "
+                f"for {extension_list}: {relative_text!r}"
+            )
+        extensions.append(f"/arm/{relative_path.as_posix()}")
+    return extensions
+
+
+def _config_append_system_prompt(config_root: Path) -> str:
+    layers: list[str] = []
+    for filename in ("system_preamble.md", "orchestration.md"):
+        path = config_root / filename
+        text = path.read_text().strip("\n") if path.is_file() else ""
+        if text.strip():
+            layers.append(text)
+    return "\n\n".join(layers)
+
+
+def _resolve_omp_subject_behavior(
+    request: LaunchRequest,
+    resolved: config_resolution.ResolvedConfigLeaf,
+) -> dict[str, object]:
+    if not request.model.startswith("openai-codex/"):
+        raise ValueError(
+            "OMP launch restriction: model must use explicit "
+            f"openai-codex route; got {request.model!r}"
+        )
+    config_root = resolved.config_root
+    skill_root = config_root / "skills"
+    if skill_root.is_dir() and any(skill_root.iterdir()):
+        raise ValueError(
+            "OMP launch restriction: configs must not define skills"
+        )
+    if _active_config_lines(config_root / "pi-flags"):
+        raise ValueError(
+            "OMP launch restriction: configs must not define Pi flags"
+        )
+    forbidden_leaf_files = [
+        filename
+        for filename in ("advisor.json", "models.json", "settings.json")
+        if (resolved.config_leaf / filename).is_file()
+    ]
+    if forbidden_leaf_files:
+        raise ValueError(
+            "OMP launch restriction: model, advisor, and settings leaf files "
+            f"are not supported; found={forbidden_leaf_files!r}"
+        )
+    system_prompt_path = config_root / "omp-system-prompt.md"
+    system_prompt: str | None = None
+    if system_prompt_path.is_file():
+        system_prompt = (
+            system_prompt_path.read_text()
+            .replace(
+                "{{current_date}}",
+                datetime.now().astimezone().date().isoformat(),
+            )
+            .replace("{{cwd}}", "/app")
+        )
+    return {
+        "appendSystemPrompt": _config_append_system_prompt(config_root),
+        "captureInitialContext": True,
+        "credentialRoute": "OPENAI_CODEX_OAUTH",
+        "extensions": _resolve_omp_extension_paths(config_root),
+        "modelRoute": "openai-codex",
+        "overlay": (
+            "/arm/omp-overlay.yml"
+            if (config_root / "omp-overlay.yml").is_file()
+            else None
+        ),
+        "systemPrompt": system_prompt,
+        "toolWhitelist": _resolve_omp_tool_whitelist(config_root),
+    }
+
+
 def _legacy_launch_config_document(
     resolved: config_resolution.ResolvedConfigLeaf,
     config_identity: str,
+    subject_behavior: Mapping[str, object] | None,
 ) -> LaunchConfigDocument:
-    return {
+    document: LaunchConfigDocument = {
         "behaviorInputs": [],
         "configLeaf": str(resolved.config_leaf.resolve()),
         "configRoot": str(resolved.config_root.resolve()),
@@ -1038,6 +1294,9 @@ def _legacy_launch_config_document(
         "usageSources": [],
         "versionImpact": None,
     }
+    if subject_behavior is not None:
+        document["subjectBehavior"] = dict(subject_behavior)
+    return document
 
 
 def _validate_extension_surface_coverage(
@@ -1098,6 +1357,11 @@ def _config_plan(
         request.model,
         request.thinking,
     )
+    subject_behavior = (
+        _resolve_omp_subject_behavior(request, resolved)
+        if request.subject == "omp"
+        else None
+    )
     versioned_identity = config_resolution.parse_versioned_config_identity(
         config_identity
     )
@@ -1111,7 +1375,11 @@ def _config_plan(
         config_identity,
     )
     if lock_document is None:
-        return _legacy_launch_config_document(resolved, config_identity)
+        return _legacy_launch_config_document(
+            resolved,
+            config_identity,
+            subject_behavior,
+        )
     behavior_inputs = _lock_object_list(lock_document, "behaviorInputs")
     launch_surfaces = _lock_object_list(lock_document, "launchSurfaces")
     _validate_extension_surface_coverage(
@@ -1120,6 +1388,14 @@ def _config_plan(
         launch_surfaces,
     )
     credential_routes = _lock_string_list(lock_document, "credentialRoutes")
+    if (
+        request.subject == "omp"
+        and "OPENAI_CODEX_OAUTH" not in credential_routes
+    ):
+        raise ValueError(
+            "OMP launch restriction: OPENAI_CODEX_OAUTH must be a declared "
+            "credential route"
+        )
     declared_roles = _lock_object_list(lock_document, "declaredRoles")
     usage_sources = _lock_string_list(lock_document, "usageSources")
     _validate_role_usage_sources(
@@ -1147,7 +1423,7 @@ def _config_plan(
     lock_identity = lock_document.get("lockIdentity")
     if not isinstance(lock_identity, str):
         raise TypeError("Config lock invalid: lockIdentity must be a string")
-    return {
+    document: LaunchConfigDocument = {
         "behaviorInputs": behavior_inputs,
         "configLeaf": str(resolved.config_leaf.resolve()),
         "configRoot": str(resolved.config_root.resolve()),
@@ -1173,6 +1449,9 @@ def _config_plan(
         "usageSources": usage_sources,
         "versionImpact": version_impact,
     }
+    if subject_behavior is not None:
+        document["subjectBehavior"] = dict(subject_behavior)
+    return document
 
 
 def _validate_config_runtime_compatibility(
@@ -1624,6 +1903,21 @@ def _render_role_lines(configs: Sequence[LaunchConfigDocument]) -> list[str]:
     return lines
 
 
+def _render_subject_behavior_lines(
+    configs: Sequence[LaunchConfigDocument],
+) -> list[str]:
+    lines: list[str] = []
+    for config in configs:
+        behavior = config.get("subjectBehavior")
+        if behavior is None:
+            continue
+        lines.append(
+            f"- {config['identity']}: "
+            + json.dumps(behavior, sort_keys=True, separators=(",", ":"))
+        )
+    return lines
+
+
 def _render_launch_receipt(document: LaunchPlanDocument) -> str:
     counts = document["counts"]
     subject = document["subject"]
@@ -1636,6 +1930,7 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
         if config.get("identity") == baseline_identity
     )
     warnings = _receipt_warnings(document)
+    subject_behavior_lines = _render_subject_behavior_lines(configs)
     lines = ["LAUNCH RECEIPT", "WARNINGS"]
     lines.extend(f"- {warning}" for warning in warnings)
     if not warnings:
@@ -1671,6 +1966,11 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
                     "  Required capabilities: "
                     + (", ".join(config["requiredCapabilities"]) or "-"),
                 )
+            ),
+            *(
+                ["", "SUBJECT BEHAVIOR", *subject_behavior_lines]
+                if subject_behavior_lines
+                else []
             ),
             "",
             f"BEHAVIOR DIFFERENCES FROM {baseline_identity}",
@@ -1724,6 +2024,10 @@ def compile_launch_request(
         )
     runtime = runtime_resolver.resolve_launch_runtime(request, tasks)
     _require_runtime_identity(runtime, tasks)
+    if request.subject == "omp" and not runtime.subject_runtime_identity:
+        raise ValueError(
+            "Launch runtime identity unresolved: OMP binary identity missing"
+        )
     _validate_config_runtime_compatibility(config_plans, runtime)
     batch_cells = _batch_cells(
         results_root,
@@ -1746,6 +2050,17 @@ def compile_launch_request(
     }
     if request.task_selection.name is not None:
         selection["name"] = request.task_selection.name
+    subject_document: LaunchSubjectDocument = {
+        "name": request.subject,
+        "runner": str(
+            _subject_runner_path(repository_root, request.subject).resolve()
+        ),
+        "version": runtime.subject_version,
+    }
+    if runtime.subject_runtime_identity:
+        subject_document["runtimeIdentity"] = dict(
+            runtime.subject_runtime_identity
+        )
     document: LaunchPlanDocument = {
         "schemaVersion": _LAUNCH_PLAN_SCHEMA_VERSION,
         "baselineConfig": request.baseline_config,
@@ -1783,13 +2098,7 @@ def compile_launch_request(
             "verifierIdentities": dict(runtime.verifier_identities),
         },
         "selection": selection,
-        "subject": {
-            "name": request.subject,
-            "runner": str(
-                _subject_runner_path(repository_root, request.subject).resolve()
-            ),
-            "version": runtime.subject_version,
-        },
+        "subject": subject_document,
         "thinking": request.thinking,
     }
     document["planIdentity"] = _launch_plan_identity(document)
@@ -1829,15 +2138,15 @@ def _confirmed_plan_document(
     return parsed_plan.to_document()
 
 
-def _confirmed_pi_cell(
+def _confirmed_subject_cell(
     document: LaunchPlanDocument,
     cell_document: Mapping[str, object],
-) -> ConfirmedPiCell:
+) -> ConfirmedSubjectCell:
     subject = document["subject"]
-    if subject["name"] != "pi":
+    if subject["name"] not in {"pi", "omp"}:
         raise ValueError(
-            "Confirmed Pi execution subject mismatch: "
-            f"expected 'pi', got {subject['name']!r}"
+            "Confirmed subject execution mismatch: "
+            f"unsupported subject {subject['name']!r}"
         )
     config_identity = cell_document.get("config")
     task = cell_document.get("task")
@@ -1850,7 +2159,7 @@ def _confirmed_pi_cell(
         or not isinstance(result_path, str)
     ):
         raise TypeError(
-            "Confirmed Pi execution cell invalid: config, task, rep, and "
+            "Confirmed subject execution cell invalid: config, task, rep, and "
             "resultPath must be resolved"
         )
     config_document = next(
@@ -1863,13 +2172,13 @@ def _confirmed_pi_cell(
     )
     if config_document is None:
         raise ValueError(
-            "Confirmed Pi execution config missing: "
+            "Confirmed subject execution config missing: "
             f"plan has no config document for {config_identity!r}"
         )
     lock_identity = config_document["lockIdentity"]
     if not isinstance(lock_identity, str):
         raise TypeError(
-            "Confirmed Pi execution config provenance missing: "
+            "Confirmed subject execution config provenance missing: "
             f"config={config_identity!r}"
         )
     verifier_identity = document["runtime"]["verifierIdentities"].get(task)
@@ -1879,10 +2188,24 @@ def _confirmed_pi_cell(
         dict,
     ):
         raise TypeError(
-            f"Confirmed Pi execution runtime missing: task={task!r}"
+            f"Confirmed subject execution runtime missing: task={task!r}"
         )
     smoke_contract = config_document["smokeContract"]
-    return ConfirmedPiCell(
+    subject_behavior = config_document.get("subjectBehavior", {})
+    subject_runtime_identity = subject.get("runtimeIdentity", {})
+    if not isinstance(subject_behavior, Mapping) or not isinstance(
+        subject_runtime_identity,
+        Mapping,
+    ):
+        raise TypeError(
+            "Confirmed subject execution behavior invalid: expected objects"
+        )
+    if subject["name"] == "omp" and not subject_behavior:
+        raise ValueError(
+            "Confirmed OMP execution behavior missing: plan has no resolved "
+            f"behavior for {config_identity!r}"
+        )
+    return ConfirmedSubjectCell(
         config_identity=config_identity,
         config_lock_identity=lock_identity,
         config_root=Path(config_document["configRoot"]),
@@ -1895,7 +2218,10 @@ def _confirmed_pi_cell(
         model=document["model"],
         thinking=document["thinking"],
         result_path=Path(result_path),
+        subject=subject["name"],
+        subject_behavior=dict(subject_behavior),
         subject_runner=Path(subject["runner"]),
+        subject_runtime_identity=dict(subject_runtime_identity),
         subject_version=subject["version"],
         harness_revision=document["runtime"]["harnessRevision"],
         task_revision=document["runtime"]["taskRevision"],
@@ -1923,25 +2249,26 @@ def _confirmed_pi_cell(
     )
 
 
-def _confirmed_pi_cells(
+def _confirmed_subject_cells(
     document: LaunchPlanDocument,
     plan_field: str,
-) -> list[ConfirmedPiCell]:
-    """Materialize plan-resolved Pi cells without discovering launch inputs."""
+) -> list[ConfirmedSubjectCell]:
+    """Materialize plan-resolved cells without discovering launch inputs."""
     planned_cells = document.get(plan_field)
     if not isinstance(planned_cells, list):
         raise TypeError(
-            f"Confirmed Pi execution cells invalid: {plan_field} must be a list"
+            "Confirmed subject execution cells invalid: "
+            f"{plan_field} must be a list"
         )
-    cells: list[ConfirmedPiCell] = []
+    cells: list[ConfirmedSubjectCell] = []
     for index, cell_document in enumerate(planned_cells):
         if not isinstance(cell_document, Mapping):
             raise TypeError(
-                "Confirmed Pi execution cell invalid: "
+                "Confirmed subject execution cell invalid: "
                 f"{plan_field}[{index}] must be an object"
             )
         cells.append(
-            _confirmed_pi_cell(
+            _confirmed_subject_cell(
                 document,
                 cast(Mapping[str, object], cell_document),
             )
@@ -1950,7 +2277,7 @@ def _confirmed_pi_cells(
 
 
 def _confirmed_result_record(
-    cell: ConfirmedPiCell,
+    cell: ConfirmedSubjectCell,
     record: Mapping[str, object],
 ) -> dict[str, object]:
     config_identity = config_resolution.parse_versioned_config_identity(
@@ -1958,7 +2285,7 @@ def _confirmed_result_record(
     )
     if config_identity is None:
         raise ValueError(
-            "Confirmed Pi execution config version missing: "
+            "Confirmed subject execution config version missing: "
             f"config={cell.config_identity!r}"
         )
     confirmed_record = dict(record)
@@ -1973,7 +2300,7 @@ def _confirmed_result_record(
             "launch_plan_identity": cell.launch_plan_identity,
             "model": cell.model,
             "rep": cell.rep,
-            "subject": "pi",
+            "subject": cell.subject,
             "subject_version": cell.subject_version,
             "task": cell.task,
             "task_revision": cell.task_revision,
@@ -1981,17 +2308,21 @@ def _confirmed_result_record(
             "verifier_identity": cell.verifier_identity,
         }
     )
+    if cell.subject_runtime_identity:
+        confirmed_record["subject_runtime_identity"] = dict(
+            cell.subject_runtime_identity
+        )
     return confirmed_record
 
 
-def _confirmed_launch_log_path(state_path: Path) -> Path:
+def _confirmed_launch_log_path(state_path: Path, subject: str) -> Path:
     """Return the searchable structured-state log for a confirmed launch."""
-    return state_path / "logs" / "confirmed-pi-cell.log"
+    return state_path / "logs" / f"confirmed-{subject}-cell.log"
 
 
 def _confirmed_state_cell(
     state_path: Path,
-    cell: ConfirmedPiCell,
+    cell: ConfirmedSubjectCell,
 ) -> dict[str, object]:
     """Project one plan-resolved cell into structured run state."""
     return run_state.make_cell(
@@ -1999,7 +2330,7 @@ def _confirmed_state_cell(
         config=cell.config_identity,
         rep=cell.rep,
         result_path=cell.result_path,
-        log_path=_confirmed_launch_log_path(state_path),
+        log_path=_confirmed_launch_log_path(state_path, cell.subject),
         contract_path=(
             str(cell.smoke_contract)
             if cell.smoke_contract is not None
@@ -2010,8 +2341,8 @@ def _confirmed_state_cell(
 
 def _confirmed_run_manifest(
     document: LaunchPlanDocument,
-    batch_cells: Sequence[ConfirmedPiCell],
-    preflight_cells: Sequence[ConfirmedPiCell],
+    batch_cells: Sequence[ConfirmedSubjectCell],
+    preflight_cells: Sequence[ConfirmedSubjectCell],
     state_path: Path,
 ) -> dict[str, object]:
     manifest = run_state.base_manifest(
@@ -2024,7 +2355,7 @@ def _confirmed_run_manifest(
         selection=dict(document["selection"]),
         runs=int(document["counts"]["reps"]),
         workers=int(document["concurrency"]),
-        agent="pi",
+        agent=document["subject"]["name"],
         agent_timeout_s=None,
         rpc_quiescence_s=None,
         progress_interval_s=None,
@@ -2053,7 +2384,7 @@ def _confirmed_run_manifest(
 
 def _append_confirmed_cell_log(
     log_path: Path,
-    cell: ConfirmedPiCell,
+    cell: ConfirmedSubjectCell,
     message: str,
 ) -> None:
     """Append one cell-attributed message to the confirmed launch log."""
@@ -2262,6 +2593,12 @@ def _runtime_input_drift_changes(
         observed.subject_version,
     )
     compare(
+        "subject-runtime-identity",
+        document["subject"]["name"],
+        document["subject"].get("runtimeIdentity", {}),
+        dict(observed.subject_runtime_identity),
+    )
+    compare(
         "harness-revision",
         document["paths"]["workspace"],
         approved["harnessRevision"],
@@ -2305,7 +2642,7 @@ class _ApprovedLaunchInputVerifier:
         self.state = state
         self.runtime_resolver = runtime_resolver
 
-    def require_unchanged_before_rep(self, cell: ConfirmedPiCell) -> None:
+    def require_unchanged_before_rep(self, cell: ConfirmedSubjectCell) -> None:
         """Recheck before every submission, including resumed or retried reps."""
         changes = _config_input_drift_changes(self.document)
         changes.extend(_config_lock_drift_changes(self.document))
@@ -2328,15 +2665,24 @@ class _ApprovedLaunchInputVerifier:
         )
 
 
-def _run_confirmed_pi_cell(
-    cell: ConfirmedPiCell,
-    pi_runner: ConfirmedPiRunner,
+def _run_confirmed_subject_cell(
+    cell: ConfirmedSubjectCell,
+    subject_runner: _ConfirmedSubjectRunner,
     log_path: Path,
 ) -> dict[str, object]:
     """Run one exact planned cell and persist its provenance-bearing result."""
     cell.result_path.parent.mkdir(parents=True, exist_ok=True)
     _append_confirmed_cell_log(log_path, cell, "started")
-    runner_record = pi_runner.run_confirmed_pi_cell(cell)
+    if cell.subject == "pi":
+        runner_record = cast(
+            ConfirmedPiRunner,
+            subject_runner,
+        ).run_confirmed_pi_cell(cell)
+    else:
+        runner_record = cast(
+            ConfirmedOmpRunner,
+            subject_runner,
+        ).run_confirmed_omp_cell(cell)
     result_record = _confirmed_result_record(cell, runner_record)
     run_state.atomic_write_json(cell.result_path, result_record)
     _append_confirmed_cell_log(log_path, cell, "completed")
@@ -2344,11 +2690,11 @@ def _run_confirmed_pi_cell(
 
 
 def _execute_confirmed_preflight_cell(
-    cell: ConfirmedPiCell,
+    cell: ConfirmedSubjectCell,
     state_path: Path,
     state: run_state.RunStateWriter,
     input_verifier: _ApprovedLaunchInputVerifier,
-    pi_runner: ConfirmedPiRunner,
+    subject_runner: _ConfirmedSubjectRunner,
     log_path: Path,
 ) -> bool:
     """Run and atomically decide one confirmed preflight cell."""
@@ -2366,7 +2712,11 @@ def _execute_confirmed_preflight_cell(
                 result_provenance.read_result_record(cell.result_path)
             )
         else:
-            result_record = _run_confirmed_pi_cell(cell, pi_runner, log_path)
+            result_record = _run_confirmed_subject_cell(
+                cell,
+                subject_runner,
+                log_path,
+            )
         raw_exit = result_record.get("agent_exit")
         exit_code = raw_exit if isinstance(raw_exit, int | str) else None
     except Exception as error:  # noqa: BLE001 - runner boundary records failure
@@ -2410,11 +2760,11 @@ def _execute_confirmed_preflight_cell(
 
 
 def _execute_confirmed_preflights(
-    cells: Sequence[ConfirmedPiCell],
+    cells: Sequence[ConfirmedSubjectCell],
     state_path: Path,
     state: run_state.RunStateWriter,
     input_verifier: _ApprovedLaunchInputVerifier,
-    pi_runner: ConfirmedPiRunner,
+    subject_runner: _ConfirmedSubjectRunner,
     log_path: Path,
 ) -> set[Path]:
     """Run every planned preflight and stop before batch on any failure."""
@@ -2426,7 +2776,7 @@ def _execute_confirmed_preflights(
             state_path,
             state,
             input_verifier,
-            pi_runner,
+            subject_runner,
             log_path,
         ):
             passed_paths.add(cell.result_path.resolve())
@@ -2446,11 +2796,11 @@ def _execute_confirmed_preflights(
 
 
 def _execute_confirmed_batch_cell(
-    cell: ConfirmedPiCell,
+    cell: ConfirmedSubjectCell,
     state_path: Path,
     state: run_state.RunStateWriter,
     input_verifier: _ApprovedLaunchInputVerifier,
-    pi_runner: ConfirmedPiRunner,
+    subject_runner: _ConfirmedSubjectRunner,
     log_path: Path,
 ) -> None:
     """Run one planned batch cell and record its durable outcome."""
@@ -2458,7 +2808,11 @@ def _execute_confirmed_batch_cell(
     input_verifier.require_unchanged_before_rep(cell)
     state.cell_started(state_cell)
     try:
-        result_record = _run_confirmed_pi_cell(cell, pi_runner, log_path)
+        result_record = _run_confirmed_subject_cell(
+            cell,
+            subject_runner,
+            log_path,
+        )
     except Exception as error:
         _append_confirmed_cell_log(
             log_path,
@@ -2470,7 +2824,9 @@ def _execute_confirmed_batch_cell(
             log_path=log_path,
             exit_code="exception",
         )
-        state.run_failed(reason="Confirmed Pi cell execution failed")
+        state.run_failed(
+            reason=f"Confirmed {cell.subject} cell execution failed"
+        )
         raise
     raw_exit = result_record.get("agent_exit")
     exit_code = raw_exit if isinstance(raw_exit, int | str) else None
@@ -2482,7 +2838,7 @@ def _execute_confirmed_batch_cell(
     )
 
 
-def _require_planned_result_reuse(cell: ConfirmedPiCell) -> None:
+def _require_planned_result_reuse(cell: ConfirmedSubjectCell) -> None:
     """Require the exact result bytes and provenance approved by the plan."""
     if (
         cell.reuse_provenance is None
@@ -2514,12 +2870,12 @@ def _require_planned_result_reuse(cell: ConfirmedPiCell) -> None:
 
 
 def _execute_confirmed_batch(
-    cells: Sequence[ConfirmedPiCell],
+    cells: Sequence[ConfirmedSubjectCell],
     passed_preflight_paths: set[Path],
     state_path: Path,
     state: run_state.RunStateWriter,
     input_verifier: _ApprovedLaunchInputVerifier,
-    pi_runner: ConfirmedPiRunner,
+    subject_runner: _ConfirmedSubjectRunner,
     log_path: Path,
 ) -> None:
     """Fan out every planned batch cell once after atomic preflight."""
@@ -2546,7 +2902,7 @@ def _execute_confirmed_batch(
             state_path,
             state,
             input_verifier,
-            pi_runner,
+            subject_runner,
             log_path,
         )
 
@@ -2556,14 +2912,34 @@ def execute_confirmed_launch(
     *,
     confirmation_identity: str | None,
     runtime_resolver: LaunchRuntimeResolver,
-    pi_runner: ConfirmedPiRunner,
+    pi_runner: ConfirmedPiRunner | None = None,
+    omp_runner: ConfirmedOmpRunner | None = None,
 ) -> ConfirmedLaunchExecution:
     """Execute atomic preflight and conditional fan-out for one exact plan."""
     document = _confirmed_plan_document(plan, confirmation_identity)
-    batch_cells = _confirmed_pi_cells(document, "batchCells")
-    preflight_cells = _confirmed_pi_cells(document, "preflightCells")
+    subject = document["subject"]["name"]
+    if subject == "pi":
+        if pi_runner is None:
+            raise ValueError(
+                "Confirmed Pi runner missing: a Pi plan requires pi_runner"
+            )
+        subject_runner: _ConfirmedSubjectRunner = pi_runner
+    elif subject == "omp":
+        if omp_runner is None:
+            raise ValueError(
+                "Confirmed OMP runner missing: an OMP plan requires omp_runner"
+            )
+        subject_runner = omp_runner
+    else:
+        raise ValueError(
+            f"Confirmed subject runner missing: unsupported subject {subject!r}"
+        )
+    batch_cells = _confirmed_subject_cells(document, "batchCells")
+    preflight_cells = _confirmed_subject_cells(document, "preflightCells")
     if not batch_cells:
-        raise ValueError("Confirmed Pi execution cells invalid: batch is empty")
+        raise ValueError(
+            "Confirmed subject execution cells invalid: batch is empty"
+        )
     state_path = Path(document["paths"]["statePath"])
     expected_state_path = (
         Path(document["paths"]["stateRoot"])
@@ -2578,7 +2954,7 @@ def execute_confirmed_launch(
             f"planned={str(state_path)!r}, "
             f"expected={str(expected_state_path)!r}"
         )
-    log_path = state_path / "logs" / "confirmed-pi-cell.log"
+    log_path = _confirmed_launch_log_path(state_path, subject)
     manifest = _confirmed_run_manifest(
         document,
         batch_cells,
@@ -2589,8 +2965,9 @@ def execute_confirmed_launch(
     state.start()
     (state_path / "launch-plan.json").write_text(plan.canonical_json)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    subject_label = "Pi" if subject == "pi" else "OMP"
     log_path.write_text(
-        "Confirmed Pi cell execution\n"
+        f"Confirmed {subject_label} cell execution\n"
         f"launch_plan_identity={document['planIdentity']}\n"
     )
     input_verifier = _ApprovedLaunchInputVerifier(
@@ -2604,7 +2981,7 @@ def execute_confirmed_launch(
         state_path,
         state,
         input_verifier,
-        pi_runner,
+        subject_runner,
         log_path,
     )
     _execute_confirmed_batch(
@@ -2613,7 +2990,7 @@ def execute_confirmed_launch(
         state_path,
         state,
         input_verifier,
-        pi_runner,
+        subject_runner,
         log_path,
     )
     state.run_completed()
