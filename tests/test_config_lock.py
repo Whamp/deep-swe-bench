@@ -248,6 +248,12 @@ def test_config_maintainer_creates_lock_consumed_by_preflight_plan(
         json.dumps(
             {
                 "declaredRoles": [{"name": "executor"}],
+                "launchSurfaces": [
+                    {
+                        "modelRoles": ["executor"],
+                        "path": "extensions/index.ts",
+                    }
+                ],
                 "usageSources": ["session/*.jsonl"],
                 "requiredCapabilities": ["rpc"],
                 "testedSubjectVersions": ["pi@0.50.0"],
@@ -271,6 +277,9 @@ def test_config_maintainer_creates_lock_consumed_by_preflight_plan(
         "thinking": "low",
     }
     assert lock["declaredRoles"] == [{"name": "executor"}]
+    assert lock["launchSurfaces"] == [
+        {"modelRoles": ["executor"], "path": "extensions/index.ts"}
+    ]
     assert lock["usageSources"] == ["session/*.jsonl"]
     assert lock["requiredCapabilities"] == ["rpc"]
     assert lock["testedSubjectVersions"] == ["pi@0.50.0"]

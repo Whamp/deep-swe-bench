@@ -39,6 +39,7 @@ _METADATA_FIELDS = frozenset(
     {
         "credentialRoutes",
         "declaredRoles",
+        "launchSurfaces",
         "previousRelease",
         "requiredCapabilities",
         "testedSubjectVersions",

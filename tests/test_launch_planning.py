@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from harness import config_lock
+from harness import config_lock, launch
 from harness.launch import (
     LaunchExecutionPolicies,
     LaunchRequest,
@@ -61,14 +62,28 @@ def _create_locked_config(
         "low",
         "rerun",
         {
+            "credentialRoutes": ["FIXTURE_CREDENTIAL"],
             "declaredRoles": [
                 {
                     "billingCategory": "subscription quota",
-                    "credentialRoute": "OPENAI_CODEX_OAUTH",
-                    "model": "provider/model",
+                    "callBehavior": {
+                        "callsPerRep": 1,
+                        "kind": "fixed",
+                        "maxConcurrency": 1,
+                    },
+                    "credentialRoute": "FIXTURE_CREDENTIAL",
+                    "modelSelection": {
+                        "kind": "fixed",
+                        "model": "provider/model",
+                        "provider": "provider",
+                        "thinking": "low",
+                    },
                     "name": "executor",
-                    "provider": "provider",
-                    "thinking": "low",
+                    "roleKind": "executor",
+                    "usageSource": {
+                        "format": "native-session",
+                        "path": "session/*.jsonl",
+                    },
                 }
             ],
             "testedSubjectVersions": ["pi@0.81.1"],
@@ -93,6 +108,15 @@ def _runtime_identity(
             }
             for task in tasks
         },
+        subject_capabilities=frozenset({"pi-rpc"}),
+        available_credential_routes=frozenset(
+            {
+                "FIXTURE_CREDENTIAL",
+                "OPENAI_API_KEY",
+                "OPENAI_CODEX_OAUTH",
+                "WORKFLOW_API_KEY",
+            }
+        ),
     )
 
 
@@ -208,6 +232,732 @@ def test_compile_launch_request_is_deterministic_without_execution(
     assert not state_root.exists()
 
 
+def test_launch_plan_resolves_and_renders_declared_model_role_patterns(
+    tmp_path: Path,
+) -> None:
+    """Planning resolves fixed, inherited, and bounded dynamic model roles."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    declared_roles = [
+        {
+            "billingCategory": "subscription quota",
+            "callBehavior": {
+                "callsPerRep": 1,
+                "kind": "fixed",
+                "maxConcurrency": 1,
+            },
+            "credentialRoute": "OPENAI_CODEX_OAUTH",
+            "modelSelection": {
+                "kind": "fixed",
+                "model": "provider/model",
+                "provider": "provider",
+                "thinking": "low",
+            },
+            "name": "executor",
+            "roleKind": "executor",
+            "usageSource": {
+                "format": "native-session",
+                "path": "session/*.jsonl",
+            },
+        },
+        {
+            "billingCategory": "paid API",
+            "callBehavior": {
+                "kind": "bounded",
+                "maxCallsPerRep": 2,
+                "maxConcurrency": 1,
+            },
+            "credentialRoute": "WORKFLOW_API_KEY",
+            "modelSelection": {
+                "kind": "fixed",
+                "model": "provider/advisor",
+                "provider": "provider",
+                "thinking": "medium",
+            },
+            "name": "advisor",
+            "roleKind": "advisor",
+            "usageSource": {
+                "format": "filtered-tool-events",
+                "path": "tool-usage.jsonl",
+            },
+        },
+        {
+            "billingCategory": "subscription quota",
+            "callBehavior": {
+                "kind": "bounded",
+                "maxCallsPerRep": 3,
+                "maxConcurrency": 1,
+            },
+            "credentialRoute": "OPENAI_CODEX_OAUTH",
+            "modelSelection": {"kind": "inherited", "role": "executor"},
+            "name": "memory-observer",
+            "roleKind": "observational-memory",
+            "usageSource": {
+                "format": "compact-worker-trace",
+                "path": (
+                    "pi-agent/observational-memory/worker-usage/usage.ndjson"
+                ),
+            },
+        },
+        {
+            "billingCategory": "subscription quota",
+            "callBehavior": {
+                "kind": "bounded",
+                "maxCallsPerRep": 2,
+                "maxConcurrency": 1,
+            },
+            "credentialRoute": "OPENAI_CODEX_OAUTH",
+            "modelSelection": {"kind": "inherited", "role": "executor"},
+            "name": "recursive-child",
+            "roleKind": "recursive",
+            "usageSource": {
+                "format": "compact-jsonl",
+                "path": "recursive-usage/usage.ndjson",
+            },
+        },
+        {
+            "billingCategory": "paid API",
+            "callBehavior": {
+                "kind": "bounded",
+                "maxCallsPerRep": 4,
+                "maxConcurrency": 2,
+            },
+            "credentialRoute": "WORKFLOW_API_KEY",
+            "modelSelection": {
+                "kind": "bounded-dynamic",
+                "models": [
+                    {
+                        "model": "provider/worker-a",
+                        "provider": "provider",
+                        "thinking": "medium",
+                    },
+                    {
+                        "model": "provider/worker-b",
+                        "provider": "provider",
+                        "thinking": "high",
+                    },
+                ],
+            },
+            "name": "workflow-worker",
+            "roleKind": "workflow",
+            "usageSource": {
+                "format": "compact-jsonl",
+                "path": "workflow-usage/usage.ndjson",
+            },
+        },
+    ]
+    for config_identity in ("baseline@1.0.0", "review-assistant@1.0.0"):
+        config_root = repository_root / "configs" / config_identity
+        extension_path = config_root / "extensions" / "roles.ts"
+        extension_path.parent.mkdir()
+        extension_path.write_text("export default {}\n")
+        lock_path = config_root / "model" / "low" / "config-lock.json"
+        lock_path.unlink()
+        config_lock.write_config_lock(
+            repository_root,
+            config_identity,
+            "provider/model",
+            "low",
+            "rerun",
+            {
+                "credentialRoutes": [
+                    "OPENAI_CODEX_OAUTH",
+                    "WORKFLOW_API_KEY",
+                ],
+                "declaredRoles": declared_roles,
+                "launchSurfaces": [
+                    {
+                        "modelRoles": [
+                            "advisor",
+                            "memory-observer",
+                            "recursive-child",
+                            "workflow-worker",
+                        ],
+                        "path": "extensions/roles.ts",
+                    }
+                ],
+                "requiredCapabilities": ["pi-rpc"],
+                "testedSubjectVersions": ["pi@0.81.1"],
+                "usageSources": [
+                    "pi-agent/observational-memory/worker-usage/usage.ndjson",
+                    "recursive-usage/usage.ndjson",
+                    "session/*.jsonl",
+                    "tool-usage.jsonl",
+                    "workflow-usage/usage.ndjson",
+                ],
+            },
+        )
+
+    compiled = compile_launch_request(
+        _launch_request(),
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+    )
+
+    roles = {
+        role["name"]: role
+        for role in compiled.plan.to_document()["configs"][1]["declaredRoles"]
+    }
+    assert compiled.plan.to_document()["configs"][1]["launchSurfaces"] == [
+        {
+            "modelRoles": [
+                "advisor",
+                "memory-observer",
+                "recursive-child",
+                "workflow-worker",
+            ],
+            "path": "extensions/roles.ts",
+        }
+    ]
+    assert roles["executor"]["models"] == [
+        {
+            "model": "provider/model",
+            "provider": "provider",
+            "thinking": "low",
+        }
+    ]
+    advisor_models = roles["advisor"]["models"]
+    workflow_models = roles["workflow-worker"]["models"]
+    assert isinstance(advisor_models, list)
+    advisor_model = cast(dict[str, object], advisor_models[0])
+    assert advisor_model["model"] == "provider/advisor"
+    assert roles["memory-observer"]["models"] == roles["executor"]["models"]
+    assert roles["recursive-child"]["models"] == roles["executor"]["models"]
+    assert isinstance(workflow_models, list)
+    workflow_model_documents = cast(list[dict[str, object]], workflow_models)
+    assert [model["model"] for model in workflow_model_documents] == [
+        "provider/worker-a",
+        "provider/worker-b",
+    ]
+    assert (
+        "memory-observer | observational-memory | inherited from executor | "
+        "provider | provider/model | low"
+    ) in compiled.receipt
+    assert "advisor | advisor | fixed | provider | provider/advisor" in (
+        compiled.receipt
+    )
+    assert "recursive-child | recursive | inherited from executor" in (
+        compiled.receipt
+    )
+    assert "workflow-worker | workflow | bounded dynamic (2 models)" in (
+        compiled.receipt
+    )
+    assert "max 4 calls/rep; max concurrency 2" in compiled.receipt
+    assert "Required capabilities: pi-rpc" in compiled.receipt
+    assert "Tested subject versions: pi@0.81.1" in compiled.receipt
+
+
+def test_launch_planning_rejects_untested_subject_version(
+    tmp_path: Path,
+) -> None:
+    """A subject version absent from a config lock cannot reach approval."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    runtime = replace(_runtime_identity(), subject_version="pi@0.82.0")
+
+    with pytest.raises(
+        ValueError, match=r"^Untested subject version:"
+    ) as raised:
+        compile_launch_request(
+            _launch_request(),
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(runtime),
+        )
+
+    assert "baseline@1.0.0" in str(raised.value)
+    assert "pi@0.82.0" in str(raised.value)
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def test_launch_planning_rejects_missing_subject_capability(
+    tmp_path: Path,
+) -> None:
+    """Every required subject capability must have runtime evidence."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    config_identity = "review-assistant@1.0.0"
+    lock_path = (
+        repository_root
+        / "configs"
+        / config_identity
+        / "model"
+        / "low"
+        / "config-lock.json"
+    )
+    previous_lock = json.loads(lock_path.read_text())
+    lock_path.unlink()
+    config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {
+            "credentialRoutes": previous_lock["credentialRoutes"],
+            "declaredRoles": previous_lock["declaredRoles"],
+            "requiredCapabilities": ["sandbox-rpc"],
+            "testedSubjectVersions": previous_lock["testedSubjectVersions"],
+            "usageSources": previous_lock["usageSources"],
+        },
+    )
+
+    with pytest.raises(
+        ValueError, match=r"^Launch subject capability missing:"
+    ) as raised:
+        compile_launch_request(
+            _launch_request(),
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+        )
+
+    assert "sandbox-rpc" in str(raised.value)
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def test_launch_planning_rejects_unavailable_credential_route(
+    tmp_path: Path,
+) -> None:
+    """A declared credential route must be available before approval."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    runtime = replace(
+        _runtime_identity(), available_credential_routes=frozenset()
+    )
+
+    with pytest.raises(
+        ValueError, match=r"^Launch credential route unavailable:"
+    ) as raised:
+        compile_launch_request(
+            _launch_request(),
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(runtime),
+        )
+
+    assert "FIXTURE_CREDENTIAL" in str(raised.value)
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def test_launch_planning_rejects_executor_role_mismatch(tmp_path: Path) -> None:
+    """The declared executor must match the requested model and thinking."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    config_identity = "review-assistant@1.0.0"
+    lock_path = (
+        repository_root
+        / "configs"
+        / config_identity
+        / "model"
+        / "low"
+        / "config-lock.json"
+    )
+    previous_lock = json.loads(lock_path.read_text())
+    role = dict(previous_lock["declaredRoles"][0])
+    selection = dict(role["modelSelection"])
+    selection["model"] = "provider/other-model"
+    role["modelSelection"] = selection
+    lock_path.unlink()
+    config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {
+            "credentialRoutes": previous_lock["credentialRoutes"],
+            "declaredRoles": [role],
+            "testedSubjectVersions": previous_lock["testedSubjectVersions"],
+            "usageSources": previous_lock["usageSources"],
+        },
+    )
+
+    with pytest.raises(
+        ValueError, match=r"^Launch executor role mismatch:"
+    ) as raised:
+        compile_launch_request(
+            _launch_request(),
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+        )
+
+    assert "provider/other-model" in str(raised.value)
+    assert "provider/model" in str(raised.value)
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def test_launch_planning_rejects_incomplete_model_role_declaration(
+    tmp_path: Path,
+) -> None:
+    """Provider, model, and thinking are mandatory for fixed role models."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    config_identity = "review-assistant@1.0.0"
+    lock_path = (
+        repository_root
+        / "configs"
+        / config_identity
+        / "model"
+        / "low"
+        / "config-lock.json"
+    )
+    previous_lock = json.loads(lock_path.read_text())
+    role = dict(previous_lock["declaredRoles"][0])
+    selection = dict(role["modelSelection"])
+    selection.pop("provider")
+    role["modelSelection"] = selection
+    lock_path.unlink()
+    config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {
+            "credentialRoutes": previous_lock["credentialRoutes"],
+            "declaredRoles": [role],
+            "testedSubjectVersions": previous_lock["testedSubjectVersions"],
+            "usageSources": previous_lock["usageSources"],
+        },
+    )
+
+    with pytest.raises(
+        ValueError, match=r"^Launch model role invalid:"
+    ) as raised:
+        compile_launch_request(
+            _launch_request(),
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+        )
+
+    assert "provider" in str(raised.value)
+    assert "executor" in str(raised.value)
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def test_launch_planning_rejects_role_without_compact_usage_source(
+    tmp_path: Path,
+) -> None:
+    """Every role needs a compact source for smoke and result accounting."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    config_identity = "review-assistant@1.0.0"
+    lock_path = (
+        repository_root
+        / "configs"
+        / config_identity
+        / "model"
+        / "low"
+        / "config-lock.json"
+    )
+    previous_lock = json.loads(lock_path.read_text())
+    role = dict(previous_lock["declaredRoles"][0])
+    role.pop("usageSource")
+    lock_path.unlink()
+    config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {
+            "credentialRoutes": previous_lock["credentialRoutes"],
+            "declaredRoles": [role],
+            "testedSubjectVersions": previous_lock["testedSubjectVersions"],
+            "usageSources": previous_lock["usageSources"],
+        },
+    )
+
+    with pytest.raises(
+        TypeError, match=r"^Launch model role invalid:"
+    ) as raised:
+        compile_launch_request(
+            _launch_request(),
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+        )
+
+    assert "compact usage source" in str(raised.value)
+    assert "executor" in str(raised.value)
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def test_launch_planning_requires_clarification_for_undeclared_model_roles(
+    tmp_path: Path,
+) -> None:
+    """A versioned config cannot hide all model-call surfaces."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    config_identity = "review-assistant@1.0.0"
+    lock_path = (
+        repository_root
+        / "configs"
+        / config_identity
+        / "model"
+        / "low"
+        / "config-lock.json"
+    )
+    lock_path.unlink()
+    config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {"testedSubjectVersions": ["pi@0.81.1"]},
+    )
+
+    with pytest.raises(launch.LaunchClarificationRequired) as raised:
+        compile_launch_request(
+            _launch_request(),
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+        )
+
+    assert raised.value.details == (
+        {
+            "config": config_identity,
+            "reason": "undeclared-model-roles",
+        },
+    )
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def test_launch_planning_requires_clarification_for_unbounded_role_calls(
+    tmp_path: Path,
+) -> None:
+    """Every secondary call surface must declare finite per-rep bounds."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    config_identity = "review-assistant@1.0.0"
+    lock_path = (
+        repository_root
+        / "configs"
+        / config_identity
+        / "model"
+        / "low"
+        / "config-lock.json"
+    )
+    previous_lock = json.loads(lock_path.read_text())
+    role = dict(previous_lock["declaredRoles"][0])
+    role["callBehavior"] = {"kind": "unbounded"}
+    lock_path.unlink()
+    config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {
+            "credentialRoutes": previous_lock["credentialRoutes"],
+            "declaredRoles": [role],
+            "testedSubjectVersions": previous_lock["testedSubjectVersions"],
+            "usageSources": previous_lock["usageSources"],
+        },
+    )
+
+    with pytest.raises(launch.LaunchClarificationRequired) as raised:
+        compile_launch_request(
+            _launch_request(),
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+        )
+
+    assert raised.value.details == (
+        {
+            "callKind": "unbounded",
+            "config": config_identity,
+            "reason": "unbounded-call-behavior",
+            "role": "executor",
+        },
+    )
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def test_launch_planning_requires_clarification_for_unbounded_model_selection(
+    tmp_path: Path,
+) -> None:
+    """An arbitrary model surface fails with structured planning evidence."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    config_identity = "review-assistant@1.0.0"
+    lock_path = (
+        repository_root
+        / "configs"
+        / config_identity
+        / "model"
+        / "low"
+        / "config-lock.json"
+    )
+    lock_path.unlink()
+    config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {
+            "credentialRoutes": ["WORKFLOW_API_KEY"],
+            "declaredRoles": [
+                {
+                    "billingCategory": "paid API",
+                    "callBehavior": {
+                        "kind": "bounded",
+                        "maxCallsPerRep": 8,
+                        "maxConcurrency": 8,
+                    },
+                    "credentialRoute": "WORKFLOW_API_KEY",
+                    "modelSelection": {"kind": "arbitrary"},
+                    "name": "workflow-worker",
+                    "roleKind": "workflow",
+                    "usageSource": {
+                        "format": "compact-jsonl",
+                        "path": "workflow-usage/usage.ndjson",
+                    },
+                }
+            ],
+            "testedSubjectVersions": ["pi@0.81.1"],
+            "usageSources": ["workflow-usage/usage.ndjson"],
+        },
+    )
+
+    with pytest.raises(launch.LaunchClarificationRequired) as raised:
+        compile_launch_request(
+            _launch_request(),
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+        )
+
+    assert raised.value.details == (
+        {
+            "config": config_identity,
+            "reason": "unbounded-model-selection",
+            "role": "workflow-worker",
+            "selectionKind": "arbitrary",
+        },
+    )
+    assert str(raised.value).startswith("Launch clarification required:")
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def test_launch_planning_requires_clarification_for_unknown_extension_behavior(
+    tmp_path: Path,
+) -> None:
+    """Undeclared extension behavior stops before subject execution."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    config_identity = "review-assistant@1.0.0"
+    config_root = repository_root / "configs" / config_identity
+    extension_path = config_root / "extensions" / "unknown.ts"
+    extension_path.parent.mkdir()
+    extension_path.write_text("export default {}\n")
+    lock_path = config_root / "model" / "low" / "config-lock.json"
+    lock_path.unlink()
+    config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {
+            "credentialRoutes": ["FIXTURE_CREDENTIAL"],
+            "declaredRoles": [
+                {
+                    "billingCategory": "subscription quota",
+                    "callBehavior": {
+                        "callsPerRep": 1,
+                        "kind": "fixed",
+                        "maxConcurrency": 1,
+                    },
+                    "credentialRoute": "FIXTURE_CREDENTIAL",
+                    "modelSelection": {
+                        "kind": "fixed",
+                        "model": "provider/model",
+                        "provider": "provider",
+                        "thinking": "low",
+                    },
+                    "name": "executor",
+                    "roleKind": "executor",
+                    "usageSource": {
+                        "format": "native-session",
+                        "path": "session/*.jsonl",
+                    },
+                }
+            ],
+            "testedSubjectVersions": ["pi@0.81.1"],
+            "usageSources": ["session/*.jsonl"],
+        },
+    )
+
+    with pytest.raises(launch.LaunchClarificationRequired) as raised:
+        compile_launch_request(
+            _launch_request(),
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+        )
+
+    assert raised.value.details == (
+        {
+            "config": config_identity,
+            "path": "extensions/unknown.ts",
+            "reason": "unknown-extension-behavior",
+        },
+    )
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
 def test_launch_receipt_shows_review_information_and_baseline_differences(
     tmp_path: Path,
 ) -> None:
@@ -231,8 +981,11 @@ def test_launch_receipt_shows_review_information_and_baseline_differences(
     assert "Model: provider/model (thinking=low)" in receipt
     assert "Tasks: 1; configs: 2; reps: 2; concurrency: 1" in receipt
     assert "Cells: 2 preflight; 4 batch" in receipt
-    assert "executor | provider | provider/model | low" in receipt
-    assert "OPENAI_CODEX_OAUTH | subscription quota" in receipt
+    assert (
+        "executor | executor | fixed | provider | provider/model | low"
+        in receipt
+    )
+    assert "FIXTURE_CREDENTIAL | subscription quota" in receipt
     assert "BEHAVIOR DIFFERENCES FROM baseline@1.0.0" in receipt
     assert "review-assistant@1.0.0" in receipt
     assert "changed prompt: orchestration.md" in receipt
@@ -384,6 +1137,7 @@ timeout_sec = 60
     fake_docker.write_text("#!/bin/sh\necho sha256:fixture-image\n")
     fake_docker.chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake_bin}:{Path('/usr/bin')}")
+    monkeypatch.setenv("FIXTURE_CREDENTIAL", "available-to-fixture")
 
     compiled = compile_launch_request(
         _launch_request(),
@@ -557,6 +1311,9 @@ def test_launch_plan_and_receipt_exclude_config_secret_values(
     for config_identity in ("baseline@1.0.0", "review-assistant@1.0.0"):
         config_root = repository_root / "configs" / config_identity
         lock_path = config_root / "model" / "low" / "config-lock.json"
+        previous_lock = json.loads(lock_path.read_text())
+        role = dict(previous_lock["declaredRoles"][0])
+        role["credentialRoute"] = "OPENAI_API_KEY"
         lock_path.unlink()
         (config_root / "env").write_text(f"OPENAI_API_KEY={secret}\n")
         config_lock.write_config_lock(
@@ -565,7 +1322,12 @@ def test_launch_plan_and_receipt_exclude_config_secret_values(
             "provider/model",
             "low",
             "rerun",
-            {"credentialRoutes": ["OPENAI_API_KEY"]},
+            {
+                "credentialRoutes": ["OPENAI_API_KEY"],
+                "declaredRoles": [role],
+                "testedSubjectVersions": previous_lock["testedSubjectVersions"],
+                "usageSources": previous_lock["usageSources"],
+            },
         )
 
     compiled = compile_launch_request(

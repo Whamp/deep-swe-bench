@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
@@ -21,6 +22,29 @@ _THINKING_LEVELS = frozenset(
 _PREFLIGHT_POLICIES = frozenset({"disabled", "new-configs", "required"})
 _EXISTING_RESULT_POLICIES = frozenset({"require-compatible", "rerun"})
 _TRANSIENT_ERROR_POLICIES = frozenset({"pause", "stop"})
+_BILLING_CATEGORIES = frozenset(
+    {"local compute", "paid API", "subscription quota"}
+)
+_COMPACT_USAGE_FORMATS = frozenset(
+    {
+        "compact-jsonl",
+        "compact-worker-trace",
+        "filtered-tool-events",
+        "native-session",
+    }
+)
+
+
+class LaunchClarificationRequired(ValueError):
+    """Stop planning with structured evidence about unresolved model behavior."""
+
+    def __init__(self, details: Sequence[Mapping[str, object]]) -> None:
+        """Record secret-free clarification evidence for the caller."""
+        self.details = tuple(dict(detail) for detail in details)
+        super().__init__(
+            "Launch clarification required: "
+            + json.dumps(self.details, sort_keys=True, separators=(",", ":"))
+        )
 
 
 class LaunchConfigDocument(TypedDict):
@@ -32,6 +56,7 @@ class LaunchConfigDocument(TypedDict):
     credentialRoutes: list[str]
     declaredRoles: list[dict[str, object]]
     identity: str
+    launchSurfaces: list[dict[str, object]]
     legacy: bool
     lockIdentity: str | None
     requiredCapabilities: list[str]
@@ -143,6 +168,8 @@ class LaunchRuntimeIdentity:
     task_revision: str
     verifier_identities: Mapping[str, str]
     immutable_image_identities: Mapping[str, Mapping[str, str]]
+    subject_capabilities: frozenset[str] = frozenset()
+    available_credential_routes: frozenset[str] = frozenset()
 
 
 class LaunchRuntimeResolver(Protocol):
@@ -259,6 +286,16 @@ class RepositoryLaunchRuntimeResolver:
             )
         return _file_set_identity(self.tasks_root, [verifier_root])
 
+    @staticmethod
+    def _available_credential_routes() -> frozenset[str]:
+        routes = frozenset(
+            name for name, value in os.environ.items() if value.strip()
+        )
+        oauth_path = Path.home() / ".pi" / "agent" / "auth.json"
+        if oauth_path.is_file():
+            return routes | {"OPENAI_CODEX_OAUTH"}
+        return routes
+
     def resolve_launch_runtime(
         self,
         request: LaunchRequest,
@@ -286,6 +323,10 @@ class RepositoryLaunchRuntimeResolver:
             task_revision=self._task_revision(tasks),
             verifier_identities=verifier_identities,
             immutable_image_identities=image_identities,
+            subject_capabilities=frozenset(
+                {"native-session-usage", "pi-extensions", "pi-rpc", "pi-skills"}
+            ),
+            available_credential_routes=self._available_credential_routes(),
         )
 
 
@@ -540,6 +581,424 @@ def _lock_object_list(
     return normalized
 
 
+def _declared_role_model(
+    config_identity: str,
+    role_name: str,
+    value: object,
+) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise TypeError(
+            "Launch model role invalid: "
+            f"config={config_identity!r}; role={role_name!r}; "
+            "model declaration must be an object"
+        )
+    model = value.get("model")
+    provider = value.get("provider")
+    thinking = value.get("thinking")
+    missing = [
+        field
+        for field, field_value in (
+            ("provider", provider),
+            ("model", model),
+            ("thinking", thinking),
+        )
+        if not isinstance(field_value, str) or not field_value
+    ]
+    if missing:
+        raise ValueError(
+            "Launch model role invalid: "
+            f"config={config_identity!r}; role={role_name!r}; "
+            f"missing model fields={missing!r}"
+        )
+    if thinking not in _THINKING_LEVELS:
+        raise ValueError(
+            "Launch model role invalid: "
+            f"config={config_identity!r}; role={role_name!r}; "
+            f"thinking={thinking!r}"
+        )
+    return {
+        "model": str(model),
+        "provider": str(provider),
+        "thinking": str(thinking),
+    }
+
+
+def _resolved_role_models(
+    config_identity: str,
+    role_name: str,
+    roles_by_name: Mapping[str, Mapping[str, object]],
+    resolved_by_name: dict[str, list[dict[str, str]]],
+    resolving: frozenset[str] = frozenset(),
+) -> list[dict[str, str]]:
+    if role_name in resolved_by_name:
+        return resolved_by_name[role_name]
+    if role_name in resolving:
+        raise ValueError(
+            f"Launch model role invalid: inherited role cycle at {role_name!r}"
+        )
+    role = roles_by_name[role_name]
+    selection = role.get("modelSelection")
+    if not isinstance(selection, dict):
+        raise TypeError(
+            "Launch model role invalid: "
+            f"config={config_identity!r}; role={role_name!r}; "
+            "modelSelection must be an object"
+        )
+    if selection.get("kind") == "fixed":
+        models = [_declared_role_model(config_identity, role_name, selection)]
+    elif selection.get("kind") == "inherited":
+        inherited_role = selection.get("role")
+        if (
+            not isinstance(inherited_role, str)
+            or inherited_role not in roles_by_name
+        ):
+            raise ValueError(
+                "Launch model role invalid: inherited role "
+                f"{role_name!r} references {inherited_role!r}"
+            )
+        models = _resolved_role_models(
+            config_identity,
+            inherited_role,
+            roles_by_name,
+            resolved_by_name,
+            resolving | {role_name},
+        )
+    elif selection.get("kind") == "bounded-dynamic":
+        choices = selection.get("models")
+        if not isinstance(choices, list):
+            raise TypeError(
+                "Launch model role invalid: bounded-dynamic models must be a list"
+            )
+        if not choices:
+            raise ValueError(
+                "Launch model role invalid: "
+                f"config={config_identity!r}; role={role_name!r}; "
+                "bounded-dynamic models cannot be empty"
+            )
+        models = [
+            _declared_role_model(config_identity, role_name, choice)
+            for choice in choices
+        ]
+    else:
+        raise ValueError(
+            "Launch model role invalid: modelSelection kind must be fixed, "
+            "inherited, or bounded-dynamic"
+        )
+    resolved_by_name[role_name] = [dict(model) for model in models]
+    return models
+
+
+def _declared_roles_by_name(
+    config_identity: str,
+    declared_roles: Sequence[Mapping[str, object]],
+) -> dict[str, Mapping[str, object]]:
+    if not declared_roles:
+        raise LaunchClarificationRequired(
+            [{"config": config_identity, "reason": "undeclared-model-roles"}]
+        )
+    roles_by_name: dict[str, Mapping[str, object]] = {}
+    for role in declared_roles:
+        role_name = role.get("name")
+        required_strings = {
+            "billingCategory": role.get("billingCategory"),
+            "credentialRoute": role.get("credentialRoute"),
+            "name": role_name,
+            "roleKind": role.get("roleKind"),
+        }
+        missing = sorted(
+            field
+            for field, value in required_strings.items()
+            if not isinstance(value, str) or not value
+        )
+        if missing:
+            raise ValueError(
+                "Launch model role invalid: "
+                f"config={config_identity!r}; missing fields={missing!r}"
+            )
+        role_name = str(role_name)
+        if role.get("billingCategory") not in _BILLING_CATEGORIES:
+            raise ValueError(
+                "Launch model role invalid: "
+                f"config={config_identity!r}; role={role_name!r}; "
+                f"billing category={role.get('billingCategory')!r}"
+            )
+        if role_name in roles_by_name:
+            raise ValueError(
+                "Launch model role invalid: "
+                f"config={config_identity!r}; duplicate role={role_name!r}"
+            )
+        roles_by_name[role_name] = role
+    return roles_by_name
+
+
+def _validate_role_call_behavior(
+    config_identity: str,
+    role_name: str,
+    call_behavior: object,
+) -> None:
+    call_kind = (
+        call_behavior.get("kind") if isinstance(call_behavior, dict) else None
+    )
+    if call_kind not in {"fixed", "bounded"}:
+        raise LaunchClarificationRequired(
+            [
+                {
+                    "callKind": call_kind,
+                    "config": config_identity,
+                    "reason": "unbounded-call-behavior",
+                    "role": role_name,
+                }
+            ]
+        )
+    call_document = cast(dict[str, object], call_behavior)
+    calls_field = "callsPerRep" if call_kind == "fixed" else "maxCallsPerRep"
+    calls = call_document.get(calls_field)
+    max_concurrency = call_document.get("maxConcurrency")
+    if (
+        not isinstance(calls, int)
+        or isinstance(calls, bool)
+        or calls < 1
+        or not isinstance(max_concurrency, int)
+        or isinstance(max_concurrency, bool)
+        or max_concurrency < 1
+    ):
+        raise ValueError(
+            "Launch model role invalid: "
+            f"config={config_identity!r}; role={role_name!r}; "
+            "call bounds must be positive integers"
+        )
+
+
+def _validated_role_selection_kind(
+    config_identity: str,
+    role_name: str,
+    selection: object,
+) -> str:
+    selection_kind = (
+        selection.get("kind") if isinstance(selection, dict) else None
+    )
+    if selection_kind not in {"fixed", "inherited", "bounded-dynamic"}:
+        raise LaunchClarificationRequired(
+            [
+                {
+                    "config": config_identity,
+                    "reason": "unbounded-model-selection",
+                    "role": role_name,
+                    "selectionKind": selection_kind,
+                }
+            ]
+        )
+    return str(selection_kind)
+
+
+def _role_selection_summary(
+    selection_kind: str,
+    selection: object,
+    model_count: int,
+) -> str:
+    if selection_kind == "inherited":
+        selection_document = cast(dict[str, object], selection)
+        return f"inherited from {selection_document.get('role')}"
+    if selection_kind == "bounded-dynamic":
+        return f"bounded dynamic ({model_count} models)"
+    return "fixed"
+
+
+def _resolve_declared_roles(
+    config_identity: str,
+    declared_roles: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    roles_by_name = _declared_roles_by_name(config_identity, declared_roles)
+    resolved_by_name: dict[str, list[dict[str, str]]] = {}
+    resolved_roles: list[dict[str, object]] = []
+    for role in declared_roles:
+        role_name = str(role["name"])
+        _validate_role_call_behavior(
+            config_identity,
+            role_name,
+            role.get("callBehavior"),
+        )
+        selection = role.get("modelSelection")
+        selection_kind = _validated_role_selection_kind(
+            config_identity,
+            role_name,
+            selection,
+        )
+        resolved_role = dict(role)
+        models = _resolved_role_models(
+            config_identity,
+            role_name,
+            roles_by_name,
+            resolved_by_name,
+        )
+        resolved_role["models"] = models
+        resolved_role["selectionSummary"] = _role_selection_summary(
+            selection_kind,
+            selection,
+            len(models),
+        )
+        resolved_roles.append(resolved_role)
+    return resolved_roles
+
+
+def _validate_executor_role(
+    config_identity: str,
+    roles: Sequence[Mapping[str, object]],
+    request: LaunchRequest,
+) -> None:
+    executors = [role for role in roles if role.get("roleKind") == "executor"]
+    models = executors[0].get("models") if len(executors) == 1 else None
+    if (
+        not isinstance(models, list)
+        or len(models) != 1
+        or not isinstance(models[0], dict)
+        or models[0].get("model") != request.model
+        or models[0].get("thinking") != request.thinking
+    ):
+        raise ValueError(
+            "Launch executor role mismatch: "
+            f"config={config_identity!r}; requested model={request.model!r}, "
+            f"thinking={request.thinking!r}; declared={models!r}"
+        )
+
+
+def _validate_launch_surfaces(
+    config_identity: str,
+    launch_surfaces: Sequence[Mapping[str, object]],
+    roles: Sequence[Mapping[str, object]],
+) -> None:
+    role_names = {str(role.get("name")) for role in roles}
+    for surface in launch_surfaces:
+        path = surface.get("path")
+        model_roles = surface.get("modelRoles")
+        if (
+            not isinstance(path, str)
+            or not path
+            or Path(path).is_absolute()
+            or ".." in Path(path).parts
+            or not isinstance(model_roles, list)
+            or any(not isinstance(role, str) for role in model_roles)
+        ):
+            raise ValueError(
+                "Launch surface invalid: "
+                f"config={config_identity!r}; surface={surface!r}"
+            )
+        declared_surface_roles = {
+            role for role in model_roles if isinstance(role, str)
+        }
+        unknown_roles = sorted(declared_surface_roles - role_names)
+        if unknown_roles:
+            raise ValueError(
+                "Launch surface invalid: "
+                f"config={config_identity!r}; path={path!r}; "
+                f"unknown roles={unknown_roles!r}"
+            )
+
+
+def _validate_role_usage_sources(
+    config_identity: str,
+    roles: Sequence[Mapping[str, object]],
+    usage_sources: Sequence[str],
+) -> None:
+    for role in roles:
+        role_name = str(role.get("name", ""))
+        usage_source = role.get("usageSource")
+        if not isinstance(usage_source, dict):
+            raise TypeError(
+                "Launch model role invalid: "
+                f"config={config_identity!r}; role={role_name!r}; "
+                "compact usage source is required"
+            )
+        source_path = usage_source.get("path")
+        source_format = usage_source.get("format")
+        if (
+            not isinstance(source_path, str)
+            or not source_path
+            or source_path not in usage_sources
+            or source_path.endswith("pi.jsonl")
+            or source_format not in _COMPACT_USAGE_FORMATS
+        ):
+            raise ValueError(
+                "Launch model role invalid: "
+                f"config={config_identity!r}; role={role_name!r}; "
+                "compact usage source must name a declared path and supported "
+                f"format; got path={source_path!r}, format={source_format!r}"
+            )
+
+
+def _legacy_launch_config_document(
+    resolved: config_resolution.ResolvedConfigLeaf,
+    config_identity: str,
+) -> LaunchConfigDocument:
+    return {
+        "behaviorInputs": [],
+        "configLeaf": str(resolved.config_leaf.resolve()),
+        "configRoot": str(resolved.config_root.resolve()),
+        "credentialRoutes": [],
+        "declaredRoles": [],
+        "identity": config_identity,
+        "launchSurfaces": [],
+        "legacy": True,
+        "lockIdentity": None,
+        "requiredCapabilities": [],
+        "smokeContract": (
+            str(resolved.smoke_contract.resolve())
+            if resolved.smoke_contract is not None
+            else None
+        ),
+        "testedSubjectVersions": [],
+        "usageSources": [],
+        "versionImpact": None,
+    }
+
+
+def _validate_extension_surface_coverage(
+    config_identity: str,
+    behavior_inputs: Sequence[Mapping[str, object]],
+    launch_surfaces: Sequence[Mapping[str, object]],
+) -> None:
+    uncovered: list[dict[str, object]] = []
+    for behavior_input in behavior_inputs:
+        path = behavior_input.get("path")
+        if behavior_input.get("kind") != "extension" or not isinstance(
+            path, str
+        ):
+            continue
+        covered = any(
+            isinstance(surface.get("path"), str)
+            and (
+                path == surface["path"]
+                or path.startswith(str(surface["path"]).rstrip("/") + "/")
+            )
+            for surface in launch_surfaces
+        )
+        if not covered:
+            uncovered.append(
+                {
+                    "config": config_identity,
+                    "path": path,
+                    "reason": "unknown-extension-behavior",
+                }
+            )
+    if uncovered:
+        raise LaunchClarificationRequired(uncovered)
+
+
+def _validate_role_credential_routes(
+    config_identity: str,
+    roles: Sequence[Mapping[str, object]],
+    credential_routes: Sequence[str],
+) -> None:
+    for role in roles:
+        credential_route = role.get("credentialRoute")
+        if credential_route not in credential_routes:
+            raise ValueError(
+                "Launch model role invalid: "
+                f"config={config_identity!r}; role={role.get('name')!r}; "
+                f"credential route {credential_route!r} is not declared"
+            )
+
+
 def _config_plan(
     repository_root: Path,
     request: LaunchRequest,
@@ -556,25 +1015,34 @@ def _config_plan(
         config_identity,
     )
     if lock_document is None:
-        return {
-            "behaviorInputs": [],
-            "configLeaf": str(resolved.config_leaf.resolve()),
-            "configRoot": str(resolved.config_root.resolve()),
-            "credentialRoutes": [],
-            "declaredRoles": [],
-            "identity": config_identity,
-            "legacy": True,
-            "lockIdentity": None,
-            "requiredCapabilities": [],
-            "smokeContract": (
-                str(resolved.smoke_contract.resolve())
-                if resolved.smoke_contract is not None
-                else None
-            ),
-            "testedSubjectVersions": [],
-            "usageSources": [],
-            "versionImpact": None,
-        }
+        return _legacy_launch_config_document(resolved, config_identity)
+    behavior_inputs = _lock_object_list(lock_document, "behaviorInputs")
+    launch_surfaces = _lock_object_list(lock_document, "launchSurfaces")
+    _validate_extension_surface_coverage(
+        config_identity,
+        behavior_inputs,
+        launch_surfaces,
+    )
+    credential_routes = _lock_string_list(lock_document, "credentialRoutes")
+    declared_roles = _lock_object_list(lock_document, "declaredRoles")
+    usage_sources = _lock_string_list(lock_document, "usageSources")
+    _validate_role_usage_sources(
+        config_identity,
+        declared_roles,
+        usage_sources,
+    )
+    resolved_roles = _resolve_declared_roles(config_identity, declared_roles)
+    _validate_executor_role(config_identity, resolved_roles, request)
+    _validate_launch_surfaces(
+        config_identity,
+        launch_surfaces,
+        resolved_roles,
+    )
+    _validate_role_credential_routes(
+        config_identity,
+        resolved_roles,
+        credential_routes,
+    )
     version_impact = lock_document.get("versionImpact")
     if version_impact is not None and not isinstance(version_impact, str):
         raise TypeError(
@@ -584,14 +1052,13 @@ def _config_plan(
     if not isinstance(lock_identity, str):
         raise TypeError("Config lock invalid: lockIdentity must be a string")
     return {
-        "behaviorInputs": _lock_object_list(lock_document, "behaviorInputs"),
+        "behaviorInputs": behavior_inputs,
         "configLeaf": str(resolved.config_leaf.resolve()),
         "configRoot": str(resolved.config_root.resolve()),
-        "credentialRoutes": _lock_string_list(
-            lock_document, "credentialRoutes"
-        ),
-        "declaredRoles": _lock_object_list(lock_document, "declaredRoles"),
+        "credentialRoutes": credential_routes,
+        "declaredRoles": resolved_roles,
         "identity": config_identity,
+        "launchSurfaces": launch_surfaces,
         "legacy": False,
         "lockIdentity": lock_identity,
         "requiredCapabilities": _lock_string_list(
@@ -607,9 +1074,46 @@ def _config_plan(
             lock_document,
             "testedSubjectVersions",
         ),
-        "usageSources": _lock_string_list(lock_document, "usageSources"),
+        "usageSources": usage_sources,
         "versionImpact": version_impact,
     }
+
+
+def _validate_config_runtime_compatibility(
+    configs: Sequence[LaunchConfigDocument],
+    runtime: LaunchRuntimeIdentity,
+) -> None:
+    for config in configs:
+        if config["legacy"]:
+            continue
+        tested_versions = config["testedSubjectVersions"]
+        if runtime.subject_version not in tested_versions:
+            raise ValueError(
+                "Untested subject version: "
+                f"config={config['identity']!r}; "
+                f"subject={runtime.subject_version!r}; "
+                f"tested={tested_versions!r}"
+            )
+        missing_capabilities = sorted(
+            set(config["requiredCapabilities"]) - runtime.subject_capabilities
+        )
+        if missing_capabilities:
+            raise ValueError(
+                "Launch subject capability missing: "
+                f"config={config['identity']!r}; "
+                f"missing={missing_capabilities!r}; "
+                f"available={sorted(runtime.subject_capabilities)!r}"
+            )
+        unavailable_routes = sorted(
+            set(config["credentialRoutes"])
+            - runtime.available_credential_routes
+        )
+        if unavailable_routes:
+            raise ValueError(
+                "Launch credential route unavailable: "
+                f"config={config['identity']!r}; "
+                f"routes={unavailable_routes!r}"
+            )
 
 
 def _cell_result_path(
@@ -782,34 +1286,82 @@ def _render_behavior_differences(
     return lines
 
 
+def _role_model_columns(role: Mapping[str, object]) -> tuple[str, str, str]:
+    models = role.get("models")
+    if not isinstance(models, list) or not models:
+        return "-", "-", "-"
+    return (
+        ",".join(
+            str(model.get("provider", "-"))
+            for model in models
+            if isinstance(model, dict)
+        ),
+        ",".join(
+            str(model.get("model", "-"))
+            for model in models
+            if isinstance(model, dict)
+        ),
+        ",".join(
+            str(model.get("thinking", "-"))
+            for model in models
+            if isinstance(model, dict)
+        ),
+    )
+
+
+def _role_call_summary(role: Mapping[str, object]) -> str:
+    behavior = role.get("callBehavior")
+    if not isinstance(behavior, dict):
+        return "-"
+    max_concurrency = behavior.get("maxConcurrency", "-")
+    if behavior.get("kind") == "fixed":
+        return (
+            f"{behavior.get('callsPerRep', '-')} calls/rep; "
+            f"max concurrency {max_concurrency}"
+        )
+    return (
+        f"max {behavior.get('maxCallsPerRep', '-')} calls/rep; "
+        f"max concurrency {max_concurrency}"
+    )
+
+
 def _render_role_lines(configs: Sequence[LaunchConfigDocument]) -> list[str]:
     lines = [
-        "config | role | provider | model | thinking | credential | "
-        "billing | usage"
+        (
+            "config | role | kind | selection | provider | model | thinking | "
+            "credential | billing | usage | bounds"
+        )
     ]
     for config in configs:
         roles = config["declaredRoles"]
-        usage = ",".join(config["usageSources"])
         if not roles:
             lines.append(
-                f"{config['identity']} | undeclared | - | - | - | - | "
-                f"- | {usage or '-'}"
+                f"{config['identity']} | undeclared | - | - | - | - | - | "
+                "- | - | - | -"
             )
             continue
         for role in roles:
-            if not isinstance(role, dict):
-                continue
+            provider, model, thinking = _role_model_columns(role)
+            usage_source = role.get("usageSource")
+            usage = (
+                str(usage_source.get("path", "-"))
+                if isinstance(usage_source, dict)
+                else ",".join(config["usageSources"]) or "-"
+            )
             lines.append(
                 " | ".join(
                     [
                         str(config["identity"]),
                         str(role.get("name", "-")),
-                        str(role.get("provider", "-")),
-                        str(role.get("model", "-")),
-                        str(role.get("thinking", "-")),
+                        str(role.get("roleKind", "-")),
+                        str(role.get("selectionSummary", "fixed")),
+                        provider,
+                        model,
+                        thinking,
                         str(role.get("credentialRoute", "-")),
                         str(role.get("billingCategory", "-")),
-                        usage or "-",
+                        usage,
+                        _role_call_summary(role),
                     ]
                 )
             )
@@ -851,6 +1403,19 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
             "",
             "MODEL ROLES",
             *_render_role_lines(configs),
+            "",
+            "SUBJECT COMPATIBILITY",
+            *(
+                line
+                for config in configs
+                for line in (
+                    f"- {config['identity']}",
+                    "  Tested subject versions: "
+                    + (", ".join(config["testedSubjectVersions"]) or "-"),
+                    "  Required capabilities: "
+                    + (", ".join(config["requiredCapabilities"]) or "-"),
+                )
+            ),
             "",
             f"BEHAVIOR DIFFERENCES FROM {baseline_identity}",
         ]
@@ -894,6 +1459,7 @@ def compile_launch_request(
         )
     runtime = runtime_resolver.resolve_launch_runtime(request, tasks)
     _require_runtime_identity(runtime, tasks)
+    _validate_config_runtime_compatibility(config_plans, runtime)
     batch_cells = _batch_cells(results_root, request, tasks)
     preflight_cells = _preflight_cells(
         repository_root,

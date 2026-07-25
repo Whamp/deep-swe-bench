@@ -24,7 +24,8 @@ Each model+thinking leaf owns `config-lock.json`. Schema version 1 records:
 - config name, version, version impact, and any declared predecessor;
 - the exact model+thinking leaf;
 - declared roles, usage sources, required capabilities, tested subject versions,
-  and credential routes;
+  and credential routes, using the
+  [confirmed-launch role schema](../confirmed-launch-role-declarations.md);
 - one fingerprint for each shared and leaf behavior input; and
 - one aggregate `lockIdentity` over the canonical, secret-free lock document.
 
