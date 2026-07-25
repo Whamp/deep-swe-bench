@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import tempfile
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime
@@ -313,6 +314,11 @@ def test_plan_command_writes_review_artifacts_without_execution(
             "pause",
             "--cell-retries",
             "1",
+            "--agent-timeout",
+            "321",
+            "--rpc-quiescence",
+            "4.5",
+            "--no-initial-context-capture",
             "--repository",
             str(repository_root),
             "--tasks-root",
@@ -331,8 +337,15 @@ def test_plan_command_writes_review_artifacts_without_execution(
 
     plan = parse_launch_plan_json(plan_path.read_text())
     assert plan.identity.startswith("sha256:")
+    policies = plan.to_document()["policies"]
+    assert policies["agent_timeout_s"] == 321.0
+    assert policies["rpc_quiescence_s"] == 4.5
+    assert policies["capture_initial_context"] is False
     receipt = receipt_path.read_text()
     assert f"Plan: {plan.identity}" in receipt
+    assert "agent timeout=321.0" in receipt
+    assert "RPC quiescence=4.5s" in receipt
+    assert "initial context=not captured" in receipt
     assert "MODEL ROLES" in receipt
     assert len(runtime_resolver.requests) == 1
     assert not results_root.exists()
@@ -460,14 +473,13 @@ def test_omp_launch_planning_records_exact_resolved_subject_behavior(
         "modelRoute": "openai-codex",
         "overlay": "/arm/omp-overlay.yml",
         "systemPrompt": (
-            "date="
-            f"{datetime.now().astimezone().date().isoformat()} cwd=/app\n"
+            f"date={datetime.now().astimezone().date().isoformat()} cwd=/app\n"
         ),
         "toolWhitelist": ["read", "bash", "edit", "write"],
     }
     assert "OPENAI_CODEX_OAUTH" in compiled.receipt
     assert "/arm/omp-overlay.yml" in compiled.receipt
-    assert '\"toolWhitelist\":[\"read\",\"bash\",\"edit\",\"write\"]' in (
+    assert '"toolWhitelist":["read","bash","edit","write"]' in (
         compiled.receipt
     )
     assert not results_root.exists()
@@ -919,8 +931,7 @@ def test_launch_planning_preserves_legacy_smoke_contract_readability(
     assert legacy_config["smokeContract"] == str(legacy_contract)
     assert (
         "legacy configs are readable for diagnosis but require a versioned "
-        "release before confirmed execution: legacy-review"
-        in compiled.receipt
+        "release before confirmed execution: legacy-review" in compiled.receipt
     )
 
 
@@ -2020,6 +2031,42 @@ def test_launch_planning_rejects_unresolved_runtime_identity(
 
     assert not results_root.exists()
     assert not state_root.exists()
+
+
+@given(
+    selection_kind=st.text().filter(
+        lambda kind: kind not in {"tasks", "subset", "range", "all"}
+    )
+)
+def test_launch_planning_rejects_unknown_task_selection_kind(
+    selection_kind: str,
+) -> None:
+    """Every noncanonical selector kind is rejected before resolution."""
+    with tempfile.TemporaryDirectory() as directory:
+        tmp_path = Path(directory)
+        repository_root, tasks_root, results_root, state_root = (
+            _write_launch_fixture(tmp_path)
+        )
+        request = replace(
+            _launch_request(),
+            task_selection=LaunchTaskSelection(
+                kind=selection_kind,
+                tasks=("task-a",),
+            ),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"^Launch task selection invalid:",
+        ):
+            compile_launch_request(
+                request,
+                repository_root=repository_root,
+                tasks_root=tasks_root,
+                results_root=results_root,
+                state_root=state_root,
+                runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+            )
 
 
 def test_launch_planning_rejects_invalid_task_selection(tmp_path: Path) -> None:

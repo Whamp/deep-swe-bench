@@ -330,6 +330,27 @@ def needs_openrouter_key(model: str, arm_cfg: dict) -> bool:
     return False
 
 
+def credential_route_env_flags(
+    credential_routes: tuple[str, ...],
+    *,
+    already_passed: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Validate declared credential routes and expose only their env names."""
+    flags: list[str] = []
+    for route in credential_routes:
+        if route == "OPENAI_CODEX_OAUTH":
+            continue
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", route) is None:
+            raise ValueError(
+                f"Declared credential route invalid: {route!r}"
+            )
+        if not os.environ.get(route):
+            sys.exit(f"Declared credential route unavailable: {route}")
+        if route not in already_passed:
+            flags.extend(("-e", route))
+    return flags
+
+
 def _matches_transient_marker(text: str) -> bool:
     low = text.lower()
     return any(s in low for s in TRANSIENT_MODEL_ERROR_PATTERNS) or any(
@@ -440,6 +461,7 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
              agent_timeout: float | None, keep: bool,
              pass_openai_codex_oauth: bool, rpc_quiescence: float,
              capture_initial_context: bool = True,
+             credential_routes: tuple[str, ...] = (),
              output_cell: Path | None = None,
              persist_result_file: bool = True,
              persist_result_index: bool = True,
@@ -490,10 +512,18 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     )
     # Optional advisor/secondary-model providers. Passing these symmetrically is
     # harmless; only arms with matching extensions/models use them.
+    passed_credential_routes: set[str] = set()
+    if api_key:
+        passed_credential_routes.add("OPENROUTER_API_KEY")
     if os.environ.get("ZAI_API_KEY"):
         env_flag += ["-e", f"ZAI_API_KEY={os.environ['ZAI_API_KEY']}"]
+        passed_credential_routes.add("ZAI_API_KEY")
     for k, v in arm_cfg["env"].items():
         env_flag += ["-e", f"{k}={v}"]
+    env_flag += credential_route_env_flags(
+        credential_routes,
+        already_passed=frozenset(passed_credential_routes),
+    )
     env_flag += initial_context_capture_env(capture_initial_context)
 
     print(f"[cell] task={task_id} config={config} lang={task.language} "

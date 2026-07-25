@@ -88,13 +88,22 @@ class RepositoryConfirmedOmpRunner:
                 model=cell.model,
                 thinking=cell.thinking,
                 rep=cell.rep,
-                agent_timeout=None,
+                agent_timeout=cell.agent_timeout_s,
                 keep=False,
-                pass_openai_codex_oauth=True,
-                rpc_quiescence=2.0,
-                capture_initial_context=bool(
-                    cell.subject_behavior.get("captureInitialContext", True)
+                pass_openai_codex_oauth=(
+                    "OPENAI_CODEX_OAUTH" in cell.credential_routes
                 ),
+                rpc_quiescence=cell.rpc_quiescence_s,
+                capture_initial_context=(
+                    cell.capture_initial_context
+                    and bool(
+                        cell.subject_behavior.get(
+                            "captureInitialContext",
+                            True,
+                        )
+                    )
+                ),
+                credential_routes=cell.credential_routes,
                 output_cell=cell.result_path.parent,
                 persist_result_file=False,
                 persist_result_index=False,
@@ -129,11 +138,14 @@ class RepositoryConfirmedPiRunner:
                 model=cell.model,
                 thinking=cell.thinking,
                 rep=cell.rep,
-                agent_timeout=None,
+                agent_timeout=cell.agent_timeout_s,
                 keep=False,
-                pass_openai_codex_oauth=cell.model.startswith("openai-codex/"),
-                rpc_quiescence=2.0,
-                capture_initial_context=True,
+                pass_openai_codex_oauth=(
+                    "OPENAI_CODEX_OAUTH" in cell.credential_routes
+                ),
+                rpc_quiescence=cell.rpc_quiescence_s,
+                capture_initial_context=cell.capture_initial_context,
+                credential_routes=cell.credential_routes,
                 output_cell=cell.result_path.parent,
                 persist_result_file=False,
                 persist_result_index=False,
@@ -811,6 +823,14 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
         default="pause",
     )
     plan_parser.add_argument("--cell-retries", type=int, default=1)
+    plan_parser.add_argument("--agent-timeout", type=float)
+    plan_parser.add_argument("--rpc-quiescence", type=float, default=2.0)
+    plan_parser.add_argument(
+        "--no-initial-context-capture",
+        action="store_false",
+        dest="capture_initial_context",
+        default=True,
+    )
     plan_parser.add_argument("--repository", type=Path, default=REPO)
     plan_parser.add_argument("--tasks-root", type=Path, default=TASKS)
     plan_parser.add_argument("--results-root", type=Path)
@@ -899,6 +919,9 @@ def _plan_confirmed_launch(
             existing_results=args.existing_results,
             transient_errors=args.transient_errors,
             cell_retries=args.cell_retries,
+            agent_timeout_s=args.agent_timeout,
+            rpc_quiescence_s=args.rpc_quiescence,
+            capture_initial_context=args.capture_initial_context,
         ),
     )
     compiled = launch.compile_launch_request(

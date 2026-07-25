@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
+import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -18,6 +21,7 @@ from harness.launch import (
     ConfirmedOmpCell,
     ConfirmedPiCell,
     LaunchExecutionPolicies,
+    LaunchInputDriftError,
     LaunchPreflightError,
     LaunchRequest,
     LaunchRuntimeIdentity,
@@ -252,6 +256,7 @@ def _config_lock_metadata() -> dict[str, object]:
                 "path": "extensions/machine-markers.ts",
             }
         ],
+        "requiredCapabilities": ["pi-rpc"],
         "testedSubjectVersions": ["pi@0.81.1"],
         "usageSources": ["session/*.jsonl"],
     }
@@ -267,6 +272,12 @@ def _compile_existing_fixture(
     existing_results: str = "rerun",
     reuse_decisions: tuple[launch.ExplicitResultReuseDecision, ...] = (),
     state_root: Path | None = None,
+    concurrency: int = 1,
+    cell_retries: int = 0,
+    transient_errors: str = "stop",
+    agent_timeout_s: float | None = None,
+    rpc_quiescence_s: float = 2.0,
+    capture_initial_context: bool = True,
 ) -> CompiledLaunch:
     """Compile an initialized launch fixture without changing its config."""
     repository_root = tmp_path / "repository"
@@ -281,13 +292,16 @@ def _compile_existing_fixture(
         baseline_config="baseline@1.0.0",
         task_selection=LaunchTaskSelection(kind="tasks", tasks=tasks),
         reps=reps,
-        concurrency=1,
+        concurrency=concurrency,
         run_id=run_id,
         policies=LaunchExecutionPolicies(
             preflight=preflight,
             existing_results=existing_results,
-            transient_errors="stop",
-            cell_retries=0,
+            transient_errors=transient_errors,
+            cell_retries=cell_retries,
+            agent_timeout_s=agent_timeout_s,
+            rpc_quiescence_s=rpc_quiescence_s,
+            capture_initial_context=capture_initial_context,
         ),
         reuse_decisions=reuse_decisions,
     )
@@ -343,6 +357,7 @@ def _runtime_resolver_for(
     """Build a mutable fake resolver from approved plan runtime fields."""
     document = compiled.plan.to_document()
     runtime = document["runtime"]
+    configs = document["configs"]
     return StaticLaunchRuntimeResolver(
         LaunchRuntimeIdentity(
             subject_version=document["subject"]["version"],
@@ -350,9 +365,15 @@ def _runtime_resolver_for(
             task_revision=runtime["taskRevision"],
             verifier_identities=runtime["verifierIdentities"],
             immutable_image_identities=runtime["immutableImageIdentities"],
-            subject_capabilities=frozenset({"pi-rpc"}),
+            subject_capabilities=frozenset(
+                capability
+                for config in configs
+                for capability in config["requiredCapabilities"]
+            ),
             available_credential_routes=frozenset(
-                {"FIXTURE_CREDENTIAL", "OPENAI_CODEX_OAUTH"}
+                route
+                for config in configs
+                for route in config["credentialRoutes"]
             ),
             subject_runtime_identity=document["subject"].get(
                 "runtimeIdentity",
@@ -367,6 +388,9 @@ def _compile_single_omp_launch(
     *,
     preflight: str = "required",
     reps: int = 1,
+    agent_timeout_s: float | None = None,
+    rpc_quiescence_s: float = 2.0,
+    capture_initial_context: bool = True,
 ) -> tuple[CompiledLaunch, Path]:
     """Compile one OMP preflight cell against temporary fixture inputs."""
     repository_root = tmp_path / "repository"
@@ -437,6 +461,9 @@ def _compile_single_omp_launch(
             existing_results="rerun",
             transient_errors="stop",
             cell_retries=0,
+            agent_timeout_s=agent_timeout_s,
+            rpc_quiescence_s=rpc_quiescence_s,
+            capture_initial_context=capture_initial_context,
         ),
     )
     runtime = LaunchRuntimeIdentity(
@@ -480,6 +507,12 @@ def _compile_single_cell_launch(
     version_impact: str = "rerun",
     run_id: str = "confirmed-fixture",
     state_root: Path | None = None,
+    concurrency: int = 1,
+    cell_retries: int = 0,
+    transient_errors: str = "stop",
+    agent_timeout_s: float | None = None,
+    rpc_quiescence_s: float = 2.0,
+    capture_initial_context: bool = True,
 ) -> tuple[CompiledLaunch, Path, Path, Path, Path]:
     repository_root = tmp_path / "repository"
     tasks_root = tmp_path / "tasks"
@@ -522,6 +555,12 @@ def _compile_single_cell_launch(
         tasks=tasks,
         run_id=run_id,
         state_root=state_root,
+        concurrency=concurrency,
+        cell_retries=cell_retries,
+        transient_errors=transient_errors,
+        agent_timeout_s=agent_timeout_s,
+        rpc_quiescence_s=rpc_quiescence_s,
+        capture_initial_context=capture_initial_context,
     )
     return compiled, config_leaf, smoke_contract, results_root, state_root
 
@@ -630,8 +669,13 @@ def test_execute_command_consumes_only_reviewed_plan_and_confirmation(
 def test_execute_command_default_pi_runner_uses_plan_resolved_paths(
     tmp_path: Path,
 ) -> None:
-    """The real Pi adapter does not rediscover config or result paths."""
-    compiled, config_leaf, _, _, _ = _compile_single_cell_launch(tmp_path)
+    """The real Pi adapter consumes all plan-resolved execution inputs."""
+    compiled, config_leaf, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        agent_timeout_s=321.0,
+        rpc_quiescence_s=4.5,
+        capture_initial_context=False,
+    )
     reviewed_plan_path = tmp_path / "reviewed-launch-plan.json"
     reviewed_plan_path.write_text(compiled.plan.canonical_json)
     legacy_result = {
@@ -666,6 +710,20 @@ def test_execute_command_default_pi_runner_uses_plan_resolved_paths(
     assert call.kwargs["output_cell"] == Path(result_path).parent
     assert call.kwargs["persist_result_file"] is False
     assert call.kwargs["persist_result_index"] is False
+    assert call.kwargs["agent_timeout"] == 321.0
+    assert call.kwargs["rpc_quiescence"] == 4.5
+    assert call.kwargs["capture_initial_context"] is False
+    assert call.kwargs["credential_routes"] == ("FIXTURE_CREDENTIAL",)
+
+    manifest = json.loads(
+        (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "manifest.json"
+        ).read_text()
+    )
+    assert manifest["agent_timeout_s"] == 321.0
+    assert manifest["rpc_quiescence_s"] == 4.5
+    assert manifest["capture_initial_context"] is False
 
 
 def test_confirmed_launch_resumes_after_transient_without_rerunning_rep(
@@ -676,6 +734,7 @@ def test_confirmed_launch_resumes_after_transient_without_rerunning_rep(
         tmp_path,
         preflight="required",
         reps=2,
+        transient_errors="pause",
     )
 
     class PauseOnSecondRepRunner(FakeConfirmedPiRunner):
@@ -724,11 +783,66 @@ def test_confirmed_launch_resumes_after_transient_without_rerunning_rep(
     assert "run_resumed" in event_names
 
 
+@pytest.mark.parametrize("preflight", ["disabled", "required"])
+def test_confirmed_launch_honors_transient_stop_policy(
+    tmp_path: Path,
+    preflight: str,
+) -> None:
+    """A stop policy converts a provider transient into a hard failure."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        preflight=preflight,
+        transient_errors="stop",
+    )
+
+    class TransientConfirmedPiRunner(FakeConfirmedPiRunner):
+        """Emit one controlled provider transient without a model call."""
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            self.calls.append(cell)
+            raise LaunchTransientModelError("fixture quota window")
+
+    runner = TransientConfirmedPiRunner(_planned_launch_plan_path(compiled))
+
+    with pytest.raises(RuntimeError, match="stopped after transient"):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+
+    status = json.loads(
+        (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "status.json"
+        ).read_text()
+    )
+    assert status["state"] == "failed"
+    events = [
+        json.loads(line)["event"]
+        for line in (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "events.ndjson"
+        )
+        .read_text()
+        .splitlines()
+    ]
+    assert "run_paused" not in events
+    assert runner.calls
+
+
 def test_execute_command_reports_transient_pause_as_exit_75(
     tmp_path: Path,
 ) -> None:
     """The canonical CLI preserves the established transient pause signal."""
-    compiled, _, _, _, state_root = _compile_single_cell_launch(tmp_path)
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        transient_errors="pause",
+    )
     reviewed_plan_path = tmp_path / "reviewed-launch-plan.json"
     reviewed_plan_path.write_text(compiled.plan.canonical_json)
 
@@ -760,6 +874,9 @@ def test_execute_command_default_omp_runner_uses_plan_resolved_behavior(
     compiled, _ = _compile_single_omp_launch(
         tmp_path,
         preflight="disabled",
+        agent_timeout_s=654.0,
+        rpc_quiescence_s=3.5,
+        capture_initial_context=False,
     )
     reviewed_plan_path = tmp_path / "reviewed-omp-launch-plan.json"
     reviewed_plan_path.write_text(compiled.plan.canonical_json)
@@ -795,10 +912,15 @@ def test_execute_command_default_omp_runner_uses_plan_resolved_behavior(
     call = run_cell.call_args
     assert call.kwargs["config_root"] == Path(planned_config["configRoot"])
     assert call.kwargs["config_leaf"] == Path(planned_config["configLeaf"])
-    assert call.kwargs["subject_behavior"] == plan_document["configs"][0][
-        "subjectBehavior"
-    ]
+    assert (
+        call.kwargs["subject_behavior"]
+        == plan_document["configs"][0]["subjectBehavior"]
+    )
     assert call.kwargs["omp_binary_path"] == Path("/fixture/bin/omp")
+    assert call.kwargs["agent_timeout"] == 654.0
+    assert call.kwargs["rpc_quiescence"] == 3.5
+    assert call.kwargs["capture_initial_context"] is False
+    assert call.kwargs["credential_routes"] == ("OPENAI_CODEX_OAUTH",)
     assert call.kwargs["persist_result_file"] is False
     assert call.kwargs["persist_result_index"] is False
 
@@ -842,9 +964,7 @@ def test_confirmed_omp_preflight_executes_plan_resolved_subject_behavior(
     assert result["config_lock_identity"].startswith("sha256:")
     assert result["subject"] == "omp"
     assert result["subject_version"] == "omp@16.3.5"
-    assert result["subject_runtime_identity"] == (
-        cell.subject_runtime_identity
-    )
+    assert result["subject_runtime_identity"] == (cell.subject_runtime_identity)
     assert result["model"] == "openai-codex/gpt-5.5"
     assert result["thinking_level"] == "low"
     assert result["harness_revision"] == "sha256:harness-fixture"
@@ -864,9 +984,10 @@ def test_confirmed_omp_preflight_executes_plan_resolved_subject_behavior(
     )
     status = json.loads(status_path.read_text())
     assert status["state"] == "completed"
-    assert status["preflight"][
-        "task-a/baseline-omp@1.0.0/rep0"
-    ]["state"] == "passed"
+    assert (
+        status["preflight"]["task-a/baseline-omp@1.0.0/rep0"]["state"]
+        == "passed"
+    )
 
 
 def test_confirmed_omp_launch_stops_before_binary_identity_drifted_rep(
@@ -971,9 +1092,7 @@ def test_confirmed_worktree_launches_register_centrally_with_provenance(
     assert len(runs) == 2
     assert {run["run_id"] for run in runs} == {"shared-run"}
     assert len({run["run_key"] for run in runs}) == 2
-    assert {
-        run["workspace"] for run in runs
-    } == {
+    assert {run["workspace"] for run in runs} == {
         str((tmp_path / workspace / "repository").resolve())
         for workspace in ("worktree-a", "worktree-b")
     }
@@ -990,17 +1109,221 @@ def test_confirmed_worktree_launches_register_centrally_with_provenance(
             legacy_root=None,
         )
         assert detail is not None
-        manifest = detail["manifest"] if "manifest" in detail else json.loads(
-            Path(detail["paths"]["manifest"]).read_text()
+        manifest = (
+            detail["manifest"]
+            if "manifest" in detail
+            else json.loads(Path(detail["paths"]["manifest"]).read_text())
         )
         assert manifest["workspace"] == summary["workspace"]
         assert manifest["results_root"]
         assert manifest["state_root"] == str(state_root.resolve())
         assert manifest["config_identities"] == ["baseline@1.0.0"]
-        assert manifest["launch_plan_identity"] == summary[
-            "launch_plan_identity"
-        ]
+        assert (
+            manifest["launch_plan_identity"] == summary["launch_plan_identity"]
+        )
         assert detail["preflight_state"] == "passed"
+
+
+def test_confirmed_batch_honors_approved_worker_concurrency(
+    tmp_path: Path,
+) -> None:
+    """Confirmed fan-out uses the worker count stored in the launch plan."""
+    tasks = ("task-a", "task-b", "task-c", "task-d")
+    compiled, _, _, _, _ = _compile_single_cell_launch(
+        tmp_path,
+        tasks=tasks,
+        concurrency=2,
+    )
+
+    class ConcurrentConfirmedPiRunner(FakeConfirmedPiRunner):
+        """Measure active fake subject calls through the public runner seam."""
+
+        def __init__(self, expected_plan_path: Path) -> None:
+            super().__init__(expected_plan_path)
+            self._active_lock = threading.Lock()
+            self.active_calls = 0
+            self.max_active_calls = 0
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            with self._active_lock:
+                self.active_calls += 1
+                self.max_active_calls = max(
+                    self.max_active_calls,
+                    self.active_calls,
+                )
+            try:
+                time.sleep(0.1)
+                return super().run_confirmed_pi_cell(cell)
+            finally:
+                with self._active_lock:
+                    self.active_calls -= 1
+
+    runner = ConcurrentConfirmedPiRunner(_planned_launch_plan_path(compiled))
+
+    execute_confirmed_launch(
+        compiled.plan,
+        confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
+        pi_runner=runner,
+    )
+
+    assert runner.max_active_calls == 2
+    assert {(cell.task, cell.rep) for cell in runner.calls} == {
+        (task, 0) for task in tasks
+    }
+
+
+def test_concurrent_drift_allows_active_reps_and_blocks_pending_reps(
+    tmp_path: Path,
+) -> None:
+    """One drift verdict gates every worker waiting to start a subject."""
+    tasks = ("task-a", "task-b", "task-c", "task-d")
+    compiled, config_leaf, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        tasks=tasks,
+        concurrency=2,
+    )
+    prompt_path = config_leaf.parent.parent / "orchestration.md"
+
+    class DriftAfterTwoActiveRunner(FakeConfirmedPiRunner):
+        """Ensure two calls are active before mutating a confirmed input."""
+
+        def __init__(self, expected_plan_path: Path) -> None:
+            super().__init__(expected_plan_path)
+            self.both_active = threading.Barrier(2)
+            self.input_changed = threading.Event()
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            assert cell.task in {"task-a", "task-b"}
+            self.both_active.wait(timeout=5)
+            result = super().run_confirmed_pi_cell(cell)
+            if cell.task == "task-a":
+                prompt_path.write_text("Drift after active calls.\n")
+                self.input_changed.set()
+            else:
+                assert self.input_changed.wait(timeout=5)
+            return result
+
+    runner = DriftAfterTwoActiveRunner(_planned_launch_plan_path(compiled))
+
+    with pytest.raises(LaunchInputDriftError):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+
+    assert {cell.task for cell in runner.calls} == {"task-a", "task-b"}
+    state_path = _registered_state_path(state_root, "confirmed-fixture")
+    events = [
+        json.loads(line)
+        for line in (state_path / "events.ndjson").read_text().splitlines()
+    ]
+    assert sum(event["event"] == "launch_input_drift" for event in events) == 1
+
+
+def test_confirmed_launch_heartbeats_while_a_cell_is_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Central status remains live throughout confirmed subject execution."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(tmp_path)
+    monkeypatch.setattr(
+        launch,
+        "_CONFIRMED_HEARTBEAT_INTERVAL_S",
+        0.05,
+        raising=False,
+    )
+
+    class BlockingConfirmedPiRunner(FakeConfirmedPiRunner):
+        """Hold one fake cell active while the test observes state writes."""
+
+        def __init__(self, expected_plan_path: Path) -> None:
+            super().__init__(expected_plan_path)
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            self.started.set()
+            assert self.release.wait(timeout=5)
+            return super().run_confirmed_pi_cell(cell)
+
+    runner = BlockingConfirmedPiRunner(_planned_launch_plan_path(compiled))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        execution_future = executor.submit(
+            execute_confirmed_launch,
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+        try:
+            assert runner.started.wait(timeout=5)
+            status_path = (
+                _registered_state_path(state_root, "confirmed-fixture")
+                / "status.json"
+            )
+            initial_write_time = status_path.stat().st_mtime_ns
+            time.sleep(0.2)
+            assert status_path.stat().st_mtime_ns > initial_write_time
+        finally:
+            runner.release.set()
+        execution = execution_future.result(timeout=5)
+
+    assert execution.state_path == status_path.parent
+
+
+def test_confirmed_batch_honors_approved_missing_result_retries(
+    tmp_path: Path,
+) -> None:
+    """A runner failure without a result retries only as the plan allows."""
+    compiled, _, _, _, _ = _compile_single_cell_launch(
+        tmp_path,
+        cell_retries=1,
+    )
+
+    class RetryOnceConfirmedPiRunner(FakeConfirmedPiRunner):
+        """Fail the first fake attempt before producing durable output."""
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            if not self.calls:
+                self.calls.append(cell)
+                raise RuntimeError("fixture infrastructure failure")
+            return super().run_confirmed_pi_cell(cell)
+
+    runner = RetryOnceConfirmedPiRunner(_planned_launch_plan_path(compiled))
+
+    execution = execute_confirmed_launch(
+        compiled.plan,
+        confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
+        pi_runner=runner,
+    )
+
+    assert len(runner.calls) == 2
+    assert execution.result_path.is_file()
+    status = json.loads((execution.state_path / "status.json").read_text())
+    assert status["state"] == "completed"
+    event_names = [
+        json.loads(line)["event"]
+        for line in (execution.state_path / "events.ndjson")
+        .read_text()
+        .splitlines()
+    ]
+    assert "run_failed" not in event_names
 
 
 def test_passing_preflight_fans_out_exactly_once_without_second_confirmation(
@@ -1096,9 +1419,7 @@ def test_required_preflight_reuses_compatible_result_without_writing(
         first.plan,
         confirmation_identity=first.plan.identity,
         runtime_resolver=_runtime_resolver_for(first),
-        pi_runner=FakeConfirmedPiRunner(
-            _planned_launch_plan_path(first)
-        ),
+        pi_runner=FakeConfirmedPiRunner(_planned_launch_plan_path(first)),
     )
     result_before = first_execution.result_path.read_bytes()
     compiled = _compile_existing_fixture(
@@ -1211,9 +1532,7 @@ def test_preflight_verdict_controls_config_leaf_sealing(
         passed.plan,
         confirmation_identity=passed.plan.identity,
         runtime_resolver=_runtime_resolver_for(passed),
-        pi_runner=FakeConfirmedPiRunner(
-            _planned_launch_plan_path(passed)
-        ),
+        pi_runner=FakeConfirmedPiRunner(_planned_launch_plan_path(passed)),
     )
     sealed_recompile = _compile_existing_fixture(
         tmp_path / "passed",
@@ -1290,9 +1609,7 @@ def test_sealed_release_allows_only_leaves_with_unchanged_shared_behavior(
         compiled.plan,
         confirmation_identity=compiled.plan.identity,
         runtime_resolver=_runtime_resolver_for(compiled),
-        pi_runner=FakeConfirmedPiRunner(
-            _planned_launch_plan_path(compiled)
-        ),
+        pi_runner=FakeConfirmedPiRunner(_planned_launch_plan_path(compiled)),
     )
     repository_root = tmp_path / "repository"
     config_root = repository_root / "configs" / "baseline@1.0.0"
@@ -1338,9 +1655,7 @@ def test_confirmed_launch_reuses_compatible_result_without_writing(
 ) -> None:
     """A compatible cell is reused without runner or artifact writes."""
     first, _, _, _, _ = _compile_single_cell_launch(tmp_path)
-    first_runner = FakeConfirmedPiRunner(
-        _planned_launch_plan_path(first)
-    )
+    first_runner = FakeConfirmedPiRunner(_planned_launch_plan_path(first))
     first_execution = execute_confirmed_launch(
         first.plan,
         confirmation_identity=first.plan.identity,
@@ -1357,9 +1672,7 @@ def test_confirmed_launch_reuses_compatible_result_without_writing(
         run_id="confirmed-reuse",
         existing_results="require-compatible",
     )
-    reuse_runner = FakeConfirmedPiRunner(
-        _planned_launch_plan_path(compiled)
-    )
+    reuse_runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
 
     execution = execute_confirmed_launch(
         compiled.plan,
@@ -1444,9 +1757,7 @@ def test_execute_confirmed_launch_rejects_reuse_changed_after_confirmation(
         first.plan,
         confirmation_identity=first.plan.identity,
         runtime_resolver=_runtime_resolver_for(first),
-        pi_runner=FakeConfirmedPiRunner(
-            _planned_launch_plan_path(first)
-        ),
+        pi_runner=FakeConfirmedPiRunner(_planned_launch_plan_path(first)),
     )
     compiled = _compile_existing_fixture(
         tmp_path,
@@ -1458,9 +1769,7 @@ def test_execute_confirmed_launch_rejects_reuse_changed_after_confirmation(
     changed["harness_revision"] = "sha256:changed-after-confirmation"
     first_execution.result_path.write_text(json.dumps(changed) + "\n")
     state_root = tmp_path / "central-state"
-    runner = FakeConfirmedPiRunner(
-        _planned_launch_plan_path(compiled)
-    )
+    runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
 
     with pytest.raises(
         ValueError,
@@ -1530,9 +1839,7 @@ def test_execute_confirmed_launch_honors_exact_explicit_legacy_reuse(
         existing_results="require-compatible",
         reuse_decisions=(decision,),
     )
-    runner = FakeConfirmedPiRunner(
-        _planned_launch_plan_path(approved)
-    )
+    runner = FakeConfirmedPiRunner(_planned_launch_plan_path(approved))
 
     execution = execute_confirmed_launch(
         approved.plan,
@@ -1641,9 +1948,7 @@ def test_launch_planning_rejects_incompatible_occupied_rerun_path(
         first.plan,
         confirmation_identity=first.plan.identity,
         runtime_resolver=_runtime_resolver_for(first),
-        pi_runner=FakeConfirmedPiRunner(
-            _planned_launch_plan_path(first)
-        ),
+        pi_runner=FakeConfirmedPiRunner(_planned_launch_plan_path(first)),
     )
     result = json.loads(first_execution.result_path.read_text())
     result["subject_version"] = "pi@earlier"
@@ -1745,9 +2050,7 @@ def test_execute_confirmed_launch_rejects_missing_or_stale_confirmation(
     compiled, _, _, results_root, state_root = _compile_single_cell_launch(
         tmp_path
     )
-    fake_runner = FakeConfirmedPiRunner(
-        _planned_launch_plan_path(compiled)
-    )
+    fake_runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
 
     with pytest.raises(ValueError, match="Launch confirmation"):
         execute_confirmed_launch(
@@ -1782,11 +2085,7 @@ def test_execute_confirmed_launch_stops_before_config_input_drifted_rep(
         reps=2,
     )
     behavior_path = (
-        tmp_path
-        / "repository"
-        / "configs"
-        / "baseline@1.0.0"
-        / relative_path
+        tmp_path / "repository" / "configs" / "baseline@1.0.0" / relative_path
     )
 
     def change_behavior_after_first_rep(cell: ConfirmedPiCell) -> None:
@@ -1894,6 +2193,8 @@ def test_execute_confirmed_launch_stops_before_config_lock_drifted_rep(
         "task-revision",
         "verifier-identity",
         "immutable-image-identity",
+        "subject-capability",
+        "credential-route",
     ],
 )
 def test_execute_confirmed_launch_stops_before_runtime_drifted_rep(
@@ -1919,6 +2220,8 @@ def test_execute_confirmed_launch_stops_before_runtime_drifted_rep(
         subject_version = approved.subject_version
         harness_revision = approved.harness_revision
         task_revision = approved.task_revision
+        subject_capabilities = approved.subject_capabilities
+        available_credential_routes = approved.available_credential_routes
         if changed_category == "subject-version":
             subject_version = "pi@drifted-fixture"
         elif changed_category == "harness-revision":
@@ -1927,18 +2230,20 @@ def test_execute_confirmed_launch_stops_before_runtime_drifted_rep(
             task_revision = "sha256:drifted-task"
         elif changed_category == "verifier-identity":
             verifier_identities["task-a"] = "sha256:drifted-verifier"
-        else:
+        elif changed_category == "immutable-image-identity":
             image_identities["task-a"]["agent"] = "sha256:drifted-image"
+        elif changed_category == "subject-capability":
+            subject_capabilities = frozenset()
+        else:
+            available_credential_routes = frozenset({"OPENAI_CODEX_OAUTH"})
         runtime_resolver.identity = LaunchRuntimeIdentity(
             subject_version=subject_version,
             harness_revision=harness_revision,
             task_revision=task_revision,
             verifier_identities=verifier_identities,
             immutable_image_identities=image_identities,
-            subject_capabilities=approved.subject_capabilities,
-            available_credential_routes=(
-                approved.available_credential_routes
-            ),
+            subject_capabilities=subject_capabilities,
+            available_credential_routes=available_credential_routes,
         )
 
     runner = FakeConfirmedPiRunner(
@@ -1976,6 +2281,8 @@ def test_execute_confirmed_launch_stops_before_runtime_drifted_rep(
         "task-revision": "selected-tasks",
         "verifier-identity": "task-a",
         "immutable-image-identity": "task-a:agent",
+        "subject-capability": "pi-rpc",
+        "credential-route": "FIXTURE_CREDENTIAL",
     }
     assert change["input"] == expected_inputs[changed_category]
     assert change["observedIdentity"] != change["approvedIdentity"]
@@ -2039,7 +2346,7 @@ def test_execute_confirmed_launch_records_every_changed_input(
     drift_event = next(
         event for event in events if event["event"] == "launch_input_drift"
     )
-    assert len(drift_event["changes"]) == 9
+    assert len(drift_event["changes"]) == 11
     assert {change["category"] for change in drift_event["changes"]} == {
         "config-input",
         "config-lock",
@@ -2048,6 +2355,8 @@ def test_execute_confirmed_launch_records_every_changed_input(
         "task-revision",
         "verifier-identity",
         "immutable-image-identity",
+        "subject-capability",
+        "credential-route",
     }
     assert all(
         change["approvedIdentity"] != change["observedIdentity"]

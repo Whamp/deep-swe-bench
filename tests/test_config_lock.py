@@ -76,7 +76,11 @@ def test_canonical_config_lock_serialization_round_trips(
     assert config_lock.parse_config_lock_json(serialized) == document
 
 
-@given(st.text(alphabet=st.characters(min_codepoint=97, max_codepoint=122), min_size=1))
+@given(
+    st.text(
+        alphabet=st.characters(min_codepoint=97, max_codepoint=122), min_size=1
+    )
+)
 def test_config_lock_excludes_secret_values_from_identity(
     secret_suffix: str,
 ) -> None:
@@ -84,13 +88,17 @@ def test_config_lock_excludes_secret_values_from_identity(
     with tempfile.TemporaryDirectory() as directory:
         repository_root = Path(directory)
         config_identity = "review-assistant@1.0.0"
-        config_leaf = repository_root / "configs" / config_identity / "model" / "low"
+        config_leaf = (
+            repository_root / "configs" / config_identity / "model" / "low"
+        )
         config_leaf.mkdir(parents=True)
         env_path = config_leaf.parent.parent / "env"
         models_path = config_leaf / "models.json"
         first_secret = f"first-secret-{secret_suffix}"
         second_secret = f"second-secret-{secret_suffix}"
-        env_path.write_text(f"FEATURE_MODE=review\nOPENAI_API_KEY={first_secret}\n")
+        env_path.write_text(
+            f"FEATURE_MODE=review\nOPENAI_API_KEY={first_secret}\n"
+        )
         models_path.write_text(
             json.dumps(
                 {
@@ -120,7 +128,9 @@ def test_config_lock_excludes_secret_values_from_identity(
             metadata,
         )
 
-        env_path.write_text(f"FEATURE_MODE=review\nOPENAI_API_KEY={second_secret}\n")
+        env_path.write_text(
+            f"FEATURE_MODE=review\nOPENAI_API_KEY={second_secret}\n"
+        )
         models_path.write_text(
             json.dumps(
                 {
@@ -133,7 +143,9 @@ def test_config_lock_excludes_secret_values_from_identity(
                 }
             )
         )
-        metadata["declaredRoles"] = [{"name": "executor", "apiKey": second_secret}]
+        metadata["declaredRoles"] = [
+            {"name": "executor", "apiKey": second_secret}
+        ]
         second_lock = config_lock.build_config_lock_document(
             resolved,
             config_identity,
@@ -179,7 +191,9 @@ def test_config_lock_identity_ignores_nonbehavioral_ordering(
     with tempfile.TemporaryDirectory() as directory:
         repository_root = Path(directory)
         config_identity = "review-assistant@1.0.0"
-        config_leaf = repository_root / "configs" / config_identity / "model" / "low"
+        config_leaf = (
+            repository_root / "configs" / config_identity / "model" / "low"
+        )
         config_leaf.mkdir(parents=True)
         settings_path = config_leaf / "settings.json"
         settings_path.write_text(json.dumps(settings))
@@ -235,13 +249,17 @@ def test_config_maintainer_creates_lock_consumed_by_preflight_plan(
     (config_root / "bin").mkdir()
     config_leaf.mkdir(parents=True)
     (config_root / "orchestration.md").write_text("Reviewed prompt.\n")
-    (config_root / "pi-flags").write_text("--extension\n/arm/extensions/index.ts\n")
+    (config_root / "pi-flags").write_text(
+        "--extension\n/arm/extensions/index.ts\n"
+    )
     (config_root / "env").write_text("FEATURE_MODE=review\n")
     (config_root / "skills" / "review" / "SKILL.md").write_text("# Review\n")
     (config_root / "extensions" / "index.ts").write_text("export {};\n")
     (config_root / "extensions" / "package-lock.json").write_text("{}\n")
     (config_root / "bin" / "generated-tool").write_bytes(b"tool-v1")
-    (config_leaf / "settings.json").write_text('{"defaultThinkingLevel":"low"}\n')
+    (config_leaf / "settings.json").write_text(
+        '{"defaultThinkingLevel":"low"}\n'
+    )
     (config_leaf / "smoke.json").write_text('{"requireFiles":[]}\n')
     metadata_path = tmp_path / "release-metadata.json"
     metadata_path.write_text(
@@ -441,7 +459,9 @@ def test_non_secret_token_setting_change_invalidates_config_lock(
     assert completed.returncode == 0, completed.stderr
     settings_path.write_text('{"maxOutputToken":200}\n')
 
-    with pytest.raises(ValueError, match="changed=\\['model/low/settings.json'\\]"):
+    with pytest.raises(
+        ValueError, match="changed=\\['model/low/settings.json'\\]"
+    ):
         run_subject.load_config(
             config_identity,
             "provider/model",

@@ -99,6 +99,9 @@ python3 -m harness.run_batch plan \
   --range 0:10 \
   --reps 1 \
   --workers 2 \
+  --cell-retries 1 \
+  --agent-timeout 150 \
+  --rpc-quiescence 2 \
   --run-id ponytail-review \
   --state-root "$DEEP_SWE_BENCH_STATE_ROOT" \
   --plan-out runs/launch-plans/ponytail-review.json \
@@ -106,9 +109,10 @@ python3 -m harness.run_batch plan \
 ```
 
 Review the receipt, including warnings, model roles, credential and billing
-routes, tested subject versions, preflight cells, conditional batch fan-out,
-behavior differences, and exact paths. After explicitly approving the printed
-plan identity, execute only that stored plan:
+routes, tested subject versions, worker count, retry limit, agent timeout, RPC
+quiescence, initial-context capture, preflight cells, conditional batch fan-out,
+behavior differences, and exact paths. After approving the printed plan
+identity, execute only that stored plan:
 
 ```sh
 python3 -m harness.run_batch execute \
@@ -119,9 +123,11 @@ python3 -m harness.run_batch execute \
 Repeating raw config/model/task arguments is not confirmation and is rejected.
 Resume uses the same plan file and identity; compatible completed reps are read
 without rewriting, while provenance mismatch or launch-input drift stops the
-run. A required or new-config preflight remains atomic until generic health and
-the config-owned `smoke.json` assertions pass, then the approved fan-out starts
-without a second confirmation. See
+run. Execution uses the worker count and retry limit stored in the plan. It
+rechecks config, runtime, capability, and credential-route inputs before every
+new or retried rep. A required or new-config preflight remains atomic until
+generic health and the config-owned `smoke.json` assertions pass, then the
+approved fan-out starts without a second confirmation. See
 [`configs/README.md#smoke-tests-and-contracts`](configs/README.md#smoke-tests-and-contracts).
 
 ### Live dashboard
@@ -182,12 +188,13 @@ reporting.
 
 ### Codex OAuth models
 
-For `openai-codex/*` models, pass only the host Pi `openai-codex` OAuth entry
-into each container (`--pass-openai-codex-oauth` is **required** for these
-models or the cell exits early):
+Direct probes of `openai-codex/*` models require
+`--pass-openai-codex-oauth`. Confirmed launches do not accept that raw execution
+flag. Declare `OPENAI_CODEX_OAUTH` on the executor role in the config lock so the
+plan can verify the route and pass only the host Pi `openai-codex` OAuth entry
+into each container.
 
-Declare `OPENAI_CODEX_OAUTH` on the executor role in the config lock and use
-the confirmed `plan` command above with
+Use the confirmed `plan` command above with
 `--model openai-codex/gpt-5.3-codex-spark`. Planning verifies the named route
 without putting its value in the plan or receipt. Confirmed execution copies
 only the `openai-codex` credential; it does not mount the whole host Pi agent

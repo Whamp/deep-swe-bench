@@ -33,8 +33,12 @@ _SHARED_BEHAVIOR_FILES = frozenset(
         "system_preamble.md",
     }
 )
-_SHARED_BEHAVIOR_DIRECTORIES = frozenset({"bin", "extensions", "skills", "tools"})
-_IGNORED_BEHAVIOR_DIRECTORIES = frozenset({".git", "__pycache__", "node_modules"})
+_SHARED_BEHAVIOR_DIRECTORIES = frozenset(
+    {"bin", "extensions", "skills", "tools"}
+)
+_IGNORED_BEHAVIOR_DIRECTORIES = frozenset(
+    {".git", "__pycache__", "node_modules"}
+)
 _METADATA_FIELDS = frozenset(
     {
         "credentialRoutes",
@@ -125,7 +129,9 @@ def _excluded_secret_value(key: str, value: object) -> dict[str, object]:
     if isinstance(value, str):
         route = _CREDENTIAL_ROUTE.fullmatch(value)
         if route is not None:
-            return {"credentialRoute": route.group("braced") or route.group("plain")}
+            return {
+                "credentialRoute": route.group("braced") or route.group("plain")
+            }
     return {"credentialName": key, "secretExcluded": True}
 
 
@@ -221,7 +227,9 @@ def _iter_behavior_files(resolved: ResolvedConfigLeaf) -> list[Path]:
         if not directory.is_dir():
             continue
         for path in directory.rglob("*"):
-            if any(part in _IGNORED_BEHAVIOR_DIRECTORIES for part in path.parts):
+            if any(
+                part in _IGNORED_BEHAVIOR_DIRECTORIES for part in path.parts
+            ):
                 continue
             if path.is_file() or path.is_symlink():
                 files.add(path)
@@ -233,7 +241,8 @@ def _iter_behavior_files(resolved: ResolvedConfigLeaf) -> list[Path]:
         if path.is_file() or path.is_symlink():
             files.add(path)
     return sorted(
-        files, key=lambda path: path.relative_to(resolved.config_root).as_posix()
+        files,
+        key=lambda path: path.relative_to(resolved.config_root).as_posix(),
     )
 
 
@@ -251,7 +260,9 @@ def collect_config_behavior_inputs(
                 "kind": _behavior_input_kind(relative_path),
                 "path": relative_path.as_posix(),
                 "scope": (
-                    "leaf" if path.is_relative_to(resolved.config_leaf) else "shared"
+                    "leaf"
+                    if path.is_relative_to(resolved.config_leaf)
+                    else "shared"
                 ),
             }
         )
@@ -263,7 +274,9 @@ def _ordered_metadata_value(value: object) -> object:
         normalized = [_ordered_metadata_value(item) for item in value]
         return sorted(
             normalized,
-            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+            key=lambda item: json.dumps(
+                item, sort_keys=True, separators=(",", ":")
+            ),
         )
     if isinstance(value, dict):
         return {
@@ -276,7 +289,9 @@ def _ordered_metadata_value(value: object) -> object:
 def _normalized_metadata(metadata: Mapping[str, object]) -> dict[str, object]:
     unknown = sorted(set(metadata) - _METADATA_FIELDS)
     if unknown:
-        raise ValueError(f"Config lock metadata invalid: unknown fields {unknown!r}")
+        raise ValueError(
+            f"Config lock metadata invalid: unknown fields {unknown!r}"
+        )
     defaults: dict[str, object] = {
         field: [] for field in _METADATA_FIELDS if field != "previousRelease"
     }
@@ -299,13 +314,13 @@ def build_config_lock_document(
     identity = parse_versioned_config_identity(config_identity)
     if identity is None:
         raise ValueError(
-            "Config lock identity required: legacy unversioned configs cannot receive "
-            "fabricated locks"
+            "Config lock identity required: legacy unversioned configs "
+            "cannot receive fabricated locks"
         )
     if version_impact not in _VERSION_IMPACTS:
         raise ValueError(
-            "Config lock version impact invalid: expected reuse, recompute, or rerun; "
-            f"got {version_impact!r}"
+            "Config lock version impact invalid: expected reuse, recompute, "
+            f"or rerun; got {version_impact!r}"
         )
     document: dict[str, object] = {
         "schemaVersion": _CONFIG_LOCK_SCHEMA_VERSION,
@@ -316,7 +331,9 @@ def build_config_lock_document(
         "leaf": {
             "model": resolved.config_leaf.parent.name,
             "thinking": resolved.config_leaf.name,
-            "path": resolved.config_leaf.relative_to(resolved.config_root).as_posix(),
+            "path": resolved.config_leaf.relative_to(
+                resolved.config_root
+            ).as_posix(),
         },
         "behaviorInputs": collect_config_behavior_inputs(resolved),
         **_normalized_metadata(metadata),
@@ -457,7 +474,8 @@ def write_config_lock(
         )
     if lock_path.exists() and not replace:
         raise FileExistsError(
-            f"Config lock already exists: {lock_path}; use the explicit refresh operation"
+            f"Config lock already exists: {lock_path}; "
+            "use the explicit refresh operation"
         )
     document = build_config_lock_document(
         resolved,
@@ -487,7 +505,8 @@ def _load_config_lock(lock_path: Path) -> dict[str, object]:
     if document.get("schemaVersion") != _CONFIG_LOCK_SCHEMA_VERSION:
         raise ValueError(
             "Config lock schema unsupported: "
-            f"expected {_CONFIG_LOCK_SCHEMA_VERSION}, got {document.get('schemaVersion')!r}"
+            f"expected {_CONFIG_LOCK_SCHEMA_VERSION}, "
+            f"got {document.get('schemaVersion')!r}"
         )
     return document
 
@@ -504,14 +523,16 @@ def verify_config_lock(
     if document.get("configIdentity") != config_identity:
         raise ValueError(
             "Config lock identity mismatch: "
-            f"requested {config_identity!r}, lock has {document.get('configIdentity')!r}"
+            f"requested {config_identity!r}, "
+            f"lock has {document.get('configIdentity')!r}"
         )
     stored_identity = document.get("lockIdentity")
-    if not isinstance(stored_identity, str) or stored_identity != _document_identity(
-        document
-    ):
+    if not isinstance(
+        stored_identity, str
+    ) or stored_identity != _document_identity(document):
         raise ValueError(
-            f"Config lock identity mismatch: lock document was modified: {lock_path}"
+            "Config lock identity mismatch: lock document was modified: "
+            f"{lock_path}"
         )
 
     expected_inputs = document.get("behaviorInputs")
@@ -523,16 +544,19 @@ def verify_config_lock(
     for item in expected_inputs:
         if not isinstance(item, dict):
             raise TypeError(
-                f"Config lock invalid: behavior input needs a string path in {lock_path}"
+                "Config lock invalid: behavior input needs a string path in "
+                f"{lock_path}"
             )
         input_path = item.get("path")
         if not isinstance(input_path, str):
             raise TypeError(
-                f"Config lock invalid: behavior input needs a string path in {lock_path}"
+                "Config lock invalid: behavior input needs a string path in "
+                f"{lock_path}"
             )
         expected_by_path[input_path] = item
     actual_by_path = {
-        str(item["path"]): item for item in collect_config_behavior_inputs(resolved)
+        str(item["path"]): item
+        for item in collect_config_behavior_inputs(resolved)
     }
     expected_paths = set(expected_by_path)
     actual_paths = set(actual_by_path)
@@ -578,7 +602,9 @@ def read_matching_config_lock(
         return None
     document = _load_config_lock(resolved.config_leaf / _CONFIG_LOCK_FILENAME)
     if document.get("lockIdentity") != lock_identity:
-        raise ValueError("Config lock identity mismatch: lock changed during planning")
+        raise ValueError(
+            "Config lock identity mismatch: lock changed during planning"
+        )
     return document
 
 
@@ -587,13 +613,17 @@ def _metadata_from_path(path: Path | None) -> Mapping[str, object]:
         return {}
     value = json.loads(path.read_text())
     if not isinstance(value, dict):
-        raise TypeError(f"Config lock metadata invalid: expected object in {path}")
+        raise TypeError(
+            f"Config lock metadata invalid: expected object in {path}"
+        )
     return value
 
 
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Explicitly create, refresh, or verify a versioned config lock."
+        description=(
+            "Explicitly create, refresh, or verify a versioned config lock."
+        )
     )
     subparsers = parser.add_subparsers(dest="operation", required=True)
     for operation in ("create", "refresh"):

@@ -14,8 +14,10 @@ confirmation and must not execute canonical reps.
 1. **Prepare the model-free plan.**
    - Use `python -m harness.run_batch plan`, never raw batch execution arguments.
    - Supply the exact subject, model, thinking, versioned config identities,
-     baseline identity, task selector, reps, workers, stable run id, execution
-     policies, central `--state-root`, `--plan-out`, and `--receipt-out`.
+     baseline identity, task selector, reps, workers, stable run id, preflight
+     and result policies, cell retry limit, agent timeout, RPC quiescence,
+     initial-context capture policy, central `--state-root`, `--plan-out`, and
+     `--receipt-out`.
    - Keep the result root in the originating workspace when intended; point the
      state root at the configured central dashboard location.
    - Planning may inspect committed files, local subject versions, credential
@@ -42,8 +44,9 @@ confirmation and must not execute canonical reps.
    - Read the receipt from the top. Resolve every warning before approval.
    - Verify the config identities and lock identities, tested subject versions,
      required capabilities, exact behavior differences from the baseline, task
-     selection, reps, concurrency, preflight cells, conditional batch cells,
-     result root, central state path, and originating workspace.
+     selection, reps, concurrency, cell retry limit, agent timeout, RPC
+     quiescence, initial-context capture, preflight cells, conditional batch
+     cells, result root, central state path, and originating workspace.
    - Treat legacy config/result warnings as limitations, not modern provenance.
      Legacy evidence is reusable only through an explicit decision naming the
      exact earlier identity, recorded provenance, result identity, and rationale.
@@ -108,7 +111,12 @@ confirmation and must not execute canonical reps.
        --confirm 'sha256:<exact-reviewed-plan-identity>'
      ```
 
-   - Do not repeat subject/model/config/task arguments on execution.
+   - Do not repeat subject/model/config/task arguments or add raw credential and
+     execution flags on execution.
+   - The executor must use the plan's worker count, retry limit, timeout, RPC,
+     capture, and credential-route controls. It rechecks confirmed inputs before
+     every new or retried rep. Already-active reps may finish after drift; no
+     pending rep may start.
    - Resume with the same plan file and confirmation identity. Compatible reps
      remain read-only; result-provenance mismatch or launch-input drift requires
      operator action rather than overwrite.

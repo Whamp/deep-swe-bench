@@ -53,7 +53,8 @@ def parse_versioned_config_identity(
     if match is None:
         raise ValueError(
             "Config identity invalid: expected "
-            f"<name>@<major>.<minor>.<patch> in one path segment; got {config!r}"
+            "<name>@<major>.<minor>.<patch> in one path segment; "
+            f"got {config!r}"
         )
     name = match.group("name")
     if _VAGUE_CONFIG_NAME_SUFFIX.search(name):
@@ -87,7 +88,8 @@ def resolve_config_leaf(
     candidates.sort()
 
     request = (
-        f"config={config!r}, model_leaf={requested_model_leaf!r}, thinking={thinking!r}"
+        f"config={config!r}, model_leaf={requested_model_leaf!r}, "
+        f"thinking={thinking!r}"
     )
     if not candidates:
         raise ValueError(

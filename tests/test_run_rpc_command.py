@@ -8,6 +8,32 @@ import harness.run as run
 import harness.run_omp as run_omp
 
 
+class CredentialRouteTests(unittest.TestCase):
+    def test_declared_route_passes_only_environment_name(self):
+        secret = "credential-value-must-not-enter-docker-arguments"
+        with patch.dict(
+            run.os.environ,
+            {"WORKER_API_KEY": secret},
+            clear=True,
+        ):
+            flags = run.credential_route_env_flags(
+                ("OPENAI_CODEX_OAUTH", "WORKER_API_KEY")
+            )
+
+        self.assertEqual(flags, ["-e", "WORKER_API_KEY"])
+        self.assertNotIn(secret, repr(flags))
+
+    def test_missing_declared_route_fails_by_route_name(self):
+        with (
+            patch.dict(run.os.environ, {}, clear=True),
+            self.assertRaisesRegex(
+                SystemExit,
+                "Declared credential route unavailable: WORKER_API_KEY",
+            ),
+        ):
+            run.credential_route_env_flags(("WORKER_API_KEY",))
+
+
 class ConfigPromptLayerTests(unittest.TestCase):
     def test_clean_config_has_no_append_prompt(self):
         with tempfile.TemporaryDirectory() as td:

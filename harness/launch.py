@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -30,9 +33,11 @@ _LAUNCH_PLAN_SCHEMA_VERSION = 1
 _THINKING_LEVELS = frozenset(
     {"off", "minimal", "low", "medium", "high", "xhigh"}
 )
+_TASK_SELECTION_KINDS = frozenset({"tasks", "subset", "range", "all"})
 _PREFLIGHT_POLICIES = frozenset({"disabled", "new-configs", "required"})
 _EXISTING_RESULT_POLICIES = frozenset({"require-compatible", "rerun"})
 _TRANSIENT_ERROR_POLICIES = frozenset({"pause", "stop"})
+_CONFIRMED_HEARTBEAT_INTERVAL_S = 15.0
 _BILLING_CATEGORIES = frozenset(
     {"local compute", "paid API", "subscription quota"}
 )
@@ -69,7 +74,7 @@ _OMP_KNOWN_TOOLS = frozenset(
 
 
 class LaunchClarificationRequired(ValueError):
-    """Stop planning with structured evidence about unresolved model behavior."""
+    """Stop planning when model behavior remains unresolved."""
 
     def __init__(self, details: Sequence[Mapping[str, object]]) -> None:
         """Record secret-free clarification evidence for the caller."""
@@ -183,12 +188,15 @@ class LaunchTaskSelection:
 
 @dataclass(frozen=True, slots=True)
 class LaunchExecutionPolicies:
-    """Freeze preflight, result reuse, transient, and retry launch policies."""
+    """Freeze every behavior-changing execution policy in the launch plan."""
 
     preflight: str
     existing_results: str
     transient_errors: str
     cell_retries: int
+    agent_timeout_s: float | None = None
+    rpc_quiescence_s: float = 2.0
+    capture_initial_context: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -507,16 +515,20 @@ class CompiledLaunch:
 class ConfirmedSubjectCell:
     """Supply one subject runner with only confirmed, plan-resolved behavior."""
 
+    agent_timeout_s: float | None
+    capture_initial_context: bool
     config_identity: str
     config_lock_identity: str
     config_root: Path
     config_leaf: Path
+    credential_routes: tuple[str, ...]
     smoke_contract: Path | None
     task: str
     rep: int
     model: str
     thinking: str
     result_path: Path
+    rpc_quiescence_s: float
     subject: str
     subject_behavior: Mapping[str, object]
     subject_runner: Path
@@ -683,10 +695,41 @@ def _validate_launch_policies(request: LaunchRequest) -> None:
             "Launch transient-error policy invalid: expected pause or stop; "
             f"got {request.policies.transient_errors!r}"
         )
-    if request.policies.cell_retries < 0:
+    if (
+        isinstance(request.policies.cell_retries, bool)
+        or not isinstance(request.policies.cell_retries, int)
+        or request.policies.cell_retries < 0
+    ):
         raise ValueError(
             "Launch cell-retry policy invalid: expected zero or more; "
             f"got {request.policies.cell_retries}"
+        )
+    agent_timeout_s = request.policies.agent_timeout_s
+    if agent_timeout_s is not None and (
+        isinstance(agent_timeout_s, bool)
+        or not isinstance(agent_timeout_s, int | float)
+        or not math.isfinite(agent_timeout_s)
+        or agent_timeout_s <= 0
+    ):
+        raise ValueError(
+            "Launch agent-timeout policy invalid: expected a finite positive "
+            f"number or null; got {agent_timeout_s!r}"
+        )
+    rpc_quiescence_s = request.policies.rpc_quiescence_s
+    if (
+        isinstance(rpc_quiescence_s, bool)
+        or not isinstance(rpc_quiescence_s, int | float)
+        or not math.isfinite(rpc_quiescence_s)
+        or rpc_quiescence_s < 0
+    ):
+        raise ValueError(
+            "Launch RPC-quiescence policy invalid: expected a finite "
+            f"non-negative number; got {rpc_quiescence_s!r}"
+        )
+    if not isinstance(request.policies.capture_initial_context, bool):
+        raise TypeError(
+            "Launch initial-context policy invalid: expected true or false; "
+            f"got {request.policies.capture_initial_context!r}"
         )
 
 
@@ -707,6 +750,11 @@ def _validate_launch_request(request: LaunchRequest) -> tuple[str, ...]:
             f"got {request.concurrency}"
         )
     _validate_launch_policies(request)
+    if request.task_selection.kind not in _TASK_SELECTION_KINDS:
+        raise ValueError(
+            "Launch task selection invalid: expected tasks, subset, range, "
+            f"or all; got {request.task_selection.kind!r}"
+        )
     tasks = request.task_selection.tasks
     if not tasks:
         raise ValueError(
@@ -897,7 +945,8 @@ def _resolved_role_models(
         choices = selection.get("models")
         if not isinstance(choices, list):
             raise TypeError(
-                "Launch model role invalid: bounded-dynamic models must be a list"
+                "Launch model role invalid: bounded-dynamic models must be "
+                "a list"
             )
         if not choices:
             raise ValueError(
@@ -1937,6 +1986,7 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
     )
     warnings = _receipt_warnings(document)
     subject_behavior_lines = _render_subject_behavior_lines(configs)
+    policies = document["policies"]
     lines = ["LAUNCH RECEIPT", "WARNINGS"]
     lines.extend(f"- {warning}" for warning in warnings)
     if not warnings:
@@ -1956,6 +2006,18 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
             (
                 f"Cells: {counts['preflightCells']} preflight; "
                 f"{counts['batchCells']} batch"
+            ),
+            (
+                "Execution: "
+                f"agent timeout={policies['agent_timeout_s']}; "
+                f"RPC quiescence={policies['rpc_quiescence_s']}s; "
+                "initial context="
+                + (
+                    "captured"
+                    if policies["capture_initial_context"]
+                    else "not captured"
+                )
+                + f"; cell retries={policies['cell_retries']}"
             ),
             "",
             "MODEL ROLES",
@@ -2114,9 +2176,7 @@ def compile_launch_request(
         request.run_id,
         document["planIdentity"],
     )
-    document["paths"]["statePath"] = str(
-        (state_root / run_key).resolve()
-    )
+    document["paths"]["statePath"] = str((state_root / run_key).resolve())
     canonical_json = canonical_launch_plan_json(document)
     plan = LaunchPlan(
         identity=str(document["planIdentity"]),
@@ -2145,9 +2205,7 @@ def _confirmed_plan_document(
         )
     document = parsed_plan.to_document()
     legacy_configs = [
-        config["identity"]
-        for config in document["configs"]
-        if config["legacy"]
+        config["identity"] for config in document["configs"] if config["legacy"]
     ]
     if legacy_configs:
         raise ValueError(
@@ -2225,11 +2283,22 @@ def _confirmed_subject_cell(
             "Confirmed OMP execution behavior missing: plan has no resolved "
             f"behavior for {config_identity!r}"
         )
+    policies = _confirmed_launch_request(document).policies
+    credential_routes = config_document["credentialRoutes"]
+    if not isinstance(credential_routes, list) or not all(
+        isinstance(route, str) for route in credential_routes
+    ):
+        raise TypeError(
+            "Confirmed subject credential routes invalid: expected strings"
+        )
     return ConfirmedSubjectCell(
+        agent_timeout_s=policies.agent_timeout_s,
+        capture_initial_context=policies.capture_initial_context,
         config_identity=config_identity,
         config_lock_identity=lock_identity,
         config_root=Path(config_document["configRoot"]),
         config_leaf=Path(config_document["configLeaf"]),
+        credential_routes=tuple(credential_routes),
         smoke_contract=(
             Path(smoke_contract) if smoke_contract is not None else None
         ),
@@ -2238,6 +2307,7 @@ def _confirmed_subject_cell(
         model=document["model"],
         thinking=document["thinking"],
         result_path=Path(result_path),
+        rpc_quiescence_s=policies.rpc_quiescence_s,
         subject=subject["name"],
         subject_behavior=dict(subject_behavior),
         subject_runner=Path(subject["runner"]),
@@ -2365,6 +2435,7 @@ def _confirmed_run_manifest(
     preflight_cells: Sequence[ConfirmedSubjectCell],
     state_path: Path,
 ) -> dict[str, object]:
+    policies = _confirmed_launch_request(document).policies
     manifest = run_state.base_manifest(
         run_id=document["runId"],
         command=["execute_confirmed_launch", document["planIdentity"]],
@@ -2376,8 +2447,8 @@ def _confirmed_run_manifest(
         runs=int(document["counts"]["reps"]),
         workers=int(document["concurrency"]),
         agent=document["subject"]["name"],
-        agent_timeout_s=None,
-        rpc_quiescence_s=None,
+        agent_timeout_s=policies.agent_timeout_s,
+        rpc_quiescence_s=policies.rpc_quiescence_s,
         progress_interval_s=None,
         batch_cells=[
             _confirmed_state_cell(state_path, cell) for cell in batch_cells
@@ -2388,6 +2459,7 @@ def _confirmed_run_manifest(
     )
     manifest.update(
         {
+            "capture_initial_context": policies.capture_initial_context,
             "config_identities": [
                 config["identity"] for config in document["configs"]
             ],
@@ -2535,14 +2607,31 @@ def _confirmed_launch_request(
     existing_results = policies.get("existing_results")
     transient_errors = policies.get("transient_errors")
     cell_retries = policies.get("cell_retries")
-    if not all(
-        isinstance(policy, str)
-        for policy in (preflight, existing_results, transient_errors)
-    ) or not isinstance(cell_retries, int):
+    agent_timeout_s = policies.get("agent_timeout_s")
+    rpc_quiescence_s = policies.get("rpc_quiescence_s")
+    capture_initial_context = policies.get("capture_initial_context")
+    if (
+        not all(
+            isinstance(policy, str)
+            for policy in (preflight, existing_results, transient_errors)
+        )
+        or isinstance(cell_retries, bool)
+        or not isinstance(cell_retries, int)
+        or (
+            agent_timeout_s is not None
+            and (
+                isinstance(agent_timeout_s, bool)
+                or not isinstance(agent_timeout_s, int | float)
+            )
+        )
+        or isinstance(rpc_quiescence_s, bool)
+        or not isinstance(rpc_quiescence_s, int | float)
+        or not isinstance(capture_initial_context, bool)
+    ):
         raise TypeError(
             "Confirmed launch policies invalid: expected resolved values"
         )
-    return LaunchRequest(
+    request = LaunchRequest(
         subject=document["subject"]["name"],
         model=document["model"],
         thinking=document["thinking"],
@@ -2561,8 +2650,15 @@ def _confirmed_launch_request(
             existing_results=cast(str, existing_results),
             transient_errors=cast(str, transient_errors),
             cell_retries=cell_retries,
+            agent_timeout_s=(
+                float(agent_timeout_s) if agent_timeout_s is not None else None
+            ),
+            rpc_quiescence_s=float(rpc_quiescence_s),
+            capture_initial_context=capture_initial_context,
         ),
     )
+    _validate_launch_policies(request)
+    return request
 
 
 def _runtime_input_drift_changes(
@@ -2618,6 +2714,34 @@ def _runtime_input_drift_changes(
         document["subject"].get("runtimeIdentity", {}),
         dict(observed.subject_runtime_identity),
     )
+    required_capabilities = sorted(
+        {
+            capability
+            for config in document["configs"]
+            for capability in config["requiredCapabilities"]
+        }
+    )
+    for capability in required_capabilities:
+        compare(
+            "subject-capability",
+            capability,
+            True,
+            capability in observed.subject_capabilities,
+        )
+    credential_routes = sorted(
+        {
+            route
+            for config in document["configs"]
+            for route in config["credentialRoutes"]
+        }
+    )
+    for route in credential_routes:
+        compare(
+            "credential-route",
+            route,
+            True,
+            route in observed.available_credential_routes,
+        )
     compare(
         "harness-revision",
         document["paths"]["workspace"],
@@ -2661,28 +2785,46 @@ class _ApprovedLaunchInputVerifier:
         self.document = document
         self.state = state
         self.runtime_resolver = runtime_resolver
+        self._verification_lock = threading.Lock()
+        self._drift_message: str | None = None
 
     def require_unchanged_before_rep(self, cell: ConfirmedSubjectCell) -> None:
-        """Recheck before every submission, including resumed or retried reps."""
-        changes = _config_input_drift_changes(self.document)
-        changes.extend(_config_lock_drift_changes(self.document))
-        changes.extend(
-            _runtime_input_drift_changes(
-                self.document,
-                self.runtime_resolver,
+        """Recheck inputs before each resumed, new, or retried submission."""
+        with self._verification_lock:
+            if self._drift_message is not None:
+                raise LaunchInputDriftError(self._drift_message)
+            changes = _config_input_drift_changes(self.document)
+            changes.extend(_config_lock_drift_changes(self.document))
+            changes.extend(
+                _runtime_input_drift_changes(
+                    self.document,
+                    self.runtime_resolver,
+                )
             )
-        )
-        if not changes:
-            return
-        state_cell = _confirmed_state_cell(self.state.run_dir, cell)
-        self.state.launch_input_drift(
-            pending_cell_id=str(state_cell["cell_id"]),
-            changes=changes,
-        )
-        raise LaunchInputDriftError(
-            "Launch input drift: approved inputs changed before "
-            f"{state_cell['cell_id']}"
-        )
+            if not changes:
+                return
+            state_cell = _confirmed_state_cell(self.state.run_dir, cell)
+            self.state.launch_input_drift(
+                pending_cell_id=str(state_cell["cell_id"]),
+                changes=changes,
+            )
+            self._drift_message = (
+                "Launch input drift: approved inputs changed before "
+                f"{state_cell['cell_id']}"
+            )
+            raise LaunchInputDriftError(self._drift_message)
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfirmedLaunchExecutionContext:
+    """Hold plan-owned dependencies shared by confirmed execution stages."""
+
+    state_path: Path
+    state: run_state.RunStateWriter
+    input_verifier: _ApprovedLaunchInputVerifier
+    subject_runner: _ConfirmedSubjectRunner
+    log_path: Path
+    policies: LaunchExecutionPolicies
 
 
 def _run_confirmed_subject_cell(
@@ -2711,15 +2853,12 @@ def _run_confirmed_subject_cell(
 
 def _execute_confirmed_preflight_cell(
     cell: ConfirmedSubjectCell,
-    state_path: Path,
-    state: run_state.RunStateWriter,
-    input_verifier: _ApprovedLaunchInputVerifier,
-    subject_runner: _ConfirmedSubjectRunner,
-    log_path: Path,
+    context: _ConfirmedLaunchExecutionContext,
 ) -> bool:
     """Run and atomically decide one confirmed preflight cell."""
-    state_cell = _confirmed_state_cell(state_path, cell)
-    input_verifier.require_unchanged_before_rep(cell)
+    state = context.state
+    state_cell = _confirmed_state_cell(context.state_path, cell)
+    context.input_verifier.require_unchanged_before_rep(cell)
     state.preflight_started(state_cell)
     diagnostics: list[confirmed_preflight.PreflightDiagnostic] = []
     result_record: dict[str, object] = {}
@@ -2745,15 +2884,15 @@ def _execute_confirmed_preflight_cell(
         elif not resumed_preflight:
             result_record = _run_confirmed_subject_cell(
                 cell,
-                subject_runner,
-                log_path,
+                context.subject_runner,
+                context.log_path,
             )
         raw_exit = result_record.get("agent_exit")
         exit_code = raw_exit if isinstance(raw_exit, int | str) else None
     except LaunchTransientModelError as error:
         state.preflight_finished(
             state_cell,
-            log_path=log_path,
+            log_path=context.log_path,
             exit_code=75,
             diagnostics=[
                 dict(
@@ -2765,8 +2904,15 @@ def _execute_confirmed_preflight_cell(
                 )
             ],
         )
-        state.run_paused(reason=str(error))
-        raise
+        if context.policies.transient_errors == "pause":
+            state.run_paused(reason=str(error))
+            raise
+        state.run_failed(
+            reason=f"Confirmed preflight stopped after transient: {error}"
+        )
+        raise RuntimeError(
+            "Confirmed launch stopped after transient model error"
+        ) from error
     except Exception as error:  # noqa: BLE001 - runner boundary records failure
         exit_code = "exception"
         diagnostics.append(
@@ -2777,7 +2923,7 @@ def _execute_confirmed_preflight_cell(
             )
         )
         _append_confirmed_cell_log(
-            log_path,
+            context.log_path,
             cell,
             f"failed: {type(error).__name__}: {error}",
         )
@@ -2800,7 +2946,7 @@ def _execute_confirmed_preflight_cell(
     state.preflight_finished(
         state_cell,
         result_path=(cell.result_path if cell.result_path.is_file() else None),
-        log_path=log_path,
+        log_path=context.log_path,
         exit_code=exit_code,
         diagnostics=[dict(diagnostic) for diagnostic in diagnostics],
     )
@@ -2809,29 +2955,18 @@ def _execute_confirmed_preflight_cell(
 
 def _execute_confirmed_preflights(
     cells: Sequence[ConfirmedSubjectCell],
-    state_path: Path,
-    state: run_state.RunStateWriter,
-    input_verifier: _ApprovedLaunchInputVerifier,
-    subject_runner: _ConfirmedSubjectRunner,
-    log_path: Path,
+    context: _ConfirmedLaunchExecutionContext,
 ) -> set[Path]:
     """Run every planned preflight and stop before batch on any failure."""
     passed_paths: set[Path] = set()
     failed_count = 0
     for cell in cells:
-        if _execute_confirmed_preflight_cell(
-            cell,
-            state_path,
-            state,
-            input_verifier,
-            subject_runner,
-            log_path,
-        ):
+        if _execute_confirmed_preflight_cell(cell, context):
             passed_paths.add(cell.result_path.resolve())
         else:
             failed_count += 1
     if failed_count:
-        state.run_failed(
+        context.state.run_failed(
             reason=(
                 "Preflight assertion failure: "
                 f"{failed_count} cell(s) did not satisfy requirements"
@@ -2845,59 +2980,75 @@ def _execute_confirmed_preflights(
 
 def _execute_confirmed_batch_cell(
     cell: ConfirmedSubjectCell,
-    state_path: Path,
-    state: run_state.RunStateWriter,
-    input_verifier: _ApprovedLaunchInputVerifier,
-    subject_runner: _ConfirmedSubjectRunner,
-    log_path: Path,
+    context: _ConfirmedLaunchExecutionContext,
 ) -> None:
     """Run one planned batch cell and record its durable outcome."""
-    state_cell = _confirmed_state_cell(state_path, cell)
-    input_verifier.require_unchanged_before_rep(cell)
-    state.cell_started(state_cell)
-    try:
-        result_record = _run_confirmed_subject_cell(
-            cell,
-            subject_runner,
-            log_path,
-        )
-    except LaunchTransientModelError as error:
-        _append_confirmed_cell_log(
-            log_path,
-            cell,
-            f"paused: {error}",
-        )
+    state = context.state
+    state_cell = _confirmed_state_cell(context.state_path, cell)
+    for attempt in range(context.policies.cell_retries + 1):
+        context.input_verifier.require_unchanged_before_rep(cell)
+        state.cell_started(state_cell)
+        try:
+            result_record = _run_confirmed_subject_cell(
+                cell,
+                context.subject_runner,
+                context.log_path,
+            )
+        except LaunchTransientModelError as error:
+            _append_confirmed_cell_log(
+                context.log_path,
+                cell,
+                f"paused: {error}",
+            )
+            state.cell_finished(
+                state_cell,
+                log_path=context.log_path,
+                exit_code=75,
+                transient_exit=75,
+            )
+            if context.policies.transient_errors == "pause":
+                state.run_paused(reason=str(error))
+                raise
+            state.run_failed(
+                reason=f"Confirmed batch stopped after transient: {error}"
+            )
+            raise RuntimeError(
+                "Confirmed launch stopped after transient model error"
+            ) from error
+        except Exception as error:
+            _append_confirmed_cell_log(
+                context.log_path,
+                cell,
+                f"failed: {type(error).__name__}: {error}",
+            )
+            state.cell_finished(
+                state_cell,
+                log_path=context.log_path,
+                exit_code="exception",
+            )
+            if (
+                attempt < context.policies.cell_retries
+                and not cell.result_path.exists()
+            ):
+                _append_confirmed_cell_log(
+                    context.log_path,
+                    cell,
+                    f"retrying after attempt {attempt + 1}",
+                )
+                continue
+            state.run_failed(
+                reason=f"Confirmed {cell.subject} cell execution failed"
+            )
+            raise
+        raw_exit = result_record.get("agent_exit")
+        exit_code = raw_exit if isinstance(raw_exit, int | str) else None
         state.cell_finished(
             state_cell,
-            log_path=log_path,
-            exit_code=75,
-            transient_exit=75,
+            result_path=cell.result_path,
+            log_path=context.log_path,
+            exit_code=exit_code,
         )
-        state.run_paused(reason=str(error))
-        raise
-    except Exception as error:
-        _append_confirmed_cell_log(
-            log_path,
-            cell,
-            f"failed: {type(error).__name__}: {error}",
-        )
-        state.cell_finished(
-            state_cell,
-            log_path=log_path,
-            exit_code="exception",
-        )
-        state.run_failed(
-            reason=f"Confirmed {cell.subject} cell execution failed"
-        )
-        raise
-    raw_exit = result_record.get("agent_exit")
-    exit_code = raw_exit if isinstance(raw_exit, int | str) else None
-    state.cell_finished(
-        state_cell,
-        result_path=cell.result_path,
-        log_path=log_path,
-        exit_code=exit_code,
-    )
+        return
 
 
 def _require_confirmed_resume_result(
@@ -2963,55 +3114,96 @@ def _require_planned_result_reuse(cell: ConfirmedSubjectCell) -> None:
         )
 
 
+def _execute_confirmed_batch_entry(
+    cell: ConfirmedSubjectCell,
+    passed_preflight_paths: set[Path],
+    context: _ConfirmedLaunchExecutionContext,
+) -> None:
+    """Execute or provenance-check one approved batch cell."""
+    state = context.state
+    state_cell = _confirmed_state_cell(context.state_path, cell)
+    if cell.result_path.resolve() in passed_preflight_paths:
+        state.cell_skipped(state_cell, reason="successful_preflight")
+        return
+    if cell.result_path.is_file() and cell.reuse_reason is None:
+        try:
+            _require_confirmed_resume_result(cell)
+        except (OSError, TypeError, ValueError) as error:
+            _append_confirmed_cell_log(
+                context.log_path,
+                cell,
+                f"failed: {type(error).__name__}: {error}",
+            )
+            state.run_failed(reason=str(error))
+            raise
+        state.cell_skipped(state_cell, reason="confirmed_plan_resume")
+        return
+    if cell.reuse_reason is not None:
+        try:
+            _require_planned_result_reuse(cell)
+        except (OSError, TypeError, ValueError) as error:
+            _append_confirmed_cell_log(
+                context.log_path,
+                cell,
+                f"failed: {type(error).__name__}: {error}",
+            )
+            state.run_failed(reason=str(error))
+            raise
+        state.cell_skipped(state_cell, reason=cell.reuse_reason)
+        return
+    _execute_confirmed_batch_cell(cell, context)
+
+
 def _execute_confirmed_batch(
     cells: Sequence[ConfirmedSubjectCell],
     passed_preflight_paths: set[Path],
-    state_path: Path,
-    state: run_state.RunStateWriter,
-    input_verifier: _ApprovedLaunchInputVerifier,
-    subject_runner: _ConfirmedSubjectRunner,
-    log_path: Path,
+    context: _ConfirmedLaunchExecutionContext,
+    concurrency: int,
 ) -> None:
-    """Fan out every planned batch cell once after atomic preflight."""
-    for cell in cells:
-        state_cell = _confirmed_state_cell(state_path, cell)
-        if cell.result_path.resolve() in passed_preflight_paths:
-            state.cell_skipped(state_cell, reason="successful_preflight")
-            continue
-        if cell.result_path.is_file() and cell.reuse_reason is None:
+    """Fan out approved batch cells with bounded plan-owned concurrency."""
+    pending_cells = iter(cells)
+    futures: dict[concurrent.futures.Future[None], ConfirmedSubjectCell] = {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=concurrency,
+    ) as executor:
+
+        def submit_next_cell() -> bool:
             try:
-                _require_confirmed_resume_result(cell)
-            except (OSError, TypeError, ValueError) as error:
-                _append_confirmed_cell_log(
-                    log_path,
-                    cell,
-                    f"failed: {type(error).__name__}: {error}",
-                )
-                state.run_failed(reason=str(error))
-                raise
-            state.cell_skipped(state_cell, reason="confirmed_plan_resume")
-            continue
-        if cell.reuse_reason is not None:
-            try:
-                _require_planned_result_reuse(cell)
-            except (OSError, TypeError, ValueError) as error:
-                _append_confirmed_cell_log(
-                    log_path,
-                    cell,
-                    f"failed: {type(error).__name__}: {error}",
-                )
-                state.run_failed(reason=str(error))
-                raise
-            state.cell_skipped(state_cell, reason=cell.reuse_reason)
-            continue
-        _execute_confirmed_batch_cell(
-            cell,
-            state_path,
-            state,
-            input_verifier,
-            subject_runner,
-            log_path,
-        )
+                cell = next(pending_cells)
+            except StopIteration:
+                return False
+            future = executor.submit(
+                _execute_confirmed_batch_entry,
+                cell,
+                passed_preflight_paths,
+                context,
+            )
+            futures[future] = cell
+            return True
+
+        for _ in range(concurrency):
+            if not submit_next_cell():
+                break
+        while futures:
+            completed, _ = concurrent.futures.wait(
+                tuple(futures),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            first_failure: Exception | None = None
+            for future in completed:
+                futures.pop(future)
+                try:
+                    future.result()
+                except Exception as error:  # noqa: BLE001 - worker boundary
+                    if first_failure is None:
+                        first_failure = error
+            if first_failure is not None:
+                for future in futures:
+                    future.cancel()
+                raise first_failure
+            for _ in completed:
+                if not submit_next_cell():
+                    break
 
 
 def execute_confirmed_launch(
@@ -3024,6 +3216,7 @@ def execute_confirmed_launch(
 ) -> ConfirmedLaunchExecution:
     """Execute atomic preflight and conditional fan-out for one exact plan."""
     document = _confirmed_plan_document(plan, confirmation_identity)
+    launch_request = _confirmed_launch_request(document)
     subject = document["subject"]["name"]
     if subject == "pi":
         if pi_runner is None:
@@ -3092,27 +3285,32 @@ def execute_confirmed_launch(
         state,
         runtime_resolver,
     )
-
-    passed_preflight_paths = _execute_confirmed_preflights(
-        preflight_cells,
-        state_path,
-        state,
-        input_verifier,
-        subject_runner,
-        log_path,
-    )
-    _execute_confirmed_batch(
-        batch_cells,
-        passed_preflight_paths,
-        state_path,
-        state,
-        input_verifier,
-        subject_runner,
-        log_path,
-    )
-    state.run_completed()
-    return ConfirmedLaunchExecution(
-        result_path=batch_cells[0].result_path,
+    execution_context = _ConfirmedLaunchExecutionContext(
         state_path=state_path,
+        state=state,
+        input_verifier=input_verifier,
+        subject_runner=subject_runner,
         log_path=log_path,
+        policies=launch_request.policies,
     )
+
+    state.start_heartbeat(_CONFIRMED_HEARTBEAT_INTERVAL_S)
+    try:
+        passed_preflight_paths = _execute_confirmed_preflights(
+            preflight_cells,
+            execution_context,
+        )
+        _execute_confirmed_batch(
+            batch_cells,
+            passed_preflight_paths,
+            execution_context,
+            launch_request.concurrency,
+        )
+        state.run_completed()
+        return ConfirmedLaunchExecution(
+            result_path=batch_cells[0].result_path,
+            state_path=state_path,
+            log_path=log_path,
+        )
+    finally:
+        state.stop_heartbeat()

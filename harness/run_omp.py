@@ -32,6 +32,7 @@ from run import (  # noqa: E402
     TRANSIENT_EXIT,
     compact_verifier_stdout,
     config_append_text,
+    credential_route_env_flags,
     ensure_env_image,
     ensure_pi_image,
     ensure_verifier_image,
@@ -233,6 +234,7 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
              agent_timeout: float | None, keep: bool,
              pass_openai_codex_oauth: bool, rpc_quiescence: float,
              capture_initial_context: bool = True,
+             credential_routes: tuple[str, ...] = (),
              output_cell: Path | None = None,
              persist_result_file: bool = True,
              persist_result_index: bool = True,
@@ -323,6 +325,7 @@ def run_cell(config: str, task_id: str, *, model: str, thinking: str, rep: int,
     env_flag = ["-e", "PI_CODING_AGENT_DIR=/root/.omp/agent"]
     for k, v in cfg["env"].items():
         env_flag += ["-e", f"{k}={v}"]
+    env_flag += credential_route_env_flags(credential_routes)
     env_flag += initial_context_capture_env(capture_initial_context)
     if omp_extensions:
         env_flag += [
