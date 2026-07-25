@@ -8,28 +8,67 @@ partial-progress regimes.
 from __future__ import annotations
 
 import argparse
-import json
-import math
 import statistics as st
 from collections import defaultdict
 
-from harness import results_tree
+from harness import result_provenance, results_tree
 
 try:
     from scipy.stats import wilcoxon
-except Exception:  # analysis still prints summaries without scipy
+except ImportError:  # analysis still prints summaries without scipy
     wilcoxon = None
 
 
-def load_results(model: str, thinking: str, configs: list[str]) -> list[dict]:
+def load_results(
+    model: str,
+    thinking: str,
+    configs: list[str],
+) -> list[dict[str, object]]:
+    """Load only provenance-compatible results for one comparison."""
     tree = results_tree.Tree.of(model, thinking)
-    rows = []
+    loaded: list[result_provenance.ComparisonResult] = []
     for cell in tree.cells(configs=configs):
-        try:
-            rows.append(json.loads(cell.result.read_text()))
-        except Exception:
-            pass
-    return rows
+        record = dict(
+            result_provenance.read_result_record(
+                cell.result,
+                error_prefix="Comparison result provenance mismatch",
+            )
+        )
+        loaded.append(
+            result_provenance.ComparisonResult(
+                result_path=cell.result,
+                config=cell.config,
+                task=cell.task,
+                rep=cell.rep,
+                record=record,
+            )
+        )
+    result_provenance.require_compatible_comparison_results(
+        model,
+        thinking,
+        configs,
+        loaded,
+    )
+    return [selected.record for selected in loaded]
+
+
+def _numeric_result_value(
+    record: dict[str, object],
+    field: str,
+    fallback_field: str | None = None,
+) -> int | float:
+    """Read a numeric result field, treating a missing or null value as zero."""
+    value = record.get(field)
+    if value is None and fallback_field is not None:
+        value = record.get(fallback_field)
+    if value is None:
+        return 0
+    if not isinstance(value, int | float):
+        raise TypeError(
+            f"Comparison numeric result invalid: field={field!r}; "
+            f"recorded={value!r}"
+        )
+    return value
 
 
 def median(xs):
@@ -115,21 +154,65 @@ def main():
             o = keyed.get((task, rep, config))
             if o:
                 pairs.append((b, o))
-        dp = [(o.get("reward_partial", 0.0) or 0.0) - (b.get("reward_partial", 0.0) or 0.0) for b, o in pairs]
-        dt = [(o.get("total_tokens", 0) or 0) - (b.get("total_tokens", 0) or 0) for b, o in pairs]
-        dowt = [(o.get("om_worker_total_tokens", 0) or 0) - (b.get("om_worker_total_tokens", 0) or 0) for b, o in pairs]
-        dct = [(o.get("combined_total_tokens", o.get("total_tokens", 0)) or 0) - (b.get("combined_total_tokens", b.get("total_tokens", 0)) or 0) for b, o in pairs]
-        dc = [(o.get("cost_usd", 0.0) or 0.0) - (b.get("cost_usd", 0.0) or 0.0) for b, o in pairs]
-        dac = [(o.get("advisor_cost_usd", 0.0) or 0.0) - (b.get("advisor_cost_usd", 0.0) or 0.0) for b, o in pairs]
-        dowc = [(o.get("om_worker_cost_usd", 0.0) or 0.0) - (b.get("om_worker_cost_usd", 0.0) or 0.0) for b, o in pairs]
-        dcc = [(o.get("combined_cost_usd", o.get("cost_usd", 0.0)) or 0.0) - (b.get("combined_cost_usd", b.get("cost_usd", 0.0)) or 0.0) for b, o in pairs]
-        db = [(o.get("patch_bytes", 0) or 0) - (b.get("patch_bytes", 0) or 0) for b, o in pairs]
+        dp = [
+            _numeric_result_value(o, "reward_partial")
+            - _numeric_result_value(b, "reward_partial")
+            for b, o in pairs
+        ]
+        dt = [
+            _numeric_result_value(o, "total_tokens")
+            - _numeric_result_value(b, "total_tokens")
+            for b, o in pairs
+        ]
+        dowt = [
+            _numeric_result_value(o, "om_worker_total_tokens")
+            - _numeric_result_value(b, "om_worker_total_tokens")
+            for b, o in pairs
+        ]
+        dct = [
+            _numeric_result_value(
+                o,
+                "combined_total_tokens",
+                "total_tokens",
+            )
+            - _numeric_result_value(
+                b,
+                "combined_total_tokens",
+                "total_tokens",
+            )
+            for b, o in pairs
+        ]
+        dc = [
+            _numeric_result_value(o, "cost_usd")
+            - _numeric_result_value(b, "cost_usd")
+            for b, o in pairs
+        ]
+        dac = [
+            _numeric_result_value(o, "advisor_cost_usd")
+            - _numeric_result_value(b, "advisor_cost_usd")
+            for b, o in pairs
+        ]
+        dowc = [
+            _numeric_result_value(o, "om_worker_cost_usd")
+            - _numeric_result_value(b, "om_worker_cost_usd")
+            for b, o in pairs
+        ]
+        dcc = [
+            _numeric_result_value(o, "combined_cost_usd", "cost_usd")
+            - _numeric_result_value(b, "combined_cost_usd", "cost_usd")
+            for b, o in pairs
+        ]
+        db = [
+            _numeric_result_value(o, "patch_bytes")
+            - _numeric_result_value(b, "patch_bytes")
+            for b, o in pairs
+        ]
         p = None
         if wilcoxon and len(dp) >= 2 and any(x != 0 for x in dp):
             try:
                 p = float(wilcoxon(dp, zero_method="wilcox").pvalue)
                 pvals.append((config, p))
-            except Exception:
+            except ValueError:
                 p = None
         deltas_by_config[config] = (len(pairs), dp, dt, dowt, dct, dc, dac, dowc, dcc, db, p)
     adj = holm(pvals)
@@ -140,7 +223,7 @@ def main():
     print("task,rep," + ",".join(f"{a}_partial,{a}_tokens,{a}_advisor_tokens,{a}_om_worker_tokens,{a}_combined_tokens,{a}_cost,{a}_advisor_cost,{a}_om_worker_cost,{a}_combined_cost,{a}_patch" for a in configs))
     keys = sorted({(r["task"], r.get("rep", 0)) for r in rows})
     for task, rep in keys:
-        vals = [task, str(rep)]
+        vals = [str(task), str(rep)]
         for config in configs:
             r = keyed.get((task, rep, config), {})
             vals += [fmt(r.get("reward_partial")), str(r.get("total_tokens", "")), str(r.get("advisor_total_tokens", "")), str(r.get("om_worker_total_tokens", "")), str(r.get("combined_total_tokens", r.get("total_tokens", ""))), fmt(r.get("cost_usd"), 4), fmt(r.get("advisor_cost_usd"), 4), fmt(r.get("om_worker_cost_usd"), 4), fmt(r.get("combined_cost_usd", r.get("cost_usd")), 4), str(r.get("patch_bytes", ""))]

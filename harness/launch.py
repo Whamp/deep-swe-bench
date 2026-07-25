@@ -17,6 +17,7 @@ from harness import (
     config_resolution,
     confirmed_preflight,
     lib,
+    result_provenance,
     run_state,
     versioned_smoke_contract,
 )
@@ -159,6 +160,17 @@ class LaunchExecutionPolicies:
 
 
 @dataclass(frozen=True, slots=True)
+class ExplicitResultReuseDecision:
+    """Authorize reuse of one exact earlier result and recorded provenance."""
+
+    result_path: Path
+    prior_config_identity: str
+    result_identity: str
+    recorded_provenance: Mapping[str, object]
+    rationale: str
+
+
+@dataclass(frozen=True, slots=True)
 class LaunchRequest:
     """Capture unresolved operator intent before model-free launch planning."""
 
@@ -172,6 +184,7 @@ class LaunchRequest:
     concurrency: int
     run_id: str
     policies: LaunchExecutionPolicies
+    reuse_decisions: tuple[ExplicitResultReuseDecision, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +402,9 @@ class ConfirmedPiCell:
     verifier_identity: str
     immutable_image_identities: Mapping[str, str]
     launch_plan_identity: str
+    reuse_provenance: Mapping[str, object] | None
+    reuse_reason: str | None
+    reuse_result_identity: str | None
 
 
 class ConfirmedPiRunner(Protocol):
@@ -1199,34 +1215,176 @@ def _cell_result_path(
     )
 
 
+def _matching_explicit_reuse_decision(
+    result_path: Path,
+    record: Mapping[str, object],
+    decisions: Sequence[ExplicitResultReuseDecision],
+) -> tuple[ExplicitResultReuseDecision | None, dict[str, object] | None]:
+    """Validate explicit reuse against exact bytes and earlier provenance."""
+    matching = [
+        decision
+        for decision in decisions
+        if decision.result_path.resolve() == result_path.resolve()
+    ]
+    if not matching:
+        return None, None
+    if len(matching) != 1:
+        raise ValueError(
+            f"Result reuse decision mismatch: path={result_path}; "
+            "multiple decisions target the same result"
+        )
+    decision = matching[0]
+    recorded_provenance = result_provenance.recorded_result_provenance(record)
+    decision_mismatches: dict[str, object] = {}
+    if not decision.rationale.strip():
+        decision_mismatches["rationale"] = "must be non-empty"
+    if record.get("config") != decision.prior_config_identity:
+        decision_mismatches["prior_config_identity"] = {
+            "accepted": decision.prior_config_identity,
+            "recorded": record.get("config"),
+        }
+    if dict(decision.recorded_provenance) != recorded_provenance:
+        decision_mismatches["recorded_provenance"] = {
+            "accepted": dict(decision.recorded_provenance),
+            "recorded": recorded_provenance,
+        }
+    observed_identity = result_provenance.result_file_identity(result_path)
+    if decision.result_identity != observed_identity:
+        decision_mismatches["result_identity"] = {
+            "accepted": decision.result_identity,
+            "recorded": observed_identity,
+        }
+    if decision_mismatches:
+        raise ValueError(
+            f"Result reuse decision mismatch: path={result_path}; "
+            f"incompatible fields={decision_mismatches!r}"
+        )
+    return decision, {
+        "priorConfigIdentity": decision.prior_config_identity,
+        "rationale": decision.rationale,
+        "recordedProvenance": recorded_provenance,
+        "resultIdentity": decision.result_identity,
+        "resultPath": str(result_path.resolve()),
+    }
+
+
+def _planned_result_provenance(
+    request: LaunchRequest,
+    runtime: LaunchRuntimeIdentity,
+    config: LaunchConfigDocument,
+    task: str,
+    rep: int,
+) -> dict[str, object]:
+    """Build the exact modern provenance required for automatic reuse."""
+    return {
+        "config": config["identity"],
+        "config_lock_identity": config["lockIdentity"],
+        "harness_revision": runtime.harness_revision,
+        "immutable_image_identities": dict(
+            runtime.immutable_image_identities[task]
+        ),
+        "model": request.model,
+        "rep": rep,
+        "subject": request.subject,
+        "subject_version": runtime.subject_version,
+        "task": task,
+        "task_revision": runtime.task_revision,
+        "thinking_level": request.thinking,
+        "verifier_identity": runtime.verifier_identities[task],
+    }
+
+
 def _batch_cells(
     results_root: Path,
     request: LaunchRequest,
     tasks: tuple[str, ...],
+    configs: Sequence[LaunchConfigDocument],
+    runtime: LaunchRuntimeIdentity,
 ) -> list[dict[str, object]]:
+    configs_by_identity = {config["identity"]: config for config in configs}
+    matched_decisions: set[Path] = set()
     cells: list[dict[str, object]] = []
     for task in tasks:
         for rep in range(request.reps):
-            for config in request.configs:
+            for config_identity in request.configs:
                 result_path = _cell_result_path(
                     results_root,
                     request,
-                    config,
+                    config_identity,
                     task,
                     rep,
                 )
+                reuse_provenance: dict[str, object] | None = None
+                reuse_reason: str | None = None
+                reuse_result_identity: str | None = None
+                reuse_decision: dict[str, object] | None = None
+                if result_path.is_file():
+                    record = result_provenance.read_result_record(result_path)
+                    planned_provenance = _planned_result_provenance(
+                        request,
+                        runtime,
+                        configs_by_identity[config_identity],
+                        task,
+                        rep,
+                    )
+                    mismatches = result_provenance.result_provenance_mismatches(
+                        record,
+                        planned_provenance,
+                    )
+                    decision, reuse_decision = (
+                        _matching_explicit_reuse_decision(
+                            result_path,
+                            record,
+                            request.reuse_decisions,
+                        )
+                    )
+                    if decision is not None:
+                        matched_decisions.add(result_path.resolve())
+                        reuse_provenance = (
+                            result_provenance.recorded_result_provenance(record)
+                        )
+                        reuse_reason = "explicit_result_reuse"
+                        reuse_result_identity = decision.result_identity
+                    elif mismatches:
+                        raise ValueError(
+                            f"Result provenance mismatch: path={result_path}; "
+                            f"incompatible fields={mismatches!r}"
+                        )
+                    elif (
+                        request.policies.existing_results
+                        == "require-compatible"
+                    ):
+                        reuse_provenance = planned_provenance
+                        reuse_reason = "compatible_existing_result"
+                        reuse_result_identity = (
+                            result_provenance.result_file_identity(result_path)
+                        )
                 cells.append(
                     {
-                        "config": config,
+                        "config": config_identity,
                         "existingResult": result_path.is_file(),
                         "existingResultPolicy": (
                             request.policies.existing_results
                         ),
                         "rep": rep,
                         "resultPath": str(result_path.resolve()),
+                        "reuseDecision": reuse_decision,
+                        "reuseProvenance": reuse_provenance,
+                        "reuseReason": reuse_reason,
+                        "reuseResultIdentity": reuse_result_identity,
                         "task": task,
                     }
                 )
+    unmatched_decisions = sorted(
+        str(decision.result_path.resolve())
+        for decision in request.reuse_decisions
+        if decision.result_path.resolve() not in matched_decisions
+    )
+    if unmatched_decisions:
+        raise ValueError(
+            "Result reuse decision mismatch: no occupied planned result at "
+            f"paths={unmatched_decisions!r}"
+        )
     return cells
 
 
@@ -1247,6 +1405,7 @@ def _preflight_cells(
     request: LaunchRequest,
     tasks: tuple[str, ...],
     config_plans: Sequence[Mapping[str, object]],
+    batch_cells: Sequence[Mapping[str, object]],
 ) -> list[dict[str, object]]:
     if request.policies.preflight == "disabled":
         return []
@@ -1273,20 +1432,28 @@ def _preflight_cells(
             )
         if request.policies.preflight == "new-configs" and has_release_evidence:
             continue
+        result_path = _cell_result_path(
+            results_root,
+            request,
+            config_identity,
+            task,
+            0,
+        ).resolve()
+        batch_cell = next(
+            cell
+            for cell in batch_cells
+            if cell.get("resultPath") == str(result_path)
+        )
         cells.append(
             {
                 "config": config_identity,
                 "contractPath": config["smokeContract"],
                 "rep": 0,
-                "resultPath": str(
-                    _cell_result_path(
-                        results_root,
-                        request,
-                        config_identity,
-                        task,
-                        0,
-                    ).resolve()
-                ),
+                "resultPath": str(result_path),
+                "reuseDecision": batch_cell.get("reuseDecision"),
+                "reuseProvenance": batch_cell.get("reuseProvenance"),
+                "reuseReason": batch_cell.get("reuseReason"),
+                "reuseResultIdentity": batch_cell.get("reuseResultIdentity"),
                 "task": task,
             }
         )
@@ -1543,13 +1710,20 @@ def compile_launch_request(
     runtime = runtime_resolver.resolve_launch_runtime(request, tasks)
     _require_runtime_identity(runtime, tasks)
     _validate_config_runtime_compatibility(config_plans, runtime)
-    batch_cells = _batch_cells(results_root, request, tasks)
+    batch_cells = _batch_cells(
+        results_root,
+        request,
+        tasks,
+        config_plans,
+        runtime,
+    )
     preflight_cells = _preflight_cells(
         repository_root,
         results_root,
         request,
         tasks,
         config_plans,
+        batch_cells,
     )
     selection: dict[str, object] = {
         "kind": request.task_selection.kind,
@@ -1709,6 +1883,21 @@ def _confirmed_pi_cell(
             for name, identity in image_identities.items()
         },
         launch_plan_identity=document["planIdentity"],
+        reuse_provenance=(
+            cast(Mapping[str, object], cell_document["reuseProvenance"])
+            if isinstance(cell_document.get("reuseProvenance"), Mapping)
+            else None
+        ),
+        reuse_reason=(
+            str(cell_document["reuseReason"])
+            if cell_document.get("reuseReason") is not None
+            else None
+        ),
+        reuse_result_identity=(
+            str(cell_document["reuseResultIdentity"])
+            if cell_document.get("reuseResultIdentity") is not None
+            else None
+        ),
     )
 
 
@@ -2140,11 +2329,18 @@ def _execute_confirmed_preflight_cell(
     diagnostics: list[confirmed_preflight.PreflightDiagnostic] = []
     result_record: dict[str, object] = {}
     exit_code: int | str | None = None
+    reused_result = cell.reuse_reason is not None
     try:
-        result_record = _run_confirmed_pi_cell(cell, pi_runner, log_path)
+        if reused_result:
+            _require_planned_result_reuse(cell)
+            result_record = dict(
+                result_provenance.read_result_record(cell.result_path)
+            )
+        else:
+            result_record = _run_confirmed_pi_cell(cell, pi_runner, log_path)
         raw_exit = result_record.get("agent_exit")
         exit_code = raw_exit if isinstance(raw_exit, int | str) else None
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - runner boundary records failure
         exit_code = "exception"
         diagnostics.append(
             confirmed_preflight.preflight_diagnostic(
@@ -2171,7 +2367,7 @@ def _execute_confirmed_preflight_cell(
         )
     )
     passed = not diagnostics
-    if passed:
+    if passed and not reused_result:
         result_record["preflight_passed"] = True
         run_state.atomic_write_json(cell.result_path, result_record)
     state.preflight_finished(
@@ -2257,6 +2453,37 @@ def _execute_confirmed_batch_cell(
     )
 
 
+def _require_planned_result_reuse(cell: ConfirmedPiCell) -> None:
+    """Require the exact result bytes and provenance approved by the plan."""
+    if (
+        cell.reuse_provenance is None
+        or cell.reuse_result_identity is None
+        or not cell.result_path.is_file()
+    ):
+        raise ValueError(
+            f"Result provenance mismatch: path={cell.result_path}; "
+            "planned reusable result is missing"
+        )
+    record = result_provenance.read_result_record(cell.result_path)
+    mismatches: dict[str, object] = dict(
+        result_provenance.result_provenance_mismatches(
+            record,
+            cell.reuse_provenance,
+        )
+    )
+    recorded_identity = result_provenance.result_file_identity(cell.result_path)
+    if recorded_identity != cell.reuse_result_identity:
+        mismatches["result_identity"] = {
+            "expected": cell.reuse_result_identity,
+            "recorded": recorded_identity,
+        }
+    if mismatches:
+        raise ValueError(
+            f"Result provenance mismatch: path={cell.result_path}; "
+            f"incompatible fields={mismatches!r}"
+        )
+
+
 def _execute_confirmed_batch(
     cells: Sequence[ConfirmedPiCell],
     passed_preflight_paths: set[Path],
@@ -2271,6 +2498,19 @@ def _execute_confirmed_batch(
         state_cell = _confirmed_state_cell(state_path, cell)
         if cell.result_path.resolve() in passed_preflight_paths:
             state.cell_skipped(state_cell, reason="successful_preflight")
+            continue
+        if cell.reuse_reason is not None:
+            try:
+                _require_planned_result_reuse(cell)
+            except (OSError, TypeError, ValueError) as error:
+                _append_confirmed_cell_log(
+                    log_path,
+                    cell,
+                    f"failed: {type(error).__name__}: {error}",
+                )
+                state.run_failed(reason=str(error))
+                raise
+            state.cell_skipped(state_cell, reason=cell.reuse_reason)
             continue
         _execute_confirmed_batch_cell(
             cell,

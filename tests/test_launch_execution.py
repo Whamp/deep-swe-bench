@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
 
-from harness import config_lock
+from harness import config_lock, launch
 from harness.launch import (
     CompiledLaunch,
     ConfirmedPiCell,
@@ -181,6 +182,8 @@ def _compile_existing_fixture(
     reps: int = 1,
     tasks: tuple[str, ...] = ("task-a",),
     run_id: str = "confirmed-fixture",
+    existing_results: str = "rerun",
+    reuse_decisions: tuple[launch.ExplicitResultReuseDecision, ...] = (),
 ) -> CompiledLaunch:
     """Compile an initialized launch fixture without changing its config."""
     repository_root = tmp_path / "repository"
@@ -199,10 +202,11 @@ def _compile_existing_fixture(
         run_id=run_id,
         policies=LaunchExecutionPolicies(
             preflight=preflight,
-            existing_results="rerun",
+            existing_results=existing_results,
             transient_errors="stop",
             cell_retries=0,
         ),
+        reuse_decisions=reuse_decisions,
     )
     runtime = LaunchRuntimeIdentity(
         subject_version="pi@0.81.1",
@@ -276,6 +280,7 @@ def _compile_single_cell_launch(
     reps: int = 1,
     tasks: tuple[str, ...] = ("task-a",),
     smoke_contract_document: dict[str, object] | None = None,
+    version_impact: str = "rerun",
 ) -> tuple[CompiledLaunch, Path, Path, Path, Path]:
     repository_root = tmp_path / "repository"
     tasks_root = tmp_path / "tasks"
@@ -301,7 +306,7 @@ def _compile_single_cell_launch(
         config_identity,
         "provider/model",
         "low",
-        "rerun",
+        version_impact,
         _config_lock_metadata(),
     )
     subject_runner = repository_root / "harness" / "run.py"
@@ -399,6 +404,49 @@ def test_passing_preflight_fans_out_exactly_once_without_second_confirmation(
         json.loads(execution.result_path.read_text())["preflight_passed"]
         is True
     )
+
+
+def test_required_preflight_reuses_compatible_result_without_writing(
+    tmp_path: Path,
+) -> None:
+    """Required preflight checks existing evidence without a subject call."""
+    first, _, _, _, first_state_root = _compile_single_cell_launch(
+        tmp_path,
+        preflight="required",
+    )
+    first_execution = execute_confirmed_launch(
+        first.plan,
+        confirmation_identity=first.plan.identity,
+        runtime_resolver=_runtime_resolver_for(first),
+        pi_runner=FakeConfirmedPiRunner(
+            first_state_root / "confirmed-fixture" / "launch-plan.json"
+        ),
+    )
+    result_before = first_execution.result_path.read_bytes()
+    compiled = _compile_existing_fixture(
+        tmp_path,
+        preflight="required",
+        run_id="confirmed-preflight-reuse",
+        existing_results="require-compatible",
+    )
+    state_root = tmp_path / "central-state"
+    runner = FakeConfirmedPiRunner(
+        state_root / "confirmed-preflight-reuse" / "launch-plan.json"
+    )
+
+    execution = execute_confirmed_launch(
+        compiled.plan,
+        confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
+        pi_runner=runner,
+    )
+
+    assert runner.calls == []
+    assert execution.result_path.read_bytes() == result_before
+    status = json.loads((execution.state_path / "status.json").read_text())
+    preflight = status["preflight"]["task-a/baseline@1.0.0/rep0"]
+    assert preflight["state"] == "passed"
+    assert status["cells"]["task-a/baseline@1.0.0/rep0"]["state"] == ("skipped")
 
 
 def test_failed_preflight_records_all_diagnostics_without_batch_fan_out(
@@ -539,6 +587,8 @@ def test_preflight_verdict_controls_config_leaf_sealing(
     )
 
     assert refreshed_path.is_file()
+    failed_result = next(failed_results.glob("*/*/*/*/rep*/result.json"))
+    failed_result.unlink()
     recompiled = _compile_existing_fixture(
         tmp_path / "failed",
         preflight="new-configs",
@@ -600,6 +650,337 @@ def test_sealed_release_allows_only_leaves_with_unchanged_shared_behavior(
         )
 
     assert not (third_leaf / "config-lock.json").exists()
+
+
+def test_confirmed_launch_reuses_compatible_result_without_writing(
+    tmp_path: Path,
+) -> None:
+    """A compatible cell is reused without runner or artifact writes."""
+    first, _, _, _, first_state_root = _compile_single_cell_launch(tmp_path)
+    first_runner = FakeConfirmedPiRunner(
+        first_state_root / "confirmed-fixture" / "launch-plan.json"
+    )
+    first_execution = execute_confirmed_launch(
+        first.plan,
+        confirmation_identity=first.plan.identity,
+        runtime_resolver=_runtime_resolver_for(first),
+        pi_runner=first_runner,
+    )
+    result_before = first_execution.result_path.read_bytes()
+    artifact_before = (
+        first_execution.result_path.parent / "artifacts" / "model.patch"
+    ).read_bytes()
+    compiled = _compile_existing_fixture(
+        tmp_path,
+        preflight="disabled",
+        run_id="confirmed-reuse",
+        existing_results="require-compatible",
+    )
+    reuse_state_root = tmp_path / "central-state"
+    reuse_runner = FakeConfirmedPiRunner(
+        reuse_state_root / "confirmed-reuse" / "launch-plan.json"
+    )
+
+    execution = execute_confirmed_launch(
+        compiled.plan,
+        confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
+        pi_runner=reuse_runner,
+    )
+
+    assert reuse_runner.calls == []
+    assert execution.result_path.read_bytes() == result_before
+    assert (
+        execution.result_path.parent / "artifacts" / "model.patch"
+    ).read_bytes() == artifact_before
+    status = json.loads((execution.state_path / "status.json").read_text())
+    cell = status["cells"]["task-a/baseline@1.0.0/rep0"]
+    assert cell["state"] == "skipped"
+    assert cell["reason"] == "compatible_existing_result"
+
+
+@pytest.mark.parametrize(
+    ("field", "incompatible_value"),
+    [
+        ("config", "baseline@0.9.0"),
+        ("config_lock_identity", "sha256:other-lock"),
+        ("subject", "omp"),
+        ("subject_version", "pi@earlier"),
+        ("model", "provider/other-model"),
+        ("thinking_level", "high"),
+        ("task", "task-other"),
+        ("rep", 7),
+        ("harness_revision", "sha256:other-harness"),
+        ("task_revision", "sha256:other-task"),
+        ("verifier_identity", "sha256:other-verifier"),
+        (
+            "immutable_image_identities",
+            {
+                "agent": "sha256:other-agent",
+                "environment": "sha256:environment-image",
+                "verifier": "sha256:verifier-image",
+            },
+        ),
+    ],
+)
+def test_launch_planning_rejects_each_incompatible_result_provenance_field(
+    tmp_path: Path,
+    field: str,
+    incompatible_value: object,
+) -> None:
+    """Automatic reuse requires every behavior-defining identity to match."""
+    first, _, _, _, state_root = _compile_single_cell_launch(tmp_path)
+    execution = execute_confirmed_launch(
+        first.plan,
+        confirmation_identity=first.plan.identity,
+        runtime_resolver=_runtime_resolver_for(first),
+        pi_runner=FakeConfirmedPiRunner(
+            state_root / "confirmed-fixture" / "launch-plan.json"
+        ),
+    )
+    result = json.loads(execution.result_path.read_text())
+    result[field] = incompatible_value
+    execution.result_path.write_text(json.dumps(result) + "\n")
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Result provenance mismatch:",
+    ) as raised:
+        _compile_existing_fixture(
+            tmp_path,
+            preflight="disabled",
+            run_id=f"incompatible-{field.replace('_', '-')}",
+            existing_results="require-compatible",
+        )
+
+    assert field in str(raised.value)
+    assert str(execution.result_path) in str(raised.value)
+
+
+def test_execute_confirmed_launch_rejects_reuse_changed_after_confirmation(
+    tmp_path: Path,
+) -> None:
+    """Confirmed reuse stops if the reviewed result changes before execution."""
+    first, _, _, _, first_state_root = _compile_single_cell_launch(tmp_path)
+    first_execution = execute_confirmed_launch(
+        first.plan,
+        confirmation_identity=first.plan.identity,
+        runtime_resolver=_runtime_resolver_for(first),
+        pi_runner=FakeConfirmedPiRunner(
+            first_state_root / "confirmed-fixture" / "launch-plan.json"
+        ),
+    )
+    compiled = _compile_existing_fixture(
+        tmp_path,
+        preflight="disabled",
+        run_id="confirmed-reuse-drift",
+        existing_results="require-compatible",
+    )
+    changed = json.loads(first_execution.result_path.read_text())
+    changed["harness_revision"] = "sha256:changed-after-confirmation"
+    first_execution.result_path.write_text(json.dumps(changed) + "\n")
+    state_root = tmp_path / "central-state"
+    runner = FakeConfirmedPiRunner(
+        state_root / "confirmed-reuse-drift" / "launch-plan.json"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Result provenance mismatch:",
+    ) as raised:
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+
+    assert "harness_revision" in str(raised.value)
+    assert str(first_execution.result_path) in str(raised.value)
+    assert runner.calls == []
+    status = json.loads(
+        (state_root / "confirmed-reuse-drift" / "status.json").read_text()
+    )
+    assert status["state"] == "failed"
+    events = [
+        json.loads(line)
+        for line in (state_root / "confirmed-reuse-drift" / "events.ndjson")
+        .read_text()
+        .splitlines()
+    ]
+    failure = next(event for event in events if event["event"] == "run_failed")
+    assert "Result provenance mismatch" in failure["reason"]
+
+
+def test_execute_confirmed_launch_honors_exact_explicit_legacy_reuse(
+    tmp_path: Path,
+) -> None:
+    """An exact legacy decision reuses bytes without fabricating provenance."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(tmp_path)
+    result_path_value = compiled.plan.to_document()["batchCells"][0][
+        "resultPath"
+    ]
+    assert isinstance(result_path_value, str)
+    result_path = Path(result_path_value)
+    result_path.parent.mkdir(parents=True)
+    legacy_result = {
+        "config": "baseline",
+        "model": "provider/model",
+        "rep": 0,
+        "task": "task-a",
+        "thinking_level": "low",
+    }
+    legacy_bytes = (json.dumps(legacy_result, sort_keys=True) + "\n").encode()
+    result_path.write_bytes(legacy_bytes)
+    decision = launch.ExplicitResultReuseDecision(
+        result_path=result_path,
+        prior_config_identity="baseline",
+        result_identity=f"sha256:{hashlib.sha256(legacy_bytes).hexdigest()}",
+        recorded_provenance=legacy_result,
+        rationale="Reviewed legacy baseline remains valid for this rep.",
+    )
+    approved = _compile_existing_fixture(
+        tmp_path,
+        preflight="disabled",
+        run_id="confirmed-legacy-reuse",
+        existing_results="require-compatible",
+        reuse_decisions=(decision,),
+    )
+    runner = FakeConfirmedPiRunner(
+        state_root / "confirmed-legacy-reuse" / "launch-plan.json"
+    )
+
+    execution = execute_confirmed_launch(
+        approved.plan,
+        confirmation_identity=approved.plan.identity,
+        runtime_resolver=_runtime_resolver_for(approved),
+        pi_runner=runner,
+    )
+
+    assert runner.calls == []
+    assert result_path.read_bytes() == legacy_bytes
+    assert "config_lock_identity" not in json.loads(result_path.read_text())
+    planned_cell = approved.plan.to_document()["batchCells"][0]
+    reuse_decision = planned_cell["reuseDecision"]
+    assert isinstance(reuse_decision, Mapping)
+    assert reuse_decision.get("rationale") == decision.rationale
+    status = json.loads((execution.state_path / "status.json").read_text())
+    cell = status["cells"]["task-a/baseline@1.0.0/rep0"]
+    assert cell["reason"] == "explicit_result_reuse"
+
+
+def test_launch_planning_rejects_wrong_explicit_reuse_provenance(
+    tmp_path: Path,
+) -> None:
+    """An explicit decision accepts only its named earlier provenance."""
+    compiled, _, _, _, _ = _compile_single_cell_launch(tmp_path)
+    result_path_value = compiled.plan.to_document()["batchCells"][0][
+        "resultPath"
+    ]
+    assert isinstance(result_path_value, str)
+    result_path = Path(result_path_value)
+    result_path.parent.mkdir(parents=True)
+    legacy_result = {
+        "config": "baseline",
+        "model": "provider/model",
+        "rep": 0,
+        "task": "task-a",
+        "thinking_level": "low",
+    }
+    legacy_bytes = (json.dumps(legacy_result, sort_keys=True) + "\n").encode()
+    result_path.write_bytes(legacy_bytes)
+    decision = launch.ExplicitResultReuseDecision(
+        result_path=result_path,
+        prior_config_identity="different-baseline",
+        result_identity=f"sha256:{hashlib.sha256(legacy_bytes).hexdigest()}",
+        recorded_provenance=legacy_result,
+        rationale="Fixture intentionally names the wrong earlier config.",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Result reuse decision mismatch:",
+    ) as raised:
+        _compile_existing_fixture(
+            tmp_path,
+            preflight="disabled",
+            run_id="wrong-explicit-reuse",
+            existing_results="require-compatible",
+            reuse_decisions=(decision,),
+        )
+
+    assert "prior_config_identity" in str(raised.value)
+    assert str(result_path) in str(raised.value)
+    assert result_path.read_bytes() == legacy_bytes
+
+
+def test_version_impact_reuse_does_not_authorize_legacy_result(
+    tmp_path: Path,
+) -> None:
+    """Version impact records intent but cannot authorize reuse itself."""
+    compiled, config_leaf, _, _, _ = _compile_single_cell_launch(
+        tmp_path,
+        version_impact="reuse",
+    )
+    result_path_value = compiled.plan.to_document()["batchCells"][0][
+        "resultPath"
+    ]
+    assert isinstance(result_path_value, str)
+    result_path = Path(result_path_value)
+    result_path.parent.mkdir(parents=True)
+    legacy_bytes = b'{"config":"baseline","task":"task-a","rep":0}\n'
+    result_path.write_bytes(legacy_bytes)
+    lock_before = (config_leaf / "config-lock.json").read_bytes()
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Result provenance mismatch:",
+    ):
+        _compile_existing_fixture(
+            tmp_path,
+            preflight="disabled",
+            run_id="version-impact-is-not-a-decision",
+            existing_results="require-compatible",
+        )
+
+    assert result_path.read_bytes() == legacy_bytes
+    assert (config_leaf / "config-lock.json").read_bytes() == lock_before
+    assert json.loads(lock_before)["versionImpact"] == "reuse"
+
+
+def test_launch_planning_rejects_incompatible_occupied_rerun_path(
+    tmp_path: Path,
+) -> None:
+    """Rerun policy cannot overwrite an incompatible canonical occupant."""
+    first, _, _, _, first_state_root = _compile_single_cell_launch(tmp_path)
+    first_execution = execute_confirmed_launch(
+        first.plan,
+        confirmation_identity=first.plan.identity,
+        runtime_resolver=_runtime_resolver_for(first),
+        pi_runner=FakeConfirmedPiRunner(
+            first_state_root / "confirmed-fixture" / "launch-plan.json"
+        ),
+    )
+    result = json.loads(first_execution.result_path.read_text())
+    result["subject_version"] = "pi@earlier"
+    first_execution.result_path.write_text(json.dumps(result) + "\n")
+    occupied_result = first_execution.result_path.read_bytes()
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Result provenance mismatch:",
+    ) as raised:
+        _compile_existing_fixture(
+            tmp_path,
+            preflight="disabled",
+            run_id="confirmed-rerun",
+            existing_results="rerun",
+        )
+
+    message = str(raised.value)
+    assert str(first_execution.result_path) in message
+    assert "subject_version" in message
+    assert first_execution.result_path.read_bytes() == occupied_result
 
 
 def test_execute_confirmed_launch_runs_exact_planned_pi_cell(
