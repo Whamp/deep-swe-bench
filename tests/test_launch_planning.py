@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -47,14 +48,20 @@ def _create_locked_config(
     *,
     prompt: str,
     secret: str | None = None,
+    smoke_contract: Mapping[str, object] | None = None,
 ) -> None:
     config_root = repository_root / "configs" / config_identity
     config_leaf = config_root / "model" / "low"
     config_leaf.mkdir(parents=True)
+    (config_root / "README.md").write_text("Fixture documentation.\n")
     (config_root / "orchestration.md").write_text(prompt)
     if secret is not None:
         (config_root / "env").write_text(f"OPENAI_API_KEY={secret}\n")
-    (config_leaf / "smoke.json").write_text('{"requireFiles":[]}\n')
+    if smoke_contract is None:
+        smoke_contract = {"requireFiles": []}
+    (config_leaf / "smoke.json").write_text(
+        json.dumps(smoke_contract, sort_keys=True) + "\n"
+    )
     config_lock.write_config_lock(
         repository_root,
         config_identity,
@@ -143,7 +150,11 @@ def _launch_request(*, run_id: str = "fixture-run") -> LaunchRequest:
     )
 
 
-def _write_launch_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+def _write_launch_fixture(
+    tmp_path: Path,
+    *,
+    review_smoke_contract: Mapping[str, object] | None = None,
+) -> tuple[Path, Path, Path, Path]:
     repository_root = tmp_path / "repository"
     tasks_root = tmp_path / "tasks"
     results_root = tmp_path / "canonical-results"
@@ -163,8 +174,410 @@ def _write_launch_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         repository_root,
         "review-assistant@1.0.0",
         prompt="Review behavior.\n",
+        smoke_contract=review_smoke_contract,
     )
     return repository_root, tasks_root, results_root, state_root
+
+
+def _reject_versioned_smoke_contract(
+    tmp_path: Path,
+    contract: Mapping[str, object],
+) -> str:
+    """Compile through the public seam and return its smoke rejection."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(
+            tmp_path,
+            review_smoke_contract=contract,
+        )
+    )
+    runtime_resolver = FakeLaunchRuntimeResolver(_runtime_identity())
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Smoke contract rejected:",
+    ) as raised:
+        compile_launch_request(
+            _launch_request(),
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=runtime_resolver,
+        )
+
+    assert runtime_resolver.requests == []
+    assert not results_root.exists()
+    assert not state_root.exists()
+    return str(raised.value)
+
+
+def test_launch_planning_rejects_readme_prose_smoke_gate(
+    tmp_path: Path,
+) -> None:
+    """README wording cannot authorize a versioned launch."""
+    target = "configs/review-assistant@1.0.0/README.md"
+    message = _reject_versioned_smoke_contract(
+        tmp_path,
+        {
+            "requireRepoText": [
+                {"globs": [target], "text": "Fixture documentation."}
+            ]
+        },
+    )
+
+    assert "model/low/smoke.json#/requireRepoText/0" in message
+    assert "assertion_kind='requireRepoText'" in message
+    assert f"target={target!r}" in message
+    assert "README prose" in message
+
+
+def test_launch_planning_rejects_documentation_wording_smoke_gate(
+    tmp_path: Path,
+) -> None:
+    """Documentation wording cannot authorize a versioned launch."""
+    target = "docs/subject-compatibility.md"
+    message = _reject_versioned_smoke_contract(
+        tmp_path,
+        {
+            "requireRepoText": [
+                {"globs": [target], "text": "Compatible with the subject."}
+            ]
+        },
+    )
+
+    assert "assertion_kind='requireRepoText'" in message
+    assert f"target={target!r}" in message
+    assert "documentation wording" in message
+
+
+def test_launch_planning_rejects_source_prose_smoke_gate(
+    tmp_path: Path,
+) -> None:
+    """Source prose and formatting cannot authorize a versioned launch."""
+    target = "harness/run.py"
+    message = _reject_versioned_smoke_contract(
+        tmp_path,
+        {
+            "requireRepoText": [
+                {"globs": [target], "text": "# fixture subject runner"}
+            ]
+        },
+    )
+
+    assert "assertion_kind='requireRepoText'" in message
+    assert f"target={target!r}" in message
+    assert "source prose or formatting" in message
+
+
+def test_launch_planning_rejects_newline_sensitive_smoke_gate(
+    tmp_path: Path,
+) -> None:
+    """Newline placement cannot authorize a versioned launch."""
+    target = "logs/extension.jsonl"
+    message = _reject_versioned_smoke_contract(
+        tmp_path,
+        {
+            "requireText": [
+                {
+                    "globs": [target],
+                    "text": "first machine line\nsecond line",
+                }
+            ]
+        },
+    )
+
+    assert "assertion_kind='requireText'" in message
+    assert f"target={target!r}" in message
+    assert "newline placement" in message
+
+
+def test_launch_planning_rejects_character_count_smoke_gate(
+    tmp_path: Path,
+) -> None:
+    """Character counts cannot authorize a versioned launch."""
+    message = _reject_versioned_smoke_contract(
+        tmp_path,
+        {"equalsResultValues": {"orchestration_chars": 973}},
+    )
+
+    assert "assertion_kind='equalsResultValues'" in message
+    assert "target='orchestration_chars'" in message
+    assert "character counts" in message
+
+
+def test_launch_planning_rejects_unknown_smoke_assertion_kind(
+    tmp_path: Path,
+) -> None:
+    """Unknown versioned assertion kinds cannot be silently ignored."""
+    message = _reject_versioned_smoke_contract(
+        tmp_path,
+        {"requireExactTextLength": {"README.md": 42}},
+    )
+
+    assert "location=" in message
+    assert "assertion_kind='requireExactTextLength'" in message
+    assert "target='<contract>'" in message
+    assert "unsupported assertion kind" in message
+
+
+def test_launch_planning_rejects_malformed_smoke_assertion(
+    tmp_path: Path,
+) -> None:
+    """Supported assertion kinds still require their documented JSON shape."""
+    message = _reject_versioned_smoke_contract(
+        tmp_path,
+        {"requireFiles": {"session/*.jsonl": True}},
+    )
+
+    assert "model/low/smoke.json#/requireFiles" in message
+    assert "assertion_kind='requireFiles'" in message
+    assert "target='<contract>'" in message
+    assert "expected a list of relative file globs" in message
+
+
+def test_launch_planning_rejects_missing_smoke_repository_artifact(
+    tmp_path: Path,
+) -> None:
+    """Required repository artifacts must exist before launch approval."""
+    target = "analysis/missing-provider-probe.jsonl"
+    message = _reject_versioned_smoke_contract(
+        tmp_path,
+        {"requireRepoFiles": [target]},
+    )
+
+    assert "assertion_kind='requireRepoFiles'" in message
+    assert f"target={target!r}" in message
+    assert "referenced repository artifact does not exist" in message
+
+
+def test_launch_planning_rejects_marker_without_extension_owner(
+    tmp_path: Path,
+) -> None:
+    """A stable marker must identify an existing owning extension artifact."""
+    owner = "configs/review-assistant@1.0.0/extensions/machine-markers.ts"
+    message = _reject_versioned_smoke_contract(
+        tmp_path,
+        {
+            "requireExtensionMarkers": [
+                {
+                    "extension": owner,
+                    "globs": ["logs/pi.stderr.txt"],
+                    "marker": "__REVIEW_ASSISTANT_READY__",
+                }
+            ]
+        },
+    )
+
+    assert "assertion_kind='requireExtensionMarkers'" in message
+    assert f"target={owner!r}" in message
+    assert "owning extension artifact does not exist" in message
+
+
+def test_launch_planning_rejects_unstructured_usage_record_gate(
+    tmp_path: Path,
+) -> None:
+    """Usage gates must identify structured record fields and a count."""
+    target = "usage/worker-usage.ndjson"
+    message = _reject_versioned_smoke_contract(
+        tmp_path,
+        {
+            "requireUsageRecords": [
+                {
+                    "globs": [target],
+                    "minimum": 1,
+                    "text": "assistant_usage",
+                }
+            ]
+        },
+    )
+
+    assert "assertion_kind='requireUsageRecords'" in message
+    assert f"target={target!r}" in message
+    assert "structured equals fields" in message
+
+
+def test_launch_planning_accepts_durable_versioned_smoke_gates(
+    tmp_path: Path,
+) -> None:
+    """Structured evidence and extension-owned markers are valid gates."""
+    config_identity = "review-assistant@1.0.0"
+    owner = f"configs/{config_identity}/extensions/machine-markers.ts"
+    contract = {
+        "equalsResultValues": {
+            "config": config_identity,
+            "thinking_level": "low",
+        },
+        "minResultValues": {
+            "combined_total_tokens": 1,
+            "worker_calls": 1,
+        },
+        "requireFiles": [
+            "session/*.jsonl",
+            "usage/worker-usage.ndjson",
+        ],
+        "requireRepoFiles": [owner],
+        "requireUsageRecords": [
+            {
+                "equals": {"event": "assistant_usage", "role": "worker"},
+                "globs": ["usage/worker-usage.ndjson"],
+                "minimum": 1,
+            }
+        ],
+        "requireExtensionMarkers": [
+            {
+                "extension": owner,
+                "globs": ["logs/pi.stderr.txt"],
+                "marker": "__REVIEW_ASSISTANT_READY__",
+            }
+        ],
+        "forbidExtensionMarkers": [
+            {
+                "extension": owner,
+                "globs": ["logs/pi.stderr.txt"],
+                "marker": "__REVIEW_ASSISTANT_BROKEN__",
+            }
+        ],
+    }
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(
+            tmp_path,
+            review_smoke_contract=contract,
+        )
+    )
+    owner_path = repository_root / owner
+    owner_path.parent.mkdir()
+    owner_path.write_text("export default {}\n")
+    lock_path = (
+        repository_root
+        / "configs"
+        / config_identity
+        / "model"
+        / "low"
+        / "config-lock.json"
+    )
+    previous_lock = json.loads(lock_path.read_text())
+    lock_path.unlink()
+    config_lock.write_config_lock(
+        repository_root,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {
+            "credentialRoutes": previous_lock["credentialRoutes"],
+            "declaredRoles": previous_lock["declaredRoles"],
+            "launchSurfaces": [
+                {"modelRoles": [], "path": "extensions/machine-markers.ts"}
+            ],
+            "testedSubjectVersions": previous_lock["testedSubjectVersions"],
+            "usageSources": previous_lock["usageSources"],
+        },
+    )
+
+    compiled = compile_launch_request(
+        _launch_request(),
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+    )
+
+    review_config = compiled.plan.to_document()["configs"][1]
+    assert review_config["smokeContract"] == str(
+        repository_root
+        / "configs"
+        / config_identity
+        / "model"
+        / "low"
+        / "smoke.json"
+    )
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
+def test_launch_planning_preserves_legacy_smoke_contract_readability(
+    tmp_path: Path,
+) -> None:
+    """Legacy contracts remain referenced without gaining versioned approval."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    legacy_root = repository_root / "configs" / "legacy-review"
+    legacy_leaf = legacy_root / "model" / "low"
+    legacy_leaf.mkdir(parents=True)
+    (legacy_root / "README.md").write_text("Historical diagnosis only.\n")
+    legacy_contract = legacy_leaf / "smoke.json"
+    legacy_contract.write_text(
+        json.dumps(
+            {
+                "requireRepoText": [
+                    {
+                        "globs": ["configs/legacy-review/README.md"],
+                        "text": "Historical diagnosis only.",
+                    }
+                ]
+            }
+        )
+        + "\n"
+    )
+    request = replace(
+        _launch_request(),
+        configs=("baseline@1.0.0", "legacy-review"),
+    )
+
+    compiled = compile_launch_request(
+        request,
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+    )
+
+    legacy_config = compiled.plan.to_document()["configs"][1]
+    assert legacy_config["legacy"] is True
+    assert legacy_config["smokeContract"] == str(legacy_contract)
+    assert "legacy configs have no config-lock provenance: legacy-review" in (
+        compiled.receipt
+    )
+
+
+def test_launch_planning_reports_malformed_smoke_json(
+    tmp_path: Path,
+) -> None:
+    """Malformed contract JSON fails with a smoke-specific location."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    contract_path = (
+        repository_root
+        / "configs"
+        / "review-assistant@1.0.0"
+        / "model"
+        / "low"
+        / "smoke.json"
+    )
+    contract_path.write_text('{"requireFiles": [}\n')
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Smoke contract rejected:",
+    ) as raised:
+        compile_launch_request(
+            _launch_request(),
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+        )
+
+    message = str(raised.value)
+    assert "model/low/smoke.json#/<contract>" in message
+    assert "assertion_kind='<syntax>'" in message
+    assert "target='<contract>'" in message
+    assert "invalid JSON" in message
 
 
 def test_compile_launch_request_is_deterministic_without_execution(

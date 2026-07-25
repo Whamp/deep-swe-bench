@@ -12,7 +12,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
-from harness import config_lock, config_resolution, lib, run_state
+from harness import (
+    config_lock,
+    config_resolution,
+    lib,
+    run_state,
+    versioned_smoke_contract,
+)
 from harness.run_state import sanitize_run_id
 
 _LAUNCH_PLAN_SCHEMA_VERSION = 1
@@ -1052,6 +1058,14 @@ def _config_plan(
         request.model,
         request.thinking,
     )
+    versioned_identity = config_resolution.parse_versioned_config_identity(
+        config_identity
+    )
+    if versioned_identity is not None:
+        versioned_smoke_contract.validate_versioned_smoke_contract(
+            repository_root,
+            resolved.smoke_contract,
+        )
     lock_document = config_lock.read_matching_config_lock(
         resolved,
         config_identity,
