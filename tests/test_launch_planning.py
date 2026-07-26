@@ -989,6 +989,30 @@ def test_launch_planning_rejects_marker_without_extension_owner(
     assert "owning extension artifact does not exist" in message
 
 
+def test_launch_planning_rejects_malformed_json_record_gate(
+    tmp_path: Path,
+) -> None:
+    """JSON evidence gates require an explicit supported record format."""
+    target = "initial_context/provider_request_*.json"
+    message = _reject_versioned_smoke_contract(
+        tmp_path,
+        {
+            "requireJsonRecords": [
+                {
+                    "equals": {"reasoning.effort": "low"},
+                    "format": "text",
+                    "globs": [target],
+                    "minimum": 2,
+                }
+            ]
+        },
+    )
+
+    assert "assertion_kind='requireJsonRecords'" in message
+    assert f"target={target!r}" in message
+    assert "json or jsonl" in message
+
+
 def test_launch_planning_rejects_unstructured_usage_record_gate(
     tmp_path: Path,
 ) -> None:
@@ -1038,6 +1062,26 @@ def test_launch_planning_accepts_durable_versioned_smoke_gates(
                 "globs": ["usage/worker-usage.ndjson"],
                 "minimum": 1,
             }
+        ],
+        "requireJsonRecords": [
+            {
+                "equals": {
+                    "model": "provider/model",
+                    "reasoning.effort": "low",
+                },
+                "format": "json",
+                "globs": ["initial_context/provider_request_*.json"],
+                "minimum": 2,
+            },
+            {
+                "equals": {
+                    "thinkingLevel": "low",
+                    "type": "thinking_level_change",
+                },
+                "format": "jsonl",
+                "globs": ["session/*.jsonl"],
+                "minimum": 1,
+            },
         ],
         "requireExtensionMarkers": [
             {

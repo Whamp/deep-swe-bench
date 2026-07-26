@@ -30,10 +30,12 @@ _SUPPORTED_ASSERTION_KINDS = frozenset(
         *_FILE_ASSERTION_KINDS,
         *_EXTENSION_MARKER_ASSERTION_KINDS,
         *_PROHIBITED_TEXT_ASSERTION_KINDS,
+        "requireJsonRecords",
         "requireUsageRecords",
     }
 )
 _EXTENSION_MACHINE_MARKER = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]*$")
+_JSON_RECORD_FORMATS = frozenset({"json", "jsonl"})
 _BRITTLE_OUTPUT_LENGTH_FIELD = re.compile(
     r"(?:chars?|characters?|char_count|character_count|length|"
     r"line_count|linecount)$"
@@ -306,6 +308,64 @@ def _validate_usage_record_assertions(
             )
 
 
+def _validate_json_record_assertions(
+    location: Path,
+    document: Mapping[str, object],
+) -> None:
+    """Validate structured JSON and JSONL record gates."""
+    assertions = document.get("requireJsonRecords", [])
+    if not isinstance(assertions, list):
+        _reject_smoke_assertion(
+            location,
+            "requireJsonRecords",
+            "<contract>",
+            "expected a list of structured JSON record assertions",
+        )
+    for index, assertion in enumerate(assertions):
+        pointer = f"/requireJsonRecords/{index}"
+        if not isinstance(assertion, Mapping):
+            _reject_smoke_assertion(
+                location,
+                "requireJsonRecords",
+                "<contract>",
+                "expected equals, format, globs, and minimum fields",
+                pointer=pointer,
+            )
+        globs = assertion.get("globs")
+        targets = (
+            globs
+            if isinstance(globs, list)
+            and all(_is_relative_artifact_glob(item) for item in globs)
+            else []
+        )
+        target = targets[0] if targets else "<missing>"
+        equals = assertion.get("equals")
+        record_format = assertion.get("format")
+        minimum = assertion.get("minimum")
+        valid_equals = (
+            isinstance(equals, Mapping)
+            and bool(equals)
+            and all(isinstance(field, str) and field for field in equals)
+        )
+        if (
+            set(assertion) != {"equals", "format", "globs", "minimum"}
+            or not targets
+            or not valid_equals
+            or record_format not in _JSON_RECORD_FORMATS
+            or not isinstance(minimum, int)
+            or isinstance(minimum, bool)
+            or minimum <= 0
+        ):
+            _reject_smoke_assertion(
+                location,
+                "requireJsonRecords",
+                target,
+                "JSON records require structured equals fields, a json or "
+                "jsonl format, and a positive minimum",
+                pointer=pointer,
+            )
+
+
 def _prohibited_text_reason(
     assertion_kind: str,
     target: object,
@@ -412,6 +472,7 @@ def validate_versioned_smoke_contract(
     _validate_structured_result_assertions(location, document)
     _validate_file_assertions(repository_root, location, document)
     _validate_usage_record_assertions(location, document)
+    _validate_json_record_assertions(location, document)
     _validate_extension_marker_assertions(
         repository_root,
         location,

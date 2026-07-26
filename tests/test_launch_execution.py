@@ -202,8 +202,24 @@ class FakeConfirmedPiRunner:
         (cell_root / "artifacts" / "model.patch").write_text("fixture patch\n")
         (cell_root / "session").mkdir(exist_ok=True)
         (cell_root / "session" / "fixture.jsonl").write_text(
+            '{"type":"thinking_level_change","thinkingLevel":"low"}\n'
             '{"message":{"usage":{"total":10}}}\n'
         )
+        (cell_root / "initial_context").mkdir(exist_ok=True)
+        for request_number in (1, 2):
+            request_path = (
+                cell_root
+                / "initial_context"
+                / f"provider_request_{request_number:04d}.json"
+            )
+            request_path.write_text(
+                json.dumps(
+                    {
+                        "model": "provider/model",
+                        "reasoning": {"effort": "low"},
+                    }
+                )
+            )
         (cell_root / "logs").mkdir(exist_ok=True)
         (cell_root / "usage").mkdir(exist_ok=True)
         (cell_root / "usage" / "worker-usage.ndjson").write_text(
@@ -1701,6 +1717,78 @@ def test_missing_secondary_role_trace_fails_confirmed_preflight(
     ]
     assert [diagnostic["target"] for diagnostic in diagnostics] == [
         "tool-usage.jsonl:structured-records"
+    ]
+    assert status["counts"]["batch_done"] == 0
+
+
+def test_mismatched_json_record_fails_confirmed_preflight(
+    tmp_path: Path,
+) -> None:
+    """Provider effort must match structured smoke evidence before fan-out."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        preflight="required",
+        smoke_contract_document={
+            "requireJsonRecords": [
+                {
+                    "equals": {
+                        "model": "provider/model",
+                        "reasoning.effort": "low",
+                    },
+                    "format": "json",
+                    "globs": ["initial_context/provider_request_*.json"],
+                    "minimum": 2,
+                },
+                {
+                    "equals": {
+                        "thinkingLevel": "low",
+                        "type": "thinking_level_change",
+                    },
+                    "format": "jsonl",
+                    "globs": ["session/*.jsonl"],
+                    "minimum": 1,
+                },
+            ]
+        },
+    )
+
+    def replace_provider_effort(cell: ConfirmedPiCell) -> None:
+        for request_path in cell.result_path.parent.glob(
+            "initial_context/provider_request_*.json"
+        ):
+            request = json.loads(request_path.read_text())
+            request["reasoning"]["effort"] = "high"
+            request_path.write_text(json.dumps(request))
+
+    runner = FakeConfirmedPiRunner(
+        _planned_launch_plan_path(compiled),
+        after_call=replace_provider_effort,
+    )
+    with pytest.raises(LaunchPreflightError):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+
+    status = json.loads(
+        (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "status.json"
+        ).read_text()
+    )
+    diagnostics = status["preflight"]["task-a/baseline@1.0.0/rep0"][
+        "diagnostics"
+    ]
+    assert diagnostics == [
+        {
+            "reason": "expected at least 2, got 0",
+            "requirement": "requireJsonRecords",
+            "target": (
+                "initial_context/provider_request_*.json:json-records"
+            ),
+        }
     ]
     assert status["counts"]["batch_done"] == 0
 

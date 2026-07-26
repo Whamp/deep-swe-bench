@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -198,6 +198,68 @@ def _evaluate_usage_records(
     return diagnostics
 
 
+def _iter_json_records(
+    path: Path,
+    record_format: str,
+) -> Iterator[Mapping[str, object]]:
+    """Yield object records from one JSON object or JSONL artifact."""
+    try:
+        raw = path.read_text(errors="replace")
+    except OSError:
+        return
+    if record_format == "json":
+        try:
+            record: object = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if isinstance(record, Mapping):
+            yield cast(Mapping[str, object], record)
+        return
+    for line in raw.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, Mapping):
+            yield cast(Mapping[str, object], record)
+
+
+def _evaluate_json_records(
+    contract: Mapping[str, object],
+    cell_root: Path,
+) -> list[PreflightDiagnostic]:
+    """Count JSON records whose dotted fields match contract values."""
+    diagnostics: list[PreflightDiagnostic] = []
+    assertions = cast(
+        list[Mapping[str, object]], contract.get("requireJsonRecords", [])
+    )
+    for assertion in assertions:
+        globs = cast(list[str], assertion["globs"])
+        record_format = cast(str, assertion["format"])
+        expected = cast(Mapping[str, object], assertion["equals"])
+        minimum = cast(int, assertion["minimum"])
+        matching_records = 0
+        for pattern in globs:
+            for path in cell_root.glob(pattern):
+                if not path.is_file():
+                    continue
+                for record in _iter_json_records(path, record_format):
+                    if all(
+                        _result_value(record, field) == value
+                        for field, value in expected.items()
+                    ):
+                        matching_records += 1
+        if matching_records < minimum:
+            diagnostics.append(
+                preflight_diagnostic(
+                    "requireJsonRecords",
+                    f"{globs[0]}:{record_format}-records",
+                    f"expected at least {minimum}, got {matching_records}",
+                )
+            )
+    return diagnostics
+
+
 def _evaluate_extension_markers(
     contract: Mapping[str, object],
     cell_root: Path,
@@ -264,5 +326,6 @@ def evaluate_config_preflight(
         *_evaluate_structured_results(contract, result_record),
         *_evaluate_required_files(contract, cell_root, repository_root),
         *_evaluate_usage_records(contract, cell_root),
+        *_evaluate_json_records(contract, cell_root),
         *_evaluate_extension_markers(contract, cell_root),
     ]
