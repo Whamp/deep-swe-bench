@@ -40,7 +40,7 @@ json_value = st.recursive(
 json_object = st.dictionaries(st.text(max_size=20), json_value, max_size=8)
 
 
-def test_subject_container_name_sanitizes_versioned_config_identity():
+def test_subject_container_name_sanitizes_versioned_config_identity() -> None:
     """A released config identity must produce a Docker-valid name."""
     assert harness_lib.subject_container_name(
         "pi-check@1.0.0",
@@ -58,8 +58,11 @@ def test_subject_container_name_sanitizes_versioned_config_identity():
     process_id=st.integers(min_value=1, max_value=2**31 - 1),
 )
 def test_subject_container_name_always_uses_docker_name_characters(
-    config, task, rep, process_id
-):
+    config: str,
+    task: str,
+    rep: int,
+    process_id: int,
+) -> None:
     """Arbitrary identity characters cannot escape Docker's name alphabet."""
     name = harness_lib.subject_container_name(
         config,
