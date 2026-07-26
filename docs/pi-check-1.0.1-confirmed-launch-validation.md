@@ -34,7 +34,8 @@ analysis/pi-check-1.0.1-confirmed-launch-preflight.json
 The operator confirmed the exact plan digest before execution. The receipt had
 no warnings and declared one executor role, no secondary model roles, one
 worker, zero cell retries, no automatic quota resume, and stop-on-transient
-behavior.
+behavior. The executor bound means one Pi session per rep; that session produced
+29 measured assistant completions and two captured provider requests.
 
 ## Result
 
@@ -82,8 +83,12 @@ Specific checks:
   RPC transport.
 - `result.json` records the config lock, launch plan, harness revision, task
   revision, verifier identity, immutable image identities, and subject version.
-- The dashboard API returns HTTP 200 with `state: completed`, `stage: done`, no
-  active cells, and no stale cells.
+- The dashboard API returns HTTP 200 with the exact config version, full launch
+  identity, confirmed worktree path, `preflight: passed`, `1/1` batch progress,
+  `state: completed`, no active cells, and no stale cells.
+- Chromium rendered those same fields in the run-detail page with all requests
+  returning 200 and no console errors. The review screenshot is
+  `/tmp/issue22-confirmed-run-dashboard-final.png`.
 - Successful preflight sealed `pi-check@1.0.1`; its lock now cannot be changed in
   place.
 
@@ -112,7 +117,9 @@ http://100.112.72.93:5173/
 ## Verdict
 
 The integrated confirmed-launch workflow is validated for this Pi release,
-model, thinking level, config release, and task shape. Issue #22's production
+model, thinking level, config release, and task shape. Post-validation review
+also proved that malformed JSON/JSONL smoke evidence produces an
+artifact-specific failure instead of being skipped. Issue #22's production
 preflight gate is satisfied. Other config releases, subject versions, model
 roles, or runtime surfaces still require their own reviewed lock and smoke
 evidence before batch use.

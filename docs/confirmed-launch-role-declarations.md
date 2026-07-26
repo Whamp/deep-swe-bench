@@ -11,8 +11,9 @@ Each object in `declaredRoles` contains:
 
 - `name`: unique role name used by launch surfaces and usage accounting.
 - `roleKind`: descriptive pattern such as `executor`, `advisor`,
-  `observational-memory`, `recursive`, or `workflow`. The compiler does not
-  branch on this value.
+  `observational-memory`, `recursive`, or `workflow`. Planning uses `executor`
+  for main-session validation and receipt wording; other values describe
+  secondary role behavior.
 - `modelSelection`: one of the model-selection forms below.
 - `credentialRoute`: a route name also listed in `credentialRoutes`.
 - `billingCategory`: `subscription quota`, `paid API`, or `local compute`.
@@ -102,7 +103,7 @@ The list must be non-empty and finite. Arbitrary or unbounded selection returns
 
 ### Call behavior
 
-A fixed role declares its exact calls per rep:
+A fixed role declares its exact activations per rep:
 
 ```json
 {
@@ -121,6 +122,12 @@ A dynamic role declares upper bounds:
   "maxConcurrency": 2
 }
 ```
+
+For the executor, `callsPerRep` counts subject executor sessions. One executor
+session can contain many provider requests, turns, or tool calls; native session
+usage measures those details. For secondary roles, call bounds count that role's
+invocations. Receipts label the executor bound as sessions so it cannot be
+mistaken for provider-request count.
 
 All bounds must be positive integers. Unbounded call behavior requires
 clarification.

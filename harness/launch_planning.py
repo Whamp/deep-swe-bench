@@ -1511,8 +1511,15 @@ def _role_call_summary(role: Mapping[str, object]) -> str:
     behavior = cast(Mapping[str, object], role["callBehavior"])
     max_concurrency = behavior.get("maxConcurrency", "-")
     if behavior.get("kind") == "fixed":
+        calls_per_rep = behavior.get("callsPerRep", "-")
+        if role.get("roleKind") == "executor":
+            session_label = "session" if calls_per_rep == 1 else "sessions"
+            return (
+                f"{calls_per_rep} executor {session_label}/rep; "
+                f"max concurrency {max_concurrency}"
+            )
         return (
-            f"{behavior.get('callsPerRep', '-')} calls/rep; "
+            f"{calls_per_rep} calls/rep; "
             f"max concurrency {max_concurrency}"
         )
     return (
@@ -1642,9 +1649,12 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
     warnings = _receipt_warnings(document)
     subject_behavior_lines = _render_subject_behavior_lines(configs)
     policies = document["policies"]
-    preflight_result_paths = {cell["resultPath"] for cell in document["preflightCells"]}
+    preflight_result_paths = {
+        cell["resultPath"] for cell in document["preflightCells"]
+    }
     preflight_overlap_count = sum(
-        cell["resultPath"] in preflight_result_paths for cell in document["batchCells"]
+        cell["resultPath"] in preflight_result_paths
+        for cell in document["batchCells"]
     )
     lines = ["LAUNCH RECEIPT", "WARNINGS"]
     lines.extend(f"- {warning}" for warning in warnings)

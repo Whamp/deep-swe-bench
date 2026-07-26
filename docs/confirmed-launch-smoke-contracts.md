@@ -51,9 +51,11 @@ Each assertion has four fields:
 - `minimum`: the positive number of matching records required across all
   matching files.
 
-A JSON object counts only when every dotted field matches. Missing files,
-malformed JSON, arrays, scalar values, and mismatched records do not count. If
-the count is below `minimum`, preflight fails before batch fan-out.
+A JSON object counts only when every dotted field matches. Missing files and
+mismatched records do not count. Unreadable files, malformed JSON or JSONL
+lines, arrays, and scalar values produce an artifact-specific diagnostic and
+fail preflight. If the valid matching count is below `minimum`, preflight fails
+before batch fan-out.
 
 Use this assertion to prove request shape, thinking level, model selection, or
 other structured runtime evidence. Do not substitute `requireFiles`; file

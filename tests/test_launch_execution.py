@@ -1793,6 +1793,121 @@ def test_mismatched_json_record_fails_confirmed_preflight(
     assert status["counts"]["batch_done"] == 0
 
 
+def test_malformed_json_record_fails_confirmed_preflight(
+    tmp_path: Path,
+) -> None:
+    """Corrupt structured evidence must report its path and block fan-out."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        preflight="required",
+        smoke_contract_document={
+            "requireJsonRecords": [
+                {
+                    "equals": {"reasoning.effort": "low"},
+                    "format": "json",
+                    "globs": ["initial_context/provider_request_*.json"],
+                    "minimum": 2,
+                }
+            ]
+        },
+    )
+
+    def corrupt_provider_request(cell: ConfirmedPiCell) -> None:
+        request_path = (
+            cell.result_path.parent
+            / "initial_context"
+            / "provider_request_0001.json"
+        )
+        request_path.write_text("{not-json\n")
+
+    runner = FakeConfirmedPiRunner(
+        _planned_launch_plan_path(compiled),
+        after_call=corrupt_provider_request,
+    )
+    with pytest.raises(LaunchPreflightError):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+
+    status = json.loads(
+        (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "status.json"
+        ).read_text()
+    )
+    diagnostics = status["preflight"]["task-a/baseline@1.0.0/rep0"][
+        "diagnostics"
+    ]
+    assert diagnostics == [
+        {
+            "reason": "JSON record evidence is invalid at line 1, column 2",
+            "requirement": "requireJsonRecords",
+            "target": "initial_context/provider_request_0001.json",
+        }
+    ]
+    assert status["counts"]["batch_done"] == 0
+
+
+def test_malformed_jsonl_record_fails_even_when_minimum_matches(
+    tmp_path: Path,
+) -> None:
+    """One corrupt JSONL line invalidates otherwise sufficient evidence."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(
+        tmp_path,
+        preflight="required",
+        smoke_contract_document={
+            "requireJsonRecords": [
+                {
+                    "equals": {
+                        "thinkingLevel": "low",
+                        "type": "thinking_level_change",
+                    },
+                    "format": "jsonl",
+                    "globs": ["session/*.jsonl"],
+                    "minimum": 1,
+                }
+            ]
+        },
+    )
+
+    def corrupt_session_record(cell: ConfirmedPiCell) -> None:
+        session_path = cell.result_path.parent / "session" / "fixture.jsonl"
+        session_path.write_text("{not-json\n" + session_path.read_text())
+
+    runner = FakeConfirmedPiRunner(
+        _planned_launch_plan_path(compiled),
+        after_call=corrupt_session_record,
+    )
+    with pytest.raises(LaunchPreflightError):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+
+    status = json.loads(
+        (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "status.json"
+        ).read_text()
+    )
+    diagnostics = status["preflight"]["task-a/baseline@1.0.0/rep0"][
+        "diagnostics"
+    ]
+    assert diagnostics == [
+        {
+            "reason": "JSONL record evidence is invalid at line 1, column 2",
+            "requirement": "requireJsonRecords",
+            "target": "session/fixture.jsonl",
+        }
+    ]
+    assert status["counts"]["batch_done"] == 0
+
+
 def test_passing_preflight_fans_out_exactly_once_without_second_confirmation(
     tmp_path: Path,
 ) -> None:

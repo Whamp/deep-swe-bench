@@ -1,37 +1,13 @@
-import { describe, it, expect, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import Overview from '@/pages/overview'
+import { screen } from '@testing-library/react'
+import { describe, expect, it } from 'vitest'
 import type { RunSummary } from '@/lib/types'
-
-function mockFetch(data: { runs: RunSummary[] }) {
-  globalThis.fetch = vi.fn().mockResolvedValue({
-    ok: true,
-    status: 200,
-    json: () => Promise.resolve(data),
-  })
-}
-
-function renderWithProviders(initialPath: string) {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0 } },
-  })
-  return render(
-    <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[initialPath]}>
-        <Routes>
-          <Route index element={<Overview />} />
-        </Routes>
-      </MemoryRouter>
-    </QueryClientProvider>,
-  )
-}
+import Overview from '@/pages/overview'
+import { mockDashboardJson, renderDashboardRoute } from '@/test/dashboard-test-harness'
 
 describe('Overview page', () => {
   it('renders loading state initially', () => {
-    mockFetch({ runs: [] })
-    renderWithProviders('/')
+    mockDashboardJson({ runs: [] })
+    renderDashboardRoute(<Overview />, '/', '/')
     expect(screen.getByText(/Loading runs/i)).toBeInTheDocument()
   })
 
@@ -52,8 +28,8 @@ describe('Overview page', () => {
         preflight_state: 'passed',
       },
     ]
-    mockFetch({ runs })
-    renderWithProviders('/')
+    mockDashboardJson({ runs })
+    renderDashboardRoute(<Overview />, '/', '/')
 
     expect(await screen.findByText('test-run-1')).toBeInTheDocument()
     expect(screen.getByText(/test-model/i)).toBeInTheDocument()
@@ -64,18 +40,8 @@ describe('Overview page', () => {
   })
 
   it('renders empty state when no runs', async () => {
-    mockFetch({ runs: [] })
-    // Override: we need to wait for the query to resolve with empty
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, gcTime: 0 } },
-    })
-    render(
-      <QueryClientProvider client={client}>
-        <MemoryRouter>
-          <Overview />
-        </MemoryRouter>
-      </QueryClientProvider>,
-    )
+    mockDashboardJson({ runs: [] })
+    renderDashboardRoute(<Overview />, '/', '/')
     expect(await screen.findByText(/No structured state/i)).toBeInTheDocument()
   })
 })
@@ -95,8 +61,8 @@ describe('Overview stale cell badge', () => {
         preflight_state: 'running',
       },
     ]
-    mockFetch({ runs })
-    renderWithProviders('/')
+    mockDashboardJson({ runs })
+    renderDashboardRoute(<Overview />, '/', '/')
 
     expect(await screen.findByText('2 stale')).toBeInTheDocument()
   })

@@ -198,6 +198,10 @@ def _evaluate_usage_records(
     return diagnostics
 
 
+class _JsonRecordEvidenceError(ValueError):
+    """Structured smoke evidence could not be read as object records."""
+
+
 def _iter_json_records(
     path: Path,
     record_format: str,
@@ -205,23 +209,37 @@ def _iter_json_records(
     """Yield object records from one JSON object or JSONL artifact."""
     try:
         raw = path.read_text(errors="replace")
-    except OSError:
-        return
+    except OSError as error:
+        raise _JsonRecordEvidenceError(
+            f"JSON record evidence is unreadable: {error}"
+        ) from error
     if record_format == "json":
         try:
             record: object = json.loads(raw)
-        except json.JSONDecodeError:
-            return
-        if isinstance(record, Mapping):
-            yield cast(Mapping[str, object], record)
+        except json.JSONDecodeError as error:
+            raise _JsonRecordEvidenceError(
+                "JSON record evidence is invalid at "
+                f"line {error.lineno}, column {error.colno}"
+            ) from error
+        if not isinstance(record, Mapping):
+            raise _JsonRecordEvidenceError(
+                "JSON record evidence must contain one object"
+            )
+        yield cast(Mapping[str, object], record)
         return
-    for line in raw.splitlines():
+    for line_number, line in enumerate(raw.splitlines(), start=1):
         try:
             record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(record, Mapping):
-            yield cast(Mapping[str, object], record)
+        except json.JSONDecodeError as error:
+            raise _JsonRecordEvidenceError(
+                "JSONL record evidence is invalid at "
+                f"line {line_number}, column {error.colno}"
+            ) from error
+        if not isinstance(record, Mapping):
+            raise _JsonRecordEvidenceError(
+                f"JSONL record evidence at line {line_number} is not an object"
+            )
+        yield cast(Mapping[str, object], record)
 
 
 def _evaluate_json_records(
@@ -239,17 +257,29 @@ def _evaluate_json_records(
         expected = cast(Mapping[str, object], assertion["equals"])
         minimum = cast(int, assertion["minimum"])
         matching_records = 0
+        invalid_evidence = False
         for pattern in globs:
             for path in cell_root.glob(pattern):
                 if not path.is_file():
                     continue
-                for record in _iter_json_records(path, record_format):
-                    if all(
-                        _result_value(record, field) == value
-                        for field, value in expected.items()
-                    ):
-                        matching_records += 1
-        if matching_records < minimum:
+                try:
+                    records = _iter_json_records(path, record_format)
+                    for record in records:
+                        if all(
+                            _result_value(record, field) == value
+                            for field, value in expected.items()
+                        ):
+                            matching_records += 1
+                except _JsonRecordEvidenceError as error:
+                    invalid_evidence = True
+                    diagnostics.append(
+                        preflight_diagnostic(
+                            "requireJsonRecords",
+                            str(path.relative_to(cell_root)),
+                            str(error),
+                        )
+                    )
+        if not invalid_evidence and matching_records < minimum:
             diagnostics.append(
                 preflight_diagnostic(
                     "requireJsonRecords",

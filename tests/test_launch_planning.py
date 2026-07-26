@@ -1584,6 +1584,7 @@ def test_launch_plan_resolves_and_renders_declared_model_role_patterns(
     assert "workflow-worker | workflow | bounded dynamic (2 models)" in (
         compiled.receipt
     )
+    assert "1 executor session/rep; max concurrency 1" in compiled.receipt
     assert "max 4 calls/rep; max concurrency 2" in compiled.receipt
     assert "Required capabilities: pi-rpc" in compiled.receipt
     assert "Tested subject versions: pi@0.81.1" in compiled.receipt

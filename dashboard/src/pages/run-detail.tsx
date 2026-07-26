@@ -59,6 +59,8 @@ export default function RunDetail() {
         <div className="ml-auto flex items-center gap-2 text-sm">
           <span className="text-muted-foreground">Detail</span>
           <select
+            aria-label="Run detail level"
+            name="detail-level"
             value={detail}
             onChange={(e) => setDetail(e.target.value as DetailLevel)}
             className="rounded-md border border-border bg-card px-2 py-1 text-sm"
@@ -105,6 +107,10 @@ function RunSummary({ run }: { run: RunDetailData }) {
         </div>
         <div className="text-xs text-muted-foreground">
           updated {run.updated_at || 'unknown'} · heartbeat {fmtSeconds(run.heartbeat_age_s)}
+        </div>
+        <div className="text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">Workspace:</span>{' '}
+          <code className="break-all">{run.workspace || '—'}</code>
         </div>
         <div>
           <Progress value={c.batch_done || 0} max={c.batch_total || 1} />
