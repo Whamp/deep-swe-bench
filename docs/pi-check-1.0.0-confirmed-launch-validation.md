@@ -1,9 +1,15 @@
-# `pi-check@1.0.0` confirmed-launch validation
+# `pi-check@1.0.0` confirmed-launch preflight record
 
-`pi-check@1.0.0` passed the confirmed-launch production gate on 2026-07-26 with
-Pi 0.81.1 and `openai-codex/gpt-5.6-sol` at low thinking. The run executed one
-approved preflight cell. The identical batch entry reused that successful
-preflight result and made no second subject call.
+`pi-check@1.0.0` completed one approved confirmed-launch preflight on 2026-07-26
+with Pi 0.81.1 and `openai-codex/gpt-5.6-sol` at low thinking. The identical
+batch entry reused that successful preflight result and made no second subject
+call.
+
+Final review found that the 1.0.0 smoke contract required provider-request and
+session files but did not parse their model, reasoning effort, or thinking
+level. The observed artifacts are internally consistent, but the reusable gate
+was too shallow for production batch approval. Do not launch a production batch
+with 1.0.0. `pi-check@1.0.1` supersedes it with structured JSON checks.
 
 Compact evidence:
 
@@ -102,6 +108,10 @@ Specific checks:
 - Successful preflight sealed the release under
   `results/_runs/_config-seals/pi-check@1.0.0/`.
 
+Cell evidence paths in this note resolve from the confirmed-launch worktree.
+Central run-state paths resolve from the primary checkout's `results/_runs/`.
+The manifest records the absolute workspace and result path.
+
 Successful run state:
 
 ```text
@@ -116,7 +126,9 @@ results/gpt-5.6-sol/low/pi-check@1.0.0/fd-deterministic-multi-key-sorting/rep0/r
 
 ## Scope
 
-This proves the integrated confirmed-launch path for one versioned Pi config
-with one extension and one executor role. Each additional config release,
-subject version, model role, or runtime surface still needs its own lock and
-smoke evidence before batch use.
+This run proves the execution, failure-containment, provenance, registration,
+and sealing paths for one versioned Pi config. It does not authorize a 1.0.0
+production batch because the smoke contract did not parse the thinking evidence.
+`pi-check@1.0.1` must pass its corrected structured contract before issue #22 is
+complete. Each additional config release, subject version, model role, or
+runtime surface still needs its own lock and smoke evidence before batch use.
