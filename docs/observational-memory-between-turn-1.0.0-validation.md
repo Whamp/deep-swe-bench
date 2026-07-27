@@ -5,10 +5,19 @@ Validation note for `observational-memory-between-turn@1.0.0` on
 
 ## Status
 
-The release is a locked candidate for a confirmed atomic preflight. No model or
-paid call was made while creating it. It is not working evidence until the
-versioned smoke contract passes and the central seal registry records that
-preflight.
+The first confirmed preflight ran on `yjs-map-conflict-detection` and exercised
+the intended behavior, but the smoke gate failed. The gate expected authority
+owner `memory`; the extension's stable value is `observational-memory`. The
+corrected contract passes against the saved artifacts without changing agent
+behavior. The release remains unsealed and is not working evidence until a new
+confirmed preflight passes.
+
+A compact record of the failed attempt and hashes of its evidence files lives
+at:
+
+```text
+analysis/observational-memory-between-turn-1.0.0-first-preflight.json
+```
 
 ## Approved intervention
 
@@ -103,7 +112,8 @@ The leaf-local `smoke.json` requires all of the following:
 - an observation record in the native session;
 - a compaction entry with `fromHook: true`, `details.type: "om.folded"`, and
   `details.fullFold: false`;
-- a debug authority decision with owner `memory` and reason `covered`;
+- a debug authority decision with owner `observational-memory` and reason
+  `covered`;
 - a hidden `om.compaction.continue` session entry;
 - explicit low effort in captured executor provider requests;
 - exact low-thinking worker usage records at the nested boundary.
