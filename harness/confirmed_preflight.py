@@ -324,13 +324,31 @@ def _evaluate_extension_markers(
     return diagnostics
 
 
+def evaluate_config_preflight_contract(
+    repository_root: Path,
+    cell_root: Path,
+    contract: Mapping[str, object] | None,
+    result_record: Mapping[str, object],
+) -> list[PreflightDiagnostic]:
+    """Evaluate the smoke assertions pinned in a confirmed launch plan."""
+    if contract is None:
+        return []
+    return [
+        *_evaluate_structured_results(contract, result_record),
+        *_evaluate_required_files(contract, cell_root, repository_root),
+        *_evaluate_usage_records(contract, cell_root),
+        *_evaluate_json_records(contract, cell_root),
+        *_evaluate_extension_markers(contract, cell_root),
+    ]
+
+
 def evaluate_config_preflight(
     repository_root: Path,
     cell_root: Path,
     contract_path: Path | None,
     result_record: Mapping[str, object],
 ) -> list[PreflightDiagnostic]:
-    """Evaluate every durable assertion in a versioned smoke contract."""
+    """Read and evaluate every durable assertion in one smoke contract."""
     if contract_path is None:
         return []
     try:
@@ -351,11 +369,9 @@ def evaluate_config_preflight(
                 "contract root is not an object",
             )
         ]
-    contract = cast(Mapping[str, object], contract_value)
-    return [
-        *_evaluate_structured_results(contract, result_record),
-        *_evaluate_required_files(contract, cell_root, repository_root),
-        *_evaluate_usage_records(contract, cell_root),
-        *_evaluate_json_records(contract, cell_root),
-        *_evaluate_extension_markers(contract, cell_root),
-    ]
+    return evaluate_config_preflight_contract(
+        repository_root,
+        cell_root,
+        cast(Mapping[str, object], contract_value),
+        result_record,
+    )

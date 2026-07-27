@@ -229,6 +229,7 @@ class ConfirmedSubjectCell:
     config_root: Path
     config_leaf: Path
     credential_routes: tuple[str, ...]
+    smoke_assertions: Mapping[str, object] | None
     smoke_contract: Path | None
     task: str
     rep: int

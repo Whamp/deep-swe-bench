@@ -160,9 +160,12 @@ python -m harness.config_lock verify \
 
 Verification reports added, removed, and changed behavior inputs. Secret values
 from environment and JSON credential fields are excluded before fingerprinting;
-credential names and environment-variable routes remain reviewable. See
-[ADR-0006](../docs/adr/0006-versioned-config-locks.md) for sealing and shared
-immutability rules.
+credential names and environment-variable routes remain reviewable. Smoke
+contracts are validation rules, not behavior inputs, so they are pinned in each
+launch plan instead of the config lock. See
+[ADR-0006](../docs/adr/0006-versioned-config-locks.md) and
+[ADR-0007](../docs/adr/0007-separate-smoke-validation-from-config-behavior.md)
+for sealing and shared immutability rules.
 
 Canonical batches select the release through `python -m harness.run_batch plan`;
 the resulting receipt and plan identity must be reviewed before `execute`.
@@ -174,7 +177,10 @@ Direct `harness/run.py` and `run_omp.py` calls are draft probes only and require
 A confirmed launch with preflight policy `new-configs` plans one preflight for
 each config without compatible existing evidence; policy `required` plans one
 for every selected config. The receipt shows those cells and the conditional
-batch fan-out before confirmation. Preflight prefers the first requested task
+batch fan-out before confirmation. The plan stores the exact smoke assertions
+that execution will apply. Correcting only those assertions may revalidate saved
+artifacts without another agent run; missing evidence or changed behavior still
+requires a new rep. Preflight prefers the first requested task
 that appears in `subsets/12_v0.txt`; without overlap, it uses the first requested
 task so passing evidence remains reusable for that comparison.
 

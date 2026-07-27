@@ -80,6 +80,10 @@ or alter config-authored prompt text without approval of the exact wording.
    - Put feature assertions in
      `configs/<identity>/smoke.json` or the authoritative leaf-local
      `configs/<identity>/<model-leaf>/<thinking>/smoke.json`; leaf-local wins.
+   - Treat the smoke contract as validation, not agent behavior. It is excluded
+     from the config lock and pinned as assertions in each launch plan. A
+     contract-only correction may revalidate exact saved artifacts without a
+     subject call; missing evidence or changed behavior requires a new rep.
    - Use structured result fields/counters, required files, compact structured
      usage records, and explicitly extension-owned stable machine markers.
    - Do not gate launches on README/documentation/source prose, source formatting,
@@ -109,7 +113,8 @@ or alter config-authored prompt text without approval of the exact wording.
      ```
 
    - `refresh` is allowed only for an editable draft after investigation and
-     renewed agreement. Planning and execution verify locks read-only and never
+     renewed agreement. A smoke-contract-only correction does not refresh the
+     behavior lock. Planning and execution verify locks read-only and never
      create, refresh, or rewrite them.
    - A successful preflight writes immutable seal evidence under the configured
      central state root. Lock maintenance and planning consult that registry, so

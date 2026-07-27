@@ -1989,11 +1989,37 @@ def test_passing_preflight_fans_out_exactly_once_without_second_confirmation(
     )
 
 
+def test_confirmed_preflight_uses_plan_smoke_assertions(
+    tmp_path: Path,
+) -> None:
+    """A confirmed plan evaluates its pinned smoke contract, not a live edit."""
+    compiled, _, smoke_contract, _, _ = _compile_single_cell_launch(
+        tmp_path,
+        preflight="required",
+        smoke_contract_document={"equalsResultValues": {"reward_binary": 1}},
+    )
+    smoke_contract.write_text(
+        json.dumps({"equalsResultValues": {"reward_binary": 0}}) + "\n"
+    )
+    runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
+
+    execution = execute_confirmed_launch(
+        compiled.plan,
+        confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
+        pi_runner=runner,
+    )
+
+    assert len(runner.calls) == 1
+    status = json.loads((execution.state_path / "status.json").read_text())
+    assert status["preflight"]["task-a/baseline@1.0.0/rep0"]["state"] == "passed"
+
+
 def test_reused_unsealed_result_creates_central_config_seal(
     tmp_path: Path,
 ) -> None:
     """A successful required re-evaluation seals without rewriting a result."""
-    first, _, _, _, _ = _compile_single_cell_launch(
+    first, _, smoke_contract, _, _ = _compile_single_cell_launch(
         tmp_path,
         preflight="disabled",
     )
@@ -2005,6 +2031,9 @@ def test_reused_unsealed_result_creates_central_config_seal(
     )
     result_before = first_execution.result_path.read_bytes()
     assert "preflight_passed" not in json.loads(result_before)
+    smoke_contract.write_text(
+        json.dumps({"equalsResultValues": {"reward_binary": 1}}) + "\n"
+    )
 
     required = _compile_existing_fixture(
         tmp_path,
@@ -2012,6 +2041,9 @@ def test_reused_unsealed_result_creates_central_config_seal(
         run_id="required-recheck",
         existing_results="require-compatible",
     )
+    assert required.plan.to_document()["configs"][0]["smokeAssertions"] == {
+        "equalsResultValues": {"reward_binary": 1}
+    }
     runner = FakeConfirmedPiRunner(_planned_launch_plan_path(required))
     execute_confirmed_launch(
         required.plan,
@@ -2699,7 +2731,6 @@ def test_execute_confirmed_launch_rejects_missing_or_stale_confirmation(
         ("orchestration.md", "Drifted fixture behavior.\n"),
         ("extensions/machine-markers.ts", "export default {drift: true};\n"),
         ("model/low/settings.json", '{"defaultThinkingLevel":"high"}\n'),
-        ("model/low/smoke.json", '{"minResultValues":{"worker_calls":2}}\n'),
     ],
 )
 def test_execute_confirmed_launch_stops_before_config_input_drifted_rep(

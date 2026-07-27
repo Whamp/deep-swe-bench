@@ -1,5 +1,9 @@
 # 0006 — Versioned config identities and leaf-owned locks
 
+> Amended by [ADR-0007](0007-separate-smoke-validation-from-config-behavior.md),
+> which removes smoke contracts from behavior locks while preserving them in
+> confirmed launch plans.
+
 ## Context
 
 A config name alone cannot identify reviewed behavior across prompt, extension,

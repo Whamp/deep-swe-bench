@@ -1,11 +1,13 @@
 """Behavior tests for versioned config locks through launch-facing seams."""
 
+import hashlib
 import json
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -173,6 +175,63 @@ def test_config_lock_excludes_secret_values_from_identity(
         assert "OPENAI_API_KEY" in serialized_locks
         assert "ZAI_API_KEY" in serialized_locks
         assert first_lock["lockIdentity"] == second_lock["lockIdentity"]
+
+
+def test_existing_config_lock_ignores_legacy_smoke_fingerprint(
+    tmp_path: Path,
+) -> None:
+    """A schema-1 smoke fingerprint remains readable but is not behavior."""
+    config_identity = "review-assistant@1.0.0"
+    config_root = tmp_path / "configs" / config_identity
+    config_leaf = config_root / "model" / "low"
+    config_leaf.mkdir(parents=True)
+    smoke_path = config_leaf / "smoke.json"
+    smoke_path.write_text('{"requireFiles":[]}\n')
+    resolved = config_resolution.resolve_config_leaf(
+        tmp_path,
+        config_identity,
+        "provider/model",
+        "low",
+    )
+    document = config_lock.build_config_lock_document(
+        resolved,
+        config_identity,
+        "rerun",
+        {},
+    )
+    behavior_inputs = cast(
+        list[dict[str, object]],
+        document["behaviorInputs"],
+    )
+    behavior_inputs.append(
+        {
+            "executable": False,
+            "fingerprint": "sha256:legacy-smoke-fingerprint",
+            "kind": "smoke-contract",
+            "path": "model/low/smoke.json",
+            "scope": "leaf",
+        }
+    )
+    identity_input = dict(document)
+    identity_input.pop("lockIdentity")
+    document["lockIdentity"] = (
+        "sha256:"
+        + hashlib.sha256(
+            config_lock.canonical_config_lock_json(identity_input).encode()
+        ).hexdigest()
+    )
+    (config_leaf / "config-lock.json").write_text(
+        config_lock.canonical_config_lock_json(document)
+    )
+
+    smoke_path.write_text('{"equalsResultValues":{"reward_binary":1}}\n')
+
+    verification = config_lock.verify_config_lock(resolved, config_identity)
+    assert verification.matches
+    assert all(
+        item["kind"] != "smoke-contract"
+        for item in config_lock.config_behavior_inputs_from_lock(document)
+    )
 
 
 def test_config_behavior_kinds_preserve_directory_precedence(
@@ -349,12 +408,22 @@ def test_config_maintainer_creates_lock_consumed_by_preflight_plan(
         "extensions/index.ts",
         "extensions/package-lock.json",
         "model/low/settings.json",
-        "model/low/smoke.json",
         "orchestration.md",
         "pi-flags",
         "skills/review/SKILL.md",
     }
     assert lock["lockIdentity"].startswith("sha256:")
+
+    (config_leaf / "smoke.json").write_text(
+        '{"equalsResultValues":{"reward_binary":1}}\n'
+    )
+    resolved = config_resolution.resolve_config_leaf(
+        tmp_path,
+        config_identity,
+        "provider/model",
+        "low",
+    )
+    assert config_lock.verify_config_lock(resolved, config_identity).matches
 
     smoke_subset = tmp_path / "subsets" / "12_v0.txt"
     smoke_subset.parent.mkdir()

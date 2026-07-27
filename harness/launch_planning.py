@@ -1069,7 +1069,7 @@ def _config_plan(
     )
     if lock_document is None:
         return document
-    behavior_inputs = _lock_object_list(lock_document, "behaviorInputs")
+    behavior_inputs = config_lock.config_behavior_inputs_from_lock(lock_document)
     launch_surfaces = _lock_object_list(lock_document, "launchSurfaces")
     _validate_extension_surface_coverage(
         config_identity,

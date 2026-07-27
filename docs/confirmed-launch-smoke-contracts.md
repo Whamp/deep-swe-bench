@@ -1,9 +1,16 @@
 # Confirmed-launch smoke contracts
 
 A versioned config's leaf-local `smoke.json` defines the evidence that one
-subject cell must produce before batch fan-out. Launch planning validates the
-contract without model use. Preflight evaluates it after the subject exits and
-records structured diagnostics for every failed requirement.
+subject cell must produce before batch fan-out. It is a validation contract, not
+a behavior input, so it does not change the config lock. Launch planning
+validates the contract without model use and stores its assertions in the launch
+plan. Execution evaluates that stored copy rather than rereading a mutable file.
+Preflight records structured diagnostics for every failed requirement.
+
+A corrected contract may be applied to saved artifacts without another subject
+or model call when the config behavior and exact result evidence are unchanged.
+A new rep is required when behavior changed or the saved cell lacks evidence
+needed by the corrected contract.
 
 Versioned contracts must use stable fields, parsed records, files, counters, or
 extension-owned machine markers. They cannot use README wording, source prose,

@@ -170,7 +170,10 @@ rep).
 **preflight** (a.k.a. smoke):
 A one-cell gate that proves a config actually works at a `(model-leaf,
 thinking)` before batch fan-out. Runs one rep on a smoke task and checks a
-config-authored smoke contract. Failure stops the batch before any cell runs.
+config-authored smoke contract. The contract validates saved evidence; it is not
+part of config behavior. A launch plan freezes the contract it will apply, and a
+later contract correction may recheck compatible saved evidence without running
+the agent again. Failure stops the batch before any cell runs.
 _Avoid_: smoke test (prefer preflight as the noun; "smoke" survives in
 `smoke.json` contract filenames and the `SMOKE_SUBSET`).
 

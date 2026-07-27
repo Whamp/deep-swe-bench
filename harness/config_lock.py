@@ -33,7 +33,6 @@ _SHARED_BEHAVIOR_FILES = frozenset(
         "omp-tools.txt",
         "orchestration.md",
         "pi-flags",
-        "smoke.json",
         "system_preamble.md",
     }
 )
@@ -269,6 +268,7 @@ def _collect_leaf_behavior_files(
         path
         for path in resolved.config_leaf.rglob("*")
         if path.name != _CONFIG_LOCK_FILENAME
+        and path != resolved.smoke_contract
         and _is_collectable_behavior_file(path)
     }
 
@@ -567,15 +567,30 @@ def require_revisable_config_lock(
         )
 
 
+def config_behavior_inputs_from_lock(
+    lock_document: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Return behavior inputs while ignoring legacy smoke-contract entries."""
+    inputs = lock_document.get("behaviorInputs")
+    if not isinstance(inputs, list):
+        raise TypeError("Config lock invalid: behaviorInputs must be a list")
+    behavior_inputs: list[dict[str, object]] = []
+    for item in inputs:
+        if not isinstance(item, dict):
+            raise TypeError(
+                "Config lock invalid: behaviorInputs entries must be objects"
+            )
+        if item.get("kind") != "smoke-contract":
+            behavior_inputs.append({str(key): value for key, value in item.items()})
+    return behavior_inputs
+
+
 def _shared_behavior_inputs(
     lock_document: Mapping[str, object],
 ) -> dict[str, object]:
     """Index the shared behavior fingerprints stored in one config lock."""
-    inputs = lock_document.get("behaviorInputs")
-    if not isinstance(inputs, list):
-        raise TypeError("Config lock invalid: behaviorInputs must be a list")
     shared: dict[str, object] = {}
-    for item in inputs:
+    for item in config_behavior_inputs_from_lock(lock_document):
         if not isinstance(item, Mapping) or item.get("scope") != "shared":
             continue
         path = item.get("path")
@@ -714,18 +729,8 @@ def verify_config_lock(
             f"{lock_path}"
         )
 
-    expected_inputs = document.get("behaviorInputs")
-    if not isinstance(expected_inputs, list):
-        raise TypeError(
-            f"Config lock invalid: behaviorInputs must be a list in {lock_path}"
-        )
     expected_by_path: dict[str, object] = {}
-    for item in expected_inputs:
-        if not isinstance(item, dict):
-            raise TypeError(
-                "Config lock invalid: behavior input needs a string path in "
-                f"{lock_path}"
-            )
+    for item in config_behavior_inputs_from_lock(document):
         input_path = item.get("path")
         if not isinstance(input_path, str):
             raise TypeError(

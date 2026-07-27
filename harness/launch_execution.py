@@ -123,6 +123,14 @@ def _confirmed_subject_cell(
         dict,
     ):
         raise TypeError(f"Confirmed subject execution runtime missing: task={task!r}")
+    smoke_assertions = config_document["smokeAssertions"]
+    if smoke_assertions is not None and not isinstance(
+        smoke_assertions,
+        Mapping,
+    ):
+        raise TypeError(
+            "Confirmed smoke assertions invalid: expected an object or null"
+        )
     smoke_contract = config_document["smokeContract"]
     subject_behavior = config_document.get("subjectBehavior", {})
     subject_runtime_identity = subject.get("runtimeIdentity", {})
@@ -152,6 +160,9 @@ def _confirmed_subject_cell(
         config_root=Path(config_document["configRoot"]),
         config_leaf=Path(config_document["configLeaf"]),
         credential_routes=tuple(credential_routes),
+        smoke_assertions=(
+            dict(smoke_assertions) if isinstance(smoke_assertions, Mapping) else None
+        ),
         smoke_contract=(Path(smoke_contract) if smoke_contract is not None else None),
         task=task,
         rep=rep,
@@ -816,10 +827,10 @@ def _execute_confirmed_preflight_cell(
         confirmed_preflight.evaluate_generic_preflight(cell_root, result_record)
     )
     diagnostics.extend(
-        confirmed_preflight.evaluate_config_preflight(
+        confirmed_preflight.evaluate_config_preflight_contract(
             cell.config_root.parent.parent,
             cell_root,
-            cell.smoke_contract,
+            cell.smoke_assertions,
             result_record,
         )
     )
