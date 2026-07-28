@@ -91,6 +91,10 @@ def test_treatment_adds_same_telemetry_and_compact_return_guidance(
     copy_pi_fabric_fixture(package_root)
 
     apply_config_patch(TREATMENT_CONFIG, package_root)
+    subprocess.run(
+        ["node", "--check", str(package_root / "dist/index.js")],
+        check=True,
+    )
 
     runtime = "\n".join(
         (package_root / relative).read_text()

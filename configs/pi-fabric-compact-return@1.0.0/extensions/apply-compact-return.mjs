@@ -21,7 +21,7 @@ const compactToolMetadata = `    description: ${JSON.stringify(`${originalToolDe
         ${JSON.stringify(compactReturnGuideline)},
     ],`;
 const originalReadExample = "Examples and returns: `pi.read('/x')`,";
-const compactReadExample = `${compactReturnMarker} ${compactReturnGuideline}\nExamples and returns: \`pi.read('/x')\`,`;
+const compactReadExample = `${compactReturnMarker} ${compactReturnGuideline}\\nExamples and returns: \`pi.read('/x')\`,`;
 const originalSkillTableEnd =
   "| `write` | `{path,content}` \\| `(path, content)` | `{ok,output,details}` |\n\n";
 const compactSkillTableEnd = `${originalSkillTableEnd}### Compact return boundary\n\n${compactReturnMarker} ${compactReturnGuideline}\n\n`;
