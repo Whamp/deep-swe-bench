@@ -9,6 +9,7 @@ import math
 import re
 import statistics
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -73,7 +74,31 @@ def call_from_messages(
         "operations": [],
         "result_chars": 0,
         "success": None,
+        "native_parallel": False,
     }
+
+
+def decorate_call(call: dict[str, Any]) -> dict[str, Any]:
+    refs = operation_refs(call["operations"])
+    call["has_search"] = bool(refs & SEARCH_REFS)
+    call["has_read"] = bool(refs & READ_REFS)
+    call["has_mutation"] = bool(refs & MUTATION_REFS)
+    call["has_bash"] = "pi.bash" in refs
+    call["promise_all"] = bool(PROMISE_ALL.search(call["code"]))
+    call["parallel"] = call["native_parallel"] or call["promise_all"]
+    call["control_flow"] = bool(CONTROL_FLOW.search(call["code"]))
+    call["reads"] = [
+        read
+        for operation in call["operations"]
+        if (read := parse_read_operation(operation, call["index"])) is not None
+    ]
+    call["mutation_paths"] = [
+        str((operation.get("args") or {}).get("path"))
+        for operation in call["operations"]
+        if operation.get("ref") in MUTATION_REFS
+        and isinstance((operation.get("args") or {}).get("path"), str)
+    ]
+    return call
 
 
 def finalize_call(
@@ -91,25 +116,7 @@ def finalize_call(
     call["success"] = bool(
         details.get("success", not tool_result_message.get("isError"))
     )
-    refs = operation_refs(call["operations"])
-    call["has_search"] = bool(refs & SEARCH_REFS)
-    call["has_read"] = bool(refs & READ_REFS)
-    call["has_mutation"] = bool(refs & MUTATION_REFS)
-    call["has_bash"] = "pi.bash" in refs
-    call["promise_all"] = bool(PROMISE_ALL.search(call["code"]))
-    call["control_flow"] = bool(CONTROL_FLOW.search(call["code"]))
-    call["reads"] = [
-        read
-        for operation in call["operations"]
-        if (read := parse_read_operation(operation, call["index"])) is not None
-    ]
-    call["mutation_paths"] = [
-        str((operation.get("args") or {}).get("path"))
-        for operation in call["operations"]
-        if operation.get("ref") in MUTATION_REFS
-        and isinstance((operation.get("args") or {}).get("path"), str)
-    ]
-    return call
+    return decorate_call(call)
 
 
 def parse_fabric_session(path: Path, task: str, rep: int) -> dict[str, Any]:
@@ -137,6 +144,67 @@ def parse_fabric_session(path: Path, task: str, rep: int) -> dict[str, Any]:
             call = pending.pop(str(message.get("toolCallId")), None)
             if call is not None:
                 calls.append(finalize_call(call, message))
+    calls.sort(key=lambda call: call["index"])
+    for index, call in enumerate(calls):
+        call["index"] = index
+        for read in call["reads"]:
+            read["call_index"] = index
+    return {"task": task, "rep": rep, "calls": calls, "session": str(path)}
+
+
+def parse_native_session(path: Path, task: str, rep: int) -> dict[str, Any]:
+    calls: list[dict[str, Any]] = []
+    pending: dict[str, dict[str, Any]] = {}
+    for raw_line in path.read_text(errors="replace").splitlines():
+        try:
+            record = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("type") != "message":
+            continue
+        message = record.get("message") or {}
+        if message.get("role") == "assistant":
+            tool_calls = [
+                item
+                for item in message.get("content") or []
+                if isinstance(item, dict) and item.get("type") == "toolCall"
+            ]
+            if not tool_calls:
+                continue
+            call = {
+                "index": len(calls) + len({id(group) for group in pending.values()}),
+                "tool_call_id": None,
+                "code": "",
+                "usage": message_usage(message),
+                "operations": [
+                    {
+                        "ref": f"pi.{item.get('name', '')}",
+                        "args": item.get("arguments") or {},
+                    }
+                    for item in tool_calls
+                ],
+                "result_chars": 0,
+                "success": True,
+                "native_parallel": len(tool_calls) > 1,
+                "remaining_ids": {str(item.get("id")) for item in tool_calls},
+            }
+            for item in tool_calls:
+                pending[str(item.get("id"))] = call
+        elif message.get("role") == "toolResult":
+            tool_call_id = str(message.get("toolCallId"))
+            call = pending.pop(tool_call_id, None)
+            if call is None:
+                continue
+            call["result_chars"] += sum(
+                len(str(item.get("text", "")))
+                for item in message.get("content") or []
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+            call["success"] = call["success"] and not bool(message.get("isError"))
+            call["remaining_ids"].discard(tool_call_id)
+            if not call["remaining_ids"]:
+                call.pop("remaining_ids")
+                calls.append(decorate_call(call))
     calls.sort(key=lambda call: call["index"])
     for index, call in enumerate(calls):
         call["index"] = index
@@ -204,7 +272,7 @@ def summarize_trajectory(trajectory: dict[str, Any]) -> dict[str, Any]:
     first_mutation = next(
         (index for index, call in enumerate(calls) if call["has_mutation"]), None
     )
-    mutation_boundary = first_mutation if first_mutation is not None else len(calls)
+    mutation_boundary = first_mutation if first_mutation is not None else 0
     search_to_read = read_to_read = retrieval_continuation_cache = 0
     transition_cache: Counter[str] = Counter()
     for previous, current in pairwise(calls):
@@ -241,15 +309,23 @@ def summarize_trajectory(trajectory: dict[str, Any]) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "task": trajectory["task"],
         "rep": trajectory["rep"],
-        "fabric_calls": len(calls),
+        "outer_calls": len(calls),
         "nested_operations": sum(len(call["operations"]) for call in calls),
         "successful_calls": sum(call["success"] is True for call in calls),
         "failed_calls": sum(call["success"] is False for call in calls),
         "promise_all_calls": sum(call["promise_all"] for call in calls),
+        "parallel_calls": sum(call["parallel"] for call in calls),
         "control_flow_calls": sum(call["control_flow"] for call in calls),
         "single_operation_calls": sum(len(call["operations"]) == 1 for call in calls),
         "multi_operation_calls": sum(len(call["operations"]) > 1 for call in calls),
         "read_calls": sum(call["has_read"] for call in calls),
+        "read_operations": sum(len(call["reads"]) for call in calls),
+        "whole_file_read_operations": sum(
+            read["limit"] is None for call in calls for read in call["reads"]
+        ),
+        "bounded_read_operations": sum(
+            read["limit"] is not None for call in calls for read in call["reads"]
+        ),
         "operation_count_histogram": dict(
             Counter(len(call["operations"]) for call in calls)
         ),
@@ -263,6 +339,7 @@ def summarize_trajectory(trajectory: dict[str, Any]) -> dict[str, Any]:
         "same_call_search_and_read": sum(
             call["has_search"] and call["has_read"] for call in calls
         ),
+        "trajectories_with_explicit_mutation": int(first_mutation is not None),
         "mutation_calls": sum(category == "mutation" for category in categories),
         "mutation_operations": sum(
             operation.get("ref") in MUTATION_REFS
@@ -324,7 +401,7 @@ def aggregate_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     trajectory_medians = {
         key: statistics.median(row[key] for row in rows) for key in count_keys
     }
-    calls = total["fabric_calls"]
+    calls = total["outer_calls"]
     operation_histogram: Counter[int] = Counter()
     for row in rows:
         operation_histogram.update(
@@ -387,7 +464,10 @@ def final_patch_metrics(path: Path) -> dict[str, int]:
 
 
 def load_config_trajectories(
-    results_root: Path, config: str, tasks: set[str]
+    results_root: Path,
+    config: str,
+    tasks: set[str],
+    session_parser: Callable[[Path, str, int], dict[str, Any]] = parse_fabric_session,
 ) -> tuple[list[dict[str, Any]], dict[tuple[str, int], dict[str, Any]]]:
     trajectory_rows: list[dict[str, Any]] = []
     result_rows: dict[tuple[str, int], dict[str, Any]] = {}
@@ -402,7 +482,7 @@ def load_config_trajectories(
             raise ValueError(
                 f"Expected one session for {task}/rep{rep}: {session_paths}"
             )
-        trajectory = parse_fabric_session(session_paths[0], task, rep)
+        trajectory = session_parser(session_paths[0], task, rep)
         metrics = summarize_trajectory(trajectory)
         metrics.update(
             final_patch_metrics(result_path.parent / "artifacts/model.patch")
@@ -414,6 +494,21 @@ def load_config_trajectories(
             f"Expected {len(tasks) * 3} trajectories for {config}, found {len(trajectory_rows)}"
         )
     return trajectory_rows, result_rows
+
+
+def aggregate_outcomes(
+    result_rows: dict[tuple[str, int], dict[str, Any]],
+) -> dict[str, float | int]:
+    rows = list(result_rows.values())
+    return {
+        "trajectories": len(rows),
+        "solves": sum(int(row["reward_binary"]) == 1 for row in rows),
+        "mean_partial_reward": statistics.mean(
+            float(row["reward_partial"]) for row in rows
+        ),
+        "total_tokens": sum(int(row["combined_total_tokens"]) for row in rows),
+        "total_cost_usd": sum(float(row["combined_cost_usd"]) for row in rows),
+    }
 
 
 def paired_task_deltas(
@@ -436,7 +531,7 @@ def paired_task_deltas(
                 / int(historical_results[key]["combined_total_tokens"]),
                 "reward_delta": float(guided_results[key]["reward_partial"])
                 - float(historical_results[key]["reward_partial"]),
-                "call_delta": right["fabric_calls"] - left["fabric_calls"],
+                "call_delta": right["outer_calls"] - left["outer_calls"],
                 "retrieval_before_mutation_delta": right[
                     "retrieval_calls_before_first_mutation"
                 ]
@@ -505,6 +600,20 @@ def delta_correlations(rows: list[dict[str, Any]]) -> dict[str, float | None]:
     }
 
 
+def comparison_summary(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+    left_results: dict[tuple[str, int], dict[str, Any]],
+    right_results: dict[tuple[str, int], dict[str, Any]],
+) -> dict[str, Any]:
+    task_deltas = paired_task_deltas(left, right, left_results, right_results)
+    return {
+        "task_delta_correlations": delta_correlations(task_deltas),
+        "largest_token_regressions": task_deltas[:10],
+        "largest_token_improvements": list(reversed(task_deltas[-10:])),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-root", type=Path, required=True)
@@ -516,35 +625,54 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     tasks = set(args.subset.read_text().split())
+    baseline_config = "baseline"
     historical_config = "pi-fabric"
     guided_config = "pi-fabric-native-read-guidance@1.0.0"
+    baseline, baseline_results = load_config_trajectories(
+        args.results_root, baseline_config, tasks, parse_native_session
+    )
     historical, historical_results = load_config_trajectories(
         args.results_root, historical_config, tasks
     )
     guided, guided_results = load_config_trajectories(
         args.results_root, guided_config, tasks
     )
-    task_deltas = paired_task_deltas(
-        historical, guided, historical_results, guided_results
-    )
     summary = {
         "scope": {
             "tasks": len(tasks),
             "repetitions": 3,
             "trajectories_per_config": len(historical),
+            "baseline_config": baseline_config,
             "model": "openai-codex/gpt-5.6-sol",
             "thinking": "low",
             "historical_config": historical_config,
             "guided_config": guided_config,
         },
-        "historical": aggregate_metrics(historical),
-        "guided": aggregate_metrics(guided),
-        "task_delta_correlations": delta_correlations(task_deltas),
-        "largest_token_regressions": task_deltas[:10],
-        "largest_token_improvements": list(reversed(task_deltas[-10:])),
+        "baseline": {
+            **aggregate_metrics(baseline),
+            "outcomes": aggregate_outcomes(baseline_results),
+        },
+        "historical": {
+            **aggregate_metrics(historical),
+            "outcomes": aggregate_outcomes(historical_results),
+        },
+        "guided": {
+            **aggregate_metrics(guided),
+            "outcomes": aggregate_outcomes(guided_results),
+        },
+        "comparisons": {
+            "baseline_to_historical": comparison_summary(
+                baseline, historical, baseline_results, historical_results
+            ),
+            "historical_to_guided": comparison_summary(
+                historical, guided, historical_results, guided_results
+            ),
+        },
         "limitations": [
             "Fabric trace operations record references and arguments but not hidden nested-result sizes, so Stage 1 cannot measure raw-to-returned compression.",
-            "Historical Fabric is 0.25.6 and guided Fabric is 0.28.4 plus guidance; task-level deltas are diagnostic associations, not a same-version causal estimate.",
+            "The original baseline-versus-Fabric comparison uses matched trajectories from the same benchmark comparison and is not version-confounded.",
+            "Historical Fabric is 0.25.6 and guided Fabric is 0.28.4 plus guidance; that later task-level delta is diagnostic, not a same-version causal estimate.",
+            "Vanilla Pi can dispatch multiple native tools from one assistant message; the analysis groups those parallel tool calls into one outer turn for comparison with one fabric_exec call.",
             "The trace strips edit/write payload text, so Stage 1 can count mutation rounds and paths but cannot compare intermediate edit payload sizes.",
             "Mutation timing uses explicit pi.edit/pi.write operations; mutation performed inside pi.bash is a known blind spot.",
             "Verification classification uses command-family matching and may omit project-specific verification commands.",
@@ -553,7 +681,11 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     (args.output / "trajectory-metrics.json").write_text(
-        json.dumps({"historical": historical, "guided": guided}, indent=2) + "\n"
+        json.dumps(
+            {"baseline": baseline, "historical": historical, "guided": guided},
+            indent=2,
+        )
+        + "\n"
     )
 
 
