@@ -29,5 +29,5 @@ model-usage source.
   review-only and receives no new reps in this launch.
 
 Exact package and upstream certification evidence is recorded in
-`extensions/UPSTREAM.json` and
+`upstream.json` and
 `analysis/pi-fabric-pr10-0da479f-package-validation.json`.
