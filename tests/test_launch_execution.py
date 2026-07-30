@@ -778,6 +778,7 @@ def test_confirmed_execution_allows_reference_only_legacy_baseline(
         runtime_resolver=resolver,
     )
     runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
+    (legacy_leaf / "settings.json").write_text('{"referenceOnly":true}\n')
 
     execute_confirmed_launch(
         compiled.plan,

@@ -375,8 +375,9 @@ def _config_lock_drift_changes(
 ) -> list[dict[str, object]]:
     """Compare every approved config lock with its current document."""
     changes: list[dict[str, object]] = []
+    execution_configs = set(_execution_config_identities(document))
     for config in document["configs"]:
-        if config["legacy"]:
+        if config["identity"] not in execution_configs or config["legacy"]:
             continue
         approved_identity = config["lockIdentity"]
         lock_path = Path(config["configLeaf"]) / "config-lock.json"
@@ -421,7 +422,10 @@ def _config_input_drift_changes(
 ) -> list[dict[str, object]]:
     """Compare every approved config input with its current fingerprint."""
     changes: list[dict[str, object]] = []
+    execution_configs = set(_execution_config_identities(document))
     for config in document["configs"]:
+        if config["identity"] not in execution_configs:
+            continue
         resolved = _resolved_plan_config_leaf(config)
         approved_by_path = {
             str(item["path"]): item for item in config["behaviorInputs"]
