@@ -41,19 +41,28 @@ or an accepted Pi CLI flag alone is not sufficient evidence.
 ## Required Pi version
 
 Pi `0.80.2`, previously pinned in `harness/Dockerfile.pi-agent`, does not list
-`gpt-5.6-sol`. Pi `0.81.1` does list it under `openai-codex` with reasoning
-support. The benchmark image is pinned to `0.81.1`, and `PI_IMAGE_REV` includes
-that version so existing per-task images cannot be reused accidentally.
+`gpt-5.6-sol`. Pi `0.81.1` first established this repository's provider,
+thinking, and usage evidence for the model. Those historical artifacts remain
+valid evidence for the earlier results that recorded Pi `0.81.1`.
 
-Artifact:
+The pi-fabric PR #10 refresh uses Pi `0.83.0`, matching the candidate package's
+pinned Pi AI and development dependencies. The benchmark image and
+`PI_IMAGE_REV` are pinned to `0.83.0`, so Pi `0.81.1` task images cannot be
+reused. The candidate preflight must capture the live Pi `0.83.0` request shape
+and native session usage before fan-out.
+
+Artifacts:
 
 ```text
 analysis/openai-codex-gpt56-sol-model-registry.json
+analysis/pi-fabric-pr10-0da479f-package-validation.json
+docs/pi-fabric-pr10-0da479f-validation.md
 ```
 
 ## Request-shape probes
 
-Pi `0.81.1` `before_provider_request` captures recorded these request fields:
+The historical Pi `0.81.1` `before_provider_request` captures recorded these
+request fields:
 
 ```json
 {"model":"gpt-5.6-sol","reasoning":{"effort":"low","summary":"auto"},"stream":true,"store":false}
@@ -100,13 +109,15 @@ not persisted raw `--mode json` streams.
 Each config needs a leaf at `gpt-5.6-sol/<thinking>/` containing:
 
 - `settings.json` with `defaultThinkingLevel` set to that leaf's thinking level;
-- a leaf-local `smoke.json` requiring model, thinking, Pi-version,
-  request-probe, and live-probe evidence;
+- a leaf-local `smoke.json` requiring model, thinking, exact subject version,
+  request-shape, and native session evidence;
 - session evidence containing the exact `"thinkingLevel":"<thinking>"` value;
 - captured provider-request evidence containing the matching explicit effort.
 
 Launches must use `openai-codex/gpt-5.6-sol`, the matching `--thinking` value,
-and `--pass-openai-codex-oauth`.
+and the declared `OPENAI_CODEX_OAUTH` credential route. A Pi `0.83.0` launch
+must not claim compatibility from the older Pi `0.81.1` version alone; its
+preflight supplies the live version-specific request and usage evidence.
 
 ## Stale patterns to avoid
 
