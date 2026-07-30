@@ -738,6 +738,57 @@ def test_confirmed_execution_rejects_legacy_config_before_subject_call(
     assert not state_root.exists()
 
 
+def test_confirmed_execution_allows_reference_only_legacy_baseline(
+    tmp_path: Path,
+) -> None:
+    """A legacy baseline may be reviewed when only a locked config executes."""
+    initial, _, _, results_root, state_root = _compile_single_cell_launch(
+        tmp_path,
+        preflight="disabled",
+    )
+    document = initial.plan.to_document()
+    repository_root = Path(document["paths"]["workspace"])
+    tasks_root = Path(document["paths"]["tasksRoot"])
+    legacy_leaf = repository_root / "configs" / "legacy-baseline" / "model" / "low"
+    legacy_leaf.mkdir(parents=True)
+    request = LaunchRequest(
+        subject="pi",
+        model="provider/model",
+        thinking="low",
+        configs=("baseline@1.0.0",),
+        baseline_config="legacy-baseline",
+        task_selection=LaunchTaskSelection(kind="tasks", tasks=("task-a",)),
+        reps=1,
+        concurrency=1,
+        run_id="reference-baseline-plan",
+        policies=LaunchExecutionPolicies(
+            preflight="disabled",
+            existing_results="rerun",
+            transient_errors="stop",
+            cell_retries=0,
+        ),
+    )
+    resolver = _runtime_resolver_for(initial)
+    compiled = compile_launch_request(
+        request,
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=resolver,
+    )
+    runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
+
+    execute_confirmed_launch(
+        compiled.plan,
+        confirmation_identity=compiled.plan.identity,
+        runtime_resolver=resolver,
+        pi_runner=runner,
+    )
+
+    assert [cell.config_identity for cell in runner.calls] == ["baseline@1.0.0"]
+
+
 def test_execute_command_consumes_only_reviewed_plan_and_confirmation(
     tmp_path: Path,
 ) -> None:

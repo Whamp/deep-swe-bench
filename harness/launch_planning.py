@@ -174,11 +174,13 @@ def _validate_launch_configs(request: LaunchRequest) -> None:
         raise ValueError(
             "Launch configs invalid: duplicate config identities are not allowed"
         )
-    if request.baseline_config not in request.configs:
-        raise ValueError(
-            "Launch baseline invalid: selected baseline must be a config; "
-            f"got {request.baseline_config!r}"
-        )
+    if not request.baseline_config.strip():
+        raise ValueError("Launch baseline invalid: baseline config cannot be empty")
+
+
+def _reviewed_config_identities(request: LaunchRequest) -> tuple[str, ...]:
+    """Return the reference baseline followed by configs that will execute."""
+    return tuple(dict.fromkeys((request.baseline_config, *request.configs)))
 
 
 def _validate_launch_policies(request: LaunchRequest) -> None:
@@ -1442,11 +1444,32 @@ def _preflight_cells(
 
 def _receipt_warnings(document: LaunchPlanDocument) -> list[str]:
     warnings: list[str] = []
-    legacy = [config["identity"] for config in document["configs"] if config["legacy"]]
-    if legacy:
+    execution_configs = set(
+        document.get(
+            "executionConfigs",
+            [config["identity"] for config in document["configs"]],
+        )
+    )
+    legacy_execution = [
+        config["identity"]
+        for config in document["configs"]
+        if config["legacy"] and config["identity"] in execution_configs
+    ]
+    if legacy_execution:
         warnings.append(
             "legacy configs are readable for diagnosis but require a "
-            "versioned release before confirmed execution: " + ", ".join(legacy)
+            "versioned release before confirmed execution: "
+            + ", ".join(legacy_execution)
+        )
+    legacy_references = [
+        config["identity"]
+        for config in document["configs"]
+        if config["legacy"] and config["identity"] not in execution_configs
+    ]
+    if legacy_references:
+        warnings.append(
+            "reference-only legacy configs have historical provenance and will "
+            "not execute: " + ", ".join(legacy_references)
         )
     if document["policies"]["preflight"] == "disabled":
         warnings.append("preflight is disabled")
@@ -1647,6 +1670,17 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
         config for config in configs if config.get("identity") == baseline_identity
     )
     warnings = _receipt_warnings(document)
+    execution_config_identities = set(
+        document.get(
+            "executionConfigs",
+            [config["identity"] for config in configs],
+        )
+    )
+    execution_configs = [
+        config
+        for config in configs
+        if config["identity"] in execution_config_identities
+    ]
     subject_behavior_lines = _render_subject_behavior_lines(configs)
     policies = document["policies"]
     preflight_result_paths = {
@@ -1667,6 +1701,16 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
             f"Plan: {document['planIdentity']}",
             f"Subject: {subject['name']} {subject['version']}",
             f"Model: {document['model']} (thinking={document['thinking']})",
+            *(
+                [
+                    (
+                        f"Reference baseline: {baseline_identity} "
+                        "(review only; no reps planned)"
+                    )
+                ]
+                if baseline_identity not in document.get("executionConfigs", [])
+                else []
+            ),
             (
                 f"Tasks: {counts['tasks']}; configs: {counts['configs']}; "
                 f"reps: {counts['reps']}; "
@@ -1709,7 +1753,7 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
             *_render_config_release_lines(configs),
             "",
             "MODEL ROLES",
-            *_render_role_lines(configs),
+            *_render_role_lines(execution_configs),
             "",
             "SUBJECT COMPATIBILITY",
             *(
@@ -1775,7 +1819,10 @@ def compile_launch_request(
     _validate_selected_tasks(tasks_root, tasks)
     config_plans = [
         _config_plan(repository_root, request, config_identity)
-        for config_identity in request.configs
+        for config_identity in _reviewed_config_identities(request)
+    ]
+    execution_config_plans = [
+        config for config in config_plans if config["identity"] in request.configs
     ]
     for config_plan in config_plans:
         if config_plan["legacy"]:
@@ -1798,7 +1845,7 @@ def compile_launch_request(
         raise ValueError(
             "Launch runtime identity unresolved: OMP binary identity missing"
         )
-    _validate_config_runtime_compatibility(config_plans, runtime)
+    _validate_config_runtime_compatibility(execution_config_plans, runtime)
     batch_cells = _batch_cells(
         results_root,
         request,
@@ -1812,7 +1859,7 @@ def compile_launch_request(
         state_root,
         request,
         tasks,
-        config_plans,
+        execution_config_plans,
         batch_cells,
     )
     selection: dict[str, object] = {
@@ -1841,6 +1888,7 @@ def compile_launch_request(
             "reps": request.reps,
             "tasks": len(tasks),
         },
+        "executionConfigs": list(request.configs),
         "identityExclusions": ["paths.statePath", "runId"],
         "model": request.model,
         "paths": {
