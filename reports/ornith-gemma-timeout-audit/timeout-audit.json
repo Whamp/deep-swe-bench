@@ -1,0 +1,925 @@
+{
+  "comparison": {
+    "agent_timeout_s": 3600,
+    "configs": {
+      "Gemma": "baseline-gemma4-31b@1.0.0",
+      "Ornith": "baseline-ornith-35b@1.0.0"
+    },
+    "reps": 3,
+    "subset": "12_v2",
+    "thinking": "high",
+    "verifier_timeout_s": 2100
+  },
+  "conclusion": {
+    "gemma_langchain_more_time": "plausibly_improves_partial",
+    "gemma_mobly_more_time": "unlikely_material_rescue",
+    "ornith_more_wall_time_alone": "would_not_help",
+    "recommended_clean_comparison": "keep the 3600-second cap and run pi-check unchanged; report intention-to-treat and check-delivered cells separately",
+    "recommended_practical_variant": "pair a baseline and pi-check release with the same automatic default timeout for unbounded bash calls"
+  },
+  "generated_at": "2026-07-30T22:09:38.001319+00:00",
+  "incidents": [
+    {
+      "agent_wall_s": 3600.1,
+      "assessment": {
+        "confidence": "high",
+        "extension": "A modest extension plausibly would have improved partial credit because the next fixes were explicit. Exact completion remained uncertain with 30 feature tests still failing.",
+        "mechanism": "No tool was pending. Gemma used almost the full hour, had just identified two concrete callback/future fixes, and was waiting in another model turn when killed. External verification completed with 20/50 feature and 232/232 preservation tests.",
+        "state": "Genuine model-time exhaustion while still reasoning"
+      },
+      "f2p": [
+        20,
+        50
+      ],
+      "last_completed_tool_calls": [
+        {
+          "arguments": {
+            "content": "\"\"\"Request coalescing for Runnables.\"\"\"\n\nfrom __future__ import annotations\n\nimport asyncio\nimport threading\nimport uuid\nfrom abc import ABC, abstractmethod\nfrom dataclasses import dataclass\nfrom typing import Any, Dict, Generic, Iterator, AsyncIterator, TypeVar, Optional\n\nfrom pydantic import BaseModel\nfrom langchain_core.runnables.base import Runnable\nfrom langchain_core.runnables.config import RunnableConfig, get_callback_manager_for_config, get_async_callback_manager_for_config, ensure_config\n\nInput = TypeVar(\"Input\")\nOutput = TypeVar(\"Output\")\n\n@dataclass\nclass CoalesceStats:\n    \"\"\"Statistics for request coalescing.\"\"\"\n    active: int = 0\n    coalesced: int = 0\n    total: int = 0\n\nclass CoalesceBackend(ABC):\n    \"\"\"Backend for request coalescing.\"\"\"\n\n    @abstractmethod\n    def register(self, key: Any) -> bool:\n        \"\"\"Register a request. Return True if this call is the leader.\"\"\"\n        ...\n\n    @abstractmethod\n    def join(self, key: Any) -> Any:\n        \"\"\"Wait for the leader to complete and return the result.\"\"\"\n        ...\n\n    @abstractmethod\n    def complete(self, key: Any, *, result: Any = None, error: Optional[Exception] = None):\n        \"\"\"Mark the request as complete and notify all joiners.\"\"\"\n        ...\n\n    @abstractmethod\n    def is_active(self, key: Any) -> bool:\n        \"\"\"Check if a request for the given key is currently active.\"\"\"\n        ...\n\n    @property\n    @abstractmethod\n    def stats(self) -> CoalesceStats:\n        \"\"\"Return the current coalescing statistics.\"\"\"\n        ...\n\n    @abstractmethod\n    async def aregister(self, key: Any) -> bool:\n        ...\n\n    @abstractmethod\n    async def ajoin(self, key: Any) -> Any:\n        ...\n\n    @abstractmethod\n    async def acomplete(self, key: Any, *, result: Any = None, error: Optional[Exception] = None):\n        ...\n\n    @abstractmethod\n    async def ais_active(self, key: Any) -> bool:\n        ...\n\n    @abstractmethod\n    def clear(self):\n        \"\"\"Cancel all waiters and reset stats.\"\"\"\n        ...\n\nclass InMemoryCoalesceBackend(CoalesceBackend):\n    \"\"\"Thread-safe in-memory implementation of CoalesceBackend.\"\"\"\n\n    class RequestState:\n        def __init__(self):\n            self.result: Any = None\n            self.error: Optional[Exception] = None\n            self.done = False\n            self.event = threading.Event()\n            self.future: Optional[asyncio.Future] = None\n\n    def __init__(self):\n        self._lock = threading.Lock()\n        self._requests: Dict[Any, InMemoryCoalesceBackend.RequestState] = {}\n        self._active_count = 0\n        self._coalesced_count = 0\n        self._total_count = 0\n\n    def register(self, key: Any) -> bool:\n        with self._lock:\n            self._total_count += 1\n            if key in self._requests:\n                self._coalesced_count += 1\n                return False\n            self._requests[key] = self.RequestState()\n            self._active_count += 1\n            return True\n\n    def join(self, key: Any) -> Any:\n        state = self._get_state(key)\n        state.event.wait()\n        if state.error:\n            raise state.error\n        return state.result\n\n    def complete(self, key: Any, *, result: Any = None, error: Optional[Exception] = None):\n        with self._lock:\n            state = self._requests.pop(key, None)\n            if state:\n                state.result = result\n                state.error = error\n                state.done = True\n                state.event.set()\n                if state.future and not state.future.done():\n                    loop = state.future.loop\n                    if error:\n                        loop.call_soon_threadsafe(state.future.set_exception, error)\n                    else:\n                        loop.call_soon_threadsafe(state.future.set_result, result)\n                self._active_count -= 1\n\n    def is_active(self, key: Any) -> bool:\n        with self._lock:\n            return key in self._requests\n\n    @property\n    def stats(self) -> CoalesceStats:\n        with self._lock:\n            return CoalesceStats(\n                active=self._active_count,\n                coalesced=self._coalesced_count,\n                total=self._total_count,\n            )\n\n    async def aregister(self, key: Any) -> bool:\n        return self.register(key)\n\n    async def ajoin(self, key: Any) -> Any:\n        state = self._get_state(key)\n        \n        loop = asyncio.get_running_loop()\n        if state.future is None:\n            with self._lock:\n                if state.future is None:\n                    state.future = loop.create_future()\n        \n        await state.future\n        if state.error:\n            raise state.error\n        return state.result\n\n    async def acomplete(self, key: Any, *, result: Any = None, error: Optional[Exception] = None):\n        self.complete(key, result=result, error=error)\n\n    async def ais_active(self, key: Any) -> bool:\n        return self.is_active(key)\n\n    def clear(self):\n        \"\"\"Cancel all waiters and reset stats.\"\"\"\n        with self._lock:\n            for state in self._requests.values():\n                state.event.set()\n                if state.future and not state.future.done():\n                    loop = state.future.loop\n                    loop.call_soon_threadsafe(state.future.set_exception, asyncio.CancelledError())\n            self._requests.clear()\n            self._active_count = 0\n            self._coalesced_count = 0\n            self._total_count = 0\n\n    def _get_state(self, key: Any) -> RequestState:\n        with self._lock:\n            state = self._requests.get(key)\n            if state is None:\n                raise KeyError(f\"No active request for key {key}\")\n            return state\n\ndef make_hashable(obj: Any) -> Any:\n    \"\"\"Convert non-hashable objects to hashable ones.\"\"\"\n    if isinstance(obj, dict):\n        return frozenset((k, make_hashable(v)) for k, v in obj.items())\n    if isinstance(obj, list):\n        return tuple(make_hashable(i) for i in obj)\n    if isinstance(obj, set):\n        return frozenset(make_hashable(i) for i in obj)\n    return obj\n\nclass CoalesceRunnable(Runnable[Input, Output]):\n    \"\"\"A Runnable that coalesces concurrent identical requests.\"\"\"\n\n    def __init__(self, runnable: Runnable[Input, Output], *, backend: CoalesceBackend | None = None):\n        super().__init__()\n        self.runnable = runnable\n        self.backend = backend or InMemoryCoalesceBackend()\n\n    def invoke(self, input: Input, config: RunnableConfig | None = None, **kwargs: Any) -> Output:\n        key = make_hashable(input)\n        config = ensure_config(config)\n        cm = get_callback_manager_for_config(config)\n        run_id = str(uuid.uuid4())\n        \n        if cm:\n            cm.on_chain_start(\n                name=self.get_name(),\n                run_id=run_id,\n                inputs={\"input\": input},\n                serialized=None,\n                request_id=None,\n            )\n            \n        is_leader = self.backend.register(key)\n        try:\n            if is_leader:\n                result = self.runnable.invoke(input, config, **kwargs)\n                self.backend.complete(key, result=result)\n                res = result\n            else:\n                res = self.backend.join(key)\n            \n            if cm:\n                cm.on_chain_end(output=res, run_id=run_id)\n            return res\n        except Exception as e:\n            if is_leader:\n                self.backend.complete(key, error=e)\n            if cm:\n                cm.on_chain_exception(exception=e, run_id=run_id)\n            raise e\n\n    async def ainvoke(self, input: Input, config: RunnableConfig | None = None, **kwargs: Any) -> Output:\n        key = make_hashable(input)\n        config = ensure_config(config)\n        cm = get_async_callback_manager_for_config(config)\n        run_id = str(uuid.uuid4())\n        \n        if cm:\n            await cm.on_chain_start(\n                name=self.get_name(),\n                run_id=run_id,\n                inputs={\"input\": input},\n                serialized=None,\n                request_id=None,\n            )\n            \n        is_leader = await self.backend.aregister(key)\n        try:\n            if is_leader:\n                result = await self.runnable.ainvoke(input, config, **kwargs)\n                await self.backend.acomplete(key, result=result)\n                res = result\n            else:\n                res = await self.backend.ajoin(key)\n            \n            if cm:\n                await cm.on_chain_end(output=res, run_id=run_id)\n            return res\n        except Exception as e:\n            if is_leader:\n                await self.backend.acomplete(key, error=e)\n            if cm:\n                await cm.on_chain_exception(exception=e, run_id=run_id)\n            raise e\n\n    def stream(self, input: Input, config: RunnableConfig | None = None, **kwargs: Any | None) -> Iterator[Output]:\n        key = make_hashable(input)\n        config = ensure_config(config)\n        cm = get_callback_manager_for_config(config)\n        run_id = str(uuid.uuid4())\n        \n        if cm:\n            cm.on_chain_start(\n                name=self.get_name(),\n                run_id=run_id,\n                inputs={\"input\": input},\n                serialized=None,\n                request_id=None,\n            )\n            \n        is_leader = self.backend.register(key)\n        try:\n            if is_leader:\n                chunks = []\n                for chunk in self.runnable.stream(input, config, **kwargs):\n                    chunks.append(chunk)\n                    yield chunk\n                self.backend.complete(key, result=chunks)\n            else:\n                result = self.backend.join(key)\n                # result is the list of chunks\n                for chunk in result:\n                    yield chunk\n            \n            if cm:\n                cm.on_chain_end(output=None, run_id=run_id)\n        except Exception as e:\n            if is_leader:\n                self.backend.complete(key, error=e)\n            if cm:\n                cm.on_chain_exception(exception=e, run_id=run_id)\n            raise e\n\n    async def astream(self, input: Input, config: RunnableConfig | None = None, **kwargs: Any | None) -> AsyncIterator[Output]:\n        key = make_hashable(input)\n        config = ensure_config(config)\n        cm = get_async_callback_manager_for_config(config)\n        run_id = str(uuid.uuid4())\n        \n        if cm:\n            await cm.on_chain_start(\n                name=self.get_name(),\n                run_id=run_id,\n                inputs={\"input\": input},\n                serialized=None,\n                request_id=None,\n            )\n            \n        is_leader = await self.backend.aregister(key)\n        try:\n            if is_leader:\n                chunks = []\n                async for chunk in self.runnable.astream(input, config, **kwargs):\n                    chunks.append(chunk)\n                    yield chunk\n                await self.backend.acomplete(key, result=chunks)\n            else:\n                result = await self.backend.ajoin(key)\n                for chunk in result:\n                    yield chunk\n            \n            if cm:\n                await cm.on_chain_end(output=None, run_id=run_id)\n        except Exception as e:\n            if is_leader:\n                await self.backend.acomplete(key, error=e)\n            if cm:\n                await cm.on_chain_exception(exception=e, run_id=run_id)\n            raise e\n\n    def coalesce_info(self) -> CoalesceStats:\n        \"\"\"Return statistics for the coalescing backend.\"\"\"\n        return self.backend.stats\n\n    def coalesce_clear(self):\n        \"\"\"Cancel all waiters and reset stats.\"\"\"\n        self.backend.clear()\n\n    def batch(self, inputs, config, *, return_exceptions=False, **kwargs):\n        return super().batch(inputs, config, return_exceptions=return_exceptions, **kwargs)\n\n    async def abatch(self, inputs, config, *, return_exceptions=False, **kwargs):\n        return await super().abatch(inputs, config, return_exceptions=return_exceptions, **kwargs)\n\n    def batch_as_completed(self, inputs, config, *, return_exceptions=False, **kwargs):\n        return super().batch_as_completed(inputs, config, return_exceptions=return_exceptions, **kwargs)\n\n    async def abatch_as_completed(self, inputs, config, *, return_exceptions=False, **kwargs):\n        return await super().abatch_as_completed(inputs, config, return_exceptions=return_exceptions, **kwargs)\n",
+            "path": "libs/core/langchain_core/runnables/coalesce.py"
+          },
+          "name": "write",
+          "timestamp": "2026-07-29T02:47:14.680Z"
+        },
+        {
+          "arguments": {
+            "command": "uv run pytest libs/core/langchain_core/runnables/test_coalesce.py"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-29T02:47:19.407Z"
+        },
+        {
+          "arguments": {
+            "command": "grep \"def \" libs/core/langchain_core/callbacks/manager.py | grep \"on_chain\""
+          },
+          "name": "bash",
+          "timestamp": "2026-07-29T02:47:53.225Z"
+        },
+        {
+          "arguments": {
+            "path": "libs/core/langchain_core/callbacks/manager.py"
+          },
+          "name": "read",
+          "timestamp": "2026-07-29T02:48:06.610Z"
+        },
+        {
+          "arguments": {
+            "content": "\"\"\"Request coalescing for Runnables.\"\"\"\n\nfrom __future__ import annotations\n\nimport asyncio\nimport threading\nimport uuid\nfrom abc import ABC, abstractmethod\nfrom dataclasses import dataclass\nfrom typing import Any, Dict, Generic, Iterator, AsyncIterator, TypeVar, Optional\n\nfrom pydantic import BaseModel\nfrom langchain_core.runnables.base import Runnable\nfrom langchain_core.runnables.config import RunnableConfig, get_callback_manager_for_config, get_async_callback_manager_for_config, ensure_config\n\nInput = TypeVar(\"Input\")\nOutput = TypeVar(\"Output\")\n\n@dataclass\nclass CoalesceStats:\n    \"\"\"Statistics for request coalescing.\"\"\"\n    active: int = 0\n    coalesced: int = 0\n    total: int = 0\n\nclass CoalesceBackend(ABC):\n    \"\"\"Backend for request coalescing.\"\"\"\n\n    @abstractmethod\n    def register(self, key: Any) -> bool:\n        \"\"\"Register a request. Return True if this call is the leader.\"\"\"\n        ...\n\n    @abstractmethod\n    def join(self, key: Any) -> Any:\n        \"\"\"Wait for the leader to complete and return the result.\"\"\"\n        ...\n\n    @abstractmethod\n    def complete(self, key: Any, *, result: Any = None, error: Optional[Exception] = None):\n        \"\"\"Mark the request as complete and notify all joiners.\"\"\"\n        ...\n\n    @abstractmethod\n    def is_active(self, key: Any) -> bool:\n        \"\"\"Check if a request for the given key is currently active.\"\"\"\n        ...\n\n    @property\n    @abstractmethod\n    def stats(self) -> CoalesceStats:\n        \"\"\"Return the current coalescing statistics.\"\"\"\n        ...\n\n    @abstractmethod\n    async def aregister(self, key: Any) -> bool:\n        ...\n\n    @abstractmethod\n    async def ajoin(self, key: Any) -> Any:\n        ...\n\n    @abstractmethod\n    async def acomplete(self, key: Any, *, result: Any = None, error: Optional[Exception] = None):\n        ...\n\n    @abstractmethod\n    async def ais_active(self, key: Any) -> bool:\n        ...\n\n    @abstractmethod\n    def clear(self):\n        \"\"\"Cancel all waiters and reset stats.\"\"\"\n        ...\n\nclass InMemoryCoalesceBackend(CoalesceBackend):\n    \"\"\"Thread-safe in-memory implementation of CoalesceBackend.\"\"\"\n\n    class RequestState:\n        def __init__(self):\n            self.result: Any = None\n            self.error: Optional[Exception] = None\n            self.done = False\n            self.event = threading.Event()\n            self.future: Optional[asyncio.Future] = None\n\n    def __init__(self):\n        self._lock = threading.Lock()\n        self._requests: Dict[Any, InMemoryCoalesceBackend.RequestState] = {}\n        self._active_count = 0\n        self._coalesced_count = 0\n        self._total_count = 0\n\n    def register(self, key: Any) -> bool:\n        with self._lock:\n            self._total_count += 1\n            if key in self._requests:\n                self._coalesced_count += 1\n                return False\n            self._requests[key] = self.RequestState()\n            self._active_count += 1\n            return True\n\n    def join(self, key: Any) -> Any:\n        state = self._get_state(key)\n        state.event.wait()\n        if state.error:\n            raise state.error\n        return state.result\n\n    def complete(self, key: Any, *, result: Any = None, error: Optional[Exception] = None):\n        with self._lock:\n            state = self._requests.pop(key, None)\n            if state:\n                state.result = result\n                state.error = error\n                state.done = True\n                state.event.set()\n                if state.future and not state.future.done():\n                    loop = state.future.loop\n                    if error:\n                        loop.call_soon_threadsafe(state.future.set_exception, error)\n                    else:\n                        loop.call_soon_threadsafe(state.future.set_result, result)\n                self._active_count -= 1\n\n    def is_active(self, key: Any) -> bool:\n        with self._lock:\n            return key in self._requests\n\n    @property\n    def stats(self) -> CoalesceStats:\n        with self._lock:\n            return CoalesceStats(\n                active=self._active_count,\n                coalesced=self._coalesced_count,\n                total=self._total_count,\n            )\n\n    async def aregister(self, key: Any) -> bool:\n        return self.register(key)\n\n    async def ajoin(self, key: Any) -> Any:\n        state = self._get_state(key)\n        \n        loop = asyncio.get_running_loop()\n        if state.future is None:\n            with self._lock:\n                if state.future is None:\n                    state.future = loop.create_future()\n        \n        await state.future\n        if state.error:\n            raise state.error\n        return state.result\n\n    async def acomplete(self, key: Any, *, result: Any = None, error: Optional[Exception] = None):\n        self.complete(key, result=result, error=error)\n\n    async def ais_active(self, key: Any) -> bool:\n        return self.is_active(key)\n\n    def clear(self):\n        \"\"\"Cancel all waiters and reset stats.\"\"\"\n        with self._lock:\n            for state in self._requests.values():\n                state.event.set()\n                if state.future and not state.future.done():\n                    loop = state.future.loop\n                    loop.call_soon_threadsafe(state.future.set_exception, asyncio.CancelledError())\n            self._requests.clear()\n            self._active_count = 0\n            self._coalesced_count = 0\n            self._total_count = 0\n\n    def _get_state(self, key: Any) -> RequestState:\n        with self._lock:\n            state = self._requests.get(key)\n            if state is None:\n                raise KeyError(f\"No active request for key {key}\")\n            return state\n\ndef make_hashable(obj: Any) -> Any:\n    \"\"\"Convert non-hashable objects to hashable ones.\"\"\"\n    if isinstance(obj, dict):\n        return frozenset((k, make_hashable(v)) for k, v in obj.items())\n    if isinstance(obj, list):\n        return tuple(make_hashable(i) for i in obj)\n    if isinstance(obj, set):\n        return frozenset(make_hashable(i) for i in obj)\n    return obj\n\nclass CoalesceRunnable(Runnable[Input, Output]):\n    \"\"\"A Runnable that coalesces concurrent identical requests.\"\"\"\n\n    def __init__(self, runnable: Runnable[Input, Output], *, backend: CoalesceBackend | None = None):\n        super().__init__()\n        self.runnable = runnable\n        self.backend = backend or InMemoryCoalesceBackend()\n\n    def invoke(self, input: Input, config: RunnableConfig | None = None, **kwargs: Any) -> Output:\n        key = make_hashable(input)\n        config = ensure_config(config)\n        cm = get_callback_manager_for_config(config)\n        run_id = str(uuid.uuid4())\n        \n        run_manager = None\n        if cm:\n            run_manager = cm.on_chain_start(\n                serialized=None,\n                inputs={\"input\": input},\n                run_id=run_id,\n                name=self.get_name(),\n            )\n            \n        is_leader = self.backend.register(key)\n        try:\n            if is_leader:\n                result = self.runnable.invoke(input, config, **kwargs)\n                self.backend.complete(key, result=result)\n                res = result\n            else:\n                res = self.backend.join(key)\n            \n            if run_manager:\n                run_manager.on_chain_end(output=res)\n            return res\n        except Exception as e:\n            if is_leader:\n                self.backend.complete(key, error=e)\n            if run_manager:\n                run_manager.on_chain_error(e)\n            raise e\n\n    async def ainvoke(self, input: Input, config: RunnableConfig | None = None, **kwargs: Any) -> Output:\n        key = make_hashable(input)\n        config = ensure_config(config)\n        cm = get_async_callback_manager_for_config(config)\n        run_id = str(uuid.uuid4())\n        \n        run_manager = None\n        if cm:\n            run_manager = await cm.on_chain_start(\n                serialized=None,\n                inputs={\"input\": input},\n                run_id=run_id,\n                name=self.get_name(),\n            )\n            \n        is_leader = await self.backend.aregister(key)\n        try:\n            if is_leader:\n                result = await self.runnable.ainvoke(input, config, **kwargs)\n                await self.backend.acomplete(key, result=result)\n                res = result\n            else:\n                res = await self.backend.ajoin(key)\n            \n            if run_manager:\n                await run_manager.on_chain_end(output=res)\n            return res\n        except Exception as e:\n            if is_leader:\n                await self.backend.acomplete(key, error=e)\n            if run_manager:\n                await run_manager.on_chain_error(e)\n            raise e\n\n    def stream(self, input: Input, config: RunnableConfig | None = None, **kwargs: Any | None) -> Iterator[Output]:\n        key = make_hashable(input)\n        config = ensure_config(config)\n        cm = get_callback_manager_for_config(config)\n        run_id = str(uuid.uuid4())\n        \n        run_manager = None\n        if cm:\n            run_manager = cm.on_chain_start(\n                serialized=None,\n                inputs={\"input\": input},\n                run_id=run_id,\n                name=self.get_name(),\n            )\n            \n        is_leader = self.backend.register(key)\n        try:\n            if is_leader:\n                chunks = []\n                for chunk in self.runnable.stream(input, config, **kwargs):\n                    chunks.append(chunk)\n                    yield chunk\n                self.backend.complete(key, result=chunks)\n            else:\n                result = self.backend.join(key)\n                # result is the list of chunks\n                for chunk in result:\n                    yield chunk\n            \n            if run_manager:\n                run_manager.on_chain_end(output=None)\n        except Exception as e:\n            if is_leader:\n                self.backend.complete(key, error=e)\n            if run_manager:\n                run_manager.on_chain_error(e)\n            raise e\n\n    async def astream(self, input: Input, config: RunnableConfig | None = None, **kwargs: Any | None) -> AsyncIterator[Output]:\n        key = make_hashable(input)\n        config = ensure_config(config)\n        cm = get_async_callback_manager_for_config(config)\n        run_id = str(uuid.uuid4())\n        \n        run_manager = None\n        if cm:\n            run_manager = await cm.on_chain_start(\n                serialized=None,\n                inputs={\"input\": input},\n                run_id=run_id,\n                name=self.get_name(),\n            )\n            \n        is_leader = await self.backend.aregister(key)\n        try:\n            if is_leader:\n                chunks = []\n                async for chunk in self.runnable.astream(input, config, **kwargs):\n                    chunks.append(chunk)\n                    yield chunk\n                await self.backend.acomplete(key, result=chunks)\n            else:\n                result = await self.backend.ajoin(key)\n                for chunk in result:\n                    yield chunk\n            \n            if run_manager:\n                await run_manager.on_chain_end(output=None)\n        except Exception as e:\n            if is_leader:\n                await self.backend.acomplete(key, error=e)\n            if run_manager:\n                await run_manager.on_chain_error(e)\n            raise e\n\n    def coalesce_info(self) -> CoalesceStats:\n        \"\"\"Return statistics for the coalescing backend.\"\"\"\n        return self.backend.stats\n\n    def coalesce_clear(self):\n        \"\"\"Cancel all waiters and reset stats.\"\"\"\n        self.backend.clear()\n\n    def batch(self, inputs, config, *, return_exceptions=False, **kwargs):\n        return super().batch(inputs, config, return_exceptions=return_exceptions, **kwargs)\n\n    async def abatch(self, inputs, config, *, return_exceptions=False, **kwargs):\n        return await super().abatch(inputs, config, return_exceptions=return_exceptions, **kwargs)\n\n    def batch_as_completed(self, inputs, config, *, return_exceptions=False, **kwargs):\n        return super().batch_as_completed(inputs, config, return_exceptions=return_exceptions, **kwargs)\n\n    async def abatch_as_completed(self, inputs, config, *, return_exceptions=False, **kwargs):\n        return await super().abatch_as_completed(inputs, config, return_exceptions=return_exceptions, **kwargs)\n",
+            "path": "libs/core/langchain_core/runnables/coalesce.py"
+          },
+          "name": "write",
+          "timestamp": "2026-07-29T02:55:17.442Z"
+        },
+        {
+          "arguments": {
+            "command": "uv run pytest libs/core/langchain_core/runnables/test_coalesce.py"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-29T02:55:22.740Z"
+        }
+      ],
+      "last_message_before_agent_deadline_s": 134.94799999999987,
+      "last_message_text": "Errors:\n1.  `AttributeError: '_asyncio.Future' object has no attribute 'loop'`.\n    This is because `asyncio.Future` does not have a `.loop` attribute in Python 3.12.\n    I should use `asyncio.get_running_loop()` or store the loop when creating the future.\n2.  `TypeError: CallbackManagerForChainRun.on_chain_end() missing 1 required positional argument: 'outputs'`.\n    The method is `on_chain_end(self, outputs, **kwargs)`. I called it with `output=res`. It should be `outputs=res`.\n\nLet's fix these.\nIn `InMemoryCoalesceBackend`, I'll store the loop in `RequestState`.\nAnd I'll fix the `on_chain_end` calls.",
+      "model": "Gemma",
+      "p2p": [
+        232,
+        232
+      ],
+      "patch_bytes": 20261,
+      "pending_arguments": null,
+      "pending_has_timeout_argument": null,
+      "pending_seconds_at_deadline": null,
+      "pending_tool": null,
+      "pending_tool_calls": 0,
+      "rep": 2,
+      "result_path": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/langchain-request-coalescing/rep2/result.json",
+      "reward_binary": 0,
+      "reward_partial": 0.8936170212765957,
+      "rpc_event_counts": {
+        "agent_end": 2,
+        "agent_start": 3,
+        "auto_retry_start": 2,
+        "message_end": 75,
+        "message_start": 76,
+        "message_update": 9355,
+        "response": 7161,
+        "tool_execution_end": 36,
+        "tool_execution_start": 36,
+        "tool_execution_update": 51,
+        "turn_end": 38,
+        "turn_start": 39
+      },
+      "session_span_s": 3464.031,
+      "task": "langchain-request-coalescing",
+      "tool_calls": 36,
+      "total_tokens": 2039648,
+      "turns": 38,
+      "verifier_elapsed_s": 33.90000000000009,
+      "verifier_exit": 0
+    },
+    {
+      "agent_wall_s": 3600.1,
+      "assessment": {
+        "confidence": "high",
+        "extension": "More time might have produced another edit, but a meaningful score rescue was unlikely without changing approach; further destructive rewriting was also plausible.",
+        "mechanism": "No tool was pending. Gemma was waiting for another model response after repeated exact-edit failures and a full-file read. External verification completed, but only 1/79 feature tests passed and preservation had regressed to 679/808.",
+        "state": "Genuine model-time exhaustion in a poor implementation state"
+      },
+      "f2p": [
+        1,
+        79
+      ],
+      "last_completed_tool_calls": [
+        {
+          "arguments": {
+            "path": "mobly/base_test.py"
+          },
+          "name": "read",
+          "timestamp": "2026-07-29T04:23:08.137Z"
+        },
+        {
+          "arguments": {
+            "content": "# Copyright 2016 Google Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport collections\nimport contextlib\nimport copy\nimport functools\nimport inspect\nimport logging\nimport os\nimport re\nimport sys\nimport threading\nfrom concurrent.futures import ThreadPoolExecutor\n\nfrom mobly import controller_manager\nfrom mobly import expects\nfrom mobly import records\nfrom mobly import runtime_test_info\nfrom mobly import signals\nfrom mobly import utils\n\nclass SyncManager:\n  \"\"\"Manages synchronization barriers for test execution.\"\"\"\n\n  def __init__(self):\n    self._barriers = {}\n    self._lock = threading.Lock()\n\n  def _get_barrier(self, key, group_size):\n    with self._lock:\n      if key not in self._barriers:\n        self._barriers[key] = threading.Barrier(group_size)\n      return self._barriers[key]\n\n  def _clear_barrier(self, key):\n    with self._lock:\n      self._barriers.pop(key, None)\n\n  def sync(self, key, group_size, name, timeout):\n    if timeout < 0:\n      raise ValueError(f'Timeout for {name} cannot be negative: {timeout}')\n    if timeout == 0:\n      raise signals.TestError(f'Timeout for {name} cannot be zero')\n\n    barrier = self._get_barrier(key, group_size)\n    try:\n      barrier.wait(timeout)\n    except threading.BrokenBarrierError:\n      raise signals.TestError(f'Barrier {name} is broken')\n    except Exception as e:\n      self._clear_barrier(key)\n      if isinstance(e, threading.TimeoutError) or 'timed out' in str(e).lower():\n        raise signals.TestError(f'Timeout occurred while synchronizing on {name}')\n      raise signals.TestError(f'Error occurred while synchronizing on {name}: {e}')\n\n  def clear(self, key):\n    self._clear_barrier(key)\n\n# Macro strings for test result reporting.\n\nTEST_CASE_TOKEN = '[Test]'\nRESULT_LINE_TEMPLATE = TEST_CASE_TOKEN + ' %s %s'\nTEST_SELECTOR_REGEX_PREFIX = 're:'\n\nTEST_STAGE_BEGIN_LOG_TEMPLATE = '[{parent_token}]#{child_token} >>> BEGIN >>>'\nTEST_STAGE_END_LOG_TEMPLATE = '[{parent_token}]#{child_token} <<< END <<<'\n\n# Names of execution stages, in the order they happen during test runs.\nSTAGE_NAME_PRE_RUN = 'pre_run'\nSTAGE_NAME_SETUP_CLASS = 'setup_class'\nSTAGE_NAME_SETUP_TEST = 'setup_test'\nSTAGE_NAME_TEARDOWN_TEST = 'teardown_test'\nSTAGE_NAME_TEARDOWN_CLASS = 'teardown_class'\nSTAGE_NAME_CLEAN_UP = 'clean_up'\n\n# Attribute names\nATTR_REPEAT_CNT = '_repeat_count'\nATTR_MAX_RETRY_CNT = '_max_retry_count'\nATTR_MAX_CONSEC_ERROR = '_max_consecutive_error'\n\n\nclass Error(Exception):\n  \"\"\"Raised for exceptions that occurred in BaseTestClass.\"\"\"\n\n\ndef repeat(count, max_consecutive_error=None):\n  \"\"\"Decorator for repeating a test case multiple times.\n\n  The BaseTestClass will execute the test cases annotated with this decorator\n  the specified number of time.\n\n  This decorator only stores the information needed for the repeat. It does not\n  execute the repeat.\n\n  Args:\n    count: int, the total number of times to execute the decorated test case.\n    max_consecutive_error: int, the maximum number of consecutively failed\n      iterations allowed. If reached, the remaining iterations is abandoned.\n      By default this is not enabled.\n\n  Returns:\n    The wrapped test function.\n\n  Raises:\n    ValueError, if the user input is invalid.\n  \"\"\"\n  if count <= 1:\n    raise ValueError(\n        f'The `count` for `repeat` must be larger than 1, got \"{count}\".'\n    )\n\n  if max_consecutive_error is not None and max_consecutive_error > count:\n    raise ValueError(\n        f'The `max_consecutive_error` ({max_consecutive_error}) for `repeat` '\n        f'must be smaller than `count` ({count}).'\n    )\n\n  def _outer_decorator(func):\n    setattr(func, ATTR_REPEAT_CNT, count)\n    setattr(func, ATTR_MAX_CONSEC_ERROR, max_consecutive_error)\n\n    @functools.wraps(func)\n    def _wrapper(*args):\n      func(*args)\n\n    return _wrapper\n\n  return _outer_decorator\n\n\ndef retry(max_count):\n  \"\"\"Decorator for retrying a test case until it passes.\n\n  The BaseTestClass will keep executing the test cases annotated with this\n  decorator until the test passes, or the maxinum number of iterations have\n  been met.\n\n  This decorator only stores the information needed for the retry. It does not\n  execute the retry.\n\n  Args:\n    max_count: int, the maximum number of times to execute the decorated test\n      case.\n\n  Returns:\n    The wrapped test function.\n\n  Raises:\n    ValueError, if the user input is invalid.\n  \"\"\"\n  if max_count <= 1:\n    raise ValueError(\n        f'The `max_count` for `retry` must be larger than 1, got \"{max_count}\".'\n    )\n\n  def _outer_decorator(func):\n    setattr(func, ATTR_MAX_RETRY_CNT, max_count)\n\n    @functools.wraps(func)\n    def _wrapper(*args):\n      func(*args)\n\n    return _wrapper\n\n  return _outer_decorator\n\n\nclass BaseTestClass:\n  \"\"\"Base class for all test classes to inherit from.\n\n  This class gets all the controller objects from test_runner and executes\n  the tests requested within itself.\n\n  Most attributes of this class are set at runtime based on the configuration\n  provided.\n\n  The default logger in logging module is set up for each test run. If you\n  want to log info to the test run output file, use `logging` directly, like\n  `logging.info`.\n\n  Attributes:\n    tests: A list of strings, each representing a test method name.\n    TAG: A string used to refer to a test class. Default is the test class\n      name.\n    results: A records.TestResult object for aggregating test results from\n      the execution of tests.\n    controller_configs: dict, controller configs provided by the user via\n      test bed config.\n    current_test_info: RuntimeTestInfo, runtime information on the test\n      currently being executed.\n    root_output_path: string, storage path for output files associated with\n      the entire test run. A test run can have multiple test class\n      executions. This includes the test summary and Mobly log files.\n    log_path: string, storage path for files specific to a single test\n      class execution.\n    test_bed_name: [Deprecated, use 'testbed_name' instead]\n      string, the name of the test bed used by a test run.\n    testbed_name: string, the name of the test bed used by a test run.\n    user_params: dict, custom parameters from user, to be consumed by\n      the test logic.\n  \"\"\"\n\n  # Explicitly set the type since we set this to `None` in between\n  # test cases executions when there's no active test. However, since\n  # it is safe for clients to call at any point during normal execution\n  # of a Mobly test, we avoid using the `Optional` type hint for convenience.\n  current_test_info: runtime_test_info.RuntimeTestInfo\n\n  TAG = None\n\n  def __init__(self, configs):\n    \"\"\"Constructor of BaseTestClass.\n\n    The constructor takes a config_parser.TestRunConfig object and which has\n    all the information needed to execute this test class, like log_path\n    and controller configurations. For details, see the definition of class\n    config_parser.TestRunConfig.\n\n    Args:\n      configs: A config_parser.TestRunConfig object.\n    \"\"\"\n    self.tests = []\n    class_identifier = self.__class__.__name__\n    if configs.test_class_name_suffix:\n      class_identifier = '%s_%s' % (\n          class_identifier,\n          configs.test_class_name_suffix,\n      )\n    if self.TAG is None:\n      self.TAG = class_identifier\n    # Set params.\n    self.root_output_path = configs.log_path\n    self.log_path = os.path.join(self.root_output_path, class_identifier)\n    utils.create_dir(self.log_path)\n    # Deprecated, use 'testbed_name'\n    self.test_bed_name = configs.test_bed_name\n    self.testbed_name = configs.testbed_name\n    self.user_params = configs.user_params\n    self.results = records.TestResult()\n    self.summary_writer = configs.summary_writer\n    self._generated_test_table = collections.OrderedDict()\n    self._controller_manager = controller_manager.ControllerManager(\n        class_name=self.TAG, controller_configs=configs.controller_configs\n    )\n    self.controller_configs = self._controller_manager.controller_configs\n    self._sync_manager = SyncManager()\n    self._local = threading.local()\n    self._local.current_device = None\n    self._local.current_device_id = None\n    self._local.sync_context_allowed = False\n    self._local.current_test_info = None\n\n  @property\n  def current_device(self):\n    \"\"\"Returns the current device associated with the test execution.\"\"\"\n    if not getattr(self._local, 'sync_context_allowed', False):\n      raise RuntimeError('current_device can only be accessed in group_setup, '\n                         'group_teardown, and test methods.')\n    if self._local.current_device is None:\n      raise RuntimeError('current_device is not available in the current context.')\n    return self._local.current_device\n\n  @current_device.setter\n  def current_device(self, value):\n    self._local.current_device = value\n\n  @property\n  def current_device_id(self):\n    \"\"\"Returns the current device ID associated with the test execution.\"\"\"\n    if not getattr(self._local, 'sync_context_allowed', False):\n      raise RuntimeError('current_device_id can only be accessed in group_setup, '\n                         'group_teardown, and test methods.')\n    if self._local.current_device_id is None:\n      raise RuntimeError('current_device_id is not available in the current context.')\n    return self._local.current_device_id\n\n  @current_device_id.setter\n  def current_device_id(self, value):\n    self._local.current_device_id = value\n\n  @property\n  def current_test_info(self):\n    return getattr(self._local, 'current_test_info', None)\n\n  @current_test_info.setter\n  def current_test_info(self, value):\n    self._local.current_test_info = value\n\n  def global_setup(self):\n    \"\"\"Global setup hook. Implementation is optional.\"\"\"\n    pass\n\n  def global_teardown(self):\n    \"\"\"Global teardown hook. Implementation is optional.\"\"\"\n    pass\n\n  def group_setup(self, devices):\n    \"\"\"Group setup hook. Implementation is optional.\"\"\"\n    pass\n\n  def group_teardown(self, devices):\n    \"\"\"Group teardown hook. Implementation is optional.\"\"\"\n    pass\n\n  def synchronized_step(self, name, timeout=None):\n    \"\"\"Synchronizes execution at a given step.\n\n    Args:\n      name: string, the name of the synchronization point.\n      timeout: float, optional timeout in seconds.\n    \"\"\"\n    if not getattr(self._local, 'sync_context_allowed', False):\n      raise signals.TestError(f'synchronized_step({name}) can only be called '\n                              'within group_setup, group_teardown, or test methods.')\n    \n    group = getattr(self, '_current_group', 'default')\n    test_name = self.current_test_info.name if self.current_test_info else 'hook'\n    key = (id(self), group, test_name, name)\n    group_size = getattr(self, '_current_group_size', 1)\n    self._sync_manager.sync(key, group_size, name, timeout)\n\n  @contextlib.contextmanager\n  def synchronized_context(self, name, timeout=None):\n    \"\"\"Synchronizes execution upon entering the context.\n\n    Args:\n      name: string, the name of the synchronization point.\n      timeout: float, optional timeout in seconds.\n    \"\"\"\n    self.synchronized_step(name, timeout)\n    yield\n\n  def unpack_userparams(\n      self, req_param_names=None, opt_param_names=None, **kwargs\n  ):\n    \"\"\"An optional function that unpacks user defined parameters into\n    individual variables.\n\n    After unpacking, the params can be directly accessed with self.xxx.\n\n    If a required param is not provided, an exception is raised. If an\n    optional param is not provided, a warning line will be logged.\n\n    To provide a param, add it in the config file or pass it in as a kwarg.\n    If a param appears in both the config file and kwarg, the value in the\n    config file is used.\n\n    User params from the config file can also be directly accessed in\n    self.user_params.\n\n    Args:\n      req_param_names: A list of names of the required user params.\n      opt_param_names: A list of names of the optional user params.\n      **kwargs: Arguments that provide default values.\n        e.g. unpack_userparams(required_list, opt_list, arg_a='hello')\n        self.arg_a will be 'hello' unless it is specified again in\n        required_list or opt_list.\n\n    Raises:\n      Error: A required user params is not provided.\n    \"\"\"\n    req_param_names = req_param_names or []\n    opt_param_names = opt_param_names or []\n    for k, v in kwargs.items():\n      if k in self.user_params:\n        v = self.user_params[k]\n      setattr(self, k, v)\n    for name in req_param_names:\n      if hasattr(self, name):\n        continue\n      if name not in self.user_params:\n        raise Error(\n            'Missing required user param \"%s\" in test configuration.' % name\n        )\n      setattr(self, name, self.user_params[name])\n    for name in opt_param_names:\n      if hasattr(self, name):\n        continue\n      if name in self.user_params:\n        setattr(self, name, self.user_params[name])\n      else:\n        logging.warning(\n            'Missing optional user param \"%s\" in configuration, continue.', name\n        )\n\n  def register_controller(self, module, required=True, min_number=1):\n    \"\"\"Loads a controller module and returns its loaded devices.\n\n    A Mobly controller module is a Python lib that can be used to control\n    a device, service, or equipment. To be Mobly compatible, a controller\n    module needs to have the following members:\n\n    .. code-block:: python\n\n      def create(configs):\n        [Required] Creates controller objects from configurations.\n\n        Args:\n          configs: A list of serialized data like string/dict. Each\n            element of the list is a configuration for a controller\n            object.\n\n        Returns:\n          A list of objects.\n\n      def destroy(objects):\n        [Required] Destroys controller objects created by the create\n        function. Each controller object shall be properly cleaned up\n        and all the resources held should be released, e.g. memory\n        allocation, sockets, file handlers etc.\n\n        Args:\n          A list of controller objects created by the create function.\n\n      def get_info(objects):\n        [Optional] Gets info from the controller objects used in a test\n        run. The info will be included in test_summary.yaml under\n        the key 'ControllerInfo'. Such information could include unique\n        ID, version, or anything that could be useful for describing the\n        test bed and debugging.\n\n        Args:\n          objects: A list of controller objects created by the create\n            function.\n\n        Returns:\n          A list of json serializable objects: each represents the\n            info of a controller object. The order of the info\n            object should follow that of the input objects.\n\n    Registering a controller module declares a test class's dependency the\n    controller. If the module config exists and the module matches the\n    controller interface, controller objects will be instantiated with\n    corresponding configs. The module should be imported first.\n\n    Args:\n      module: A module that follows the controller module interface.\n      required: A bool. If True, failing to register the specified\n        controller module raises exceptions. If False, the objects\n        failed to instantiate will be skipped.\n      min_number: An integer that is the minimum number of controller\n        objects to be created. Default is one, since you should not\n        register a controller module without expecting at least one\n        object.\n\n    Returns:\n      A list of controller objects instantiated from controller_module, or\n      None if no config existed for this controller and it was not a\n      required controller.\n\n    Raises:\n      ControllerError:\n        * The controller module has already been registered.\n        * The actual number of objects instantiated is less than the\n        * `min_number`.\n        * `required` is True and no corresponding config can be found.\n        * Any other error occurred in the registration process.\n    \"\"\"\n    return self._controller_manager.register_controller(\n        module, required, min_number\n    )\n\n  def _record_controller_info(self):\n    # Collect controller information and write to test result.\n    for record in self._controller_manager.get_controller_info_records():\n      self.results.add_controller_info_record(record)\n      self.summary_writer.dump(\n          record.to_dict(), records.TestSummaryEntryType.CONTROLLER_INFO\n      )\n\n  def _pre_run(self):\n    \"\"\"Proxy function to guarantee the base implementation of `pre_run` is\n    called.\n\n    Returns:\n      True if setup is successful, False otherwise.\n    \"\"\"\n    stage_name = STAGE_NAME_PRE_RUN\n    record = records.TestResultRecord(stage_name, self.TAG)\n    record.test_begin()\n    self.current_test_info = runtime_test_info.RuntimeTestInfo(\n        stage_name, self.log_path, record\n    )\n    try:\n      with self._log_test_stage(stage_name):\n        self.pre_run()\n      return True\n    except Exception as e:\n      logging.exception('%s failed for %s.', stage_name, self.TAG)\n      record.test_error(e)\n      self.results.add_class_error(record)\n      self.summary_writer.dump(\n          record.to_dict(), records.TestSummaryEntryType.RECORD\n      )\n      return False\n\n  def pre_run(self):\n    \"\"\"Preprocesses that need to be done before setup_class.\n\n    This phase is used to do pre-test processes like generating tests.\n    This is the only place `self.generate_tests` should be called.\n\n    If this function throws an error, the test class will be marked failure\n    and the \"Requested\" field will be 0 because the number of tests\n    requested is unknown at this point.\n    \"\"\"\n\n  def _setup_class(self):\n    \"\"\"Proxy function to guarantee the base implementation of setup_class\n    is called.\n\n    Returns:\n      If `self.results` is returned instead of None, this means something\n      has gone wrong, and the rest of the test class should not execute.\n    \"\"\"\n    # Setup for the class.\n    class_record = records.TestResultRecord(STAGE_NAME_SETUP_CLASS, self.TAG)\n    class_record.test_begin()\n    self.current_test_info = runtime_test_info.RuntimeTestInfo(\n        STAGE_NAME_SETUP_CLASS, self.log_path, class_record\n    )\n    expects.recorder.reset_internal_states(class_record)\n    try:\n      with self._log_test_stage(STAGE_NAME_SETUP_CLASS):\n        self.setup_class()\n    except signals.TestAbortSignal:\n      # Throw abort signals to outer try block for handling.\n      raise\n    except Exception as e:\n      # Setup class failed for unknown reasons.\n      # Fail the class and skip all tests.\n      logging.exception('Error in %s#setup_class.', self.TAG)\n      class_record.test_error(e)\n      self.results.add_class_error(class_record)\n      self._exec_procedure_func(self._on_fail, class_record)\n      class_record.update_record()\n      self.summary_writer.dump(\n          class_record.to_dict(), records.TestSummaryEntryType.RECORD\n      )\n      self._skip_remaining_tests(e)\n      return self.results\n    if expects.recorder.has_error:\n      self._exec_procedure_func(self._on_fail, class_record)\n      class_record.test_error()\n      class_record.update_record()\n      self.summary_writer.dump(\n          class_record.to_dict(), records.TestSummaryEntryType.RECORD\n      )\n      self.results.add_class_error(class_record)\n      self._skip_remaining_tests(class_record.termination_signal.exception)\n      return self.results\n\n  def setup_class(self):\n    \"\"\"Setup function that will be called before executing any test in the\n    class.\n\n    To signal setup failure, use asserts or raise your own exception.\n\n    Errors raised from `setup_class` will trigger `on_fail`.\n\n    Implementation is optional.\n    \"\"\"\n\n  def _teardown_class(self):\n    \"\"\"Proxy function to guarantee the base implementation of\n    teardown_class is called.\n    \"\"\"\n    stage_name = STAGE_NAME_TEARDOWN_CLASS\n    record = records.TestResultRecord(stage_name, self.TAG)\n    record.test_begin()\n    self.current_test_info = runtime_test_info.RuntimeTestInfo(\n        stage_name, self.log_path, record\n    )\n    expects.recorder.reset_internal_states(record)\n    try:\n      with self._log_test_stage(stage_name):\n        self.teardown_class()\n    except signals.TestAbortAll as e:\n      setattr(e, 'results', self.results)\n      raise\n    except Exception as e:\n      logging.exception('Error encountered in %s.', stage_name)\n      record.test_error(e)\n      record.update_record()\n      self.results.add_class_error(record)\n      self.summary_writer.dump(\n          record.to_dict(), records.TestSummaryEntryType.RECORD\n      )\n    else:\n      if expects.recorder.has_error:\n        record.test_error()\n        record.update_record()\n        self.results.add_class_error(record)\n        self.summary_writer.dump(\n            record.to_dict(), records.TestSummaryEntryType.RECORD\n        )\n    finally:\n      self._clean_up()\n\n  def teardown_class(self):\n    \"\"\"Teardown function that will be called after all the selected tests in\n    the test class have been executed.\n\n    Errors raised from `teardown_class` do not trigger `on_fail`.\n\n    Implementation is optional.\n    \"\"\"\n\n  @contextlib.contextmanager\n  def _log_test_stage(self, stage_name):\n    \"\"\"Logs the begin and end of a test stage.\n\n    This context adds two log lines meant for clarifying the boundary of\n    each execution stage in Mobly log.\n\n    Args:\n      stage_name: string, name of the stage to log.\n    \"\"\"\n    parent_token = self.current_test_info.name\n    # If the name of the stage is the same as the test name, in which case\n    # the stage is class-level instead of test-level, use the class's\n    # reference tag as the parent token instead.\n    if parent_token == stage_name:\n      parent_token = self.TAG\n    logging.debug(\n        TEST_STAGE_BEGIN_LOG_TEMPLATE.format(\n            parent_token=parent_token, child_token=stage_name\n        )\n    )\n    try:\n      yield\n    finally:\n      logging.debug(\n          TEST_STAGE_END_LOG_TEMPLATE.format(\n              parent_token=parent_token, child_token=stage_name\n          )\n      )\n\n  def _setup_test(self, test_name):\n    \"\"\"Proxy function to guarantee the base implementation of setup_test is\n    called.\n    \"\"\"\n    with self._log_test_stage(STAGE_NAME_SETUP_TEST):\n      self.setup_test()\n\n  def setup_test(self):\n    \"\"\"Setup function that will be called every time before executing each\n    test method in the test class.\n\n    To signal setup failure, use asserts or raise your own exception.\n\n    Implementation is optional.\n    \"\"\"\n\n  def _teardown_test(self, test_name):\n    \"\"\"Proxy function to guarantee the base implementation of teardown_test\n    is called.\n    \"\"\"\n    with self._log_test_stage(STAGE_NAME_TEARDOWN_TEST):\n      self.teardown_test()\n\n  def teardown_test(self):\n    \"\"\"Teardown function that will be called every time a test method has\n    been executed.\n\n    Implementation is optional.\n    \"\"\"\n\n  def _on_fail(self, record):\n    \"\"\"Proxy function to guarantee the base implementation of on_fail is\n    called.\n\n    Args:\n      record: records.TestResultRecord, a copy of the test record for\n          this test, containing all information of the test execution\n          including exception objects.\n    \"\"\"\n    self.on_fail(record)\n\n  def on_fail(self, record):\n    \"\"\"A function that is executed upon a test failure.\n\n    User implementation is optional.\n\n    Args:\n      record: records.TestResultRecord, a copy of the test record for\n        this test, containing all information of the test execution\n        including exception objects.\n    \"\"\"\n\n  def _on_pass(self, record):\n    \"\"\"Proxy function to guarantee the base implementation of on_pass is\n    called.\n\n    Args:\n      record: records.TestResultRecord, a copy of the test record for\n        this test, containing all information of the test execution\n        including exception objects.\n    \"\"\"\n    msg = record.details\n    if msg:\n      logging.info(msg)\n    self.on_pass(record)\n\n  def on_pass(self, record):\n    \"\"\"A function that is executed upon a test passing.\n\n    Implementation is optional.\n\n    Args:\n      record: records.TestResultRecord, a copy of the test record for\n        this test, containing all information of the test execution\n        including exception objects.\n    \"\"\"\n\n  def _on_skip(self, record):\n    \"\"\"Proxy function to guarantee the base implementation of on_skip is\n    called.\n\n    Args:\n      record: records.TestResultRecord, a copy of the test record for\n        this test, containing all information of the test execution\n        including exception objects.\n    \"\"\"\n    logging.info('Reason to skip: %s', record.details)\n    logging.info(RESULT_LINE_TEMPLATE, record.test_name, record.result)\n    self.on_skip(record)\n\n  def on_skip(self, record):\n    \"\"\"A function that is executed upon a test being skipped.\n\n    Implementation is optional.\n\n    Args:\n      record: records.TestResultRecord, a copy of the test record for\n        this test, containing all information of the test execution\n        including exception objects.\n    \"\"\"\n\n  def _exec_procedure_func(self, func, tr_record):\n    \"\"\"Executes a procedure function like on_pass, on_fail etc.\n\n    This function will alter the 'Result' of the test's record if\n    exceptions happened when executing the procedure function, but\n    prevents procedure functions from altering test records themselves\n    by only passing in a copy.\n\n    This will let signals.TestAbortAll through so abort_all works in all\n    procedure functions.\n\n    Args:\n      func: The procedure function to be executed.\n      tr_record: The TestResultRecord object associated with the test\n        executed.\n    \"\"\"\n    func_name = func.__name__\n    procedure_name = func_name[1:] if func_name[0] == '_' else func_name\n    with self._log_test_stage(procedure_name):\n      try:\n        # Pass a copy of the record instead of the actual object so that it\n        # will not be modified.\n        func(copy.deepcopy(tr_record))\n      except signals.TestAbortSignal:\n        raise\n      except Exception as e:\n        logging.exception(\n            'Exception happened when executing %s for %s.',\n            procedure_name,\n            self.current_test_info.name,\n        )\n        tr_record.add_error(procedure_name, e)\n\n  def record_data(self, content):\n    \"\"\"Record an entry in test summary file.\n\n    Sometimes additional data need to be recorded in summary file for\n    debugging or post-test analysis.\n\n    Each call adds a new entry to the summary file, with no guarantee of\n    its position among the summary file entries.\n\n    The content should be a dict. If absent, timestamp field is added for\n    ease of parsing later.\n\n    Args:\n      content: dict, the data to add to summary file.\n    \"\"\"\n    if 'timestamp' not in content:\n      content = content.copy()\n      content['timestamp'] = utils.get_current_epoch_time()\n    self.summary_writer.dump(content, records.TestSummaryEntryType.USER_DATA)\n\n  def _exec_one_test_with_retry(self, test_name, test_method, max_count):\n    \"\"\"Executes one test and retry the test if needed.\n\n    Repeatedly execute a test case until it passes or the maximum count of\n    iteration has been reached.\n\n    Args:\n      test_name: string, Name of the test.\n      test_method: function, The test method to execute.\n      max_count: int, the maximum number of iterations to execute the test for.\n    \"\"\"\n\n    def should_retry(record):\n      return record.result in [\n          records.TestResultEnums.TEST_RESULT_FAIL,\n          records.TestResultEnums.TEST_RESULT_ERROR,\n      ]\n\n    previous_record = self.exec_one_test(test_name, test_method)\n\n    if not should_retry(previous_record):\n      return\n\n    for i in range(max_count - 1):\n      retry_name = f'{test_name}_retry_{i+1}'\n      new_record = records.TestResultRecord(retry_name, self.TAG)\n      new_record.retry_parent = previous_record\n      new_record.parent = (previous_record, records.TestParentType.RETRY)\n      previous_record = self.exec_one_test(retry_name, test_method, new_record)\n      if not should_retry(previous_record):\n        break\n\n  def _exec_one_test_with_repeat(\n      self, test_name, test_method, repeat_count, max_consecutive_error\n  ):\n    \"\"\"Repeatedly execute a test case.\n\n    This method performs the action defined by the `repeat` decorator.\n\n    If the number of consecutive failures reach the threshold set by\n    `max_consecutive_error`, the remaining iterations will be abandoned.\n\n    Args:\n      test_name: string, Name of the test.\n      test_method: function, The test method to execute.\n      repeat_count: int, the number of times to repeat the test case.\n      max_consecutive_error: int, the maximum number of consecutive iterations\n        allowed to fail before abandoning the remaining iterations.\n    \"\"\"\n\n    consecutive_error_count = 0\n\n    # If max_consecutive_error is not set by user, it is considered the same as\n    # the repeat_count.\n    if max_consecutive_error == 0:\n      max_consecutive_error = repeat_count\n\n    previous_record = None\n    for i in range(repeat_count):\n      new_test_name = f'{test_name}_{i}'\n      new_record = records.TestResultRecord(new_test_name, self.TAG)\n      if i > 0:\n        new_record.parent = (previous_record, records.TestParentType.REPEAT)\n      previous_record = self.exec_one_test(\n          new_test_name, test_method, new_record\n      )\n      if previous_record.result in [\n          records.TestResultEnums.TEST_RESULT_FAIL,\n          records.TestResultEnums.TEST_RESULT_ERROR,\n      ]:\n        consecutive_error_count += 1\n      else:\n        consecutive_error_count = 0\n\n      if consecutive_error_count == max_consecutive_error:\n        logging.error(\n            'Repeated test case \"%s\" has consecutively failed %d iterations, '\n            'aborting the remaining %d iterations.',\n            test_name,\n            consecutive_error_count,\n            repeat_count - 1 - i,\n        )\n        return\n\n  def exec_one_test(self, test_name, test_method, record=None):\n    \"\"\"Executes one test and update test results.\n\n    Executes setup_test, the test method, and teardown_test; then creates a\n    records.TestResultRecord object with the execution information and adds\n    the record to the test class's test results.\n\n    Args:\n      test_name: string, Name of the test.\n      test_method: function, The test method to execute.\n      record: records.TestResultRecord, optional arg for injecting a record\n        object to use for this test execution. If not set, a new one is created\n        created. This is meant for passing information between consecutive test\n        case execution for retry purposes. Do NOT abuse this for \"magical\"\n        features.\n\n    Returns:\n      TestResultRecord, the test result record object of the test execution.\n      This object is strictly for read-only purposes. Modifying this record\n      will not change what is reported in the test run's summary yaml file.\n    \"\"\"\n    tr_record = record or records.TestResultRecord(test_name, self.TAG)\n    tr_record.uid = getattr(test_method, 'uid', None)\n    tr_record.test_begin()\n    self.current_test_info = runtime_test_info.RuntimeTestInfo(\n        test_name, self.log_path, tr_record\n    )\n    expects.recorder.reset_internal_states(tr_record)\n    logging.info('%s %s', TEST_CASE_TOKEN, test_name)\n    # Did teardown_test throw an error.\n    teardown_test_failed = False\n    try:\n      try:\n        try:\n          self._setup_test(test_name)\n        except signals.TestFailure as e:\n          _, _, traceback = sys.exc_info()\n          raise signals.TestError(e.details, e.extras).with_traceback(traceback)\n        test_method()\n      except (signals.TestPass, signals.TestAbortSignal, signals.TestSkip):\n        raise\n      except Exception:\n        logging.exception(\n            'Exception occurred in %s.', self.current_test_info.name\n        )\n        raise\n      finally:\n        before_count = expects.recorder.error_count\n        try:\n          self._teardown_test(test_name)\n        except signals.TestAbortSignal:\n          raise\n        except Exception as e:\n          logging.exception(\n              'Exception occurred in %s of %s.',\n              STAGE_NAME_TEARDOWN_TEST,\n              self.current_test_info.name,\n          )\n          tr_record.test_error()\n          tr_record.add_error(STAGE_NAME_TEARDOWN_TEST, e)\n          teardown_test_failed = True\n        else:\n          # Check if anything failed by `expects`.\n          if before_count < expects.recorder.error_count:\n            tr_record.test_error()\n            teardown_test_failed = True\n    except (signals.TestFailure, AssertionError) as e:\n      tr_record.test_fail(e)\n    except signals.TestSkip as e:\n      # Test skipped.\n      tr_record.test_skip(e)\n    except signals.TestAbortSignal as e:\n      # Abort signals, pass along.\n      tr_record.test_fail(e)\n      raise\n    except signals.TestPass as e:\n      # Explicit test pass.\n      tr_record.test_pass(e)\n    except Exception as e:\n      # Exception happened during test.\n      tr_record.test_error(e)\n    else:\n      # No exception is thrown from test and teardown, if `expects` has\n      # error, the test should fail with the first error in `expects`.\n      if expects.recorder.has_error and not teardown_test_failed:\n        tr_record.test_fail()\n      # Otherwise the test passed.\n      elif not teardown_test_failed:\n        tr_record.test_pass()\n    finally:\n      tr_record.update_record()\n      try:\n        if tr_record.result in (\n            records.TestResultEnums.TEST_RESULT_ERROR,\n            records.TestResultEnums.TEST_RESULT_FAIL,\n        ):\n          self._exec_procedure_func(self._on_fail, tr_record)\n        elif tr_record.result == records.TestResultEnums.TEST_RESULT_PASS:\n          self._exec_procedure_func(self._on_pass, tr_record)\n        elif tr_record.result == records.TestResultEnums.TEST_RESULT_SKIP:\n          self._exec_procedure_func(self._on_skip, tr_record)\n      finally:\n        logging.info(\n            RESULT_LINE_TEMPLATE, tr_record.test_name, tr_record.result\n        )\n        self.results.add_record(tr_record)\n        self.summary_writer.dump(\n            tr_record.to_dict(), records.TestSummaryEntryType.RECORD\n        )\n        self.current_test_info = None\n    return tr_record\n\n  def _assert_function_names_in_stack(self, expected_func_names):\n    \"\"\"Asserts that the current stack contains any of the given function names.\"\"\"\n    current_frame = inspect.currentframe()\n    caller_frames = inspect.getouterframes(current_frame, 2)\n    for caller_frame in caller_frames[2:]:\n      if caller_frame[3] in expected_func_names:\n        return\n    raise Error(\n        f\"'{caller_frames[1][3]}' cannot be called outside of the \"\n        f'following functions: {expected_func_names}.'\n    )\n\n  def generate_tests(self, test_logic, name_func, arg_sets, uid_func=None):\n    \"\"\"Generates tests in the test class.\n\n    This function has to be called inside a test class's `self.pre_run`.\n\n    Generated tests are not written down as methods, but as a list of\n    parameter sets. This way we reduce code repetition and improve test\n    scalability.\n\n    Users can provide an optional function to specify the UID of each test.\n    Not all generated tests are required to have UID.\n\n    Args:\n      test_logic: function, the common logic shared by all the generated\n        tests.\n      name_func: function, generate a test name according to a set of\n        test arguments. This function should take the same arguments as\n        the test logic function.\n      arg_sets: a list of tuples, each tuple is a set of arguments to be\n        passed to the test logic function and name function.\n      uid_func: function, an optional function that takes the same\n        arguments as the test logic function and returns a string that\n        is the corresponding UID.\n    \"\"\"\n    self._assert_function_names_in_stack([STAGE_NAME_PRE_RUN])\n    root_msg = 'During test generation of \"%s\":' % test_logic.__name__\n    for args in arg_sets:\n      test_name = name_func(*args)\n      if test_name in self.get_existing_test_names():\n        raise Error(\n            '%s Test name \"%s\" already exists, cannot be duplicated!'\n            % (root_msg, test_name)\n        )\n      test_func = functools.partial(test_logic, *args)\n      # If the `test_logic` method is decorated by `retry` or `repeat`\n      # decorators, copy the attributes added by the decorators to the\n      # generated test methods as well, so the generated test methods\n      # also have the retry/repeat behavior.\n      for attr_name in (\n          ATTR_MAX_RETRY_CNT,\n          ATTR_MAX_CONSEC_ERROR,\n          ATTR_REPEAT_CNT,\n      ):\n        attr = getattr(test_logic, attr_name, None)\n        if attr is not None:\n          setattr(test_func, attr_name, attr)\n      if uid_func is not None:\n        uid = uid_func(*args)\n        if uid is None:\n          logging.warning('%s UID for arg set %s is None.', root_msg, args)\n        else:\n          setattr(test_func, 'uid', uid)\n      self._generated_test_table[test_name] = test_func\n\n  def _safe_exec_func(self, func, *args):\n    \"\"\"Executes a function with exception safeguard.\n\n    This will let signals.TestAbortAll through so abort_all works in all\n    procedure functions.\n\n    Args:\n      func: Function to be executed.\n      args: Arguments to be passed to the function.\n\n    Returns:\n      Whatever the function returns.\n    \"\"\"\n    try:\n      return func(*args)\n    except signals.TestAbortAll:\n      raise\n    except Exception:\n      logging.exception(\n          'Exception happened when executing %s in %s.', func.__name__, self.TAG\n      )\n\n  def get_existing_test_names(self):\n    \"\"\"Gets the names of existing tests in the class.\n\n    A method in the class is considered a test if its name starts with\n    'test_*'.\n\n    Note this only gets the names of tests that already exist. If\n    `generate_tests` has not happened when this was called, the\n    generated tests won't be listed.\n\n    Returns:\n      A list of strings, each is a test method name.\n    \"\"\"\n    test_names = []\n    for name, _ in inspect.getmembers(type(self), callable):\n      if name.startswith('test_'):\n        test_names.append(name)\n    return test_names + list(self._generated_test_table.keys())\n\n  def _get_test_methods(self, test_names):\n    \"\"\"Resolves test method names to bound test methods.\n\n    Args:\n      test_names: A list of strings, each string is a test method name or a\n        regex for matching test names.\n\n    Returns:\n      A list of tuples of (string, function). String is the test method\n      name, function is the actual python method implementing its logic.\n\n    Raises:\n      Error: The test name does not follow naming convention 'test_*'.\n        This can only be caused by user input.\n    \"\"\"\n    test_methods = []\n    # Process the test name selector one by one.\n    for test_name in test_names:\n      if test_name.startswith(TEST_SELECTOR_REGEX_PREFIX):\n        # process the selector as a regex.\n        regex_matching_methods = self._get_regex_matching_test_methods(\n            test_name.removeprefix(TEST_SELECTOR_REGEX_PREFIX)\n        )\n        test_methods += regex_matching_methods\n        continue\n      # process the selector as a regular test name string.\n      self._assert_valid_test_name(test_name)\n      if test_name not in self.get_existing_test_names():\n        raise Error(f'{self.TAG} does not have test method {test_name}.')\n      if hasattr(self, test_name):\n        test_method = getattr(self, test_name)\n      elif test_name in self._generated_test_table:\n        test_method = self._generated_test_table[test_name]\n      test_methods.append((test_name, test_method))\n    return test_methods\n\n  def _get_regex_matching_test_methods(self, test_name_regex):\n    matching_name_tuples = []\n    for name, method in inspect.getmembers(self, callable):\n      if (\n          name.startswith('test_')\n          and re.fullmatch(test_name_regex, name) is not None\n      ):\n        matching_name_tuples.append((name, method))\n    for name, method in self._generated_test_table.items():\n      if re.fullmatch(test_name_regex, name) is not None:\n        self._assert_valid_test_name(name)\n        matching_name_tuples.append((name, method))\n    if not matching_name_tuples:\n      raise Error(\n          f'{test_name_regex} does not match with any valid test case '\n          f'in {self.TAG}, abort!'\n      )\n    return matching_name_tuples\n\n  def _get_participants(self):\n    \"\"\"Maps controller configurations to participant devices.\n\n    Returns:\n      A list of tuples (participant, group, id).\n    \"\"\"\n    participants = []\n    for module_config_name, configs in self.controller_configs.items():\n      # Find the module that registered this config.\n      module = None\n      for mod in self._controller_manager._controller_modules.values():\n        if mod.MOBLY_CONTROLLER_CONFIG_NAME == module_config_name:\n          module = mod\n          break\n      \n      if module:\n        # Get the objects registered for this module.\n        module_ref_name = module.__name__.split('.')[-1]\n        objects = self._controller_manager._controller_objects.get(module_ref_name, [])\n        if len(objects) == len(configs):\n          for obj, config in zip(objects, configs):\n            group = config.get('group', 'default') if isinstance(config, dict) else 'default'\n            id_ = config.get('id') if isinstance(config, dict) else None\n            participants.append((obj, group, id_))\n        else:\n          for config in configs:\n            group = config.get('group', 'default') if isinstance(config, dict) else 'default'\n            id_ = config.get('id') if isinstance(config, dict) else None\n            participants.append((config, group, id_))\n      else:\n        for config in configs:\n          group = config.get('group', 'default') if isinstance(config, dict) else 'default'\n          id_ = config.get('id') if isinstance(config, dict) else None\n          participants.append((config, group, id_))\n    return participants\n\n  def _get_participant_info(self, participant):\n    \"\"\"Extracts group and id from a participant.\n\n    Args:\n      participant: Either a controller object or a config dict.\n\n    Returns:\n      A tuple of (group, id).\n    \"\"\"\n    if isinstance(participant, dict):\n      return participant.get('group', 'default'), participant.get('id')\n    return 'default', None\n\n  def _skip_remaining_tests(self, exception):\n    \"\"\"Marks any requested test that has not been executed in a class as\n    skipped.\n\n    This is useful for handling abort class signal.\n\n    Args:\n      exception: The exception object that was thrown to trigger the\n        skip.\n    \"\"\"\n    for test_name in self.results.requested:\n      if not self.results.is_test_executed(test_name):\n        test_record = records.TestResultRecord(test_name, self.TAG)\n        test_record.test_skip(exception)\n        self.results.add_record(test_record)\n        self.summary_writer.dump(\n            test_record.to_dict(), records.TestSummaryEntryType.RECORD\n        )\n\n  def run(self, test_names=None):\n    \"\"\"Runs tests within a test class.\n\n    One of these test method lists will be executed, shown here in priority\n    order:\n\n    1. The test_names list, which is passed from cmd line. Invalid names\n       are guarded by cmd line arg parsing.\n    2. The self.tests list defined in test class. Invalid names are\n       ignored.\n    3. All function that matches test method naming convention in the test\n       class.\n\n    Args:\n      test_names: A list of string that are test method names requested in\n        cmd line.\n\n    Returns:\n      The test results object of this class.\n    \"\"\"\n    logging.log_path = self.log_path\n    # Executes pre-setup procedures, like generating test methods.\n    if not self._pre_run():\n      return self.results\n    logging.info('==========> %s <==========', self.TAG)\n    # Devise the actual test methods to run in the test class.\n    if not test_names:\n      if self.tests:\n        # Specified by run list in class.\n        test_names = list(self.tests)\n      else:\n        # No test method specified by user, execute all in test class.\n        test_names = self.get_existing_test_names()\n    self.results.requested = test_names\n    self.summary_writer.dump(\n        self.results.requested_test_names_dict(),\n        records.TestSummaryEntryType.TEST_NAME_LIST,\n    )\n    tests = self._get_test_methods(test_names)\n\n    # Grouping and synchronization setup.\n    participants = self._get_participants()\n    group_map = collections.defaultdict(list)\n    has_explicit_group = False\n    for p, g, i in participants:\n      group_map[g].append((p, i))\n      # Check if this participant has an explicit group (meaning the config was a dict and had 'group').\n      # This is a bit tricky because `_get_participants` already defaults to 'default'.\n      # I need to check the original configs.\n      pass\n    \n    # Determine if explicit mode is active.\n    for module_configs in self.controller_configs.values():\n      for config in module_configs:\n        if isinstance(config, dict) and 'group' in config:\n          has_explicit_group = True\n          break\n      if has_explicit_group:\n        break\n\n    # 1. Global Setup\n    global_setup_failed = False\n    try:\n      self.global_setup()\n    except Exception as e:\n      logging.exception('Error in global_setup')\n      record = records.TestResultRecord('global_setup', self.TAG)\n      record.test_error(e)\n      self.results.add_class_error(record)\n      self.summary_writer.dump(record.to_dict(), records.TestSummaryEntryType.RECORD)\n      global_setup_failed = True\n\n    try:\n      if not global_setup_failed:\n        # Mode: No entries\n        if not participants:\n          try:\n            # Standard run\n            setup_class_result = self._setup_class()\n            if setup_class_result:\n              return setup_class_result\n            for test_name, test_method in tests:\n              self._run_test_with_repeat_retry(test_name, test_method)\n            return self.results\n          except Exception:\n            # Handle as before\n            raise\n        \n        # Mode: Implicit or Explicit\n        # Group tests\n        if not has_explicit_group:\n          # Implicit mode: one 'default' group\n          self._run_group('default', participants, tests)\n        else:\n          # Explicit mode: group by group\n          for group_name in sorted(group_map.keys()):\n            self._run_group(group_name, group_map[group_name], tests)\n        \n        # After group tests, run teardown_class\n        self._teardown_class()\n        return self.results\n\n    except signals.TestAbortClass as e:\n      e.details = 'Test class aborted due to: %s' % e.details\n      self._skip_remaining_tests(e)\n      return self.results\n    except signals.TestAbortAll as e:\n      e.details = 'All remaining tests aborted due to: %s' % e.details\n      self._skip_remaining_tests(e)\n      setattr(e, 'results', self.results)\n      raise e\n    finally:\n      # 2. Global Teardown\n      try:\n        self.global_teardown()\n      except Exception as e:\n        logging.exception('Error in global_teardown')\n        record = records.TestResultRecord('global_teardown', self.TAG)\n        record.test_error(e)\n        self.results.add_class_error(record)\n        self.summary_writer.dump(record.to_dict(), records.TestSummaryEntryType.RECORD)\n      \n      if not global_setup_failed:\n        # If we were in No entries mode, we might have called _teardown_class\n        # in the standard run. But here it's handled differently.\n        # Let's make sure _teardown_class is called once.\n        pass\n      \n      logging.info(\n          'Summary for test class %s: %s', self.TAG, self.results.summary_str()\n      )\n\n  def _run_group(self, group_name, group_participants, tests):\n    \"\"\"Runs a group of tests.\"\"\"\n    # participants is either a list of (participant, id) or a list of all participants.\n    if not isinstance(group_participants, list) or not group_participants or not isinstance(group_participants[0], tuple):\n      # This is for implicit mode where we passed all participants directly.\n      # Let's normalize them to (participant, id)\n      normalized = []\n      for p in group_participants:\n        _, i = self._get_participant_info(p)\n        normalized.append((p, i))\n      group_participants = normalized\n\n    devices = [p for p, i in group_participants]\n    \n    # Group Setup\n    setup_failed = False\n    try:\n      # For group_setup, current_device is first device in group\n      self._local.sync_context_allowed = True\n      self._current_group = group_name\n      self._current_group_size = len(group_participants)\n      self.current_device = devices[0]\n      self.current_device_id = group_participants[0][1]\n      \n      self.group_setup(devices)\n    except Exception as e:\n      logging.exception(f'Error in group_setup for group {group_name}')\n      record = records.TestResultRecord(f'group_setup_{group_name}', self.TAG)\n      record.test_error(e)\n      self.results.add_class_error(record)\n      self.summary_writer.dump(record.to_dict(), records.TestSummaryEntryType.RECORD)\n      setup_failed = True\n    finally:\n      self._local.sync_context_allowed = False\n\n    # Run Tests\n    if not setup_failed:\n      # Explicit mode: concurrent execution. Implicit: sequential (just once).\n      has_explicit_group = any('group' in config if isinstance(config, dict) else False \n                               for module_configs in self.controller_configs.values() \n                               for config in module_configs)\n      \n      if has_explicit_group:\n        # Run tests once per participant concurrently\n        with ThreadPoolExecutor() as executor:\n          futures = []\n          for p, i in group_participants:\n            for test_name, test_method in tests:\n              futures.append(executor.submit(self._exec_test_for_participant, p, i, test_name, test_method))\n          # Wait for all to complete.\n          for future in futures:\n            future.result()\n      else:\n        # Implicit mode: run each test once total (using first device)\n        self._local.sync_context_allowed = True\n        self.current_device = devices[0]\n        self.current_device_id = group_participants[0][1]\n        for test_name, test_method in tests:\n          self._run_test_with_// ... (truncated)\n"
+          },
+          "name": "write",
+          "timestamp": "2026-07-29T04:46:20.046Z"
+        },
+        {
+          "arguments": {
+            "edits": [
+              {
+                "newText": "  def _run_test_with_repeat_retry(self, test_name, test_method):\n    \"\"\"Helper to run test with retry/repeat logic.\"\"\"\n    max_consecutive_error = getattr(test_method, ATTR_MAX_CONSEC_ERROR, 0)\n    repeat_count = getattr(test_method, ATTR_REPEAT_CNT, 0)\n    max_retry_count = getattr(test_method, ATTR_MAX_RETRY_CNT, 0)\n    if max_retry_count:\n      self._exec_one_test_with_retry(test_name, test_method, max_retry_count)\n    elif repeat_count:\n      self._exec_one_test_with_repeat(test_name, test_method, repeat_count, max_consecutive_error)\n    else:\n      self.exec_one_test(test_name, test_method)\n\n  def _exec_test_for_participant(self, participant, device_id, test_name, test_method):\n    \"\"\"Helper to run a test for a specific participant in a separate thread.\"\"\"\n    self._local.sync_context_allowed = True\n    self.current_device = participant\n    self.current_device_id = device_id\n    \n    try:\n      self.exec_one_test(test_name, test_method)\n    finally:\n      self._local.sync_context_allowed = False\n",
+                "oldText": "  def _exec_test_for_participant(self, participant, device_id, test_name, test_method):\n    \"\"\"Helper to run a test for a specific participant in a separate thread.\"\"\"\n    # Each thread needs its own context.\n    # Since BaseTestClass is shared, we must be careful about shared state.\n    # This is a problem. BaseTestClass stores current_test_info and other things.\n    # For concurrent execution, we might need a per-thread state.\n    \n    # I'll use threading.local() for current_device, current_device_id, and current_test_info.\n    pass\n"
+              }
+            ],
+            "path": "mobly/base_test.py"
+          },
+          "name": "edit",
+          "timestamp": "2026-07-29T04:47:57.896Z"
+        },
+        {
+          "arguments": {
+            "command": "grep -n \"_exec_test_for_participant\" mobly/base_test.py"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-29T04:48:03.908Z"
+        },
+        {
+          "arguments": {
+            "edits": [
+              {
+                "newText": "    self._local.sync_context_allowed = True\n    self.current_device = participant\n    self.current_device_id = device_id\n    \n    try:\n      self.exec_one_test(test_name, test_method)\n    finally:\n      self._local.sync_context_allowed = False\n",
+                "oldText": "    # Each thread needs its own context.\n    # Since BaseTestClass is shared, we must be careful about shared state.\n    # This is a problem. BaseTestClass stores current_test_info and other things.\n    # For concurrent execution, we might need a per-thread state.\n    \n    # I'll use threading.local() for current_device, current_device_id, and current_test_info.\n    pass\n"
+              }
+            ],
+            "path": "mobly/base_test.py"
+          },
+          "name": "edit",
+          "timestamp": "2026-07-29T04:48:32.389Z"
+        },
+        {
+          "arguments": {
+            "path": "mobly/base_test.py"
+          },
+          "name": "read",
+          "timestamp": "2026-07-29T04:48:39.246Z"
+        }
+      ],
+      "last_message_before_agent_deadline_s": 594.8510000000001,
+      "last_message_text": "# Copyright 2016 Google Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport collections\nimport contextlib\nimport copy\nimport functools\nimport inspect\nimport logging\nimport os\nimport re\nimport sys\nimport threading\nfrom concurrent.futures import ThreadPoolExecutor\n\nfrom mobly import controller_manager\nfrom mobly import expects\nfrom mobly import records\nfrom mobly import runtime_test_info\nfrom mobly import signals\nfrom mobly import utils\n\nclass SyncManager:\n  \"\"\"Manages synchronization barriers for test execution.\"\"\"\n\n  def __init__(self):\n    self._barriers = {}\n    self._lock = threading.Lock()\n\n  def _get_barrier(self, key, group_size):\n    with self._lock:\n      if key not in self._barriers:\n        self._barriers[key] = threading.Barrier(group_size)\n      return self._barriers[key]\n\n  def _clear_barrier(self, key):\n    with self._lock:\n      self._barriers.pop(key, None)\n\n  def sync(self, key, group_size, name, timeout):\n    if timeout < 0:\n      raise ValueError(f'Timeout for {name} cannot be negative: {timeout}')\n    if timeout == 0:\n      raise signals.TestError(f'Timeout for {name} cannot be zero')\n\n    barrier = self._get_barrier(key, group_size)\n    try:\n      barrier.wait(timeout)\n    except threading.BrokenBarrierError:\n      raise signals.TestError(f'Barrier {name} is broken')\n    except threading.BarrierNetworkError: # This is not in stdlib, meant BrokenBarrierError\n      raise signals.TestError(f'Barrier {name} network error')\n    except Exception as e:\n      self._clear_barrier(key)\n      if isinstance(e, threading.TimeoutError) or 'timed out' in str(e).lower():\n        raise signals.TestError(f'Timeout occurred while synchronizing on {name}')\n      raise signals.TestError(f'Error occurred while synchronizing on {name}: {e}')\n    finally:\n      # This part is tricky. The prompt says: \"After completion, reuse creates a new barrier.\"\n      # If the last participant just left, we should clear it.\n      # But we don't know if we are the last one.\n      # However, the barrier is normally cleared once all participants have passed.\n      # With threading.Barrier, if it's broken it's useless.\n      # If it's not broken, and everyone passed, the next call to wait() will use a new period.\n      # Wait, if it's a Barrier, it resets automatically.\n      # But the requirement says \"After completion, reuse creates a new barrier.\"\n      # This might mean we need to manually clear it.\n      pass\n\n  def clear(self, key):\n    self._clear_barrier(key)\n\n#",
+      "model": "Gemma",
+      "p2p": [
+        679,
+        808
+      ],
+      "patch_bytes": 17953,
+      "pending_arguments": null,
+      "pending_has_timeout_argument": null,
+      "pending_seconds_at_deadline": null,
+      "pending_tool": null,
+      "pending_tool_calls": 0,
+      "rep": 2,
+      "result_path": "results/gemma-4-31b/high/baseline-gemma4-31b@1.0.0/mobly-grouped-test-barriers/rep2/result.json",
+      "reward_binary": 0,
+      "reward_partial": 0.7666290868094702,
+      "rpc_event_counts": {
+        "agent_start": 1,
+        "message_end": 49,
+        "message_start": 50,
+        "message_update": 3415,
+        "response": 7173,
+        "tool_execution_end": 24,
+        "tool_execution_start": 24,
+        "tool_execution_update": 4,
+        "turn_end": 24,
+        "turn_start": 25
+      },
+      "session_span_s": 3003.33,
+      "task": "mobly-grouped-test-barriers",
+      "tool_calls": 24,
+      "total_tokens": 1248465,
+      "turns": 24,
+      "verifier_elapsed_s": 11.900000000000091,
+      "verifier_exit": 0
+    },
+    {
+      "agent_wall_s": 3600.1,
+      "assessment": {
+        "confidence": "high",
+        "extension": "No benefit from more wall time alone. With a bounded test command, further debugging could plausibly improve partial credit; an exact solve was still distant.",
+        "mechanism": "The final self-authored pytest suite blocked. The saved patch did not hang the external grader: it completed with 23/50 feature tests and 232/232 preservation tests.",
+        "state": "Blocked in local validation; patch remained gradable"
+      },
+      "f2p": [
+        23,
+        50
+      ],
+      "last_completed_tool_calls": [
+        {
+          "arguments": {
+            "command": "cd /app/libs/core && python -m pytest tests/unit_tests/runnables/test_coalesce.py -x -v 2>&1 | head -100"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:42:02.271Z"
+        },
+        {
+          "arguments": {
+            "edits": [
+              {
+                "newText": "def test_compute_coalesce_key_list_vs_tuple() -> None:\n    \"\"\"Lists and tuples are serialized identically by JSON.\"\"\"\n    # JSON treats lists and tuples the same, so they produce the same key.\n    key_list = _compute_coalesce_key([1, 2])\n    key_tuple = _compute_coalesce_key((1, 2))\n    assert key_list == key_tuple",
+                "oldText": "def test_compute_coalesce_key_list_vs_tuple() -> None:\n    \"\"\"Lists and tuples are treated differently (no canonicalization).\"\"\"\n    # A list [1, 2] and tuple (1, 2) produce different keys because they\n    # have different types. This is intentional: the user should use the\n    # same type for equivalent inputs.\n    key_list = _compute_coalesce_key([1, 2])\n    key_tuple = _compute_coalesce_key((1, 2))\n    assert key_list != key_tuple"
+              }
+            ],
+            "path": "/app/libs/core/tests/unit_tests/runnables/test_coalesce.py"
+          },
+          "name": "edit",
+          "timestamp": "2026-07-30T16:42:09.028Z"
+        },
+        {
+          "arguments": {
+            "command": "cd /app/libs/core && python -m pytest tests/unit_tests/runnables/test_coalesce.py -x -v 2>&1 | head -120"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:42:10.190Z"
+        },
+        {
+          "arguments": {
+            "edits": [
+              {
+                "newText": "    async def aregister(self, key: str) -> bool:\n        loop = asyncio.get_running_loop()\n        return await loop.run_in_executor(None, self.register, key)\n\n    async def ajoin(self, key: str) -> None:\n        loop = asyncio.get_running_loop()\n        await loop.run_in_executor(None, self.join, key)\n\n    async def acomplete(\n        self,\n        key: str,\n        *,\n        result: Any = None,\n        error: BaseException | None = None,\n    ) -> None:\n        loop = asyncio.get_running_loop()\n        await loop.run_in_executor(\n            None,\n            lambda: self.complete(key, result=result, error=error),\n        )\n\n    async def ais_active(self, key: str) -> bool:\n        loop = asyncio.get_running_loop()\n        return await loop.run_in_executor(None, self.is_active, key)",
+                "oldText": "    async def aregister(self, key: str) -> bool:\n        loop = asyncio.get_running_loop()\n        return await loop.run_in_executor(None, self.register, key)\n\n    async def ajoin(self, key: str) -> None:\n        loop = asyncio.get_running_loop()\n        await loop.run_in_executor(None, self.join, key)\n\n    async def acomplete(\n        self,\n        key: str,\n        *,\n        result: Any = None,\n        error: BaseException | None = None,\n    ) -> None:\n        loop = asyncio.get_running_loop()\n        await loop.run_in_executor(None, self.complete, key, result=result, error=error)\n\n    async def ais_active(self, key: str) -> bool:\n        loop = asyncio.get_running_loop()\n        return await loop.run_in_executor(None, self.is_active, key)"
+              }
+            ],
+            "path": "/app/libs/core/langchain_core/runnables/coalesce.py"
+          },
+          "name": "edit",
+          "timestamp": "2026-07-30T16:42:18.421Z"
+        },
+        {
+          "arguments": {
+            "edits": [
+              {
+                "newText": "    async def aregister(self, key: str) -> bool:\n        \"\"\"Async version of `register`.\"\"\"\n        loop = asyncio.get_running_loop()\n        return await loop.run_in_executor(None, self.register, key)\n\n    async def ajoin(self, key: str) -> None:\n        \"\"\"Async version of `join`.\"\"\"\n        loop = asyncio.get_running_loop()\n        await loop.run_in_executor(None, self.join, key)\n\n    async def acomplete(\n        self,\n        key: str,\n        *,\n        result: Any = None,\n        error: BaseException | None = None,\n    ) -> None:\n        \"\"\"Async version of `complete`.\"\"\"\n        loop = asyncio.get_running_loop()\n        await loop.run_in_executor(\n            None,\n            lambda: self.complete(key, result=result, error=error),\n        )\n\n    async def ais_active(self, key: str) -> bool:\n        \"\"\"Async version of `is_active`.\"\"\"\n        loop = asyncio.get_running_loop()\n        return await loop.run_in_executor(None, self.is_active, key)",
+                "oldText": "    async def aregister(self, key: str) -> bool:\n        \"\"\"Async version of `register`.\"\"\"\n        loop = asyncio.get_running_loop()\n        return await loop.run_in_executor(None, self.register, key)\n\n    async def ajoin(self, key: str) -> None:\n        \"\"\"Async version of `join`.\"\"\"\n        loop = asyncio.get_running_loop()\n        await loop.run_in_executor(None, self.join, key)\n\n    async def acomplete(\n        self,\n        key: str,\n        *,\n        result: Any = None,\n        error: BaseException | None = None,\n    ) -> None:\n        \"\"\"Async version of `complete`.\"\"\"\n        loop = asyncio.get_running_loop()\n        await loop.run_in_executor(None, self.complete, key, result=result, error=error)\n\n    async def ais_active(self, key: str) -> bool:\n        \"\"\"Async version of `is_active`.\"\"\"\n        loop = asyncio.get_running_loop()\n        return await loop.run_in_executor(None, self.is_active, key)"
+              }
+            ],
+            "path": "/app/libs/core/langchain_core/runnables/coalesce.py"
+          },
+          "name": "edit",
+          "timestamp": "2026-07-30T16:42:25.562Z"
+        },
+        {
+          "arguments": {
+            "command": "cd /app/libs/core && python -m pytest tests/unit_tests/runnables/test_coalesce.py -x -v 2>&1 | head -150"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:42:26.903Z"
+        }
+      ],
+      "last_message_before_agent_deadline_s": 3267.197,
+      "last_message_text": "Now let me run the tests again:\n\n",
+      "model": "Ornith",
+      "p2p": [
+        232,
+        232
+      ],
+      "patch_bytes": 69309,
+      "pending_arguments": {
+        "command": "cd /app/libs/core && python -m pytest tests/unit_tests/runnables/test_coalesce.py -x -v 2>&1 | head -150"
+      },
+      "pending_has_timeout_argument": false,
+      "pending_seconds_at_deadline": 3267.197,
+      "pending_tool": "bash",
+      "pending_tool_calls": 1,
+      "rep": 0,
+      "result_path": "results/ornith-1.0-35b/high/baseline-ornith-35b@1.0.0/langchain-request-coalescing/rep0/result.json",
+      "reward_binary": 0,
+      "reward_partial": 0.9042553191489362,
+      "rpc_event_counts": {
+        "agent_start": 1,
+        "message_end": 78,
+        "message_start": 78,
+        "message_update": 13889,
+        "response": 7176,
+        "tool_execution_end": 43,
+        "tool_execution_start": 44,
+        "tool_execution_update": 35,
+        "turn_end": 33,
+        "turn_start": 34
+      },
+      "session_span_s": 330.803,
+      "task": "langchain-request-coalescing",
+      "tool_calls": 44,
+      "total_tokens": 1350885,
+      "turns": 34,
+      "verifier_elapsed_s": 27.90000000000009,
+      "verifier_exit": 0
+    },
+    {
+      "agent_wall_s": 3600.1,
+      "assessment": {
+        "confidence": "high",
+        "extension": "No benefit from more wall time alone. The model needed the local command to time out and return control before it could diagnose the deadlock.",
+        "mechanism": "The final pytest suite blocked, and external verification independently stalled at test_abatch_per_item_coalescing after reaching 36% of the feature suite.",
+        "state": "Patch-level async deadlock"
+      },
+      "f2p": [
+        null,
+        null
+      ],
+      "last_completed_tool_calls": [
+        {
+          "arguments": {
+            "edits": [
+              {
+                "newText": "    def test_invoke_dict_input_key_ordering(self) -> None:\n        \"\"\"Test that dict input key ordering doesn't affect coalescing.\"\"\"\n        backend = InMemoryCoalesceBackend()\n        call_count = 0\n\n        def lambda_func(x: dict) -> str:\n            nonlocal call_count\n            call_count += 1\n            time.sleep(0.1)\n            # Return a consistent result regardless of dict ordering\n            return f\"result for {dict(sorted(x.items()))}\"\n\n        runnable = RunnableLambda(lambda_func).with_coalesce(backend=backend)\n\n        input1 = {\"a\": 1, \"b\": 2}\n        input2 = {\"b\": 2, \"a\": 1}\n\n        # These should be coalesced\n        result1 = runnable.invoke(input1)\n        result2 = runnable.invoke(input2)\n        assert result1 == result2\n        assert call_count == 1",
+                "oldText": "    def test_invoke_dict_input_key_ordering(self) -> None:\n        \"\"\"Test that dict input key ordering doesn't affect coalescing.\"\"\"\n        backend = InMemoryCoalesceBackend()\n        call_count = 0\n\n        def lambda_func(x: dict) -> str:\n            nonlocal call_count\n            call_count += 1\n            time.sleep(0.1)\n            return f\"result for {x}\"\n\n        runnable = RunnableLambda(lambda_func).with_coalesce(backend=backend)\n\n        input1 = {\"a\": 1, \"b\": 2}\n        input2 = {\"b\": 2, \"a\": 1}\n\n        # These should be coalesced\n        result1 = runnable.invoke(input1)\n        result2 = runnable.invoke(input2)\n        assert result1 == result2\n        assert call_count == 1"
+              }
+            ],
+            "path": "/app/libs/core/tests/unit_tests/runnables/test_coalesce.py"
+          },
+          "name": "edit",
+          "timestamp": "2026-07-30T16:53:44.739Z"
+        },
+        {
+          "arguments": {
+            "command": "cd /app/libs/core && uv run --group test pytest tests/unit_tests/runnables/test_coalesce.py -xvs 2>&1 | tail -50"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:53:45.779Z"
+        },
+        {
+          "arguments": {
+            "command": "cd /app/libs/core && uv run --group test python -c \"\nfrom langchain_core.runnables import RunnableLambda, InMemoryCoalesceBackend\nfrom langchain_core.runnables.coalesce import _make_hashable\nimport time\n\nbackend = InMemoryCoalesceBackend()\ncall_count = 0\n\ndef lambda_func(x: dict) -> str:\n    global call_count\n    call_count += 1\n    time.sleep(0.1)\n    return f'result for {dict(sorted(x.items()))}'\n\nrunnable = RunnableLambda(lambda_func).with_coalesce(backend=backend)\n\ninput1 = {'a': 1, 'b': 2}\ninput2 = {'b': 2, 'a': 1}\n\nkey1 = runnable._make_key(input1)\nkey2 = runnable._make_key(input2)\n\nprint(f'Key1: {key1}')\nprint(f'Key2: {key2}')\nprint(f'Keys equal: {key1 == key2}')\nprint(f'Hashable key1: {_make_hashable(input1)}')\nprint(f'Hashable key2: {_make_hashable(input2)}')\n\""
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:53:51.493Z"
+        },
+        {
+          "arguments": {
+            "command": "cd /app/libs/core && uv run --group test python -c \"\nfrom langchain_core.runnables import RunnableLambda, InMemoryCoalesceBackend\nimport time\n\nbackend = InMemoryCoalesceBackend()\ncall_count = 0\n\ndef lambda_func(x: dict) -> str:\n    global call_count\n    call_count += 1\n    print(f'Executing, call #{call_count}')\n    time.sleep(0.1)\n    return f'result for {dict(sorted(x.items()))}'\n\nrunnable = RunnableLambda(lambda_func).with_coalesce(backend=backend)\n\ninput1 = {'a': 1, 'b': 2}\ninput2 = {'b': 2, 'a': 1}\n\nprint('Calling with input1...')\nresult1 = runnable.invoke(input1)\nprint(f'Result1: {result1}')\nprint(f'Stats after first call: {backend.stats}')\n\nprint('Calling with input2...')\nresult2 = runnable.invoke(input2)\nprint(f'Result2: {result2}')\nprint(f'Stats after second call: {backend.stats}')\nprint(f'Call count: {call_count}')\n\""
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:53:55.893Z"
+        },
+        {
+          "arguments": {
+            "edits": [
+              {
+                "newText": "    def test_invoke_dict_input_key_ordering(self) -> None:\n        \"\"\"Test that dict input key ordering doesn't affect coalescing.\"\"\"\n        backend = InMemoryCoalesceBackend()\n        call_count = 0\n\n        def lambda_func(x: dict) -> str:\n            nonlocal call_count\n            call_count += 1\n            time.sleep(0.1)\n            # Return a consistent result regardless of dict ordering\n            return f\"result for {dict(sorted(x.items()))}\"\n\n        runnable = RunnableLambda(lambda_func).with_coalesce(backend=backend)\n\n        input1 = {\"a\": 1, \"b\": 2}\n        input2 = {\"b\": 2, \"a\": 1}\n\n        # These should be coalesced when called concurrently\n        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:\n            future1 = executor.submit(runnable.invoke, input1)\n            future2 = executor.submit(runnable.invoke, input2)\n            result1 = future1.result()\n            result2 = future2.result()\n\n        assert result1 == result2\n        assert call_count == 1",
+                "oldText": "    def test_invoke_dict_input_key_ordering(self) -> None:\n        \"\"\"Test that dict input key ordering doesn't affect coalescing.\"\"\"\n        backend = InMemoryCoalesceBackend()\n        call_count = 0\n\n        def lambda_func(x: dict) -> str:\n            nonlocal call_count\n            call_count += 1\n            time.sleep(0.1)\n            # Return a consistent result regardless of dict ordering\n            return f\"result for {dict(sorted(x.items()))}\"\n\n        runnable = RunnableLambda(lambda_func).with_coalesce(backend=backend)\n\n        input1 = {\"a\": 1, \"b\": 2}\n        input2 = {\"b\": 2, \"a\": 1}\n\n        # These should be coalesced\n        result1 = runnable.invoke(input1)\n        result2 = runnable.invoke(input2)\n        assert result1 == result2\n        assert call_count == 1"
+              }
+            ],
+            "path": "/app/libs/core/tests/unit_tests/runnables/test_coalesce.py"
+          },
+          "name": "edit",
+          "timestamp": "2026-07-30T16:54:04.424Z"
+        },
+        {
+          "arguments": {
+            "command": "cd /app/libs/core && uv run --group test pytest tests/unit_tests/runnables/test_coalesce.py -xvs 2>&1 | tail -50"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:54:05.687Z"
+        }
+      ],
+      "last_message_before_agent_deadline_s": 3226.413,
+      "last_message_text": "Now let me run the tests again.\n\n",
+      "model": "Ornith",
+      "p2p": [
+        null,
+        null
+      ],
+      "patch_bytes": 81251,
+      "pending_arguments": {
+        "command": "cd /app/libs/core && uv run --group test pytest tests/unit_tests/runnables/test_coalesce.py -xvs 2>&1 | tail -50"
+      },
+      "pending_has_timeout_argument": false,
+      "pending_seconds_at_deadline": 3226.413,
+      "pending_tool": "bash",
+      "pending_tool_calls": 1,
+      "rep": 1,
+      "result_path": "results/ornith-1.0-35b/high/baseline-ornith-35b@1.0.0/langchain-request-coalescing/rep1/result.json",
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "rpc_event_counts": {
+        "agent_start": 1,
+        "message_end": 97,
+        "message_start": 97,
+        "message_update": 12649,
+        "response": 7174,
+        "tool_execution_end": 52,
+        "tool_execution_start": 53,
+        "tool_execution_update": 63,
+        "turn_end": 43,
+        "turn_start": 44
+      },
+      "session_span_s": 372.246,
+      "task": "langchain-request-coalescing",
+      "tool_calls": 53,
+      "total_tokens": 1598133,
+      "turns": 44,
+      "verifier_elapsed_s": 2101.9,
+      "verifier_exit": "timeout"
+    },
+    {
+      "agent_wall_s": 3600.1,
+      "assessment": {
+        "confidence": "high",
+        "extension": "No benefit from more wall time alone. The hang was itself the bug; bounded execution and thread-state inspection were required.",
+        "mechanism": "The final two-thread reproducer blocked. External pytest reached a 19-fail/31-pass summary in 247 seconds but did not exit; thread-safety took 180 seconds and patch-created non-daemon work remained alive until the verifier cap.",
+        "state": "Patch leaked or stranded concurrency work"
+      },
+      "f2p": [
+        null,
+        null
+      ],
+      "last_completed_tool_calls": [
+        {
+          "arguments": {
+            "command": "cd /app/libs/core && python -c \"\nimport time\nimport threading\nfrom langchain_core.runnables import RunnableLambda\nfrom langchain_core.runnables.coalesce import InMemoryCoalesceBackend\n\nbackend = InMemoryCoalesceBackend()\nfn = RunnableLambda(lambda x: (time.sleep(0.1), x * 2)[1])\ncoalesced = fn.with_coalesce(backend=backend)\n\nresults = []\nlock = threading.Lock()\n\ndef caller(idx):\n    tid = threading.current_thread().ident\n    try:\n        r = coalesced.invoke(5)\n        with lock:\n            results.append((idx, tid, r))\n    except Exception as e:\n        with lock:\n            results.append((idx, tid, f'ERROR: {e}'))\n\nthreads = [threading.Thread(target=caller, args=(i,)) for i in range(3)]\nfor t in threads:\n    t.start()\nfor t in threads:\n    t.join(timeout=5)\n\nfor r in results:\n    print(r)\nprint('Stats:', backend.stats)\nprint('Entry:', {k: (v.is_leader, v.is_completed, v.result, v.error) for k, v in backend._entries.items()})\n\" 2>&1"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T17:01:46.781Z"
+        },
+        {
+          "arguments": {
+            "command": "cd /app/libs/core && python -c \"\nimport time\nimport threading\nfrom langchain_core.runnables import RunnableLambda\nfrom langchain_core.runnables.coalesce import InMemoryCoalesceBackend, _make_coalesce_key\n\nbackend = InMemoryCoalesceBackend()\nfn = RunnableLambda(lambda x: (time.sleep(0.1), x * 2)[1])\ncoalesced = fn.with_coalesce(backend=backend)\n\nkey = 5\n\ndef caller(idx):\n    tid = threading.current_thread().name\n    print(f'[{tid}] register({key}) =', backend.register(key))\n    time.sleep(0.01)  # Ensure ordering\n    print(f'[{tid}] is_leader? checking entry...')\n    with backend._lock:\n        entry = backend._entries.get(key)\n        print(f'[{tid}] entry.is_leader={entry.is_leader}, is_completed={entry.is_completed}, joiner_event={entry.joiner_event}')\n    if not backend._entries.get(key).is_leader:\n        print(f'[{tid}] calling join...')\n        backend.join(key)\n        print(f'[{tid}] join returned!')\n        r, e = backend._get_result(key)\n        print(f'[{tid}] _get_result -> ({r}, {e})')\n        print(f'[{tid}] result = {r}')\n\nthreads = [threading.Thread(target=caller, args=(i,)) for i in range(3)]\nfor t in threads:\n    t.start()\nfor t in threads:\n    t.join(timeout=5)\n\" 2>&1"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T17:01:51.772Z"
+        },
+        {
+          "arguments": {
+            "limit": 40,
+            "offset": 320,
+            "path": "/app/libs/core/langchain_core/runnables/coalesce.py"
+          },
+          "name": "read",
+          "timestamp": "2026-07-30T17:02:35.243Z"
+        },
+        {
+          "arguments": {
+            "limit": 40,
+            "offset": 397,
+            "path": "/app/libs/core/langchain_core/runnables/coalesce.py"
+          },
+          "name": "read",
+          "timestamp": "2026-07-30T17:02:41.906Z"
+        },
+        {
+          "arguments": {
+            "edits": [
+              {
+                "newText": "    def _get_joiner_event(self, key: Hashable) -> threading.Event | None:\n        \"\"\"Get or create the joiner event for a key. Must be called\n        under ``self._lock``.\"\"\"\n        entry = self._entries.get(key)\n        if entry is None:\n            return None\n        if entry.is_completed:\n            return None\n        if entry.joiner_event is None:\n            entry.joiner_event = threading.Event()\n        return entry.joiner_event",
+                "oldText": "    def _get_joiner_event(self, key: Hashable) -> threading.Event | None:\n        \"\"\"Get or create the joiner event for a key. Must be called\n        under ``self._lock``.\"\"\"\n        entry = self._entries.get(key)\n        if entry is None:\n            return None\n        if entry.is_leader:\n            return None\n        if entry.is_completed:\n            return None\n        if entry.joiner_event is None:\n            entry.joiner_event = threading.Event()\n        return entry.joiner_event"
+              },
+              {
+                "newText": "    async def ajoin(self, key: Hashable) -> None:\n        # Wait for the leader to complete using asyncio.to_thread\n        # on the sync event. This is correct for mixed sync/async\n        # usage of the same backend.\n        while True:\n            entry = self._peek_entry(key)\n            if entry is None or entry.is_completed:\n                return\n            if entry.joiner_event is None:\n                # No joiner event yet -- create one.\n                self._ensure_joiner_event(key)\n                entry = self._peek_entry(key)\n                if entry is None or entry.is_completed:\n                    return\n            event = entry.joiner_event\n            if event.is_set():\n                return\n            await asyncio.to_thread(event.wait)\n            return",
+                "oldText": "    async def ajoin(self, key: Hashable) -> None:\n        # Use asyncio.Event for non-blocking async wait.\n        while True:\n            entry = self._peek_entry(key)\n            if entry is None or entry.is_leader or entry.is_completed:\n                return\n            if entry.joiner_event is None:\n                # No joiner event yet -- create one and wait on it.\n                self._ensure_joiner_event(key)\n                entry = self._peek_entry(key)\n                if entry is None or entry.is_leader or entry.is_completed:\n                    return\n            event = entry.joiner_event\n            if event.is_set():\n                return\n            # Wait using asyncio to_thread to block the event loop thread.\n            await asyncio.to_thread(event.wait)\n            return"
+              }
+            ],
+            "path": "/app/libs/core/langchain_core/runnables/coalesce.py"
+          },
+          "name": "edit",
+          "timestamp": "2026-07-30T17:02:50.276Z"
+        },
+        {
+          "arguments": {
+            "command": "cd /app/libs/core && python -c \"\nimport time\nimport threading\nfrom langchain_core.runnables import RunnableLambda\nfrom langchain_core.runnables.coalesce import InMemoryCoalesceBackend\n\nbackend = InMemoryCoalesceBackend()\nfn = RunnableLambda(lambda x: (time.sleep(0.3), x * 2)[1])\ncoalesced = fn.with_coalesce(backend=backend)\n\nresults = []\nlock = threading.Lock()\n\ndef caller(idx):\n    try:\n        r = coalesced.invoke(5)\n        with lock:\n            results.append((idx, r))\n    except Exception as e:\n        with lock:\n            results.append((idx, f'ERROR: {e}'))\n\nthreads = [threading.Thread(target=caller, args=(i,)) for i in range(3)]\nfor t in threads:\n    t.start()\nfor t in threads:\n    t.join(timeout=5)\n\nfor r in results:\n    print(r)\nprint('Stats:', backend.stats)\n\" 2>&1"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T17:02:54.261Z"
+        }
+      ],
+      "last_message_before_agent_deadline_s": 3139.839,
+      "last_message_text": "Now let me test again:\n\n",
+      "model": "Ornith",
+      "p2p": [
+        null,
+        null
+      ],
+      "patch_bytes": 48964,
+      "pending_arguments": {
+        "command": "cd /app/libs/core && python -c \"\nimport time\nimport threading\nfrom langchain_core.runnables import RunnableLambda\nfrom langchain_core.runnables.coalesce import InMemoryCoalesceBackend\n\nbackend = InMemoryCoalesceBackend()\nfn = RunnableLambda(lambda x: (time.sleep(0.3), x * 2)[1])\ncoalesced = fn.with_coalesce(backend=backend)\n\nresults = []\nlock = threading.Lock()\n\ndef caller(idx):\n    try:\n        r = coalesced.invoke(5)\n        with lock:\n            results.append((idx, r))\n    except Exception as e:\n        with lock:\n            results.append((idx, f'ERROR: {e}'))\n\nthreads = [threading.Thread(target=caller, args=(i,)) for i in range(3)]\nfor t in threads:\n    t.start()\nfor t in threads:\n    t.join(timeout=5)\n\nfor r in results:\n    print(r)\nprint('Stats:', backend.stats)\n\" 2>&1"
+      },
+      "pending_has_timeout_argument": false,
+      "pending_seconds_at_deadline": 3139.839,
+      "pending_tool": "bash",
+      "pending_tool_calls": 1,
+      "rep": 2,
+      "result_path": "results/ornith-1.0-35b/high/baseline-ornith-35b@1.0.0/langchain-request-coalescing/rep2/result.json",
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "rpc_event_counts": {
+        "agent_start": 1,
+        "message_end": 98,
+        "message_start": 98,
+        "message_update": 41515,
+        "response": 7173,
+        "tool_execution_end": 52,
+        "tool_execution_start": 53,
+        "tool_execution_update": 73,
+        "turn_end": 44,
+        "turn_start": 45
+      },
+      "session_span_s": 458.178,
+      "task": "langchain-request-coalescing",
+      "tool_calls": 53,
+      "total_tokens": 2135611,
+      "turns": 45,
+      "verifier_elapsed_s": 2101.9,
+      "verifier_exit": "timeout"
+    },
+    {
+      "agent_wall_s": 3600.1,
+      "assessment": {
+        "confidence": "high",
+        "extension": "No benefit from more wall time alone. A short command timeout plus thread dump or narrower barrier reproducer was needed.",
+        "mechanism": "The final synchronization test blocked. External verification then blocked before producing suite artifacts for its full cap, corroborating a barrier or thread-lifecycle deadlock in the saved patch.",
+        "state": "Patch-level synchronization deadlock"
+      },
+      "f2p": [
+        null,
+        null
+      ],
+      "last_completed_tool_calls": [
+        {
+          "arguments": {
+            "limit": 60,
+            "offset": 1620,
+            "path": "/app/mobly/base_test.py"
+          },
+          "name": "read",
+          "timestamp": "2026-07-30T17:50:29.849Z"
+        },
+        {
+          "arguments": {
+            "limit": 50,
+            "offset": 1680,
+            "path": "/app/mobly/base_test.py"
+          },
+          "name": "read",
+          "timestamp": "2026-07-30T17:50:31.504Z"
+        },
+        {
+          "arguments": {
+            "edits": [
+              {
+                "newText": "    if group_ok:\n      # Run each test once total.\n      self._current_group = group_name\n      self._explicit_mode = False\n      for test_name, test_method in tests:\n        self._run_single_test(test_name, test_method)\n        # Reset per-test device back to the first device (implicit mode).\n        self._current_device = first_device\n        self._current_device_id = first_id\n    else:\n      # Record skipped for all requested tests in this group.\n      skip_exc = RuntimeError(\n          f'group_setup failed for group \"{group_name}\"; '\n          f'tests skipped.'\n      )\n      executed_names = {r.test_name for r in self.results.executed}\n      for test_name in self.results.requested:\n        if test_name not in executed_names:\n          test_record = records.TestResultRecord(test_name, self.TAG)\n          test_record.test_skip(skip_exc)\n          self.results.add_record(test_record)\n          self.summary_writer.dump(\n              test_record.to_dict(), records.TestSummaryEntryType.RECORD\n          )\n\n    # group_teardown",
+                "oldText": "    if group_ok:\n      # Run each test once total.\n      self._current_group = group_name\n      self._explicit_mode = False\n      for test_name, test_method in tests:\n        self._run_single_test(test_name, test_method)\n        # Reset per-test device back to the first device (implicit mode).\n        self._current_device = first_device\n        self._current_device_id = first_id\n\n    # group_teardown"
+              }
+            ],
+            "path": "/app/mobly/base_test.py"
+          },
+          "name": "edit",
+          "timestamp": "2026-07-30T17:50:39.842Z"
+        },
+        {
+          "arguments": {
+            "limit": 40,
+            "offset": 1755,
+            "path": "/app/mobly/base_test.py"
+          },
+          "name": "read",
+          "timestamp": "2026-07-30T17:50:41.820Z"
+        },
+        {
+          "arguments": {
+            "edits": [
+              {
+                "newText": "      if group_ok:\n        self._run_tests_for_group(tests, group_name, group_devices)\n      else:\n        # Record skipped for all requested tests \u00d7 participants in this group.\n        skip_exc = RuntimeError(\n            f'group_setup failed for group \"{group_name}\"; '\n            f'tests skipped.'\n        )\n        for test_name, _ in tests:\n          for _p_idx in range(len(self._groups[group_name])):\n            # Only skip if not already executed.\n            already = any(\n                r.test_name == test_name for r in self.results.executed\n            )\n            if not already:\n              test_record = records.TestResultRecord(test_name, self.TAG)\n              test_record.test_skip(skip_exc)\n              self.results.add_record(test_record)\n              self.summary_writer.dump(\n                  test_record.to_dict(),\n                  records.TestSummaryEntryType.RECORD,\n              )\n\n      # group_teardown (always runs)\n      gtd_record = records.TestResultRecord(STAGE_NAME_GROUP_TEARDOWN, self.TAG)\n      gtd_record.test_begin()\n      self.current_test_info = runtime_test_info.RuntimeTestInfo(\n          STAGE_NAME_GROUP_TEARDOWN, self.log_path, gtd_record\n      )\n      expects.recorder.reset_internal_states(gtd_record)\n      self._current_hook_name = STAGE_NAME_GROUP_TEARDOWN\n      self._current_device = first_device\n      self._current_device_id = first_id\n      try:\n        with self._log_test_stage(STAGE_NAME_GROUP_TEARDOWN):\n          self.group_teardown(group_devices)",
+                "oldText": "      if group_ok:\n        self._run_tests_for_group(tests, group_name, group_devices)\n\n      # group_teardown (always runs)\n      gtd_record = records.TestResultRecord(STAGE_NAME_GROUP_TEARDOWN, self.TAG)\n      gtd_record.test_begin()\n      self.current_test_info = runtime_test_info.RuntimeTestInfo(\n          STAGE_NAME_GROUP_TEARDOWN, self.log_path, gtd_record\n      )\n      expects.recorder.reset_internal_states(gtd_record)\n      self._current_hook_name = STAGE_NAME_GROUP_TEARDOWN\n      self._current_device = first_device\n      self._current_device_id = first_id\n      try:\n        with self._log_test_stage(STAGE_NAME_GROUP_TEARDOWN):\n          self.group_teardown(group_devices)"
+              }
+            ],
+            "path": "/app/mobly/base_test.py"
+          },
+          "name": "edit",
+          "timestamp": "2026-07-30T17:50:50.070Z"
+        },
+        {
+          "arguments": {
+            "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py::SynchronizationTest::test_synchronized_context_in_test -v 2>&1 | tail -40"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T17:50:53.870Z"
+        }
+      ],
+      "last_message_before_agent_deadline_s": 3221.23,
+      "last_message_text": "Now let me also look at the synchronization test failures. The issue is that the `_SynchronizedContextManager` calls `barrier.sync(self._timeout)` but the barrier's `sync` method uses `utils.get_current_epoch_time()` for the deadline, which returns an epoch time. Let me check if that's working properly.\n\nActually, looking at the sync test failure more carefully:\n\n```python\ndef test_synchronized_context_in_test(self):\n    tracker = _Tracker()\n    event = threading.Event()\n    ctx_reached = threading.Event()\n\n    class MockBT(base_test.BaseTestClass):\n      def test_one(self):\n        tracker.record('before', self.current_device_id)\n        with bt.synchronized_context('ctx1'):\n          if self.current_device_id == 'DUT1':\n            event.set()\n          else:\n            ctx_reached.set()\n        tracker.record('after', self.current_device_id)\n\n    bt = MockBT(self.cfg)\n    bt.run(test_names=['test_one'])\n    self.assertTrue(event.is_set())\n    self.assertTrue(ctx_reached.is_set())\n```\n\nThe test expects both DUT1 and DUT2 to reach the event/ctx_reached checks. The sync context should make them both arrive at the `with` block entry. But looking at the error:\n\n",
+      "model": "Ornith",
+      "p2p": [
+        null,
+        null
+      ],
+      "patch_bytes": 62949,
+      "pending_arguments": {
+        "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py::SynchronizationTest::test_synchronized_context_in_test -v 2>&1 | tail -40"
+      },
+      "pending_has_timeout_argument": false,
+      "pending_seconds_at_deadline": 3221.23,
+      "pending_tool": "bash",
+      "pending_tool_calls": 1,
+      "rep": 0,
+      "result_path": "results/ornith-1.0-35b/high/baseline-ornith-35b@1.0.0/mobly-grouped-test-barriers/rep0/result.json",
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "rpc_event_counts": {
+        "agent_start": 1,
+        "message_end": 134,
+        "message_start": 134,
+        "message_update": 17022,
+        "response": 7180,
+        "tool_execution_end": 71,
+        "tool_execution_start": 72,
+        "tool_execution_update": 64,
+        "turn_end": 61,
+        "turn_start": 62
+      },
+      "session_span_s": 377.228,
+      "task": "mobly-grouped-test-barriers",
+      "tool_calls": 72,
+      "total_tokens": 3452329,
+      "turns": 62,
+      "verifier_elapsed_s": 2100.9,
+      "verifier_exit": "timeout"
+    },
+    {
+      "agent_wall_s": 3600.1,
+      "assessment": {
+        "confidence": "high",
+        "extension": "No benefit from more wall time alone. The model needed a bounded reproducer and lock-state diagnosis, not a longer global budget.",
+        "mechanism": "The final controller-manager test blocked immediately after a condition-variable edit. External verification also blocked before emitting suite artifacts for its full cap.",
+        "state": "Patch-level condition-variable deadlock"
+      },
+      "f2p": [
+        null,
+        null
+      ],
+      "last_completed_tool_calls": [
+        {
+          "arguments": {
+            "command": "cd /app && python -m pytest tests/mobly/controller_manager_test.py tests/mobly/base_test_test.py -x -v 2>&1 | tail -50"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T18:09:16.469Z"
+        },
+        {
+          "arguments": {
+            "path": "/app/tests/lib/mock_controller.py"
+          },
+          "name": "read",
+          "timestamp": "2026-07-30T18:09:19.228Z"
+        },
+        {
+          "arguments": {
+            "content": "# Copyright 2024 Google Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\"\"\"Unit tests for grouped execution and synchronization.\"\"\"\n\nimport threading\nimport time\nimport unittest\nfrom unittest import mock\n\nfrom mobly import base_test\nfrom mobly import config_parser\nfrom mobly import controller_manager\nfrom mobly import records\nfrom mobly import signals\nfrom tests.lib import mock_controller\n\n\ndef _make_config(controller_configs=None):\n  \"\"\"Helper to build a minimal TestRunConfig.\"\"\"\n  cfg = config_parser.TestRunConfig()\n  cfg.controller_configs = controller_configs or {}\n  cfg.log_path = '/tmp/mobly_test'\n  cfg.user_params = {}\n  return cfg\n\n\nclass _FakeDevice:\n  \"\"\"Minimal fake device that can be used as a controller object.\"\"\"\n\n  def __init__(self, name):\n    self.name = name\n\n\n# ---------------------------------------------------------------------------\n# _SynchronizationBarrier / _SyncRegistry\n# ---------------------------------------------------------------------------\n\n\nclass SynchronizationBarrierTest(unittest.TestCase):\n  \"\"\"Tests for the low-level synchronization barrier.\"\"\"\n\n  def test_all_participants_arrive_proceeds(self):\n    barrier = controller_manager._SynchronizationBarrier(\n        key=('inst', 'g', 'h', 'sync'), num_participants=2\n    )\n    results = []\n\n    def waiter(idx):\n      barrier.enter()\n      results.append(idx)\n\n    threads = [threading.Thread(target=waiter, args=(i,)) for i in range(2)]\n    for t in threads:\n      t.start()\n    for t in threads:\n      t.join()\n    self.assertEqual(sorted(results), [0, 1])\n\n  def test_is_complete_after_all_arrive(self):\n    barrier = controller_manager._SynchronizationBarrier(\n        key=('inst', 'g', 'h', 'sync'), num_participants=1\n    )\n    barrier.enter()\n    self.assertTrue(barrier.is_complete())\n\n  def test_timeout_raises_test_error(self):\n    barrier = controller_manager._SynchronizationBarrier(\n        key=('inst', 'g', 'h', 'sync'), num_participants=2\n    )\n\n    def slow_waiter():\n      barrier.enter(timeout=0.1)\n\n    t = threading.Thread(target=slow_waiter)\n    t.start()\n    with self.assertRaises(signals.TestError) as ctx:\n      t.join()\n    self.assertIn('sync', str(ctx.exception.details))\n\n  def test_error_propagates_to_other_waiters(self):\n    barrier = controller_manager._SynchronizationBarrier(\n        key=('inst', 'g', 'h', 'sync'), num_participants=2\n    )\n    barrier._fail(signals.TestError('boom'))\n    results = []\n\n    def waiter():\n      try:\n        barrier.enter()\n        results.append('ok')\n      except signals.TestError as e:\n        results.append(str(e.details))\n\n    threads = [threading.Thread(target=waiter) for _ in range(2)]\n    for t in threads:\n      t.start()\n    for t in threads:\n      t.join()\n    self.assertEqual(results, ['boom', 'boom'])\n\n\nclass SyncRegistryTest(unittest.TestCase):\n  \"\"\"Tests for the barrier registry.\"\"\"\n\n  def test_get_barrier_creates_new_one(self):\n    reg = controller_manager._SyncRegistry()\n    b1 = reg.get_barrier(('k',), 2)\n    b2 = reg.get_barrier(('k',), 2)\n    self.assertIs(b1, b2)\n\n  def test_get_barrier_reuses_completed(self):\n    reg = controller_manager._SyncRegistry()\n    b1 = reg.get_barrier(('k',), 1)\n    b1.enter()\n    b2 = reg.get_barrier(('k',), 1)\n    self.assertIsNot(b1, b2)\n\n\n# ---------------------------------------------------------------------------\n# ControllerManager grouped execution\n# ---------------------------------------------------------------------------\n\n\nclass _RecordingTestClass(base_test.BaseTestClass):\n  \"\"\"Test class that records hook invocations for verification.\"\"\"\n\n  def __init__(self, configs):\n    super().__init__(configs)\n    self.hooks_called = []\n\n  def _record(self, name):\n    self.hooks_called.append(name)\n\n\nclass GlobalSetupTeardownTest(unittest.TestCase):\n  \"\"\"Tests for global_setup / global_teardown lifecycle.\"\"\"\n\n  def setUp(self):\n    self.tmp_dir = '/tmp/mobly_test'\n\n  def test_global_setup_and_teardown_called(self):\n    class TC(_RecordingTestClass):\n      def global_setup(self):\n        self._record('global_setup')\n\n      def global_teardown(self):\n        self._record('global_teardown')\n\n      def test_one(self):\n        self._record('test_one')\n\n    cfg = _make_config({'MagicDevice': ['cfg1']})\n    tc = TC(cfg)\n    # Need a summary writer to avoid None issues.\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.run(test_names=['test_one'])\n    self.assertIn('global_setup', tc.hooks_called)\n    self.assertIn('global_teardown', tc.hooks_called)\n    self.assertIn('test_one', tc.hooks_called)\n\n  def test_global_setup_without_definition_is_noop(self):\n    class TC(_RecordingTestClass):\n      def test_one(self):\n        self._record('test_one')\n\n    cfg = _make_config({'MagicDevice': ['cfg1']})\n    tc = TC(cfg)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.run(test_names=['test_one'])\n    self.assertIn('test_one', tc.hooks_called)\n    self.assertEqual(tc._controller_manager._test_class, tc)\n\n  def test_global_setup_error_records_and_teardown_runs(self):\n    class TC(_RecordingTestClass):\n      def global_setup(self):\n        self._record('global_setup')\n        raise Exception('setup failed')\n\n      def global_teardown(self):\n        self._record('global_teardown')\n\n      def test_one(self):\n        self._record('test_one')\n\n    cfg = _make_config({'MagicDevice': ['cfg1']})\n    tc = TC(cfg)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.run(test_names=['test_one'])\n    self.assertIn('global_setup', tc.hooks_called)\n    self.assertIn('global_teardown', tc.hooks_called)\n    # test_one should NOT have been executed.\n    self.assertNotIn('test_one', tc.hooks_called)\n    # Check error was recorded.\n    self.assertTrue(any(r.result == 'ERROR' for r in tc.results.executed))\n\n  def test_global_setup_no_entries_runs_hooks(self):\n    \"\"\"No entries mode: global hooks still run.\"\"\"\n\n    class TC(_RecordingTestClass):\n      def global_setup(self):\n        self._record('global_setup')\n\n      def global_teardown(self):\n        self._record('global_teardown')\n\n      def test_one(self):\n        self._record('test_one')\n\n    cfg = _make_config({})\n    tc = TC(cfg)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.run(test_names=['test_one'])\n    self.assertIn('global_setup', tc.hooks_called)\n    self.assertIn('global_teardown', tc.hooks_called)\n    self.assertIn('test_one', tc.hooks_called)\n\n\n# ---------------------------------------------------------------------------\n# Implicit grouping\n# ---------------------------------------------------------------------------\n\n\nclass ImplicitGroupTest(unittest.TestCase):\n  \"\"\"Tests for implicit grouping (entries exist, no 'group' key).\"\"\"\n\n  def test_one_default_group(self):\n    \"\"\"Implicit mode: one 'default' group, group_setup called once.\"\"\"\n\n    class TC(_RecordingTestClass):\n      def group_setup(self, devices):\n        self._record(('group_setup', [d.name for d in devices]))\n\n      def group_teardown(self, devices):\n        self._record(('group_teardown', [d.name for d in devices]))\n\n      def test_one(self):\n        self._record(('test_one', self._controller_manager.current_device.name))\n\n    # Create devices via mock controller.\n    cfg = _make_config({'MagicDevice': ['cfg1', 'cfg2']})\n    tc = TC(cfg)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    # Register controllers to create real devices.\n    tc.register_controller(mock_controller)\n    tc.run(test_names=['test_one'])\n\n    # group_setup called once with both devices.\n    gs_records = [r for r in tc.hooks_called if r[0] == 'group_setup']\n    self.assertEqual(len(gs_records), 1)\n    self.assertEqual(sorted(gs_records[0][1]), ['cfg1', 'cfg2'])\n\n    # test_one called once with first device.\n    test_records = [r for r in tc.hooks_called if r[0] == 'test_one']\n    self.assertEqual(len(test_records), 1)\n    self.assertEqual(test_records[0][1], 'cfg1')\n\n  def test_current_device_first_in_implicit(self):\n    class TC(_RecordingTestClass):\n      def test_one(self):\n        self._record(self._controller_manager.current_device.name)\n\n    cfg = _make_config({'MagicDevice': ['cfg1', 'cfg2']})\n    tc = TC(cfg)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.register_controller(mock_controller)\n    tc.run(test_names=['test_one'])\n    self.assertEqual(tc.hooks_called, [('cfg1',)])\n\n  def test_current_device_id_first_in_implicit(self):\n    class TC(_RecordingTestClass):\n      def test_one(self):\n        self._record(self._controller_manager.current_device_id)\n\n    cfg = _make_config({'MagicDevice': [{'id': 'serial1'}, {'id': 'serial2'}]})\n    tc = TC(cfg)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.register_controller(mock_controller)\n    tc.run(test_names=['test_one'])\n    self.assertEqual(tc.hooks_called, ['serial1'])\n\n\n# ---------------------------------------------------------------------------\n# Explicit grouping\n# ---------------------------------------------------------------------------\n\n\nclass ExplicitGroupTest(unittest.TestCase):\n  \"\"\"Tests for explicit grouping (dict entries have 'group' key).\"\"\"\n\n  def test_groups_by_dict_key(self):\n    \"\"\"Explicit mode: entries grouped by their 'group' value.\"\"\"\n\n    class TC(_RecordingTestClass):\n      def group_setup(self, devices):\n        self._record(('group_setup', [d.name for d in devices]))\n\n      def group_teardown(self, devices):\n        self._record(('group_teardown', [d.name for d in devices]))\n\n      def test_one(self):\n        dev = self._controller_manager.current_device\n        self._record(('test_one', dev.name))\n\n    # Manually create a ControllerManager with explicit group configs.\n    cm = controller_manager.ControllerManager('TC', {\n        'MagicDevice': [\n            {'group': 'alpha', 'serial': 's1'},\n            {'group': 'alpha', 'serial': 's2'},\n            {'group': 'beta', 'serial': 's3'},\n        ]\n    })\n    cfg = _make_config()\n    tc = TC(cfg)\n    tc._controller_manager = cm\n    cm.set_test_class(tc)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n\n    # Register controllers - 3 devices for 3 entries (1:1 pairing).\n    tc.register_controller(mock_controller)\n    tc.run(test_names=['test_one'])\n\n    gs_records = sorted(\n        [r for r in tc.hooks_called if r[0] == 'group_setup'],\n        key=lambda r: r[1],\n    )\n    self.assertEqual(len(gs_records), 2)\n    # alpha group has 2 devices, beta has 1.\n    groups_found = {tuple(sorted(r[1])) for r in gs_records}\n    self.assertIn(('cfg1', 'cfg2'), groups_found)\n    self.assertIn(('cfg3',), groups_found)\n\n  def test_explicit_concurrent_execution(self):\n    \"\"\"Explicit mode: each participant runs the test concurrently.\"\"\"\n\n    class TC(_RecordingTestClass):\n      def test_one(self):\n        dev = self._controller_manager.current_device\n        # Small delay to ensure overlap.\n        time.sleep(0.05)\n        self._record(('test_one', dev.name, threading.current_thread().name))\n\n    cm = controller_manager.ControllerManager('TC', {\n        'MagicDevice': [\n            {'group': 'g1', 'serial': 's1'},\n            {'group': 'g1', 'serial': 's2'},\n        ]\n    })\n    cfg = _make_config()\n    tc = TC(cfg)\n    tc._controller_manager = cm\n    cm.set_test_class(tc)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.register_controller(mock_controller)\n    tc.run(test_names=['test_one'])\n\n    test_records = [r for r in tc.hooks_called if r[0] == 'test_one']\n    self.assertEqual(len(test_records), 2)\n    names = {r[1] for r in test_records}\n    self.assertEqual(names, {'cfg1', 'cfg2'})\n    # Different threads.\n    threads = {r[2] for r in test_records}\n    self.assertEqual(len(threads), 2)\n\n  def test_explicit_group_teardown_always_runs(self):\n    \"\"\"group_teardown runs even when tests fail.\"\"\"\n\n    class TC(_RecordingTestClass):\n      def group_teardown(self, devices):\n        self._record('group_teardown')\n\n      def test_one(self):\n        raise Exception('test failed')\n\n    cm = controller_manager.ControllerManager('TC', {\n        'MagicDevice': [{'group': 'g1', 'serial': 's1'}]\n    })\n    cfg = _make_config()\n    tc = TC(cfg)\n    tc._controller_manager = cm\n    cm.set_test_class(tc)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.register_controller(mock_controller)\n    tc.run(test_names=['test_one'])\n    self.assertIn('group_teardown', tc.hooks_called)\n\n\n# ---------------------------------------------------------------------------\n# No entries mode\n# ---------------------------------------------------------------------------\n\n\nclass NoEntriesTest(unittest.TestCase):\n  \"\"\"Tests for the no-entries mode (empty controller_configs).\"\"\"\n\n  def test_no_group_hooks_called(self):\n    \"\"\"No entries: global_setup/teardown run, group hooks don't.\"\"\"\n\n    class TC(_RecordingTestClass):\n      def global_setup(self):\n        self._record('global_setup')\n\n      def global_teardown(self):\n        self._record('global_teardown')\n\n      def group_setup(self, devices):\n        self._record('group_setup')\n\n      def group_teardown(self, devices):\n        self._record('group_teardown')\n\n      def test_one(self):\n        self._record('test_one')\n\n    cfg = _make_config({})\n    tc = TC(cfg)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.run(test_names=['test_one'])\n    self.assertIn('global_setup', tc.hooks_called)\n    self.assertIn('global_teardown', tc.hooks_called)\n    self.assertNotIn('group_setup', tc.hooks_called)\n    self.assertNotIn('group_teardown', tc.hooks_called)\n    self.assertIn('test_one', tc.hooks_called)\n\n  def test_current_device_raises_outside_hooks(self):\n    class TC(_RecordingTestClass):\n      pass\n\n    cfg = _make_config({})\n    tc = TC(cfg)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    with self.assertRaises((AttributeError, RuntimeError)):\n      _ = tc._controller_manager.current_device\n\n\n# ---------------------------------------------------------------------------\n# Synchronization\n# ---------------------------------------------------------------------------\n\n\nclass SynchronizationTest(unittest.TestCase):\n  \"\"\"Tests for synchronized_step and synchronized_context.\"\"\"\n\n  def _make_cm(self, controller_configs):\n    cm = controller_manager.ControllerManager('TC', controller_configs)\n    return cm\n\n  def _make_test_class(self):\n    class TC(_RecordingTestClass):\n      pass\n    return TC\n\n  def test_synchronized_step_outside_allowed_raises(self):\n    cm = self._make_cm({'MagicDevice': ['c1']})\n    tc = self._make_test_class()()\n    cfg = _make_config({'MagicDevice': ['c1']})\n    tc._controller_manager = cm\n    cm.set_test_class(tc)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    with self.assertRaises(signals.TestError) as ctx:\n      cm.synchronized_step('foo')\n    self.assertIn('synchronized_step', str(ctx.exception.details))\n\n  def test_synchronized_step_negative_timeout(self):\n    cm = self._make_cm({'MagicDevice': ['c1']})\n    # Set state to test phase to allow the call.\n    cm._sync_state.phase = 'test'\n    cm._sync_state.mode = 'implicit'\n    with self.assertRaises(ValueError):\n      cm.synchronized_step('foo', timeout=-1)\n\n  def test_synchronized_step_timeout_zero(self):\n    cm = self._make_cm({'MagicDevice': ['c1']})\n    cm._sync_state.phase = 'test'\n    cm._sync_state.mode = 'implicit'\n    with self.assertRaises(signals.TestError) as ctx:\n      cm.synchronized_step('foo', timeout=0)\n    self.assertIn('foo', str(ctx.exception.details))\n\n  def test_synchronized_step_in_group_setup_is_noop(self):\n    cm = self._make_cm({'MagicDevice': ['c1']})\n    cm._sync_state.phase = 'group_setup'\n    cm._sync_state.group_name = 'default'\n    cm._sync_state.hook_name = 'group_setup'\n    cm._sync_state.mode = 'implicit'\n    cm._sync_state.num_participants = 1\n    cm._sync_state.group_devices = [('d1', 'c1')]\n    # Should not block.\n    cm.synchronized_step('foo')\n\n  def test_synchronized_step_in_implicit_mode_is_noop(self):\n    cm = self._make_cm({'MagicDevice': ['c1', 'c2']})\n    cm._sync_state.phase = 'test'\n    cm._sync_state.group_name = 'default'\n    cm._sync_state.hook_name = 'test_one'\n    cm._sync_state.mode = 'implicit'\n    cm._sync_state.num_participants = 1\n    cm._sync_state.group_devices = [('d1', 'c1'), ('d2', 'c2')]\n    cm.synchronized_step('foo')\n\n  def test_synchronized_step_in_explicit_mode_blocks(self):\n    cm = self._make_cm({'MagicDevice': [{'group': 'g1', 'serial': 's1'},\n                                         {'group': 'g1', 'serial': 's2'}]})\n    cm._sync_state.phase = 'test'\n    cm._sync_state.group_name = 'g1'\n    cm._sync_state.hook_name = 'test_one'\n    cm._sync_state.mode = 'explicit'\n    cm._sync_state.num_participants = 2\n    cm._sync_state.group_devices = [('d1', {'group': 'g1', 'serial': 's1'}),\n                                     ('d2', {'group': 'g1', 'serial': 's2'})]\n\n    order = []\n    lock = threading.Lock()\n\n    def waiter(name):\n      cm.synchronized_step(name)\n      with lock:\n        order.append(name)\n\n    threads = [threading.Thread(target=waiter, args=('sync_pt',)) for _ in range(2)]\n    for t in threads:\n      t.start()\n    for t in threads:\n      t.join()\n    self.assertEqual(len(order), 2)\n\n  def test_synchronized_context_yields_after_sync(self):\n    cm = self._make_cm({'MagicDevice': ['c1']})\n    cm._sync_state.phase = 'group_setup'\n    cm._sync_state.group_name = 'default'\n    cm._sync_state.hook_name = 'group_setup'\n    cm._sync_state.mode = 'implicit'\n    cm._sync_state.num_participants = 1\n    cm._sync_state.group_devices = [('d1', 'c1')]\n\n    with cm.synchronized_context('foo'):\n      pass  # Should not block.\n\n  def test_synchronized_context_timeout_zero(self):\n    cm = self._make_cm({'MagicDevice': ['c1']})\n    cm._sync_state.phase = 'test'\n    cm._sync_state.mode = 'implicit'\n    with self.assertRaises(signals.TestError):\n      with cm.synchronized_context('foo', timeout=0):\n        pass\n\n  def test_synchronized_step_reuse_creates_new_barrier(self):\n    cm = self._make_cm({'MagicDevice': ['c1']})\n    cm._sync_state.phase = 'test'\n    cm._sync_state.mode = 'implicit'\n    cm._sync_state.num_participants = 1\n    # Two calls should not interfere.\n    cm.synchronized_step('foo')\n    cm.synchronized_step('foo')\n\n\n# ---------------------------------------------------------------------------\n# current_device / current_device_id context\n# ---------------------------------------------------------------------------\n\n\nclass CurrentDeviceContextTest(unittest.TestCase):\n  \"\"\"Tests for current_device / current_device_id in various phases.\"\"\"\n\n  def test_current_device_in_group_setup(self):\n    class TC(_RecordingTestClass):\n      def group_setup(self, devices):\n        self._record(self._controller_manager.current_device.name)\n\n    cm = controller_manager.ControllerManager('TC', {\n        'MagicDevice': [{'group': 'g1', 'serial': 's1'},\n                        {'group': 'g1', 'serial': 's2'}]\n    })\n    cfg = _make_config()\n    tc = TC(cfg)\n    tc._controller_manager = cm\n    cm.set_test_class(tc)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.register_controller(mock_controller)\n    tc.run(test_names=['_dummy'])\n    # group_setup should have been called with first device.\n    self.assertIn(('group_setup',), [r for r in tc.hooks_called if isinstance(r, tuple) and r[0] == 'group_setup'])\n    # Actually let's check more carefully.\n    gs_calls = [r for r in tc.hooks_called if isinstance(r, tuple) and r[0] == 'group_setup']\n    self.assertTrue(len(gs_calls) >= 1)\n    self.assertEqual(gs_calls[0][1], 'cfg1')\n\n  def test_current_device_id_in_group_setup(self):\n    class TC(_RecordingTestClass):\n      def group_setup(self, devices):\n        self._record(self._controller_manager.current_device_id)\n\n    cm = controller_manager.ControllerManager('TC', {\n        'MagicDevice': [{'group': 'g1', 'id': 'sid1'},\n                        {'group': 'g1', 'id': 'sid2'}]\n    })\n    cfg = _make_config()\n    tc = TC(cfg)\n    tc._controller_manager = cm\n    cm.set_test_class(tc)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.register_controller(mock_controller)\n    tc.run(test_names=['_dummy'])\n    gs_calls = [r for r in tc.hooks_called if isinstance(r, tuple)]\n    # First entry's id should be 'sid1'.\n    first = gs_calls[0]\n    self.assertEqual(first[1], 'sid1')\n\n  def test_current_device_raises_in_setup_class(self):\n    \"\"\"current_device should raise in setup_class.\"\"\"\n\n    class TC(_RecordingTestClass):\n      def setup_class(self):\n        with self.assertRaises((AttributeError, RuntimeError)):\n          _ = self._controller_manager.current_device\n\n    cfg = _make_config({'MagicDevice': ['c1']})\n    tc = TC(cfg)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.register_controller(mock_controller)\n    tc.run(test_names=['_dummy'])\n\n\n# ---------------------------------------------------------------------------\n# Group setup failure\n# ---------------------------------------------------------------------------\n\n\nclass GroupSetupFailureTest(unittest.TestCase):\n  \"\"\"Tests for group_setup failure / False return.\"\"\"\n\n  def test_group_setup_return_false_skips_tests(self):\n    class TC(_RecordingTestClass):\n      def group_setup(self, devices):\n        self._record('group_setup')\n        return False\n\n      def group_teardown(self, devices):\n        self._record('group_teardown')\n\n      def test_one(self):\n        self._record('test_one')\n\n    cm = controller_manager.ControllerManager('TC', {\n        'MagicDevice': [{'group': 'g1', 'serial': 's1'}]\n    })\n    cfg = _make_config()\n    tc = TC(cfg)\n    tc._controller_manager = cm\n    cm.set_test_class(tc)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.register_controller(mock_controller)\n    tc.run(test_names=['test_one'])\n    self.assertIn('group_setup', tc.hooks_called)\n    self.assertIn('group_teardown', tc.hooks_called)\n    self.assertNotIn('test_one', tc.hooks_called)\n\n  def test_group_setup_exception_skips_tests(self):\n    class TC(_RecordingTestClass):\n      def group_setup(self, devices):\n        self._record('group_setup')\n        raise Exception('setup failed')\n\n      def group_teardown(self, devices):\n        self._record('group_teardown')\n\n      def test_one(self):\n        self._record('test_one')\n\n    cm = controller_manager.ControllerManager('TC', {\n        'MagicDevice': [{'group': 'g1', 'serial': 's1'}]\n    })\n    cfg = _make_config()\n    tc = TC(cfg)\n    tc._controller_manager = cm\n    cm.set_test_class(tc)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.register_controller(mock_controller)\n    tc.run(test_names=['test_one'])\n    self.assertIn('group_setup', tc.hooks_called)\n    self.assertIn('group_teardown', tc.hooks_called)\n    self.assertNotIn('test_one', tc.hooks_called)\n\n  def test_group_setup_failure_continues_other_groups(self):\n    class TC(_RecordingTestClass):\n      def group_setup(self, devices):\n        self._record(('group_setup', len(devices)))\n        if len(devices) == 2:\n          return False\n\n      def group_teardown(self, devices):\n        self._record(('group_teardown', len(devices)))\n\n      def test_one(self):\n        self._record('test_one')\n\n    cm = controller_manager.ControllerManager('TC', {\n        'MagicDevice': [\n            {'group': 'bad', 'serial': 's1'},\n            {'group': 'bad', 'serial': 's2'},\n            {'group': 'good', 'serial': 's3'},\n        ]\n    })\n    cfg = _make_config()\n    tc = TC(cfg)\n    tc._controller_manager = cm\n    cm.set_test_class(tc)\n    tc.summary_writer = records.TestSummaryWriter('/tmp/test_summary.yaml')\n    tc.register_controller(mock_controller)\n    tc.run(test_names=['test_one'])\n    # 'bad' group: setup called, teardown called, no tests.\n    # 'good' group: setup called, test ran, teardown called.\n    gs_calls = sorted([r for r in tc.hooks_called if isinstance(r, tuple) and r[0] == 'group_setup'])\n    self.assertEqual(len(gs_calls), 2)\n    test_calls = [r for r in tc.hooks_called if r == 'test_one']\n    self.assertEqual(len(test_calls), 1)\n\n\n# ---------------------------------------------------------------------------\n# Device pairing\n# ---------------------------------------------------------------------------\n\n\nclass DevicePairingTest(unittest.TestCase):\n  \"\"\"Tests for 1:1 device pairing logic.\"\"\"\n\n  def test_pairing_when_counts_match(self):\n    cm = controller_manager.ControllerManager('TC', {\n        'MagicDevice': [{'group': 'g1', 'serial': 's1'},\n                        {'group': 'g1', 'serial': 's2'}]\n    })\n    # Register 2 devices.\n    fake_devices = [_FakeDevice('d1'), _FakeDevice('d2')]\n    cm._controller_objects = {'mock_controller': fake_devices}\n    entries = cm._get_entries_from_configs()\n    groups = cm._get_groups(entries)\n    paired = cm._pair_devices(entries, groups)\n    # Should pair 1:1.\n    self.assertEqual(len(paired['g1']), 2)\n    self.assertEqual(paired['g1'][0][0], fake_devices[0])\n    self.assertEqual(paired['g1'][1][0], fake_devices[1])\n\n  def test_pairing_when_counts_dont_match_uses_raw(self):\n    cm = controller_manager.ControllerManager('TC', {\n        'MagicDevice': [{'group': 'g1', 'serial': 's1'}]\n    })\n    # Register 0 devices (or different number).\n    cm._controller_objects = {}\n    entries = cm._get_entries_from_configs()\n    groups = cm._get_groups(entries)\n    paired = cm._pair_devices(entries, groups)\n    # Should use raw entries as devices.\n    self.assertEqual(paired['g1'][0][0], {'group': 'g1', 'serial': 's1'})\n\n\n# ---------------------------------------------------------------------------\n# Mode detection\n# ---------------------------------------------------------------------------\n\n\nclass ModeDetectionTest(unittest.TestCase):\n  \"\"\"Tests for _detect_mode.\"\"\"\n\n  def test_no_entries(self):\n    cm = controller_manager.ControllerManager('TC', {})\n    mode, entries = cm._detect_mode()\n    self.assertEqual(mode, 'no_entries')\n    self.assertEqual(entries, [])\n\n  def test_implicit(self):\n    cm = controller_manager.ControllerManager('TC', {\n        'MagicDevice': ['c1', 'c2']\n    })\n    mode, entries = cm._detect_mode()\n    self.assertEqual(mode, 'implicit')\n    self.assertEqual(entries, ['c1', 'c2'])\n\n  def test_explicit(self):\n    cm = controller_manager.ControllerManager('TC', {\n        'MagicDevice': [{'group': 'g1', 'serial': 's1'}, 'c2']\n    })\n    mode, entries = cm._detect_mode()\n    self.assertEqual(mode, 'explicit')\n\n\nif __name__ == '__main__':\n  unittest.main()",
+            "path": "/app/tests/mobly/controller_manager_grouped_test.py"
+          },
+          "name": "write",
+          "timestamp": "2026-07-30T18:10:13.625Z"
+        },
+        {
+          "arguments": {
+            "command": "cd /app && python -m pytest tests/mobly/controller_manager_grouped_test.py -x -v 2>&1"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T18:10:14.564Z"
+        },
+        {
+          "arguments": {
+            "edits": [
+              {
+                "newText": "  def _fail(self, error):\n    with self._cond:\n      self._error = error\n      self._completed = True\n      self._cond.notify_all()",
+                "oldText": "  def _fail(self, error):\n    self._error = error\n    self._completed = True\n    self._cond.notify_all()"
+              }
+            ],
+            "path": "/app/mobly/controller_manager.py"
+          },
+          "name": "edit",
+          "timestamp": "2026-07-30T18:10:16.867Z"
+        },
+        {
+          "arguments": {
+            "command": "cd /app && python -m pytest tests/mobly/controller_manager_grouped_test.py -x -v 2>&1"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T18:10:19.823Z"
+        }
+      ],
+      "last_message_before_agent_deadline_s": 3168.277,
+      "last_message_text": "Also need to fix `_cleanup_locked` - it's called from within the lock but `_fail` now acquires the lock. Let me check all the call sites.\n\nActually, looking at the code:\n- `_fail` is called from `enter` which already holds the lock (via `with self._cond`). But now `_fail` also acquires the lock, which would deadlock (since it's an RLock). Actually `threading.Condition` uses an RLock by default, so re-acquiring is fine.\n\nWait, `_fail` calls `self._cond.notify_all()` which needs the lock. And `_cleanup_locked` is called after `_fail` in the test path. Let me trace through:\n\n1. `barrier._fail(signals.TestError('boom'))` - acquires lock, sets error, notifies all\n2. Waiters wake up, see error, call `_cleanup_locked()` which doesn't need the lock (it's called from within `enter` which holds the lock)\n\nSo the fix is correct. Let me run the tests again.\n\n",
+      "model": "Ornith",
+      "p2p": [
+        null,
+        null
+      ],
+      "patch_bytes": 54840,
+      "pending_arguments": {
+        "command": "cd /app && python -m pytest tests/mobly/controller_manager_grouped_test.py -x -v 2>&1"
+      },
+      "pending_has_timeout_argument": false,
+      "pending_seconds_at_deadline": 3168.277,
+      "pending_tool": "bash",
+      "pending_tool_calls": 1,
+      "rep": 2,
+      "result_path": "results/ornith-1.0-35b/high/baseline-ornith-35b@1.0.0/mobly-grouped-test-barriers/rep2/result.json",
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "rpc_event_counts": {
+        "agent_start": 1,
+        "message_end": 90,
+        "message_start": 90,
+        "message_update": 38262,
+        "response": 7174,
+        "tool_execution_end": 48,
+        "tool_execution_start": 49,
+        "tool_execution_update": 43,
+        "turn_end": 40,
+        "turn_start": 41
+      },
+      "session_span_s": 428.048,
+      "task": "mobly-grouped-test-barriers",
+      "tool_calls": 49,
+      "total_tokens": 2795854,
+      "turns": 41,
+      "verifier_elapsed_s": 2101.9,
+      "verifier_exit": "timeout"
+    },
+    {
+      "agent_wall_s": 3600.1,
+      "assessment": {
+        "confidence": "medium",
+        "extension": "More wall time alone was unlikely to help. If the command had been bounded and a fresh audit took over, this was the most salvageable Ornith timeout, but the saved score does not prove a one-line fix would solve it.",
+        "mechanism": "The final Python inspection command should have been short but never returned. It followed five nearly identical byte/string inspections, and its old/new replacement literals were identical. External verification completed with perfect preservation but collected no feature-test records.",
+        "state": "Tool hang plus unproductive literal-debugging loop"
+      },
+      "f2p": [
+        0,
+        60
+      ],
+      "last_completed_tool_calls": [
+        {
+          "arguments": {
+            "command": "python3 << 'PYEOF'\nwith open('src/rules/link-style.ts', 'r') as f:\n    lines = f.readlines()\n\nfor i, line in enumerate(lines):\n    if \"return '![\" in line:\n        print(f\"Line {i+1}: {repr(line)}\")\nPYEOF"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:06:21.272Z"
+        },
+        {
+          "arguments": {
+            "command": "python3 << 'PYEOF'\nwith open('src/rules/link-style.ts', 'r') as f:\n    content = f.read()\n\n# Fix line 323: \"    return '![[ ' + target + ']]';\"\n# The first string is \"![[ \" (with space). Need it to be \"![[ \" (no space, but the quote immediately follows)\n# I need to replace: '\nOLD = \"return '![[ ' + target + ']]';\"\nNEW = \"return '![[ ' + target + ']]';\"\nprint(f\"OLD repr: {repr(OLD)}\")\nprint(f\"NEW repr: {repr(NEW)}\")\nprint(f\"OLD == NEW: {OLD == NEW}\")\n\n# The issue is these look identical. Let me be very explicit\n# OLD: return + space + ' + ! + [ + [ + space + ' + space + + space + target + space + + space + ' + ] + ] + ' + ;\n# NEW: return + space + ' + ! + [ + [ + ' + space + + space + target + space + + space + ' + ] + ] + ' + ;\n\nOLD_EXPLICIT = \"return '!\" + \"[[ \" + \"' + target + ']];\"\nNEW_EXPLICIT = \"return '!\" + \"[[\" + \"' + target + ']];\"\n\nprint(f\"OLD_EXPLICIT repr: {repr(OLD_EXPLICIT)}\")\nprint(f\"NEW_EXPLICIT repr: {repr(NEW_EXPLICIT)}\")\n\ncontent = content.replace(OLD_EXPLICIT, NEW_EXPLICIT)\n\n# Same for the alt version\nOLD2 = \"return '![[ ' + target + '|' + alt + ']]';\"\nNEW2 = \"return '![[ ' + target + '|' + alt + ']]';\"\nOLD2_EXPLICIT = \"return '!\" + \"[[ \" + \"' + target + '|' + alt + ']];\"\nNEW2_EXPLICIT = \"return '!\" + \"[[\" + \"' + target + '|' + alt + ']];\"\n\ncontent = content.replace(OLD2_EXPLICIT, NEW2_EXPLICIT)\n\nwith open('src/rules/link-style.ts', 'w') as f:\n    f.write(content)\n\nprint(\"Done\")\nPYEOF"
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:06:30.923Z"
+        },
+        {
+          "arguments": {
+            "command": "python3 -c \"\nwith open('src/rules/link-style.ts', 'r') as f:\n    lines = f.readlines()\nfor i, line in enumerate(lines):\n    if \\\"return '![\\\" in line:\n        print(f'Line {i+1}: {repr(line)}')\""
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:06:32.971Z"
+        },
+        {
+          "arguments": {
+            "command": "python3 -c \"\nwith open('src/rules/link-style.ts', 'r') as f:\n    lines = f.readlines()\nline = lines[322]  # 0-indexed, line 323\nprint(repr(line))\n# Check bytes around ![[\nidx = line.index(\\\"'![\\\")\nprint('Chars around [[:', repr(line[idx:idx+15]))\""
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:06:35.380Z"
+        },
+        {
+          "arguments": {
+            "command": "python3 -c \"\nwith open('src/rules/link-style.ts', 'rb') as f:\n    content = f.read()\n# Find the byte sequence\nidx = content.find(b\\\"return '![[\\\")\nprint('Found at:', idx)\nprint('Bytes:', content[idx:idx+25])\""
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:06:39.540Z"
+        },
+        {
+          "arguments": {
+            "command": "python3 -c \"\nwith open('src/rules/link-style.ts', 'rb') as f:\n    content = f.read()\n\n# Find b\\\"return '![[ ' + target\\\" and replace with b\\\"return '![[ ' + target\\\" (removing space)\n# The problematic pattern: return '![[ ' + target + ']]'\n# We want: return '![[ ' + target + ']]' (no space between [[ and ')\n\n# Let's find the exact bytes\nold = b\\\"return '![[ ' + target + ']]';\\\"\nnew = b\\\"return '![[ ' + target + ']]';\\\"\n\n# Actually let me check byte by byte\nidx = content.find(b\\\"return '![[\\\")\nprint('Context bytes:', list(content[idx:idx+30]))\n\n# The issue: after [[ there's a space (0x20) then '\n# I need to remove that space\n\n# Find all occurrences\npos = 0\nwhile True:\n    pos = content.find(b\\\"'![[ \\\", pos)\n    if pos == -1:\n        break\n    print(f'Found at {pos}: {list(content[pos:pos+8])}')\n    # Remove the space: replace b\\\"'![[ \\\" with b\\\"'![['\"\n    pos += 1  # skip the '\n    \nprint('Done finding')\n\""
+          },
+          "name": "bash",
+          "timestamp": "2026-07-30T16:06:47.975Z"
+        }
+      ],
+      "last_message_before_agent_deadline_s": 3071.125,
+      "last_message_text": "The space is still there. The replacement didn't work because my OLD_EXPLICIT also had the space! Let me try a different approach - just read the file and use sed to remove the space.\n\n",
+      "model": "Ornith",
+      "p2p": [
+        1131,
+        1131
+      ],
+      "patch_bytes": 17627,
+      "pending_arguments": {
+        "command": "python3 -c \"\nwith open('src/rules/link-style.ts', 'rb') as f:\n    content = f.read()\n\n# Find b\\\"return '![[ ' + target\\\" and replace with b\\\"return '![[ ' + target\\\" (removing space)\n# The problematic pattern: return '![[ ' + target + ']]'\n# We want: return '![[ ' + target + ']]' (no space between [[ and ')\n\n# Let's find the exact bytes\nold = b\\\"return '![[ ' + target + ']]';\\\"\nnew = b\\\"return '![[ ' + target + ']]';\\\"\n\n# Actually let me check byte by byte\nidx = content.find(b\\\"return '![[\\\")\nprint('Context bytes:', list(content[idx:idx+30]))\n\n# The issue: after [[ there's a space (0x20) then '\n# I need to remove that space\n\n# Find all occurrences\npos = 0\nwhile True:\n    pos = content.find(b\\\"'![[ \\\", pos)\n    if pos == -1:\n        break\n    print(f'Found at {pos}: {list(content[pos:pos+8])}')\n    # Remove the space: replace b\\\"'![[ \\\" with b\\\"'![['\"\n    pos += 1  # skip the '\n    \nprint('Done finding')\n\""
+      },
+      "pending_has_timeout_argument": false,
+      "pending_seconds_at_deadline": 3071.125,
+      "pending_tool": "bash",
+      "pending_tool_calls": 1,
+      "rep": 2,
+      "result_path": "results/ornith-1.0-35b/high/baseline-ornith-35b@1.0.0/obsidian-linter-link-format-conversion/rep2/result.json",
+      "reward_binary": 0,
+      "reward_partial": 0.9496221662468514,
+      "rpc_event_counts": {
+        "agent_start": 1,
+        "message_end": 98,
+        "message_start": 98,
+        "message_update": 32691,
+        "response": 7184,
+        "tool_execution_end": 48,
+        "tool_execution_start": 49,
+        "tool_execution_update": 31040,
+        "turn_end": 48,
+        "turn_start": 49
+      },
+      "session_span_s": 527.105,
+      "task": "obsidian-linter-link-format-conversion",
+      "tool_calls": 49,
+      "total_tokens": 1915885,
+      "turns": 49,
+      "verifier_elapsed_s": 19.90000000000009,
+      "verifier_exit": 0
+    }
+  ],
+  "prior_gemma_pi_check_delivery": {
+    "cells": [
+      {
+        "check_delivered": true,
+        "rep": 0,
+        "task": "adaptix-name-mapping-aliases"
+      },
+      {
+        "check_delivered": true,
+        "rep": 2,
+        "task": "adaptix-name-mapping-aliases"
+      },
+      {
+        "check_delivered": true,
+        "rep": 1,
+        "task": "goreleaser-retry-publish-auditing"
+      },
+      {
+        "check_delivered": true,
+        "rep": 2,
+        "task": "goreleaser-retry-publish-auditing"
+      },
+      {
+        "check_delivered": true,
+        "rep": 0,
+        "task": "langchain-request-coalescing"
+      },
+      {
+        "check_delivered": true,
+        "rep": 1,
+        "task": "mobly-grouped-test-barriers"
+      },
+      {
+        "check_delivered": false,
+        "rep": 0,
+        "task": "sql-formatter-bigquery-pipe-formatting"
+      },
+      {
+        "check_delivered": false,
+        "rep": 1,
+        "task": "tengo-callable-instance-isolation"
+      },
+      {
+        "check_delivered": false,
+        "rep": 2,
+        "task": "tengo-callable-instance-isolation"
+      }
+    ],
+    "delivered_before_timeout": 6,
+    "not_delivered_before_timeout": 3,
+    "timeouts": 9
+  },
+  "schema_version": 1,
+  "verifier_only_gemma_incident": {
+    "agent_timed_out": false,
+    "agent_wall_s": 1492.5,
+    "evidence": "External feature verification stalled on test_invoke_returns_correct_result for the full 35-minute verifier cap. This was a patch-induced test deadlock, not an agent timeout.",
+    "rep": 0,
+    "task": "langchain-request-coalescing",
+    "verifier_exit": "timeout"
+  }
+}
