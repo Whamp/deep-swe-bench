@@ -34,7 +34,9 @@ from harness.launch_runtime import RepositoryLaunchRuntimeResolver
 from harness.run_state import sanitize_run_id
 
 _LAUNCH_PLAN_SCHEMA_VERSION = 1
-_THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh"})
+_THINKING_LEVELS = frozenset(
+    {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
 _TASK_SELECTION_KINDS = frozenset({"tasks", "subset", "range", "all"})
 _PREFLIGHT_POLICIES = frozenset({"disabled", "new-configs", "required"})
 _EXISTING_RESULT_POLICIES = frozenset({"require-compatible", "rerun"})
@@ -163,7 +165,7 @@ def _validate_launch_subject(request: LaunchRequest) -> None:
         request.thinking,
         _THINKING_LEVELS,
         "Launch thinking invalid: expected off, minimal, low, medium, "
-        f"high, or xhigh; got {request.thinking!r}",
+        f"high, xhigh, or max; got {request.thinking!r}",
     )
 
 

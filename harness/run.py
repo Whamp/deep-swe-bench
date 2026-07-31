@@ -751,7 +751,7 @@ def main():
     ap.add_argument("--task", required=True)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--thinking", default=DEFAULT_THINKING,
-                    choices=["off", "minimal", "low", "medium", "high", "xhigh"])
+                    choices=["off", "minimal", "low", "medium", "high", "xhigh", "max"])
     ap.add_argument("--rep", type=int, default=0)
     ap.add_argument("--agent-timeout", type=float, default=None,
                     help="override task's agent timeout (s). default: task.toml")

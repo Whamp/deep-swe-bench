@@ -77,11 +77,12 @@ def _create_locked_config(
     config_identity: str,
     *,
     prompt: str,
+    thinking: str = "low",
     secret: str | None = None,
     smoke_contract: Mapping[str, object] | None = None,
 ) -> None:
     config_root = repository_root / "configs" / config_identity
-    config_leaf = config_root / "model" / "low"
+    config_leaf = config_root / "model" / thinking
     config_leaf.mkdir(parents=True)
     (config_root / "README.md").write_text("Fixture documentation.\n")
     (config_root / "orchestration.md").write_text(prompt)
@@ -96,7 +97,7 @@ def _create_locked_config(
         repository_root,
         config_identity,
         "provider/model",
-        "low",
+        thinking,
         "rerun",
         {
             "credentialRoutes": ["FIXTURE_CREDENTIAL"],
@@ -113,7 +114,7 @@ def _create_locked_config(
                         "kind": "fixed",
                         "model": "provider/model",
                         "provider": "provider",
-                        "thinking": "low",
+                        "thinking": thinking,
                     },
                     "name": "executor",
                     "roleKind": "executor",
@@ -157,11 +158,15 @@ def _runtime_identity(
     )
 
 
-def _launch_request(*, run_id: str = "fixture-run") -> LaunchRequest:
+def _launch_request(
+    *,
+    run_id: str = "fixture-run",
+    thinking: str = "low",
+) -> LaunchRequest:
     return LaunchRequest(
         subject="pi",
         model="provider/model",
-        thinking="low",
+        thinking=thinking,
         configs=("baseline@1.0.0", "review-assistant@1.0.0"),
         baseline_config="baseline@1.0.0",
         task_selection=LaunchTaskSelection(
@@ -183,6 +188,7 @@ def _launch_request(*, run_id: str = "fixture-run") -> LaunchRequest:
 def _write_launch_fixture(
     tmp_path: Path,
     *,
+    thinking: str = "low",
     review_smoke_contract: Mapping[str, object] | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     repository_root = tmp_path / "repository"
@@ -199,11 +205,13 @@ def _write_launch_fixture(
         repository_root,
         "baseline@1.0.0",
         prompt="Baseline behavior.\n",
+        thinking=thinking,
     )
     _create_locked_config(
         repository_root,
         "review-assistant@1.0.0",
         prompt="Review behavior.\n",
+        thinking=thinking,
         smoke_contract=review_smoke_contract,
     )
     return repository_root, tasks_root, results_root, state_root
@@ -298,12 +306,14 @@ def _write_omp_launch_fixture(
     return request, repository_root, tasks_root, results_root, state_root
 
 
+@pytest.mark.parametrize("thinking", ["low", "max"])
 def test_plan_command_writes_review_artifacts_without_execution(
     tmp_path: Path,
+    thinking: str,
 ) -> None:
     """Preparing a launch writes only its immutable plan and receipt."""
     repository_root, tasks_root, results_root, state_root = (
-        _write_launch_fixture(tmp_path)
+        _write_launch_fixture(tmp_path, thinking=thinking)
     )
     runtime_resolver = FakeLaunchRuntimeResolver(_runtime_identity())
     plan_path = tmp_path / "review" / "launch-plan.json"
@@ -317,7 +327,7 @@ def test_plan_command_writes_review_artifacts_without_execution(
             "--model",
             "provider/model",
             "--thinking",
-            "low",
+            thinking,
             "--configs",
             "baseline@1.0.0,review-assistant@1.0.0",
             "--baseline-config",
@@ -361,7 +371,9 @@ def test_plan_command_writes_review_artifacts_without_execution(
 
     plan = parse_launch_plan_json(plan_path.read_text())
     assert plan.identity.startswith("sha256:")
-    policies = plan.to_document()["policies"]
+    plan_document = plan.to_document()
+    assert plan_document["thinking"] == thinking
+    policies = plan_document["policies"]
     assert policies["agent_timeout_s"] == 321.0
     assert policies["rpc_quiescence_s"] == 4.5
     assert policies["capture_initial_context"] is False
