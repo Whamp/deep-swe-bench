@@ -140,6 +140,23 @@ def load_matched_result_cells(
     return expected_keys, cells
 
 
+def load_initial_outage_cells(results_root: Path) -> dict[tuple[str, int], ResultCell]:
+    """Load the 51 PR #10 cells archived before the supplemental rerun."""
+    quarantine_root = (
+        results_root.parents[1]
+        / "_contaminated/provider-outage/pi-fabric-pr10-0da479f-initial"
+    )
+    cells: dict[tuple[str, int], ResultCell] = {}
+    for result_path in sorted(quarantine_root.glob("*/rep*/result.json")):
+        result = load_json(result_path)
+        task = str(result["task"])
+        rep = int(result["rep"])
+        cells[(task, rep)] = ResultCell(result=result, path=result_path.parent)
+    if len(cells) != 51:
+        raise ValueError(f"Expected 51 archived outage cells; got {len(cells)}")
+    return cells
+
+
 def extract_pi_operation_arguments(code: str, operation: str) -> list[str]:
     """Extract balanced argument text from model-authored ``pi.<operation>(...)`` calls."""
     needle = f"pi.{operation}"
@@ -419,6 +436,8 @@ def classify_packet(
     new_audit = audits["pi-fabric-pr10@0.28.11"][key]
     files = patch_statistics(new_cell.path / "artifacts/model.patch")["files"]
     source_files = [path for path in files if path != ".pi/fabric/mesh/state.json"]
+    earlier_solved = cells["pi-fabric"][key].result["reward_binary"] == 1
+    new_solved = new_cell.result["reward_binary"] == 1
     if new_audit.affected_by_session_error:
         bucket = "provider-instability-confounded"
         mechanism = "The PR #10 session contains provider errors or a model tool call without a saved result."
@@ -427,45 +446,18 @@ def classify_packet(
         bucket = "under-implementation"
         mechanism = "The rep produced no source-code patch beyond Fabric mesh state."
         confidence = "high"
+    elif new_solved and not earlier_solved:
+        bucket = "clean-pr10-gain"
+        mechanism = "PR #10 solved this error-free rep where earlier Pi-Fabric did not."
+        confidence = "high"
+    elif earlier_solved and not new_solved:
+        bucket = "clean-pr10-loss"
+        mechanism = "Earlier Pi-Fabric solved this rep, while the error-free PR #10 trajectory did not."
+        confidence = "high"
     else:
         bucket = "outcome-churn-unclassified"
         mechanism = "The outcome changed, but this aggregate report does not assign a patch-level causal mechanism."
         confidence = "low"
-
-    overrides = {
-        ("tengo-destructuring-bindings", 1): (
-            "under-implementation",
-            "The model explicitly reported that it could not complete the task; the patch contains only Fabric mesh state and 0/91 feature tests passed.",
-            "high",
-        ),
-        ("drizzle-orm-window-function-builders", 1): (
-            "provider-instability-confounded",
-            "A pending source-write tool call never received a result, followed by WebSocket, overload, and fetch errors; no source patch landed and 0/130 feature tests passed.",
-            "high",
-        ),
-        ("textual-kitty-key-phases", 1): (
-            "provider-instability-confounded",
-            "Provider errors followed an unfinished edit sequence; the saved patch passed 1/23 feature tests and 56/57 preservation tests.",
-            "high",
-        ),
-        ("goreleaser-retry-publish-auditing", 2): (
-            "successful-despite-provider-errors",
-            "The rep contains provider errors but still committed a complete implementation and passed all 58 graded tests.",
-            "high",
-        ),
-        ("go-critic-doc-link-checker", 1): (
-            "clean-pr10-gain",
-            "The error-free PR #10 rep passed all 19 graded tests where earlier Pi-Fabric failed one feature and one preservation test.",
-            "high",
-        ),
-        ("tengo-callable-instance-isolation", 2): (
-            "clean-pr10-gain",
-            "The error-free PR #10 rep passed all 145 graded tests; earlier Pi-Fabric passed only 2/23 feature tests.",
-            "high",
-        ),
-    }
-    if key in overrides:
-        bucket, mechanism, confidence = overrides[key]
     return {"primary_bucket": bucket, "mechanism": mechanism, "confidence": confidence}
 
 
@@ -610,10 +602,10 @@ def render_metric_table(aggregate: dict[str, dict[str, Any]]) -> str:
     )
 
 
-def render_clean_metric_table(clean_aggregate: dict[str, dict[str, Any]]) -> str:
+def render_clean_metric_table(clean_aggregate: dict[str, dict[str, Any]], sample_size: int) -> str:
     """Render the conservative error-free sensitivity table."""
     rows = [
-        ("Full solves", "solves", lambda value: f"{value}/55"),
+        ("Full solves", "solves", lambda value: f"{value}/{sample_size}"),
         ("Mean partial reward", "mean_partial", lambda value: f"{value:.3f}"),
         ("Mean feature-test pass rate", "mean_f2p", lambda value: f"{value * 100:.1f}%"),
         ("Median tokens", "median_tokens", lambda value: f"{value:,.0f}"),
@@ -631,18 +623,25 @@ def render_clean_metric_table(clean_aggregate: dict[str, dict[str, Any]]) -> str
 
 def render_packet_rows(packet_index: list[dict[str, Any]], cells: dict[str, dict[tuple[str, int], ResultCell]]) -> str:
     """Render representative packet links and direct outcome evidence."""
-    representatives = [
-        ("tengo-destructuring-bindings", 1),
-        ("drizzle-orm-window-function-builders", 1),
-        ("textual-kitty-key-phases", 1),
-        ("goreleaser-retry-publish-auditing", 2),
-        ("go-critic-doc-link-checker", 1),
-        ("tengo-callable-instance-isolation", 2),
-    ]
-    packet_by_key = {(item["task"], item["rep"]): item for item in packet_index}
+    bucket_limits = {
+        "provider-instability-confounded": 2,
+        "under-implementation": 1,
+        "clean-pr10-gain": 2,
+        "clean-pr10-loss": 2,
+        "outcome-churn-unclassified": 1,
+    }
+    representatives: list[dict[str, Any]] = []
+    for bucket, limit in bucket_limits.items():
+        matches = [
+            item
+            for item in packet_index
+            if item["classification"]["primary_bucket"] == bucket
+        ]
+        representatives.extend(matches[:limit])
+    representatives = representatives[:8]
     rows: list[str] = []
-    for key in representatives:
-        item = packet_by_key[key]
+    for item in representatives:
+        key = (item["task"], item["rep"])
         outcomes = []
         for config in CONFIG_ORDER:
             result = cells[config][key].result
@@ -664,6 +663,7 @@ def render_html_report(
     """Render the self-contained Tailnet report."""
     aggregate = summary["aggregate"]
     clean = summary["strict_error_free_sensitivity"]["aggregate"]
+    clean_n = summary["strict_error_free_sensitivity"]["n"]
     audits = summary["session_audit"]
     old_audit = audits["pi-fabric"]["all"]
     new_audit = audits["pi-fabric-pr10@0.28.11"]["all"]
@@ -689,12 +689,16 @@ def render_html_report(
     clean_wall_change_old = percent_change(clean_new["median_wall_s"], clean_old["median_wall_s"])
     clean_wall_change_base = percent_change(clean_new["median_wall_s"], clean_base["median_wall_s"])
     whole_read_drop = (new_audit["whole_repo_read_rate"] - old_audit["whole_repo_read_rate"]) * 100
-
-    error_rows = "".join(
-        f"<tr><td>{escape(CONFIG_LABELS[config])}</td><td class='num'>{audits[config]['all']['affected_cells']}/108</td>"
-        f"<td class='num'>{audits[config]['all']['assistant_error_messages']}</td><td class='num'>{audits[config]['all']['missing_tool_results']}</td></tr>"
-        for config in CONFIG_ORDER
+    supplemental = summary["supplemental_rerun"]
+    initial_outage = supplemental["initial_outage_cells"]
+    replacements = supplemental["replacement_cells"]
+    current_error_details = ", ".join(
+        f"{count} {escape(error_type)}"
+        for error_type, count in sorted(
+            new_audit["error_types"].items(), key=lambda item: (-item[1], item[0])
+        )
     )
+
     read_rows = "".join(
         f"<tr><td>{scope}</td><td class='num'>{old_item['repo_reads']:,}</td><td class='num'>{new_item['repo_reads']:,}</td>"
         f"<td class='num'>{old_item['whole_repo_reads']:,} ({old_item['whole_repo_read_rate'] * 100:.1f}%)</td>"
@@ -703,21 +707,21 @@ def render_html_report(
         f"<td class='num'>{new_item['inner_operations'].get('grep', 0) + new_item['inner_operations'].get('find', 0):,}</td></tr>"
         for scope, old_item, new_item in [
             ("All 108 reps", old_audit, new_audit),
-            ("55 error-free matched reps", clean_old_audit, clean_new_audit),
+            (f"{clean_n} error-free matched reps", clean_old_audit, clean_new_audit),
         ]
     )
 
     return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Pi-Fabric PR #10 · DeepSWE analysis</title><link rel='icon' href='data:,'><style>
 :root{{--bg:#f4f7fb;--surface:#fff;--ink:#102033;--muted:#607086;--line:#d9e1ec;--blue:#335dff;--green:#178a5b;--red:#d0473f;--amber:#b87900;--green-soft:#e7f7ef;--red-soft:#fdeceb;--amber-soft:#fff4d8;--shadow:0 24px 60px rgba(14,30,62,.08);--radius:26px;--max:1240px}}*{{box-sizing:border-box}}body{{margin:0;background:radial-gradient(circle at top left,rgba(51,93,255,.11),transparent 30%),radial-gradient(circle at top right,rgba(184,121,0,.09),transparent 28%),linear-gradient(180deg,#fbfdff,var(--bg));color:var(--ink);font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.55}}.wrap{{max-width:var(--max);margin:auto;padding:28px 20px 52px}}.hero,section{{background:rgba(255,255,255,.95);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}}.hero{{padding:clamp(26px,4vw,44px)}}section{{padding:clamp(20px,3vw,30px);margin-top:20px;overflow-x:auto}}h1,h2{{margin:0;line-height:1.08;letter-spacing:-.03em}}h1{{font-size:clamp(2.2rem,5vw,4.3rem);max-width:18ch;margin-top:14px}}h2{{font-size:clamp(1.4rem,2.4vw,2rem)}}p{{color:var(--muted)}}.eyebrow,.pill,.tag{{display:inline-flex;border-radius:999px;font-size:12px;font-weight:850;letter-spacing:.05em;text-transform:uppercase}}.eyebrow{{padding:8px 12px;background:#eef3ff;color:#1d3fb8}}.pillrow{{display:flex;flex-wrap:wrap;gap:10px;margin-top:22px}}.pill{{padding:8px 12px;border:1px solid var(--line)}}.pill.good,.tag.good{{background:var(--green-soft);color:var(--green)}}.pill.bad,.tag.bad{{background:var(--red-soft);color:var(--red)}}.pill.caution,.tag.caution{{background:var(--amber-soft);color:var(--amber)}}.pill.neutral,.tag.neutral{{background:#eef3ff;color:#1d3fb8}}.stats{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px;margin-top:26px}}.stat{{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:16px;min-height:116px}}.stat .label{{display:block;color:var(--muted);font-size:11px;font-weight:850;text-transform:uppercase;letter-spacing:.07em}}.stat .value{{display:block;font-size:clamp(1.3rem,2vw,1.9rem);font-weight:900;margin-top:8px;letter-spacing:-.04em}}.stat .sub{{display:block;color:var(--muted);font-size:.86rem;margin-top:7px}}.good{{color:var(--green)}}.bad{{color:var(--red)}}.caution{{color:var(--amber)}}.neutral{{color:#1d3fb8}}.muted{{color:var(--muted)}}.callout{{border-left:5px solid var(--blue);background:linear-gradient(90deg,#f4f7ff,#fff);border-radius:14px;padding:15px 17px;margin-top:16px}}.callout.bad{{border-left-color:var(--red);background:linear-gradient(90deg,#fff5f4,#fff)}}.callout.good{{border-left-color:var(--green);background:linear-gradient(90deg,#f2fbf6,#fff)}}.callout.caution{{border-left-color:var(--amber);background:linear-gradient(90deg,#fff9e8,#fff)}}.grid2{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}}.head{{margin-bottom:16px}}.head p{{margin:.45rem 0 0;max-width:92ch}}table{{width:100%;border-collapse:collapse;font-size:.91rem}}th,td{{padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}th{{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}}td.num,th.num{{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}}code{{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eef2ff;color:#24346f;border-radius:6px;padding:.12em .35em}}a{{color:var(--blue);text-decoration:none}}a:hover{{text-decoration:underline}}.bars{{display:grid;gap:14px}}.barrow{{display:grid;grid-template-columns:170px 1fr 150px;gap:12px;align-items:center}}.track{{height:18px;border-radius:999px;background:#edf2f7;border:1px solid #dde5ef;overflow:hidden}}.fill{{height:100%;background:linear-gradient(90deg,#6a8cff,#335dff);border-radius:999px}}.fill.good{{background:linear-gradient(90deg,#4fc58f,#178a5b)}}.fill.bad{{background:linear-gradient(90deg,#f26a5f,#d0473f)}}.foot{{margin-top:22px;text-align:center;color:var(--muted);font-size:.86rem}}@media(max-width:900px){{.stats,.grid2{{grid-template-columns:1fr 1fr}}}}@media(max-width:650px){{.stats,.grid2{{grid-template-columns:1fr}}.barrow{{grid-template-columns:1fr}}table{{font-size:.8rem}}th,td{{padding:7px 5px}}}}
 </style></head><body><div class='wrap'>
-<header class='hero'><span class='eyebrow'>DeepSWE · 36_v2 × 3 reps · GPT-5.6-sol low</span><h1>PR #10 fixed read economy. Efficacy needs a clean rerun.</h1><p>The new Pi-Fabric build used far fewer whole-file reads and cut most of the earlier token overhead. Its observed solve count fell, but provider failures affected 51 of 108 new reps. The saved results support the efficiency claim; they do not support a clean causal claim that PR #10 reduced efficacy.</p><div class='pillrow'><span class='pill good'>Whole-file reads: {old_audit['whole_repo_read_rate'] * 100:.1f}% → {new_audit['whole_repo_read_rate'] * 100:.1f}%</span><span class='pill good'>Median tokens vs earlier Fabric: {token_change_old:.0f}%</span><span class='pill good'>Median cost vs earlier Fabric: {cost_change_old:.0f}%</span><span class='pill bad'>Observed solves: {old['solves']} → {new['solves']}</span><span class='pill caution'>51/108 new reps had provider errors</span></div><div class='stats'><div class='stat'><span class='label'>Observed solves</span><span class='value bad'>{baseline['solves']} / {old['solves']} / {new['solves']}</span><span class='sub'>Plain / earlier Fabric / PR #10</span></div><div class='stat'><span class='label'>Error-free sensitivity</span><span class='value neutral'>{clean_base['solves']} / {clean_old['solves']} / {clean_new['solves']}</span><span class='sub'>55 matched reps</span></div><div class='stat'><span class='label'>Whole-file read rate</span><span class='value good'>{new_audit['whole_repo_read_rate'] * 100:.1f}%</span><span class='sub'>{whole_read_drop:+.1f} percentage points</span></div><div class='stat'><span class='label'>Clean median tokens</span><span class='value good'>{clean_token_change_old:.0f}%</span><span class='sub'>vs earlier Pi-Fabric</span></div><div class='stat'><span class='label'>Clean median wall time</span><span class='value neutral'>{clean_wall_change_old:.0f}%</span><span class='sub'>vs earlier Pi-Fabric</span></div></div><div class='callout caution'><strong>Decision:</strong> accept the read-economy improvement, but do not use 45/108 as a clean estimate of PR #10 efficacy. Rerun the 51 affected PR #10 reps after the harness treats saved session errors and unmatched tool calls as transient failures.</div></header>
-<section><div class='head'><h2>Observed outcomes: all 108 reps</h2><p>This is the intention-to-treat view: every completed result stays in the primary count, including reps with provider errors. The PR #10 result is 8 solves below plain Pi and 6 below earlier Pi-Fabric. Neither paired solve difference is statistically decisive, and both are confounded by session failures.</p></div><table><thead><tr><th>Metric</th><th class='num'>Plain Pi</th><th class='num'>Earlier Pi-Fabric</th><th class='num'>PR #10 Pi-Fabric</th></tr></thead><tbody>{render_metric_table(aggregate)}</tbody></table><div class='grid2'><div class='callout'><strong>Against plain Pi:</strong> PR #10 gained {new_vs_base['right_only']} solves and lost {new_vs_base['left_only']} (net {new_vs_base['net']:+d}; exact paired p={new_vs_base['mcnemar_p']:.3f}). Mean partial reward changed {summary['partial_bootstrap']['baseline_to_pr10']['mean_delta']:+.3f}; the task-clustered 95% interval is {summary['partial_bootstrap']['baseline_to_pr10']['ci95'][0]:+.3f} to {summary['partial_bootstrap']['baseline_to_pr10']['ci95'][1]:+.3f}.</div><div class='callout'><strong>Against earlier Pi-Fabric:</strong> PR #10 gained {new_vs_old['right_only']} solves and lost {new_vs_old['left_only']} (net {new_vs_old['net']:+d}; exact paired p={new_vs_old['mcnemar_p']:.3f}). Mean partial reward changed {summary['partial_bootstrap']['pi-fabric_to_pr10']['mean_delta']:+.3f}; its 95% interval also crosses zero.</div></div></section>
-<section><div class='head'><h2>Why the efficacy result is contaminated</h2><p>The harness reported zero failed reps because Pi exited normally. The native session logs tell a different story: provider errors triggered automatic retries, and some final tool calls never received results. This directly interrupted edits in several losses.</p></div><table><thead><tr><th>Config</th><th class='num'>Affected reps</th><th class='num'>Assistant error messages</th><th class='num'>Tool calls without results</th></tr></thead><tbody>{error_rows}</tbody></table><div class='callout bad'><strong>PR #10 session evidence:</strong> 175 provider-error messages across 51 reps: 70 <code>fetch failed</code>, 44 WebSocket errors, 38 terminated responses, 13 overload responses, and 10 five-minute response-header timeouts. Thirty-four model tool calls have no matching saved tool result.</div><div class='callout caution'><strong>Concrete impact:</strong> <code>drizzle-orm-window-function-builders</code> rep1 issued a source-write call, then hit WebSocket, overload, and fetch errors. No source patch landed, and all 130 feature tests failed. This is an observed provider-interrupted outcome, not clean evidence about the guidance change.</div></section>
-<section><div class='head'><h2>Conservative sensitivity: 55 matched reps with no session errors</h2><p>This post-hoc view removes every key where any of the three configs had an assistant error or unmatched tool call. It is not a replacement score. It shows whether the headline direction survives after removing known provider failures.</p></div><table><thead><tr><th>Metric</th><th class='num'>Plain Pi</th><th class='num'>Earlier Pi-Fabric</th><th class='num'>PR #10 Pi-Fabric</th></tr></thead><tbody>{render_clean_metric_table(clean)}</tbody></table><div class='grid2'><div class='callout'><strong>Efficacy:</strong> PR #10 solved {clean_new['solves']}/55 versus {clean_base['solves']}/55 for plain Pi and {clean_old['solves']}/55 for earlier Pi-Fabric. It is net {clean_new_vs_base['net']:+d} against baseline (p={clean_new_vs_base['mcnemar_p']:.3f}) and {clean_new_vs_old['net']:+d} against earlier Fabric (p={clean_new_vs_old['mcnemar_p']:.3f}).</div><div class='callout good'><strong>Efficiency:</strong> PR #10 used {abs(clean_token_change_old):.1f}% fewer median tokens and cost {abs(clean_cost_change_old):.1f}% less than earlier Pi-Fabric on the clean subset. It still used {clean_token_change_base:.1f}% more tokens and cost {clean_cost_change_base:.1f}% more than plain Pi.</div></div></section>
-<section><div class='head'><h2>Read economy changed exactly as intended</h2><p>This static trajectory audit counts model-authored <code>pi.read</code>, <code>pi.grep</code>, and <code>pi.find</code> calls inside <code>fabric_exec</code>. A repo read is “bounded” when its arguments include an offset or limit. Skill-file reads are excluded. This is a transparent estimator, not the maintainer's separate Pier metric.</p></div><table><thead><tr><th>Scope</th><th class='num'>Earlier reads</th><th class='num'>PR #10 reads</th><th class='num'>Earlier whole-file</th><th class='num'>PR #10 whole-file</th><th class='num'>Earlier searches</th><th class='num'>PR #10 searches</th></tr></thead><tbody>{read_rows}</tbody></table><div class='grid2'><div class='callout good'><strong>All reps:</strong> whole-file reads fell from {old_audit['whole_repo_reads']:,}/{old_audit['repo_reads']:,} ({old_audit['whole_repo_read_rate'] * 100:.1f}%) to {new_audit['whole_repo_reads']:,}/{new_audit['repo_reads']:,} ({new_audit['whole_repo_read_rate'] * 100:.1f}%). The absolute count fell {percent_change(new_audit['whole_repo_reads'], old_audit['whole_repo_reads']):.1f}%.</div><div class='callout'><strong>Behavioral shift:</strong> PR #10 performed more total read calls and more searches, but used bounded windows for most reads. On the 55 error-free keys, whole-file reads fell from {clean_old_audit['whole_repo_read_rate'] * 100:.1f}% to {clean_new_audit['whole_repo_read_rate'] * 100:.1f}%.</div></div></section>
-<section><div class='head'><h2>Representative trajectory evidence</h2><p>Each linked JSON packet contains all three results, patch files and line counts, verifier failures, session errors, tool counts, and read-economy measures. “Binary / partial” is shown for each config.</p></div><table><thead><tr><th>Rep</th><th class='num'>Plain</th><th class='num'>Earlier Fabric</th><th class='num'>PR #10</th><th>Evidence-backed classification</th></tr></thead><tbody>{render_packet_rows(packet_index, cells)}</tbody></table><div class='callout'><strong>Churn remains high:</strong> PR #10 flipped 38 binary outcomes relative to earlier Pi-Fabric and 40 relative to plain Pi. The packets separate provider-interrupted reps from clean wins, clean losses, and unclassified variance. Aggregate deltas alone cannot assign one mechanism to all flips.</div></section>
-<section><div class='head'><h2>Resource tradeoff</h2><p>The overall wall-time result is dominated by provider retries, and host load was not controlled across the separately timed comparisons. The error-free sensitivity is more useful: PR #10 was faster than earlier Pi-Fabric but remained slower than plain Pi.</p></div><div class='bars'><div class='barrow'><strong>Clean median tokens</strong><div class='track'><div class='fill good' style='width:{clean_new['median_tokens'] / clean_old['median_tokens'] * 100:.1f}%'></div></div><span>{clean_new['median_tokens']:,.0f} · {clean_token_change_old:+.1f}% vs old</span></div><div class='barrow'><strong>Clean median cost</strong><div class='track'><div class='fill good' style='width:{clean_new['median_cost'] / clean_old['median_cost'] * 100:.1f}%'></div></div><span>${clean_new['median_cost']:.3f} · {clean_cost_change_old:+.1f}% vs old</span></div><div class='barrow'><strong>Clean median wall</strong><div class='track'><div class='fill good' style='width:{clean_new['median_wall_s'] / clean_old['median_wall_s'] * 100:.1f}%'></div></div><span>{clean_new['median_wall_s']:.1f}s · {clean_wall_change_old:+.1f}% vs old</span></div></div><div class='callout caution'><strong>Do not use the all-rep latency as package overhead:</strong> PR #10's overall median was {new['median_wall_s']:.1f}s and p90 was {new['p90_wall_s']:.1f}s, but the error-free median was {clean_new['median_wall_s']:.1f}s. The clean value is {clean_wall_change_base:.1f}% slower than plain Pi and {abs(clean_wall_change_old):.1f}% faster than earlier Pi-Fabric.</div></section>
-<section><div class='head'><h2>Conclusion and next move</h2></div><div class='grid2'><div class='callout good'><strong>What worked:</strong> PR #10 sharply reduced whole-file reads, eliminated almost all active-skill rereads, cut median tokens by about one-third versus earlier Pi-Fabric, and lowered its cost.</div><div class='callout bad'><strong>What remains unresolved:</strong> the primary result fell to {new['solves']}/108 solves, but nearly half the new reps contain provider failures. The error-free sensitivity is only two solves below both references.</div></div><div class='callout caution'><strong>Recommended next move:</strong> fix the harness so native-session assistant errors and unmatched tool calls cannot produce an “ok” rep, then rerun only the 51 affected PR #10 reps. Keep the 57 unaffected PR #10 reps read-only. That will answer efficacy without paying for another full matrix.</div><p class='muted'><strong>Comparability limit:</strong> plain Pi and earlier Pi-Fabric are legacy Pi 0.81.1 references with no per-result subject or harness identity fields. PR #10 ran on Pi 0.83.0 with full provenance. The user explicitly approved reference-only baseline reuse, but this is not a fully matched subject-version comparison. Scope: 36_v2, 3 reps, <code>{MODEL}</code>, low thinking. Raw data: <a href='summary.json'>summary.json</a> · <a href='paired_cells.csv'>paired_cells.csv</a> · <a href='packets/index.json'>packet index</a>.</p></section><div class='foot'>Deterministic analysis: <code>analysis/pi-fabric-pr10-vs-prior-36v2/build_report.py</code> · PR #10 package commit <code>0da479fe267232115b3fbf0893067352622b0f29</code></div>
+<header class='hero'><span class='eyebrow'>DeepSWE · 36_v2 × 3 reps · GPT-5.6-sol low</span><h1>PR #10 matches earlier Pi-Fabric with one-third fewer tokens.</h1><p>The selective rerun recovered six observed solves. PR #10 now ties earlier Pi-Fabric at {new['solves']}/108 while preserving the intended read-economy improvement. It remains two solves behind plain Pi, and {new_audit['affected_cells']} reps still contain provider/session errors, so the evidence supports parity—not a precise causal estimate.</p><div class='pillrow'><span class='pill good'>Whole-file reads: {old_audit['whole_repo_read_rate'] * 100:.1f}% → {new_audit['whole_repo_read_rate'] * 100:.1f}%</span><span class='pill good'>Median tokens vs earlier Fabric: {token_change_old:.0f}%</span><span class='pill good'>Median cost vs earlier Fabric: {cost_change_old:.0f}%</span><span class='pill neutral'>Observed solves: {old['solves']} → {new['solves']}</span><span class='pill caution'>{new_audit['affected_cells']}/108 reps still had session errors</span></div><div class='stats'><div class='stat'><span class='label'>Observed solves</span><span class='value neutral'>{baseline['solves']} / {old['solves']} / {new['solves']}</span><span class='sub'>Plain / earlier Fabric / PR #10</span></div><div class='stat'><span class='label'>Error-free sensitivity</span><span class='value neutral'>{clean_base['solves']} / {clean_old['solves']} / {clean_new['solves']}</span><span class='sub'>{clean_n} matched reps</span></div><div class='stat'><span class='label'>Whole-file read rate</span><span class='value good'>{new_audit['whole_repo_read_rate'] * 100:.1f}%</span><span class='sub'>{whole_read_drop:+.1f} percentage points</span></div><div class='stat'><span class='label'>Clean median tokens</span><span class='value good'>{clean_token_change_old:.0f}%</span><span class='sub'>vs earlier Pi-Fabric</span></div><div class='stat'><span class='label'>Clean median wall time</span><span class='value neutral'>{clean_wall_change_old:+.1f}%</span><span class='sub'>vs earlier Pi-Fabric</span></div></div><div class='callout good'><strong>Decision:</strong> PR #10 delivered its read-economy goal without a detectable efficacy loss versus earlier Pi-Fabric. The error-free sensitivity is one solve lower (paired p={clean_new_vs_old['mcnemar_p']:.3f}) with essentially identical mean partial reward. Remaining provider failures and the Pi-version mismatch limit stronger claims.</div></header>
+<section><div class='head'><h2>Observed outcomes: all 108 reps</h2><p>This is the complete merged view: 57 original clean results plus 51 supplemental replacements. PR #10 ties earlier Pi-Fabric and is two solves below plain Pi. Neither paired difference is statistically distinguishable from zero.</p></div><table><thead><tr><th>Metric</th><th class='num'>Plain Pi</th><th class='num'>Earlier Pi-Fabric</th><th class='num'>PR #10 Pi-Fabric</th></tr></thead><tbody>{render_metric_table(aggregate)}</tbody></table><div class='grid2'><div class='callout'><strong>Against plain Pi:</strong> PR #10 gained {new_vs_base['right_only']} solves and lost {new_vs_base['left_only']} (net {new_vs_base['net']:+d}; exact paired p={new_vs_base['mcnemar_p']:.3f}). Mean partial reward changed {summary['partial_bootstrap']['baseline_to_pr10']['mean_delta']:+.3f}; the task-clustered 95% interval is {summary['partial_bootstrap']['baseline_to_pr10']['ci95'][0]:+.3f} to {summary['partial_bootstrap']['baseline_to_pr10']['ci95'][1]:+.3f}.</div><div class='callout'><strong>Against earlier Pi-Fabric:</strong> PR #10 gained {new_vs_old['right_only']} solves and lost {new_vs_old['left_only']} (net {new_vs_old['net']:+d}; exact paired p={new_vs_old['mcnemar_p']:.3f}). Mean partial reward changed {summary['partial_bootstrap']['pi-fabric_to_pr10']['mean_delta']:+.3f}; the 95% interval is {summary['partial_bootstrap']['pi-fabric_to_pr10']['ci95'][0]:+.3f} to {summary['partial_bootstrap']['pi-fabric_to_pr10']['ci95'][1]:+.3f}.</div></div></section>
+<section><div class='head'><h2>The supplemental rerun helped, but the provider was still overloaded</h2><p>The rerun executed exactly 51 archived cells, reused 57 clean cells, had zero harness failures, and required no watchdog intervention. Session evidence improved substantially, but did not become clean.</p></div><table><thead><tr><th>Scope</th><th class='num'>Affected reps</th><th class='num'>Assistant error messages</th><th class='num'>Tool calls without results</th></tr></thead><tbody><tr><td>Initial 51 archived cells</td><td class='num'>{initial_outage['affected_cells']}/51</td><td class='num'>{initial_outage['assistant_error_messages']}</td><td class='num'>{initial_outage['missing_tool_results']}</td></tr><tr><td>51 supplemental replacements</td><td class='num'>{replacements['affected_cells']}/51</td><td class='num'>{replacements['assistant_error_messages']}</td><td class='num'>{replacements['missing_tool_results']}</td></tr></tbody></table><div class='callout caution'><strong>Remaining PR #10 session evidence:</strong> {new_audit['assistant_error_messages']} assistant errors across {new_audit['affected_cells']} reps and {new_audit['missing_tool_results']} unmatched tool calls. Error types: {current_error_details}. The provider explicitly reported overload {new_audit['error_types'].get('Codex error: Our servers are currently overloaded. Please try again later.', 0)} times.</div><div class='callout'><strong>Interpretation:</strong> the six-solve recovery after replacing only outage-affected cells is consistent with infrastructure noise depressing the first result. It does not prove every changed outcome was caused by the outage.</div></section>
+<section><div class='head'><h2>Conservative sensitivity: {clean_n} matched reps with no session errors</h2><p>This post-hoc view removes every key where any config had an assistant error or unmatched tool call. It is not a replacement score; it tests whether the headline direction survives without known session failures.</p></div><table><thead><tr><th>Metric</th><th class='num'>Plain Pi</th><th class='num'>Earlier Pi-Fabric</th><th class='num'>PR #10 Pi-Fabric</th></tr></thead><tbody>{render_clean_metric_table(clean, clean_n)}</tbody></table><div class='grid2'><div class='callout'><strong>Efficacy:</strong> PR #10 solved {clean_new['solves']}/{clean_n} versus {clean_base['solves']}/{clean_n} for plain Pi and {clean_old['solves']}/{clean_n} for earlier Pi-Fabric. It is net {clean_new_vs_base['net']:+d} against baseline (p={clean_new_vs_base['mcnemar_p']:.3f}) and {clean_new_vs_old['net']:+d} against earlier Fabric (p={clean_new_vs_old['mcnemar_p']:.3f}).</div><div class='callout good'><strong>Efficiency:</strong> PR #10 used {abs(clean_token_change_old):.1f}% fewer median tokens and cost {abs(clean_cost_change_old):.1f}% less than earlier Pi-Fabric on the clean subset. It still used {clean_token_change_base:.1f}% more tokens and cost {clean_cost_change_base:.1f}% more than plain Pi.</div></div></section>
+<section><div class='head'><h2>Read economy changed exactly as intended</h2><p>This static trajectory audit counts model-authored <code>pi.read</code>, <code>pi.grep</code>, and <code>pi.find</code> calls inside <code>fabric_exec</code>. A repo read is “bounded” when its arguments include an offset or limit. Skill-file reads are excluded. This is a transparent estimator, not the maintainer's separate Pier metric.</p></div><table><thead><tr><th>Scope</th><th class='num'>Earlier reads</th><th class='num'>PR #10 reads</th><th class='num'>Earlier whole-file</th><th class='num'>PR #10 whole-file</th><th class='num'>Earlier searches</th><th class='num'>PR #10 searches</th></tr></thead><tbody>{read_rows}</tbody></table><div class='grid2'><div class='callout good'><strong>All reps:</strong> whole-file reads fell from {old_audit['whole_repo_reads']:,}/{old_audit['repo_reads']:,} ({old_audit['whole_repo_read_rate'] * 100:.1f}%) to {new_audit['whole_repo_reads']:,}/{new_audit['repo_reads']:,} ({new_audit['whole_repo_read_rate'] * 100:.1f}%). The absolute count fell {percent_change(new_audit['whole_repo_reads'], old_audit['whole_repo_reads']):.1f}%.</div><div class='callout'><strong>Behavioral shift:</strong> PR #10 performed more total read calls and more searches, but used bounded windows for most reads. Active-skill rereads fell from {old_audit['skill_reads']} to {new_audit['skill_reads']}. On the {clean_n} error-free keys, whole-file reads fell from {clean_old_audit['whole_repo_read_rate'] * 100:.1f}% to {clean_new_audit['whole_repo_read_rate'] * 100:.1f}%.</div></div></section>
+<section><div class='head'><h2>Representative trajectory evidence</h2><p>Each linked JSON packet contains all three results, patch files and line counts, verifier failures, session errors, tool counts, and read-economy measures. “Binary / partial” is shown for each config.</p></div><table><thead><tr><th>Rep</th><th class='num'>Plain</th><th class='num'>Earlier Fabric</th><th class='num'>PR #10</th><th>Evidence-backed classification</th></tr></thead><tbody>{render_packet_rows(packet_index, cells)}</tbody></table><div class='callout'><strong>Churn remains high:</strong> PR #10 flipped {new_vs_old['left_only'] + new_vs_old['right_only']} binary outcomes relative to earlier Pi-Fabric and {new_vs_base['left_only'] + new_vs_base['right_only']} relative to plain Pi. The packets separate provider-confounded reps from clean gains, clean losses, under-implementation, and unclassified variance. Aggregate deltas alone cannot assign one mechanism to all flips.</div></section>
+<section><div class='head'><h2>Resource tradeoff</h2><p>PR #10 removed most of earlier Pi-Fabric's token and cost overhead. Host load was not controlled across separately timed comparisons, and remaining provider retries still affect latency tails, so the error-free medians are the safer timing view.</p></div><div class='bars'><div class='barrow'><strong>Clean median tokens</strong><div class='track'><div class='fill good' style='width:{clean_new['median_tokens'] / clean_old['median_tokens'] * 100:.1f}%'></div></div><span>{clean_new['median_tokens']:,.0f} · {clean_token_change_old:+.1f}% vs old</span></div><div class='barrow'><strong>Clean median cost</strong><div class='track'><div class='fill good' style='width:{clean_new['median_cost'] / clean_old['median_cost'] * 100:.1f}%'></div></div><span>${clean_new['median_cost']:.3f} · {clean_cost_change_old:+.1f}% vs old</span></div><div class='barrow'><strong>Clean median wall</strong><div class='track'><div class='fill good' style='width:{clean_new['median_wall_s'] / clean_old['median_wall_s'] * 100:.1f}%'></div></div><span>{clean_new['median_wall_s']:.1f}s · {clean_wall_change_old:+.1f}% vs old</span></div></div><div class='callout caution'><strong>Residual overhead versus plain Pi:</strong> on error-free keys, PR #10 used {clean_token_change_base:.1f}% more median tokens, cost {clean_cost_change_base:.1f}% more, and took {clean_wall_change_base:.1f}% longer. Against earlier Pi-Fabric it used {abs(clean_token_change_old):.1f}% fewer tokens, cost {abs(clean_cost_change_old):.1f}% less, and had nearly identical median wall time.</div></section>
+<section><div class='head'><h2>Conclusion and next move</h2></div><div class='grid2'><div class='callout good'><strong>What worked:</strong> PR #10 cut whole-file read rate from {old_audit['whole_repo_read_rate'] * 100:.1f}% to {new_audit['whole_repo_read_rate'] * 100:.1f}%, reduced median tokens {abs(token_change_old):.1f}% and median cost {abs(cost_change_old):.1f}% versus earlier Pi-Fabric, and matched its {old['solves']}/108 observed solves.</div><div class='callout caution'><strong>What remains unresolved:</strong> {new_audit['affected_cells']} PR #10 reps still contain provider/session failures, and the historical references used Pi 0.81.1 while PR #10 used Pi 0.83.0. The data supports no detectable efficacy loss; it does not establish formal non-inferiority.</div></div><div class='callout'><strong>Recommended next move:</strong> share this as strong evidence that PR #10 achieved its efficiency goal while preserving observed efficacy relative to earlier Pi-Fabric. If a publication-quality clean efficacy estimate is required, first make native-session errors invalidate a rep, then rerun only the remaining {new_audit['affected_cells']} affected cells after provider load stabilizes.</div><p class='muted'><strong>Comparability limit:</strong> plain Pi and earlier Pi-Fabric are legacy Pi 0.81.1 references with no per-result subject or harness identity fields. PR #10 ran on Pi 0.83.0 with full provenance. The baseline was intentionally reference-only, so this is not a fully matched subject-version comparison. Scope: 36_v2, 3 reps, <code>{MODEL}</code>, low thinking. Raw data: <a href='summary.json'>summary.json</a> · <a href='paired_cells.csv'>paired_cells.csv</a> · <a href='packets/index.json'>packet index</a>.</p></section><div class='foot'>Deterministic analysis: <code>analysis/pi-fabric-pr10-vs-prior-36v2/build_report.py</code> · PR #10 package commit <code>0da479fe267232115b3fbf0893067352622b0f29</code></div>
 </div></body></html>"""
 
 
@@ -731,14 +735,20 @@ def main() -> None:
         config: {key: audit_result_session(cell, config) for key, cell in config_cells.items()}
         for config, config_cells in cells.items()
     }
+    initial_outage_cells = load_initial_outage_cells(results_root)
+    initial_outage_audits = {
+        key: audit_result_session(cell, "pi-fabric-pr10@0.28.11")
+        for key, cell in initial_outage_cells.items()
+    }
+    replacement_keys = set(initial_outage_cells)
     all_keys = set(keys)
     affected_keys = {
         config: {key for key, audit in config_audits.items() if audit.affected_by_session_error}
         for config, config_audits in audits.items()
     }
     strict_error_free_keys = all_keys - set().union(*affected_keys.values())
-    if len(strict_error_free_keys) != 55:
-        raise ValueError(f"Expected 55 strict error-free matched reps; got {len(strict_error_free_keys)}")
+    if not strict_error_free_keys:
+        raise ValueError("No strict error-free matched reps remain")
 
     aggregate = {
         config: aggregate_results([cells[config][key].result for key in keys])
@@ -786,6 +796,26 @@ def main() -> None:
             "pi-fabric_to_pr10": cluster_bootstrap_partial_reward(all_keys, cells, "pi-fabric", "pi-fabric-pr10@0.28.11"),
         },
         "session_audit": session_summary,
+        "supplemental_rerun": {
+            "cells": len(replacement_keys),
+            "preserved_cells": len(all_keys - replacement_keys),
+            "initial_aggregate": aggregate_results(
+                [
+                    initial_outage_cells.get(
+                        key, cells["pi-fabric-pr10@0.28.11"][key]
+                    ).result
+                    for key in keys
+                ]
+            ),
+            "final_aggregate": aggregate["pi-fabric-pr10@0.28.11"],
+            "initial_outage_cells": aggregate_session_audits(list(initial_outage_audits.values())),
+            "replacement_cells": aggregate_session_audits(
+                [audits["pi-fabric-pr10@0.28.11"][key] for key in sorted(replacement_keys)]
+            ),
+            "run_state": "completed",
+            "harness_failures": 0,
+            "watchdog_interventions": 0,
+        },
         "strict_error_free_sensitivity": {
             "n": len(strict_error_free_keys),
             "excluded_n": len(all_keys - strict_error_free_keys),
