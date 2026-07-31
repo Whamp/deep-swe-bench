@@ -321,6 +321,10 @@ class RunPiCommandTests(unittest.TestCase):
         self.assertIn("--session-dir", cmd)
         self.assertEqual(cmd[cmd.index("--session-dir") + 1], "/out/session")
         self.assertIn("--append-system-prompt", cmd)
+        self.assertEqual(
+            cmd[cmd.index("--append-system-prompt") + 1], "system text"
+        )
+        self.assertNotIn("--system-prompt", cmd)
         self.assertIn("--no-skills", cmd)
         self.assertEqual(cmd[-4:], [
             "-e", "/arm/extensions/example.ts",

@@ -1,4 +1,4 @@
-Every `bash` call must include a `timeout`. Without one, a hung command can block you indefinitely and prevent further work. Choose a limit appropriate to the command:
+You must add `"timeout": 600` to all `bash` calls or risk getting permanently blocked.
 
 ```json
 {"command": "pytest tests/", "timeout": 600}
