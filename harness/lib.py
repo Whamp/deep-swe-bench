@@ -14,9 +14,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 
 # Bump when harness/Dockerfile.pi-agent changes in a way that should invalidate
-# cached per-task pi images. v2 added ripgrep/fd-find; v3 updates Pi to 0.81.1
-# for GPT-5.6-SOL model discovery while retaining those read-only tools.
-PI_IMAGE_REV = "v3-pi0811-tools"
+# cached per-task pi images. v2 added ripgrep/fd-find; v3 updated Pi to 0.81.1
+# for GPT-5.6-SOL; v4 updates Pi to 0.83.0 for max thinking support.
+PI_IMAGE_REV = "v4-pi0830-tools"
 
 # Tasks live in the sibling DeepSWE checkout (~/evals/deep-swe/tasks).
 # Override with the DEEP_SWE_TASKS env var to point elsewhere.

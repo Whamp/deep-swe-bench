@@ -33,7 +33,9 @@ _seg = st.text(
     max_size=12,
 )
 _model = st.lists(_seg, min_size=1, max_size=4).map("/".join)
-_thinking = st.sampled_from(["off", "minimal", "low", "medium", "high", "xhigh"])
+_thinking = st.sampled_from(
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+)
 _rep = st.integers(min_value=0, max_value=30)
 
 

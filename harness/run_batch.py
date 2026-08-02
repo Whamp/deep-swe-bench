@@ -786,7 +786,7 @@ def _legacy_main() -> None:
                     help="coding agent runner to use inside task containers (default: pi)")
     ap.add_argument("--model", default="openrouter/deepseek/deepseek-v4-flash")
     ap.add_argument("--thinking", default="high",
-                    choices=["off", "minimal", "low", "medium", "high", "xhigh"])
+                    choices=["off", "minimal", "low", "medium", "high", "xhigh", "max"])
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--cell-retries", type=int, default=1,
@@ -890,7 +890,7 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--model", required=True)
     plan_parser.add_argument(
         "--thinking",
-        choices=["off", "minimal", "low", "medium", "high", "xhigh"],
+        choices=["off", "minimal", "low", "medium", "high", "xhigh", "max"],
         required=True,
     )
     plan_parser.add_argument("--configs", required=True)

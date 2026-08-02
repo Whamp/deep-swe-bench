@@ -58,7 +58,7 @@ Three structural commitments:
   text (`-w2`, `-sub`, `-pilot`, `-rerun`) encoded run parameters in the name,
   and resume was unsafe because the name didn't pin model+thinking.
 - **Adjective subset names** (`small`/`medium`/`full`): rejected. `medium` is
-  already a thinking level (`off..xhigh`), so `--thinking medium --subset medium`
+  already a thinking level (`off..max`), so `--thinking medium --subset medium`
   would be valid and meaningless. Subsets are named by task count instead.
 - **Clinical-trial vocabulary** (arm/study/cell): rejected by the operator as
   non-native. `config`/`comparison`/`rep` replaced it.
