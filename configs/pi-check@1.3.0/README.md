@@ -3,10 +3,17 @@
 Pi-check config for `local-vllm/qwen-agentworld-35b-a3b`, served by server60 at
 `http://100.92.238.117:8080/v1`.
 
-The only behavior difference from `baseline-qwen-agentworld-35b@1.0.0` is the
-existing pi-check extension and its `--check` flag. The extension queues one
-verification follow-up after the initial agent pass. This config adds no system
-preamble, orchestration text, or other config-authored executor prompt.
+The behavior differences from `baseline-qwen-agentworld-35b@1.0.0` are:
+
+- the existing pi-check extension and its `--check` flag, which queue one
+  verification follow-up after the initial agent pass; and
+- a 360-second default for Bash calls that omit a numeric timeout, while every
+  model-chosen timeout is preserved.
+
+The Bash policy prevents one unbounded tool call from consuming the full agent
+allowance. Baseline LangChain reps 1 and 2 both ended on such calls after roughly
+51 minutes without a tool result. This config adds no system preamble,
+orchestration text, or other config-authored executor prompt.
 
 It preserves the baseline provider behavior:
 
@@ -18,5 +25,6 @@ It preserves the baseline provider behavior:
   and `repetition_penalty=1.0`.
 
 This release succeeds `pi-check@1.2.0`. Its version impact is `rerun` because it
-changes the executor model and provider request hook. It does not carry forward
-the Ornith-only default Bash timeout from `pi-check@1.2.0`.
+changes the executor model, provider request hook, and Bash timeout policy. The
+Qwen-specific audit marker records whether each Bash timeout was defaulted or
+preserved.
