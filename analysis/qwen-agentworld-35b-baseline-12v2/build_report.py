@@ -127,12 +127,15 @@ def render_task_rows(task_metrics: list[dict[str, Any]]) -> str:
         f2p = metric["f2p_mean"]
         p2p = metric["p2p_mean"]
         invalid = int(metric["invalid"])
-        verdict_class = (
-            "good" if partial >= 0.95 else "caution" if partial >= 0.75 else "bad"
-        )
-        verdict = (
-            "near miss" if partial >= 0.95 else "partial" if partial >= 0.75 else "weak"
-        )
+        if f2p is not None and float(f2p) >= 0.75:
+            verdict = "feature close"
+            verdict_class = "good"
+        elif f2p is not None and float(f2p) >= 0.4:
+            verdict = "mixed feature"
+            verdict_class = "caution"
+        else:
+            verdict = "low feature"
+            verdict_class = "bad"
         if invalid:
             verdict = f"{invalid} invalid"
             verdict_class = "bad"
@@ -207,8 +210,8 @@ def render_qwen_agentworld_report(
 <body><div class="wrap">
 <header class="hero">
 <span class="eyebrow">DeepSWE · 12_v2 · 36 reps · Pi 0.83.0</span>
-<h1>High partial credit, zero strict solves.</h1>
-<p class="subtitle">Qwen-AgentWorld 35B preserved existing behavior almost perfectly and produced substantial patches on 33 valid reps, but every valid patch missed at least one feature test. Two agent timeouts and one verifier timeout further reduced the all-rep score.</p>
+<h1>High partial credit, weak feature completion.</h1>
+<p class="subtitle">Qwen-AgentWorld 35B preserved existing behavior almost perfectly, but passed only 38.1% of weighted feature tests and solved no rep strictly. The 0.798 partial score is dominated by the much larger regression-test pool; two agent timeouts and one verifier timeout reduced it further.</p>
 <div class="pillrow"><span class="pill bad">0 / 36 strict solves</span><span class="pill caution">3 invalid reps</span><span class="pill good">99.5% P2P weighted pass</span><span class="pill neutral">pi-check is a targeted next config</span></div>
 <div class="stats">
 <div class="stat"><span class="label">Strict reward</span><span class="value">{solved}/36</span><span class="sub">no F2P-perfect valid rep</span></div>
@@ -218,12 +221,12 @@ def render_qwen_agentworld_report(
 <div class="stat"><span class="label">Cumulative tokens</span><span class="value">{total_tokens / 1_000_000:.1f}M</span><span class="sub">{output_tokens / 1_000_000:.2f}M output across turns</span></div>
 </div>
 </header>
-<section><div class="section-head"><div><h2>Verdict</h2><p>The model is capable but does not close the last-mile verification gap under stock Pi.</p></div></div>
-<div class="callout bad"><strong>Strict efficacy: failed.</strong> DeepSWE awards a binary solve only when every feature-to-pass test succeeds while pass-to-pass tests stay green. None of the 33 valid reps achieved perfect F2P, so near-perfect partial scores still count as zero solves.</div>
+<section><div class="section-head"><div><h2>Verdict</h2><p>The model is regression-safe but feature-incomplete under stock Pi.</p></div></div>
+<div class="callout bad"><strong>Strict efficacy: failed.</strong> DeepSWE awards a binary solve only when every feature-to-pass test succeeds while pass-to-pass tests stay green. None of the 33 valid reps achieved perfect F2P. Partial reward looks high because P2P tests outnumber F2P tests by more than 25 to 1.</div>
 <div class="callout good"><strong>Regression safety: strong.</strong> Valid patches passed {weighted_p2p_passed:,}/{weighted_p2p_total:,} weighted P2P tests ({weighted_p2p_passed / weighted_p2p_total:.1%}); {perfect_p2p}/{len(valid_rows)} valid reps were P2P-perfect. The model usually changed the right surface without breaking established behavior.</div>
-<div class="callout"><strong>Next test: pi-check.</strong> A single fresh verification follow-up directly targets these near misses. The risk is runtime: this baseline already used {turns:,} turns and {tool_calls:,} tool calls, and two LangChain reps exhausted the one-hour agent timeout.</div>
+<div class="callout"><strong>Next test: pi-check.</strong> A single fresh verification follow-up directly targets missed feature cases after the initial patch. The risk is runtime: this baseline already used {turns:,} turns and {tool_calls:,} tool calls, and two LangChain reps exhausted the one-hour agent timeout.</div>
 </section>
-<section><div class="section-head"><div><h2>Per-task outcomes</h2><p>Sorted by mean partial reward. Partial includes invalid reps as zero; F2P/P2P omit reps without a verifier grade.</p></div></div><div class="table-wrap"><table><thead><tr><th>Task</th><th>Mean partial</th><th class="num">F2P mean</th><th class="num">P2P mean</th><th class="num">Mean wall</th><th class="num">Mean tools</th><th>Verdict</th></tr></thead><tbody>{task_rows}</tbody></table></div></section>
+<section><div class="section-head"><div><h2>Per-task outcomes</h2><p>Sorted by mean partial reward, but verdicts follow F2P completion. Partial includes invalid reps as zero; F2P/P2P omit reps without a verifier grade.</p></div></div><div class="table-wrap"><table><thead><tr><th>Task</th><th>Mean partial</th><th class="num">F2P mean</th><th class="num">P2P mean</th><th class="num">Mean wall</th><th class="num">Mean tools</th><th>Verdict</th></tr></thead><tbody>{task_rows}</tbody></table></div></section>
 <div class="grid-2">
 <section><div class="section-head"><div><h2>Execution reliability</h2><p>Three reps lacked a normal verifier grade.</p></div></div>
 <div class="card"><h3>LangChain · reps 1 and 2</h3><p>Both agents hit 3,600.1 seconds before an <code>agent_end</code> event. Rep 0 scored 0.975 partial, so the task was solvable but unstable rather than uniformly out of reach.</p></div>
@@ -232,12 +235,12 @@ def render_qwen_agentworld_report(
 </section>
 <section><div class="section-head"><div><h2>Tool mix</h2><p>{tool_calls:,} native tool calls across 36 reps, or {tool_calls / len(rows):.1f} per rep.</p></div></div><div class="tool-list">{tool_bars}</div><div class="callout"><strong>High iteration load:</strong> {turns:,} model completions and {agent_hours:.2f} aggregate agent-hours. Bash and read account for most activity; pi-check should be judged on added solves per added turn, not partial score alone.</div></section>
 </div>
-<section><div class="section-head"><div><h2>What the near misses look like</h2></div></div>
-<div class="grid-2"><div class="card"><h3>Obsidian · 0.993 partial</h3><p>Rep 2 preserved all 1,131 P2P tests and passed 52/60 F2P tests. The remaining failures clustered around nested or escaped Markdown labels, angle-bracket destinations, whitespace, and default heading display text—edge cases a focused re-audit could plausibly catch.</p></div><div class="card"><h3>Four consistently strong tasks</h3><p>SQL Formatter, Obsidian, Adaptix, and Dateutil each averaged above 0.97 partial across three reps. They are the best signal for pi-check: the implementation was close and stable, but strict success required one more correction cycle.</p></div></div>
+<section><div class="section-head"><div><h2>What partial reward hides</h2></div></div>
+<div class="grid-2"><div class="card"><h3>Obsidian is a genuine feature near-miss</h3><p>Rep 2 preserved all 1,131 P2P tests and passed 52/60 F2P tests. The remaining failures clustered around nested or escaped Markdown labels, angle-bracket destinations, whitespace, and default heading display text—edge cases a focused re-audit could plausibly catch.</p></div><div class="card"><h3>Other 0.97+ partials are less complete</h3><p>SQL Formatter, Adaptix, and Dateutil averaged 0.98–0.99 partial, yet their mean F2P rates were 33.3%, 18.2%, and 47.8%. Their large P2P suites inflate partial reward. Pi-check must improve F2P, not merely preserve the already-green regression suite.</p></div></div>
 </section>
 <section><div class="section-head"><div><h2>Conclusion</h2></div></div>
 <div class="callout bad"><strong>Do not call this baseline successful on DeepSWE.</strong> The official strict result is 0/36, not “about 80% solved.” Partial reward shows useful progress, not task completion.</div>
-<div class="callout good"><strong>Do run the pi-check comparison.</strong> The failure shape is unusually well matched to one independent verification pass: high P2P, many 0.97–0.99 partial patches, and no perfect F2P. Preflight must prove the second request and preserve the Qwen request shape before fan-out.</div>
+<div class="callout good"><strong>Do run the pi-check comparison.</strong> The config directly tests whether one independent verification pass converts regression-safe but feature-incomplete patches into strict solves. Judge it by F2P gains and solves, not partial reward alone. Preflight must prove the second request and preserve the Qwen request shape before fan-out.</div>
 </section>
 <div class="foot">Source: <code>results/{MODEL_LEAF}/{THINKING_LEVEL}/{CONFIG_IDENTITY}/</code> · run <code>{RUN_ID}</code> · launch plan <code>{rows[0]["launch_plan_identity"]}</code><br />Generated deterministically by <code>analysis/qwen-agentworld-35b-baseline-12v2/build_report.py</code>.</div>
 </div></body></html>
