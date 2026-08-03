@@ -13,8 +13,8 @@ model-side status as unverified and keep the client and server protections below
 
 ## Recommended Pi client contract
 
-The released baseline is
-[`baseline-thinkingcap-qwen36@1.0.0`](../configs/baseline-thinkingcap-qwen36@1.0.0/README.md).
+The current released baseline is
+[`baseline-thinkingcap-qwen36@1.1.0`](../configs/baseline-thinkingcap-qwen36@1.1.0/README.md).
 It applies this contract:
 
 | Setting | Value | Why |
@@ -25,7 +25,7 @@ It applies this contract:
 | `supportsDeveloperRole` | `false` | Avoids sending a role rejected by unmodified Qwen3.6 templates. |
 | `chat_template_kwargs.enable_thinking` | `true` for the `high` leaf | Enables Qwen3.6 reasoning explicitly. |
 | `chat_template_kwargs.preserve_thinking` | `true` | Keeps prior reasoning available across tool turns; missing history can degrade later calls to empty `{}` arguments. |
-| `maxTokens` | `81920` | Avoids client-side truncation while the model is reasoning or emitting tool arguments. |
+| `maxTokens` | `98304` | Uses the operator-approved output ceiling while leaving a large reasoning and tool-call envelope. |
 | `tool_choice` | `auto` or omitted | Uses the configured XML parser path. Do not force `required` or a named tool until that exact server build passes the same streaming and non-streaming probes. |
 | Sampling | `temperature=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0` | BottleCapAI's published ThinkingCap sampling tuple. |
 
@@ -44,10 +44,10 @@ tuple at the final payload boundary.
 
 ## Thinking-budget caveat
 
-The baseline currently sets top-level `thinking_token_budget=32768` for its
-`high` leaf. This preserves comparability with the earlier ThinkingCap baseline
-and bounds runaway reasoning, but it is not the safest possible setting on every
-vLLM build.
+The historical `baseline-thinkingcap-qwen36@1.0.0` release set top-level
+`thinking_token_budget=32768` for its `high` leaf. The current 1.1.0 release
+omits that separate budget so reasoning and final output share the 98,304-token
+envelope.
 
 [vLLM #44676](https://github.com/vllm-project/vllm/issues/44676) shows that an
 expiring budget can inject the reasoning-end sequence into tool arguments when
@@ -108,30 +108,27 @@ These are not Pi settings, but the client contract depends on them:
 
 ## Validation before the 12_v2 run
 
-Once the GPU is free, validate the exact endpoint and pinned server build before
-confirming the benchmark plan:
+The exact port-8081 endpoint and vLLM 0.25.1 image passed the streamed and
+three-turn live suite recorded in
+`analysis/thinkingcap-qwen36-8081/local-vllm-thinkingcap-qwen36-8081-tool-probe.jsonl`:
 
-1. Capture Pi's first provider request and assert the baseline's smoke contract:
-   thinking enabled, thinking preserved, expected sampling, and the intended
-   budget.
-2. Run a streamed single-tool call. Require `finish_reason="tool_calls"`, one
-   non-empty function name, and JSON-decodable arguments.
-3. Run at least three tool turns in one conversation and verify that required
-   arguments do not collapse to `{}`.
-4. Replay a prior `reasoning_content` value through a tool-result turn and verify
-   it reaches the next rendered prompt.
-5. Test Unicode, multiline text, and XML-like text inside tool arguments.
-6. Test a call that begins before the thinking-budget boundary. If the server is
-   not known to include the #44676 fix, also test the same flow with no hard
-   budget.
-7. If MTP or strict tool calling is enabled, repeat the streamed probe many
-   times; intermittent FSM and bundled-delta failures do not appear reliably in
-   one request.
-8. Fail closed if raw `<tool_call>` appears in `reasoning_content` or `content`
-   while the API returns an empty `tool_calls` array.
+- the streamed call ended with `finish_reason="tool_calls"`, one function name,
+  and JSON-decodable arguments;
+- three tool-result turns retained exact, non-empty arguments;
+- the server's `reasoning` field was replayed between turns;
+- Unicode, multiline text, and XML-like text survived inside arguments;
+- no raw `<tool_call>` leaked into reasoning or content;
+- the active server had neither MTP nor a strict-tool-calling override, so their
+  intermittent failure paths did not apply.
 
-Only after these checks pass should the prepared `12_v2`, three-repetition plan
-be reviewed and executed.
+The required benchmark preflight must still validate the complete Pi path before
+fan-out. It captures Pi's provider request and requires thinking enabled,
+thinking preserved, expected sampling, the 98,304-token ceiling, a parsed
+assistant tool call, and a non-error tool result. The config injects no hard
+thinking budget.
+
+Only after that preflight passes should the remaining `12_v2`,
+three-repetition cells start.
 
 ## Sources
 
