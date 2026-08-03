@@ -4,6 +4,10 @@ Stock Pi baseline for
 `local-vllm/bottlecapai/ThinkingCap-Qwen3.6-27B`, served by server60 at
 `http://100.92.238.117:30000/v1`.
 
+Tool-calling requirements, residual risks, and the pre-run validation checklist
+are recorded in
+[`docs/thinkingcap-qwen36-tool-calling.md`](../../docs/thinkingcap-qwen36-tool-calling.md).
+
 This config adds no `system_preamble.md`, `orchestration.md`, or other
 config-authored prompt text. Its provider-request extension supplies only the
 model-specific local-vLLM infrastructure:
