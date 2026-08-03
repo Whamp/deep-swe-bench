@@ -218,10 +218,110 @@ def find_failed_tool_call_ids(records: list[dict[str, Any]]) -> set[str]:
     return failed_ids
 
 
+def tool_result_text(message: dict[str, Any]) -> str:
+    """Join text blocks from one recorded tool result."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(block.get("text", ""))
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def malformed_edit_shape(error_text: str) -> str:
+    """Describe the schema mistake in a rejected edit call."""
+    marker = "Received arguments:\n"
+    if marker not in error_text:
+        return "unclassified malformed edit arguments"
+    try:
+        arguments = json.loads(error_text.split(marker, 1)[1])
+    except json.JSONDecodeError:
+        return "unparseable edit arguments"
+    if not isinstance(arguments, dict):
+        return "edit arguments were not an object"
+    if isinstance(arguments.get("edits"), str):
+        return "edits sent as a JSON string"
+    edits = arguments.get("edits")
+    if (
+        "path" not in arguments
+        and isinstance(edits, list)
+        and any(isinstance(edit, dict) and "path" in edit for edit in edits)
+    ):
+        return "path put inside each edit instead of at top level"
+    if "path" not in arguments:
+        return "top-level path omitted"
+    return "other malformed edit arguments"
+
+
+def summarize_tool_results(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Count recorded tool failures without treating every nonzero command as a tool bug."""
+    totals: collections.Counter[str] = collections.Counter()
+    errors: collections.Counter[str] = collections.Counter()
+    categories: collections.Counter[str] = collections.Counter()
+    malformed_shapes: collections.Counter[str] = collections.Counter()
+
+    for record in records:
+        if record.get("type") != "message":
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict) or message.get("role") != "toolResult":
+            continue
+        tool_name = str(message.get("toolName", "unknown"))
+        totals[tool_name] += 1
+        if message.get("isError") is not True:
+            continue
+        errors[tool_name] += 1
+        error_text = tool_result_text(message)
+        lowered = error_text.lower()
+        if tool_name == "edit" and "validation failed for tool" in lowered:
+            categories["malformed edit arguments"] += 1
+            malformed_shapes[malformed_edit_shape(error_text)] += 1
+        elif tool_name == "edit" and any(
+            phrase in lowered
+            for phrase in (
+                "could not find the exact text",
+                "oldtext must",
+                "old text must",
+                "must be unique",
+                "found 2 occurrences",
+                "did not match",
+            )
+        ):
+            categories["edit target text did not match"] += 1
+        elif tool_name == "edit":
+            categories["other edit rejection"] += 1
+        elif tool_name == "bash" and (
+            "author identity unknown" in lowered
+            or "unable to auto-detect email address" in lowered
+        ):
+            categories["git identity was not configured"] += 1
+        elif tool_name == "bash":
+            categories["shell command returned nonzero"] += 1
+        elif tool_name == "read":
+            categories["read request failed"] += 1
+        else:
+            categories[f"other {tool_name} failure"] += 1
+
+    error_total = sum(errors.values())
+    result_total = sum(totals.values())
+    return {
+        "total": result_total,
+        "errors": error_total,
+        "error_rate": error_total / result_total if result_total else 0,
+        "by_tool_total": dict(totals),
+        "by_tool_errors": dict(errors),
+        "error_categories": dict(categories),
+        "malformed_edit_shapes": dict(malformed_shapes),
+    }
+
+
 def extract_trajectory_evidence(cell_root: Path) -> dict[str, Any]:
     """Extract file coverage, command focus, and decision timing from one trajectory."""
     records = load_session_records(cell_root)
     failed_tool_call_ids = find_failed_tool_call_ids(records)
+    tool_results = summarize_tool_results(records)
     tool_counts: collections.Counter[str] = collections.Counter()
     command_counts: collections.Counter[str] = collections.Counter()
     tool_events: list[dict[str, Any]] = []
@@ -342,6 +442,7 @@ def extract_trajectory_evidence(cell_root: Path) -> dict[str, Any]:
     return {
         "assistant_turns": assistant_turn,
         "failed_tool_calls": len(failed_tool_call_ids),
+        "tool_results": tool_results,
         "tool_counts": dict(tool_counts),
         "tool_events": tool_events,
         "command_counts": dict(command_counts),

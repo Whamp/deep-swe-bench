@@ -170,6 +170,17 @@ SCAFFOLDABILITY_LEDGER = [
         "minimal_experiment": "Both local models across the nine packet cells, using only the user prompt and normal repository tools.",
         "success_criterion": "Fewer unsupported completion claims, broader prompt-derived tests, and improved strict solves or f2p at similar p2p.",
     },
+    {
+        "weakness": "Local models sometimes call the edit tool with the wrong argument shape",
+        "evidence": "Across all 36 cells, AgentWorld made 107 malformed edit calls and ThinkingCap made 19; GPT-5.6 made none. Most put path inside each edit or encoded the edits list as a JSON string.",
+        "failure_layer": "tool-use mechanics",
+        "candidate_support": "Conservative edit-argument normalizer",
+        "expected_mechanism": "Lift one shared nested path to the required top level and decode a stringified edits list only when the transformation is unambiguous; otherwise preserve the current rejection.",
+        "non_targets": "Does not repair wrong code, stale oldText, ambiguous multi-file edits, or failed shell commands.",
+        "risk": "An over-permissive adapter could apply an edit the model did not intend; normalize only provably equivalent shapes and log every repair.",
+        "minimal_experiment": "Same-model A/B for both locals with identical prompts and serving settings, recording normalized calls separately from ordinary edit failures.",
+        "success_criterion": "Zero rejected calls for the two recoverable shapes, no increase in unintended edits, fewer wasted turns, and no regression in p2p.",
+    },
 ]
 
 
@@ -261,6 +272,58 @@ def load_model_cells(
                 }
         cells[model_key] = model_cells
     return cells
+
+
+def summarize_tool_result_delivery(
+    model_cells: dict[tuple[str, int], dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate tool-result failures across all 36 cells for one model."""
+    summaries = [cell["trace"]["tool_results"] for cell in model_cells.values()]
+
+    def merge_count_map(key: str) -> dict[str, int]:
+        names = sorted({name for summary in summaries for name in summary[key]})
+        return {
+            name: sum(summary[key].get(name, 0) for summary in summaries)
+            for name in names
+        }
+
+    total = sum(summary["total"] for summary in summaries)
+    errors = sum(summary["errors"] for summary in summaries)
+    by_tool_total = merge_count_map("by_tool_total")
+    by_tool_errors = merge_count_map("by_tool_errors")
+    return {
+        "cells": len(model_cells),
+        "cells_with_errors": sum(summary["errors"] > 0 for summary in summaries),
+        "total": total,
+        "errors": errors,
+        "error_rate": errors / total if total else 0,
+        "by_tool": {
+            tool: {
+                "total": by_tool_total[tool],
+                "errors": by_tool_errors.get(tool, 0),
+                "error_rate": by_tool_errors.get(tool, 0) / by_tool_total[tool],
+            }
+            for tool in by_tool_total
+        },
+        "error_categories": merge_count_map("error_categories"),
+        "malformed_edit_shapes": merge_count_map("malformed_edit_shapes"),
+    }
+
+
+def build_outcomes_by_task(
+    tasks: list[str], cells: dict[str, dict[tuple[str, int], dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    """Show solved, unsolved, and invalid outcomes for every task repetition."""
+    rows = []
+    for task in tasks:
+        outcomes = {}
+        for model_key in ("frontier", "agentworld", "thinkingcap"):
+            outcomes[model_key] = [
+                cells[model_key][(task, rep)]["result"]["reward_binary"]
+                for rep in range(3)
+            ]
+        rows.append({"task": task, "outcomes": outcomes})
+    return rows
 
 
 def compare_file_coverage(
@@ -682,10 +745,27 @@ def validate_analysis(analysis: dict[str, Any]) -> None:
         raise ValueError(
             "Frontier trajectory analysis: divergence ledger is incomplete"
         )
-    if len(analysis["scaffoldability_ledger"]) != 5:
+    if len(analysis["scaffoldability_ledger"]) != 6:
         raise ValueError(
             "Frontier trajectory analysis: scaffoldability ledger is incomplete"
         )
+    expected_tool_results = {
+        "frontier": (2507, 223, 0),
+        "agentworld": (3600, 339, 107),
+        "thinkingcap": (3517, 369, 19),
+    }
+    for model_key, expected in expected_tool_results.items():
+        summary = analysis["tool_results"][model_key]
+        actual = (
+            summary["total"],
+            summary["errors"],
+            summary["error_categories"].get("malformed edit arguments", 0),
+        )
+        if actual != expected:
+            raise ValueError(
+                f"Frontier trajectory analysis: unexpected {model_key} tool results "
+                f"{actual}, expected {expected}"
+            )
 
 
 def build_analysis(source_root: Path) -> dict[str, Any]:
@@ -699,7 +779,7 @@ def build_analysis(source_root: Path) -> dict[str, Any]:
     cells = load_model_cells(source_root, tasks)
     gap_pairs = build_frontier_gap_pairs(cells, task_metadata)
     analysis = {
-        "schema_version": 1,
+        "schema_version": 2,
         "title": "Local-model trajectory gaps against GPT-5.6 SOL",
         "models": {
             key: {"display_name": DISPLAY_NAMES[key], "result_root": str(path)}
@@ -717,6 +797,11 @@ def build_analysis(source_root: Path) -> dict[str, Any]:
                 (cell["result"]["reward_binary"] or 0) < 0
                 for cell in cells["frontier"].values()
             ),
+        },
+        "outcomes_by_task": build_outcomes_by_task(tasks, cells),
+        "tool_results": {
+            model_key: summarize_tool_result_delivery(model_cells)
+            for model_key, model_cells in cells.items()
         },
         "gap_pairs": gap_pairs,
         "gap_cohorts": {

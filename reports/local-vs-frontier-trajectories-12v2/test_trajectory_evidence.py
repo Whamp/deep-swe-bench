@@ -7,6 +7,7 @@ from trajectory_evidence import (
     extract_trajectory_evidence,
     is_validation_command,
     normalize_repository_path,
+    summarize_tool_results,
 )
 
 
@@ -95,3 +96,63 @@ def test_extract_trajectory_evidence_excludes_failed_or_non_file_reads(
 
     assert evidence["content_read_paths"] == ["src/index.ts"]
     assert evidence["failed_tool_calls"] == 1
+    assert evidence["tool_results"]["errors"] == 1
+
+
+def test_summarize_tool_results_separates_shell_failures_from_bad_edit_shapes() -> None:
+    records = [
+        {
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolName": "bash",
+                "isError": True,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "2 tests failed\nCommand exited with code 1",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolName": "edit",
+                "isError": True,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            'Validation failed for tool "edit":\n'
+                            "  - path: must have required properties path\n\n"
+                            'Received arguments:\n{"edits":[{"path":"src/a.py",'
+                            '"oldText":"a","newText":"b"}]}'
+                        ),
+                    }
+                ],
+            },
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolName": "read",
+                "isError": False,
+                "content": [{"type": "text", "text": "contents"}],
+            },
+        },
+    ]
+
+    summary = summarize_tool_results(records)
+
+    assert summary["total"] == 3
+    assert summary["errors"] == 2
+    assert summary["error_categories"] == {
+        "shell command returned nonzero": 1,
+        "malformed edit arguments": 1,
+    }
+    assert summary["malformed_edit_shapes"] == {
+        "path put inside each edit instead of at top level": 1
+    }
