@@ -39,6 +39,20 @@ Report substrate failures separately. A parser failure, dropped reasoning field,
 or verifier timeout is not evidence that the model could not solve the task.
 Conversely, reliable delivery does not prove the model understood the task.
 
+Audit recorded tool-result errors by tool and cause. Do not equate
+`toolResult.isError` with a broken tool or parser: a normal failing test, build,
+search, or diagnostic command also returns an error result. Separate at least:
+
+- nonzero shell commands used as feedback
+- schema-invalid tool arguments
+- edit target or stale-text mismatches
+- missing-file and range errors
+- parser, transport, or server failures
+
+Report both the numerator and denominator for each tool. A high aggregate error
+rate can hide a specific schema-adherence problem, while a productive model may
+have many shell-command errors because it runs more discriminating tests.
+
 ### 2. Map reliable capabilities
 
 Start with what the local model can do repeatedly:
@@ -153,6 +167,12 @@ remaining capability gap. Do not use it as the control for a local-model scaffol
 change when an untreated run of the same local model is available.
 
 ## Report contract
+
+Start with the complete denominator. Show task × rep outcomes for every compared
+model before presenting any filtered frontier-gap cohort or selected trajectory
+packet. State the number of full trajectories, exact matched pairs, filtered
+pairs, unique tasks, and illustrative packets separately. Never let a packet
+chosen from one rep read like evidence from the whole task or all reps.
 
 A local-model report should answer these questions in order:
 
