@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from trajectory_evidence import (
     classify_repository_file,
     extract_shell_content_targets,
@@ -39,11 +41,35 @@ def test_extract_shell_content_targets_keeps_only_exact_files() -> None:
     ]
 
 
-def test_is_validation_command_covers_supported_task_languages() -> None:
-    assert is_validation_command("go test ./...")
-    assert is_validation_command("uv run pytest tests/test_api.py -q")
-    assert is_validation_command("npm run test")
-    assert not is_validation_command("git status --short")
+@pytest.mark.parametrize(
+    "command",
+    [
+        "go test ./...",
+        "go build ./checkers/...",
+        "go vet ./checkers/internal/astwalk ./checkers",
+        "cat > /tmp/probe.go <<'EOF'\npackage main\nEOF\ngo build /tmp/probe.go",
+        "uv run pytest tests/test_api.py -q",
+        "ruff check src tests",
+        "python -m compileall -q src",
+        "tox -e lint",
+        "jest --runInBand tests/example.test.js",
+        "npm run test",
+    ],
+)
+def test_is_validation_command_covers_supported_task_languages(command: str) -> None:
+    assert is_validation_command(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status --short",
+        'rg -n "ruff|mypy" tox.ini pyproject.toml',
+        'grep -n "go build" README.md',
+    ],
+)
+def test_is_validation_command_excludes_diagnostic_commands(command: str) -> None:
+    assert not is_validation_command(command)
 
 
 def test_extract_trajectory_evidence_excludes_failed_or_non_file_reads(

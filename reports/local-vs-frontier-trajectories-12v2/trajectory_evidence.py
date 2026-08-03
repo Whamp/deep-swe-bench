@@ -10,11 +10,14 @@ from pathlib import Path
 from typing import Any
 
 VALIDATION_PATTERN = re.compile(
-    r"(?:\bgo\s+test\b|\bpytest\b|\bpython\s+-m\s+pytest\b|"
-    r"\bnpm\s+(?:test|run\s+(?:test|lint|typecheck|build))\b|"
-    r"\bpnpm\s+(?:test|run\s+(?:test|lint|typecheck|build))\b|"
-    r"\byarn\s+(?:test|lint|typecheck|build)\b|\bnpx\s+(?:tsc|jest|vitest)\b|"
-    r"\bcargo\s+test\b|\bmake\s+(?:test|check)\b|\buv\s+run\b)",
+    r"(?:^|[;&|\n]\s*)(?:go\s+(?:test|build|vet)\b|pytest\b|"
+    r"python(?:3)?\s+-m\s+(?:pytest|compileall|ruff|tox)\b|"
+    r"ruff\s+(?:check|format)\b|tox(?:\s|$)|jest(?:\s|$)|"
+    r"uvx\b[^\n;&|]*\bruff\s+(?:check|format)\b|"
+    r"npm\s+(?:test|run\s+(?:test|lint|typecheck|build))\b|"
+    r"pnpm\s+(?:test|run\s+(?:test|lint|typecheck|build))\b|"
+    r"yarn\s+(?:test|lint|typecheck|build)\b|npx\s+(?:tsc|jest|vitest)\b|"
+    r"cargo\s+test\b|make\s+(?:test|check)\b|uv\s+run\b)",
     re.IGNORECASE,
 )
 DISCOVERY_PATTERN = re.compile(r"(?:^|[;&|]\s*)(?:find|ls|tree)\b")
