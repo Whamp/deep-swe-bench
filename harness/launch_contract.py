@@ -100,6 +100,7 @@ class LaunchPlanDocument(TypedDict):
     schemaVersion: int
     baselineConfig: str
     batchCells: list[dict[str, object]]
+    comparisonBaseline: LaunchConfigDocument
     concurrency: int
     configs: list[LaunchConfigDocument]
     counts: LaunchCountsDocument
