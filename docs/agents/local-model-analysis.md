@@ -56,6 +56,17 @@ Use strict solves and feature tests as primary capability evidence. Keep
 preservation tests visible, but do not let a large preservation-test denominator
 make high partial reward look like complete feature implementation.
 
+For matched local-versus-frontier trajectories, measure exploration directly:
+
+- successful exact files read, both total and before the first mutation
+- overlap with files read by the frontier reference on the same task and rep
+- source, test, documentation, config/build, and other-file shares
+- repeated reads, search/list commands, validation timing, and changed-file scope
+
+Keep discovery separate from comprehension. A file printed by `find`, `ls`, or a
+glob search was discovered, not necessarily read. State the coverage definition
+and filter failed file reads before comparing models.
+
 ### 3. Locate the frontier gap
 
 On matched cells, select cases where the frontier reference succeeds and the
@@ -73,7 +84,11 @@ trajectory divergence:
 9. termination or resource exhaustion
 
 Describe what the frontier trajectory did that the local trajectory did not.
-Do not reduce this section to an aggregate score difference.
+Name the first consequential decision divergence, not merely the first different
+tool call. Connect that decision to the files available at the time, the chosen
+seam or abstraction, later validation behavior, and concrete verifier failures.
+File-count differences are evidence about exploration, not a mechanism by
+themselves. Do not reduce this section to an aggregate score difference.
 
 ### 4. Attribute each important failure
 
@@ -144,8 +159,9 @@ A local-model report should answer these questions in order:
 1. **What works reliably?** Name demonstrated capabilities and their evidence.
 2. **Where does the model break?** Show strict, feature, preservation, validity,
    and trajectory evidence.
-3. **How does that differ from the frontier reference?** Identify matched stage
-   divergences, not just score deltas.
+3. **How does that differ from the frontier reference?** Compare exact file
+   coverage and file-type focus, then identify matched decision-stage
+   divergences rather than only score or tool-count deltas.
 4. **Which failures appear recoverable?** Present the scaffoldability ledger.
 5. **Which failures look model-limited or unresolved?** Keep uncertainty explicit.
 6. **What should we test next?** Give minimal paired experiments and stop
