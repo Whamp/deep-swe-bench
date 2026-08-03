@@ -43,6 +43,14 @@ Use the default canonical triage labels: `needs-triage`, `needs-info`, `ready-fo
 
 This is a single-context repo: read root `CONTEXT.md` and relevant ADRs under `docs/adr/`. See `docs/agents/domain.md`.
 
+### Local-model analysis
+
+When an analysis includes a local model, read
+[local-model analysis](docs/agents/local-model-analysis.md). Treat frontier
+models as capability references, not expected peers; lead with the local
+model's reliable abilities, failure stages, scaffoldable weaknesses, and
+concrete support experiments.
+
 ## Standing rules
 
 - Before using a new provider/model/API path, prove it in a model-specific note
