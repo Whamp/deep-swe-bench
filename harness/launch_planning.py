@@ -185,9 +185,9 @@ def _validate_launch_configs(request: LaunchRequest) -> None:
         raise ValueError(
             "Launch configs invalid: duplicate config identities are not allowed"
         )
-    if request.baseline_config not in request.configs:
+    if not request.baseline_config.strip():
         raise ValueError(
-            "Launch baseline invalid: selected baseline must be a config; "
+            "Launch comparison baseline invalid: identity cannot be empty; "
             f"got {request.baseline_config!r}"
         )
 
@@ -1151,6 +1151,32 @@ def _config_plan(
     return document
 
 
+def _resolve_launch_config_plans(
+    repository_root: Path,
+    request: LaunchRequest,
+) -> tuple[list[LaunchConfigDocument], LaunchConfigDocument]:
+    """Resolve selected configs separately from the comparison-only baseline."""
+    selected = [
+        _config_plan(repository_root, request, config_identity)
+        for config_identity in request.configs
+    ]
+    comparison_baseline = next(
+        (
+            config_plan
+            for config_plan in selected
+            if config_plan["identity"] == request.baseline_config
+        ),
+        None,
+    )
+    if comparison_baseline is None:
+        comparison_baseline = _config_plan(
+            repository_root,
+            request,
+            request.baseline_config,
+        )
+    return selected, comparison_baseline
+
+
 def _validate_config_runtime_compatibility(
     configs: Sequence[LaunchConfigDocument],
     runtime: LaunchRuntimeIdentity,
@@ -1454,6 +1480,9 @@ def _preflight_cells(
 def _receipt_warnings(document: LaunchPlanDocument) -> list[str]:
     warnings: list[str] = []
     legacy = [config["identity"] for config in document["configs"] if config["legacy"]]
+    comparison_baseline = document["comparisonBaseline"]
+    if comparison_baseline["legacy"] and comparison_baseline["identity"] not in legacy:
+        legacy.append(comparison_baseline["identity"])
     if legacy:
         warnings.append(
             "legacy configs are readable for diagnosis but require a "
@@ -1620,6 +1649,21 @@ def _render_config_release_lines(
     return lines
 
 
+def _render_comparison_baseline_lines(
+    baseline: LaunchConfigDocument,
+    baseline_is_selected: bool,
+) -> list[str]:
+    """Render the comparison baseline without implying that it creates reps."""
+    if baseline_is_selected:
+        return []
+    return [
+        "",
+        "COMPARISON BASELINE",
+        *_render_config_release_lines([baseline]),
+        "  Reference only; this run creates no baseline reps.",
+    ]
+
+
 def _render_selected_task_lines(
     selection: Mapping[str, object],
 ) -> list[str]:
@@ -1654,8 +1698,9 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
     paths = document["paths"]
     configs = document["configs"]
     baseline_identity = str(document["baselineConfig"])
-    baseline = next(
-        config for config in configs if config.get("identity") == baseline_identity
+    baseline = document["comparisonBaseline"]
+    baseline_is_selected = any(
+        config["identity"] == baseline_identity for config in configs
     )
     warnings = _receipt_warnings(document)
     subject_behavior_lines = _render_subject_behavior_lines(configs)
@@ -1682,6 +1727,10 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
                 f"Tasks: {counts['tasks']}; configs: {counts['configs']}; "
                 f"reps: {counts['reps']}; "
                 f"concurrency: {document['concurrency']}"
+            ),
+            (
+                f"Comparison baseline: {baseline_identity} "
+                + ("(selected config)" if baseline_is_selected else "(reference only)")
             ),
             (
                 f"Cells: {counts['preflightCells']} preflight; "
@@ -1718,6 +1767,7 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
             "",
             "CONFIG RELEASES",
             *_render_config_release_lines(configs),
+            *_render_comparison_baseline_lines(baseline, baseline_is_selected),
             "",
             "MODEL ROLES",
             *_render_role_lines(configs),
@@ -1744,7 +1794,7 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
         ]
     )
     for config in configs:
-        if config is baseline:
+        if config["identity"] == baseline_identity:
             continue
         lines.extend(_render_behavior_differences(baseline, config))
     lines.extend(
@@ -1784,11 +1834,17 @@ def compile_launch_request(
     """Compile a deterministic launch without executing a subject."""
     tasks = _validate_launch_request(request)
     _validate_selected_tasks(tasks_root, tasks)
-    config_plans = [
-        _config_plan(repository_root, request, config_identity)
-        for config_identity in request.configs
-    ]
-    for config_plan in config_plans:
+    config_plans, comparison_baseline = _resolve_launch_config_plans(
+        repository_root,
+        request,
+    )
+    reviewed_config_plans = [comparison_baseline]
+    reviewed_config_plans.extend(
+        config_plan
+        for config_plan in config_plans
+        if config_plan["identity"] != comparison_baseline["identity"]
+    )
+    for config_plan in reviewed_config_plans:
         if config_plan["legacy"]:
             continue
         config_lock.require_shared_config_release_behavior(
@@ -1843,6 +1899,7 @@ def compile_launch_request(
         "schemaVersion": _LAUNCH_PLAN_SCHEMA_VERSION,
         "baselineConfig": request.baseline_config,
         "batchCells": batch_cells,
+        "comparisonBaseline": comparison_baseline,
         "concurrency": request.concurrency,
         "configs": config_plans,
         "counts": {

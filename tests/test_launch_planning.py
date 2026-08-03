@@ -390,6 +390,89 @@ def test_plan_command_writes_review_artifacts_without_execution(
     assert not state_root.exists()
 
 
+def test_plan_command_keeps_comparison_baseline_out_of_run_cells(
+    tmp_path: Path,
+) -> None:
+    """A comparison baseline is reference metadata, not a selected config."""
+    repository_root, tasks_root, results_root, state_root = _write_launch_fixture(
+        tmp_path
+    )
+    runtime_resolver = FakeLaunchRuntimeResolver(_runtime_identity())
+    plan_path = tmp_path / "review" / "launch-plan.json"
+    receipt_path = tmp_path / "review" / "launch-receipt.txt"
+
+    run_batch.main(
+        [
+            "plan",
+            "--subject",
+            "pi",
+            "--model",
+            "provider/model",
+            "--thinking",
+            "low",
+            "--configs",
+            "review-assistant@1.0.0",
+            "--baseline-config",
+            "baseline@1.0.0",
+            "--tasks",
+            "task-a",
+            "--reps",
+            "2",
+            "--workers",
+            "1",
+            "--run-id",
+            "config-only-run",
+            "--preflight",
+            "required",
+            "--existing-results",
+            "require-compatible",
+            "--transient-errors",
+            "pause",
+            "--cell-retries",
+            "1",
+            "--repository",
+            str(repository_root),
+            "--tasks-root",
+            str(tasks_root),
+            "--results-root",
+            str(results_root),
+            "--state-root",
+            str(state_root),
+            "--plan-out",
+            str(plan_path),
+            "--receipt-out",
+            str(receipt_path),
+        ],
+        runtime_resolver=runtime_resolver,
+    )
+
+    document = parse_launch_plan_json(plan_path.read_text()).to_document()
+    assert document["baselineConfig"] == "baseline@1.0.0"
+    assert document["comparisonBaseline"]["identity"] == "baseline@1.0.0"
+    assert [config["identity"] for config in document["configs"]] == [
+        "review-assistant@1.0.0"
+    ]
+    assert document["counts"] == {
+        "batchCells": 2,
+        "configs": 1,
+        "preflightCells": 1,
+        "reps": 2,
+        "tasks": 1,
+    }
+    assert {cell["config"] for cell in document["batchCells"]} == {
+        "review-assistant@1.0.0"
+    }
+    assert {cell["config"] for cell in document["preflightCells"]} == {
+        "review-assistant@1.0.0"
+    }
+    receipt = receipt_path.read_text()
+    assert "Tasks: 1; configs: 1; reps: 2; concurrency: 1" in receipt
+    assert "Cells: 1 preflight; 2 batch" in receipt
+    assert "Comparison baseline: baseline@1.0.0 (reference only)" in receipt
+    assert not results_root.exists()
+    assert not state_root.exists()
+
+
 def _reject_versioned_smoke_contract(
     tmp_path: Path,
     contract: Mapping[str, object],
