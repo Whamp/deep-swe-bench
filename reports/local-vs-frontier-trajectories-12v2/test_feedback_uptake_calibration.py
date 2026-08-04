@@ -14,8 +14,9 @@ from feedback_uptake_calibration import (
     validate_feedback_calibration_annotations,
 )
 from run_feedback_uptake_calibration import (
-    luna_calibration_command,
-    parse_luna_json_output,
+    calibration_command,
+    calibration_model_run_root,
+    parse_calibration_json_output,
 )
 
 REPORT_ROOT = Path(__file__).parent
@@ -112,23 +113,34 @@ def test_annotation_validator_requires_uncertainty_for_indeterminate_label() -> 
         )
 
 
-def test_luna_json_parser_accepts_plain_or_fenced_object() -> None:
-    assert parse_luna_json_output('{"ok":true}') == {"ok": True}
-    assert parse_luna_json_output('```json\n{"ok":true}\n```') == {"ok": True}
+def test_calibration_json_parser_accepts_plain_or_fenced_object() -> None:
+    assert parse_calibration_json_output('{"ok":true}') == {"ok": True}
+    assert parse_calibration_json_output('```json\n{"ok":true}\n```') == {"ok": True}
 
     with pytest.raises(ValueError, match="trailing non-JSON text"):
-        parse_luna_json_output('{"ok":true}\nextra')
+        parse_calibration_json_output('{"ok":true}\nextra')
 
 
-def test_luna_command_exposes_only_fixed_calibration_inputs() -> None:
-    command = luna_calibration_command(level="high", annotator_id="test-run")
+def test_calibration_command_exposes_only_fixed_inputs_for_selected_model() -> None:
+    command = calibration_command(
+        model="zai/glm-5.2", level="high", annotator_id="test-run"
+    )
     joined = " ".join(command)
 
-    assert "openai-codex/gpt-5.6-luna" in joined
+    assert "zai/glm-5.2" in joined
     assert "--no-tools" in command
     assert "@sample/units.jsonl" in command
     assert "@annotation-schema.json" in command
     assert "gold-adjudication" not in joined
+
+
+def test_nondefault_model_uses_separate_artifact_root() -> None:
+    assert calibration_model_run_root("openai-codex/gpt-5.6-luna") == (
+        CALIBRATION_ROOT / "runs"
+    )
+    assert calibration_model_run_root("zai/glm-5.2") == (
+        CALIBRATION_ROOT / "models/zai-glm-5.2"
+    )
 
 
 def test_calibration_gate_accepts_two_exact_repeatable_runs() -> None:
@@ -141,6 +153,24 @@ def test_calibration_gate_accepts_two_exact_repeatable_runs() -> None:
     assert evaluation["run_passes"] == [True, True]
     assert evaluation["repeatability_passes"] is True
     assert evaluation["passes"] is True
+
+
+def test_calibration_selection_accepts_supported_level_subset() -> None:
+    _, _, gold = load_calibration_artifacts()
+    evaluations = [
+        evaluate_feedback_calibration_level(
+            level=level, gold=gold, runs=[copy.deepcopy(gold), copy.deepcopy(gold)]
+        )
+        for level in ("high", "max")
+    ]
+
+    selection = select_feedback_calibration_level(
+        evaluations, level_order=("high", "max"), model_name="zai/glm-5.2"
+    )
+
+    assert selection["selected_level"] == "high"
+    assert selection["level_order"] == ["high", "max"]
+    assert selection["full_population_authorized"] is True
 
 
 def test_calibration_selection_blocks_without_fallback_when_all_levels_fail() -> None:

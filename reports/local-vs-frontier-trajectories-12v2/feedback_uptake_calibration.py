@@ -317,21 +317,24 @@ def evaluate_feedback_calibration_level(
 
 def select_feedback_calibration_level(
     level_evaluations: list[dict[str, Any]],
+    *,
+    level_order: tuple[str, ...] = CALIBRATION_LEVEL_ORDER,
+    model_name: str = "Luna",
 ) -> dict[str, Any]:
-    """Select the lowest passing Luna level or block with no fallback."""
+    """Select the lowest supported passing level or block with no fallback."""
+    if not level_order or len(level_order) != len(set(level_order)):
+        raise ValueError(
+            "Feedback calibration: supported level order must be nonempty and unique"
+        )
     evaluations_by_level = {
         evaluation["level"]: evaluation for evaluation in level_evaluations
     }
-    if set(evaluations_by_level) != set(CALIBRATION_LEVEL_ORDER):
+    if set(evaluations_by_level) != set(level_order):
         raise ValueError(
-            "Feedback calibration: selection requires every declared Luna level"
+            f"Feedback calibration: selection requires every declared {model_name} level"
         )
     selected_level = next(
-        (
-            level
-            for level in CALIBRATION_LEVEL_ORDER
-            if evaluations_by_level[level]["passes"]
-        ),
+        (level for level in level_order if evaluations_by_level[level]["passes"]),
         None,
     )
     return {
@@ -339,14 +342,13 @@ def select_feedback_calibration_level(
         "selected_level": selected_level,
         "full_population_authorized": selected_level is not None,
         "fallback_used": False,
-        "level_order": list(CALIBRATION_LEVEL_ORDER),
+        "level_order": list(level_order),
         "level_passes": {
-            level: evaluations_by_level[level]["passes"]
-            for level in CALIBRATION_LEVEL_ORDER
+            level: evaluations_by_level[level]["passes"] for level in level_order
         },
         "reason": (
-            f"Lowest level passing both runs and repeatability: {selected_level}."
+            f"Lowest {model_name} level passing both runs and repeatability: {selected_level}."
             if selected_level is not None
-            else "No Luna level passed both gold-accuracy runs and repeatability; full-population annotation is blocked."
+            else f"No {model_name} level passed both gold-accuracy runs and repeatability; full-population annotation is blocked."
         ),
     }
