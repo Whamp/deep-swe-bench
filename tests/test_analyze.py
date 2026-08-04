@@ -21,10 +21,43 @@ MODEL = "test-vendor/synth-analyze-v1"
 LEAF = "synth-analyze-v1"
 
 
-def _write_result(tree_root: Path, config: str, rep: int,
-                  reward_partial: float, tokens: int) -> None:
-    cell = (tree_root / "results" / LEAF / "high" / config / "t1"
-            / f"rep{rep}")
+def _write_result(
+    tree_root: Path,
+    config: str,
+    rep: int,
+    reward_partial: float,
+    tokens: int,
+) -> None:
+    _write_task_result(
+        tree_root,
+        config,
+        rep,
+        reward_partial,
+        tokens,
+        task="t1",
+        task_revision="sha256:task-fixture",
+    )
+
+
+def _write_task_result(
+    tree_root: Path,
+    config: str,
+    rep: int,
+    reward_partial: float,
+    tokens: int,
+    *,
+    task: str,
+    task_revision: str,
+) -> None:
+    cell = (
+        tree_root
+        / "results"
+        / LEAF
+        / "high"
+        / config
+        / task
+        / f"rep{rep}"
+    )
     cell.mkdir(parents=True, exist_ok=True)
     (cell / "result.json").write_text(
         json.dumps(
@@ -35,15 +68,15 @@ def _write_result(tree_root: Path, config: str, rep: int,
                 "subject_version": "pi@fixture",
                 "model": MODEL,
                 "thinking_level": "high",
-                "task": "t1",
+                "task": task,
                 "rep": rep,
                 "harness_revision": "sha256:harness-fixture",
-                "task_revision": "sha256:task-fixture",
-                "verifier_identity": "sha256:verifier-t1",
+                "task_revision": task_revision,
+                "verifier_identity": f"sha256:verifier-{task}",
                 "immutable_image_identities": {
-                    "agent": "sha256:agent-t1",
-                    "environment": "sha256:environment-t1",
-                    "verifier": "sha256:verifier-image-t1",
+                    "agent": f"sha256:agent-{task}",
+                    "environment": f"sha256:environment-{task}",
+                    "verifier": f"sha256:verifier-image-{task}",
                 },
                 "launch_plan_identity": f"sha256:plan-{config}-{rep}",
                 "reward_partial": reward_partial,
@@ -84,6 +117,37 @@ def test_load_results_reads_via_results_tree_module(monkeypatch, synth_tree):
         ("alt", 2): 0.50,
         ("alt", 10): 0.60,
     }
+
+
+def test_load_results_accepts_task_specific_revisions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Subset expansion may retain a different compatible revision per task."""
+    for config in ("baseline", "alt"):
+        _write_task_result(
+            tmp_path,
+            config,
+            0,
+            0.5,
+            100,
+            task="t1",
+            task_revision="sha256:nested-subset",
+        )
+        _write_task_result(
+            tmp_path,
+            config,
+            0,
+            0.5,
+            100,
+            task="t2",
+            task_revision="sha256:expanded-subset",
+        )
+    monkeypatch.setattr(lib, "REPO", tmp_path)
+
+    rows = analyze.load_results(MODEL, "high", ["baseline", "alt"])
+
+    assert len(rows) == 4
 
 
 def test_load_results_rejects_incompatible_selected_provenance(

@@ -390,6 +390,140 @@ def test_plan_command_writes_review_artifacts_without_execution(
     assert not state_root.exists()
 
 
+def test_plan_command_reuses_results_from_a_nested_subset(
+    tmp_path: Path,
+) -> None:
+    """Expanding a named subset schedules only tasks without compatible reps."""
+    repository_root, tasks_root, results_root, state_root = _write_launch_fixture(
+        tmp_path
+    )
+    task_b_root = tasks_root / "task-b"
+    task_b_root.mkdir()
+    (task_b_root / "task.toml").write_text("[metadata]\n")
+    nested_task_revision = "sha256:nested-task-revision"
+    expanded_task_revision = "sha256:expanded-task-revision"
+    runtime = replace(
+        _runtime_identity(("task-a", "task-b")),
+        task_revision=expanded_task_revision,
+        task_revision_aliases={
+            expanded_task_revision: frozenset({"task-a", "task-b"}),
+            nested_task_revision: frozenset({"task-a"}),
+        },
+    )
+    lock_path = (
+        repository_root
+        / "configs"
+        / "baseline@1.0.0"
+        / "model"
+        / "low"
+        / "config-lock.json"
+    )
+    lock_identity = json.loads(lock_path.read_text())["lockIdentity"]
+    for rep in range(2):
+        result_path = (
+            results_root
+            / "model"
+            / "low"
+            / "baseline@1.0.0"
+            / "task-a"
+            / f"rep{rep}"
+            / "result.json"
+        )
+        result_path.parent.mkdir(parents=True)
+        result_path.write_text(
+            json.dumps(
+                {
+                    "config": "baseline@1.0.0",
+                    "config_lock_identity": lock_identity,
+                    "harness_revision": runtime.harness_revision,
+                    "immutable_image_identities": (
+                        runtime.immutable_image_identities["task-a"]
+                    ),
+                    "model": "provider/model",
+                    "rep": rep,
+                    "subject": "pi",
+                    "subject_version": runtime.subject_version,
+                    "task": "task-a",
+                    "task_revision": nested_task_revision,
+                    "thinking_level": "low",
+                    "verifier_identity": runtime.verifier_identities["task-a"],
+                }
+            )
+            + "\n"
+        )
+    plan_path = tmp_path / "review" / "launch-plan.json"
+    receipt_path = tmp_path / "review" / "launch-receipt.txt"
+
+    run_batch.main(
+        [
+            "plan",
+            "--subject",
+            "pi",
+            "--model",
+            "provider/model",
+            "--thinking",
+            "low",
+            "--configs",
+            "baseline@1.0.0",
+            "--baseline-config",
+            "baseline@1.0.0",
+            "--tasks",
+            "task-a,task-b",
+            "--reps",
+            "2",
+            "--workers",
+            "1",
+            "--run-id",
+            "nested-subset-expansion",
+            "--preflight",
+            "required",
+            "--existing-results",
+            "require-compatible",
+            "--transient-errors",
+            "pause",
+            "--cell-retries",
+            "1",
+            "--repository",
+            str(repository_root),
+            "--tasks-root",
+            str(tasks_root),
+            "--results-root",
+            str(results_root),
+            "--state-root",
+            str(state_root),
+            "--plan-out",
+            str(plan_path),
+            "--receipt-out",
+            str(receipt_path),
+        ],
+        runtime_resolver=FakeLaunchRuntimeResolver(runtime),
+    )
+
+    document = parse_launch_plan_json(plan_path.read_text()).to_document()
+    reusable_cells = [
+        cell for cell in document["batchCells"] if cell["reuseReason"] is not None
+    ]
+    pending_cells = [
+        cell for cell in document["batchCells"] if cell["reuseReason"] is None
+    ]
+    assert len(reusable_cells) == 2
+    assert {cell["task"] for cell in reusable_cells} == {"task-a"}
+    assert {cell["taskRevision"] for cell in reusable_cells} == {
+        nested_task_revision
+    }
+    assert {cell["reuseReason"] for cell in reusable_cells} == {
+        "compatible_nested_subset_result"
+    }
+    assert len(pending_cells) == 2
+    assert {cell["task"] for cell in pending_cells} == {"task-b"}
+    assert {cell["taskRevision"] for cell in pending_cells} == {
+        expanded_task_revision
+    }
+    receipt = receipt_path.read_text()
+    assert "Reusable completed batch entries: 2" in receipt
+    assert "Remaining batch attempts: 2" in receipt
+
+
 def test_plan_command_keeps_comparison_baseline_out_of_run_cells(
     tmp_path: Path,
 ) -> None:
@@ -1406,6 +1540,7 @@ def test_compile_launch_request_is_deterministic_without_execution(
         "harnessRevision": "git:harness-fixture",
         "immutableImageIdentities": runtime_identity.immutable_image_identities,
         "taskRevision": "git:tasks-fixture",
+        "taskRevisionAliases": {},
         "verifierIdentities": runtime_identity.verifier_identities,
     }
     assert plan["paths"]["resultsRoot"] == str(results_root.resolve())
@@ -2403,6 +2538,16 @@ timeout_sec = 60
     tests_root = task_root / "tests"
     tests_root.mkdir()
     (tests_root / "test.sh").write_text("#!/bin/sh\nexit 0\n")
+    task_b_root = tasks_root / "task-b"
+    task_b_root.mkdir()
+    (task_b_root / "task.toml").write_text((task_root / "task.toml").read_text())
+    task_b_tests = task_b_root / "tests"
+    task_b_tests.mkdir()
+    (task_b_tests / "test.sh").write_text("#!/bin/sh\nexit 0\n")
+    subsets_root = repository_root / "subsets"
+    subsets_root.mkdir()
+    (subsets_root / "nested.txt").write_text("task-a\n")
+    (subsets_root / "not-selected.txt").write_text("task-a\ntask-c\n")
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     fake_docker = fake_bin / "docker"
@@ -2411,8 +2556,15 @@ timeout_sec = 60
     monkeypatch.setenv("PATH", f"{fake_bin}:{Path('/usr/bin')}")
     monkeypatch.setenv("FIXTURE_CREDENTIAL", "available-to-fixture")
 
-    compiled = compile_launch_request(
+    request = replace(
         _launch_request(),
+        task_selection=LaunchTaskSelection(
+            kind="tasks",
+            tasks=("task-a", "task-b"),
+        ),
+    )
+    compiled = compile_launch_request(
+        request,
         repository_root=repository_root,
         tasks_root=tasks_root,
         results_root=results_root,
@@ -2424,11 +2576,18 @@ timeout_sec = 60
     assert plan["runtime"]["harnessRevision"].startswith("sha256:")
     assert plan["runtime"]["taskRevision"].startswith("sha256:")
     assert plan["runtime"]["verifierIdentities"]["task-a"].startswith("sha256:")
-    assert plan["runtime"]["immutableImageIdentities"]["task-a"] == {
-        "agent": "sha256:fixture-image",
-        "environment": "sha256:fixture-image",
-        "verifier": "sha256:fixture-image",
+    assert plan["runtime"]["immutableImageIdentities"] == {
+        task: {
+            "agent": "sha256:fixture-image",
+            "environment": "sha256:fixture-image",
+            "verifier": "sha256:fixture-image",
+        }
+        for task in ("task-a", "task-b")
     }
+    assert sorted(plan["runtime"]["taskRevisionAliases"].values()) == [
+        ["task-a"],
+        ["task-a", "task-b"],
+    ]
     assert not results_root.exists()
     assert not state_root.exists()
 
