@@ -914,6 +914,11 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
         default="require-compatible",
     )
     plan_parser.add_argument(
+        "--reuse-decisions",
+        type=Path,
+        help="JSON file authorizing exact prior result bytes for reuse",
+    )
+    plan_parser.add_argument(
         "--transient-errors",
         choices=["pause", "stop"],
         default="pause",
@@ -965,6 +970,92 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
     execute_parser.add_argument("--plan", type=Path, required=True)
     execute_parser.add_argument("--confirm", required=True)
     return parser
+
+
+_RESULT_REUSE_DECISION_FIELDS = frozenset(
+    {
+        "priorConfigIdentity",
+        "rationale",
+        "recordedProvenance",
+        "resultIdentity",
+        "resultPath",
+    }
+)
+
+
+def _parse_result_reuse_decision(
+    source_path: Path,
+    index: int,
+    value: object,
+) -> launch.ExplicitResultReuseDecision:
+    """Parse one exact result reuse decision from the planner input file."""
+    error_prefix = (
+        f"Result reuse decisions rejected: path={source_path}; decision={index}"
+    )
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{error_prefix}; expected a JSON object")
+    decision = cast(Mapping[str, object], value)
+    fields = frozenset(decision)
+    if fields != _RESULT_REUSE_DECISION_FIELDS:
+        raise ValueError(
+            f"{error_prefix}; expected fields="
+            f"{sorted(_RESULT_REUSE_DECISION_FIELDS)!r}; got={sorted(fields)!r}"
+        )
+    string_values: dict[str, str] = {}
+    for field in (
+        "priorConfigIdentity",
+        "rationale",
+        "resultIdentity",
+        "resultPath",
+    ):
+        field_value = decision[field]
+        if not isinstance(field_value, str) or not field_value.strip():
+            raise ValueError(f"{error_prefix}; {field} must be a non-empty string")
+        string_values[field] = field_value
+    result_path = Path(string_values["resultPath"])
+    if not result_path.is_absolute():
+        raise ValueError(f"{error_prefix}; resultPath must be absolute")
+    recorded_provenance = decision["recordedProvenance"]
+    if not isinstance(recorded_provenance, Mapping):
+        raise TypeError(f"{error_prefix}; recordedProvenance must be a JSON object")
+    return launch.ExplicitResultReuseDecision(
+        result_path=result_path,
+        prior_config_identity=string_values["priorConfigIdentity"],
+        result_identity=string_values["resultIdentity"],
+        recorded_provenance=cast(Mapping[str, object], recorded_provenance),
+        rationale=string_values["rationale"],
+    )
+
+
+def _load_result_reuse_decisions(
+    source_path: Path | None,
+) -> tuple[launch.ExplicitResultReuseDecision, ...]:
+    """Load exact result reuse decisions without changing prior artifacts."""
+    if source_path is None:
+        return ()
+    try:
+        document = json.loads(source_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Result reuse decisions rejected: path={source_path}; "
+            f"file is unreadable: {error}"
+        ) from error
+    if not isinstance(document, list):
+        raise TypeError(
+            f"Result reuse decisions rejected: path={source_path}; "
+            "expected a JSON array"
+        )
+    decisions = tuple(
+        _parse_result_reuse_decision(source_path, index, value)
+        for index, value in enumerate(document)
+    )
+    result_paths = [decision.result_path.resolve() for decision in decisions]
+    if len(set(result_paths)) != len(result_paths):
+        raise ValueError(
+            f"Result reuse decisions rejected: path={source_path}; "
+            "resultPath values must be unique"
+        )
+    return decisions
 
 
 def _launch_task_selection(
@@ -1045,6 +1136,7 @@ def _plan_confirmed_launch(
             quota_poll_s=args.quota_poll_s,
             rate_limit_backoff_s=args.rate_limit_backoff_s,
         ),
+        reuse_decisions=_load_result_reuse_decisions(args.reuse_decisions),
     )
     compiled = launch.compile_launch_request(
         request,

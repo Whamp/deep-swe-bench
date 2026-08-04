@@ -390,6 +390,176 @@ def test_plan_command_writes_review_artifacts_without_execution(
     assert not state_root.exists()
 
 
+def test_plan_command_loads_exact_result_reuse_decisions(
+    tmp_path: Path,
+) -> None:
+    """Planning accepts exact prior result bytes through its public CLI."""
+    repository_root, tasks_root, results_root, state_root = _write_launch_fixture(
+        tmp_path
+    )
+    runtime_resolver = FakeLaunchRuntimeResolver(_runtime_identity())
+    result_path = (
+        results_root
+        / "model"
+        / "low"
+        / "baseline@1.0.0"
+        / "task-a"
+        / "rep0"
+        / "result.json"
+    )
+    result_path.parent.mkdir(parents=True)
+    prior_result = {
+        "config": "baseline@1.0.0",
+        "model": "provider/model",
+        "rep": 0,
+        "task": "task-a",
+        "task_revision": "git:prior-task-selection",
+        "thinking_level": "low",
+    }
+    result_bytes = (json.dumps(prior_result, sort_keys=True) + "\n").encode()
+    result_path.write_bytes(result_bytes)
+    reuse_decisions_path = tmp_path / "reuse-decisions.json"
+    reuse_decisions_path.write_text(
+        json.dumps(
+            [
+                {
+                    "priorConfigIdentity": "baseline@1.0.0",
+                    "rationale": (
+                        "The task files and immutable result bytes were reviewed."
+                    ),
+                    "recordedProvenance": prior_result,
+                    "resultIdentity": (
+                        "sha256:" + hashlib.sha256(result_bytes).hexdigest()
+                    ),
+                    "resultPath": str(result_path),
+                }
+            ],
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    plan_path = tmp_path / "review" / "launch-plan.json"
+    receipt_path = tmp_path / "review" / "launch-receipt.txt"
+
+    run_batch.main(
+        [
+            "plan",
+            "--subject",
+            "pi",
+            "--model",
+            "provider/model",
+            "--thinking",
+            "low",
+            "--configs",
+            "baseline@1.0.0",
+            "--baseline-config",
+            "baseline@1.0.0",
+            "--tasks",
+            "task-a",
+            "--reps",
+            "1",
+            "--workers",
+            "1",
+            "--run-id",
+            "fixture-reuse-run",
+            "--preflight",
+            "required",
+            "--existing-results",
+            "require-compatible",
+            "--reuse-decisions",
+            str(reuse_decisions_path),
+            "--repository",
+            str(repository_root),
+            "--tasks-root",
+            str(tasks_root),
+            "--results-root",
+            str(results_root),
+            "--state-root",
+            str(state_root),
+            "--plan-out",
+            str(plan_path),
+            "--receipt-out",
+            str(receipt_path),
+        ],
+        runtime_resolver=runtime_resolver,
+    )
+
+    plan_document = parse_launch_plan_json(plan_path.read_text()).to_document()
+    planned_cell = plan_document["batchCells"][0]
+    assert planned_cell["existingResult"] is True
+    assert planned_cell["reuseReason"] == "explicit_result_reuse"
+    assert planned_cell["reuseResultIdentity"] == (
+        "sha256:" + hashlib.sha256(result_bytes).hexdigest()
+    )
+    reuse_decision = planned_cell["reuseDecision"]
+    assert isinstance(reuse_decision, Mapping)
+    assert reuse_decision["rationale"] == (
+        "The task files and immutable result bytes were reviewed."
+    )
+    assert result_path.read_bytes() == result_bytes
+
+
+def test_plan_command_rejects_incomplete_result_reuse_decision(
+    tmp_path: Path,
+) -> None:
+    """Planning fails closed before runtime resolution on incomplete reuse data."""
+    repository_root, tasks_root, results_root, state_root = _write_launch_fixture(
+        tmp_path
+    )
+    runtime_resolver = FakeLaunchRuntimeResolver(_runtime_identity())
+    reuse_decisions_path = tmp_path / "reuse-decisions.json"
+    reuse_decisions_path.write_text(
+        json.dumps([{"resultPath": str(tmp_path / "result.json")}]) + "\n"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Result reuse decisions rejected: .*expected fields=",
+    ):
+        run_batch.main(
+            [
+                "plan",
+                "--subject",
+                "pi",
+                "--model",
+                "provider/model",
+                "--thinking",
+                "low",
+                "--configs",
+                "baseline@1.0.0",
+                "--baseline-config",
+                "baseline@1.0.0",
+                "--tasks",
+                "task-a",
+                "--reps",
+                "1",
+                "--workers",
+                "1",
+                "--run-id",
+                "fixture-reuse-rejected",
+                "--reuse-decisions",
+                str(reuse_decisions_path),
+                "--repository",
+                str(repository_root),
+                "--tasks-root",
+                str(tasks_root),
+                "--results-root",
+                str(results_root),
+                "--state-root",
+                str(state_root),
+                "--plan-out",
+                str(tmp_path / "launch-plan.json"),
+                "--receipt-out",
+                str(tmp_path / "launch-receipt.txt"),
+            ],
+            runtime_resolver=runtime_resolver,
+        )
+
+    assert runtime_resolver.requests == []
+    assert not (tmp_path / "launch-plan.json").exists()
+    assert not (tmp_path / "launch-receipt.txt").exists()
+
+
 def _reject_versioned_smoke_contract(
     tmp_path: Path,
     contract: Mapping[str, object],
