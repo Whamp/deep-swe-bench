@@ -24,6 +24,8 @@ from harness.launch import (
     LaunchInputDriftError,
     LaunchPreflightError,
     LaunchRequest,
+    LaunchResourceHaltError,
+    LaunchResourcePolicy,
     LaunchRuntimeIdentity,
     LaunchTaskSelection,
     LaunchTransientModelError,
@@ -344,6 +346,7 @@ def _compile_existing_fixture(
             )
             for task in tasks
         },
+        host_memory_bytes=64 * 1024**3,
         immutable_image_identities={
             task: {
                 "agent": "sha256:agent-image",
@@ -391,6 +394,7 @@ def _runtime_resolver_for(
             harness_revision=runtime["harnessRevision"],
             task_revision=runtime["taskRevision"],
             verifier_identities=runtime["verifierIdentities"],
+            host_memory_bytes=runtime["hostMemoryBytes"],
             immutable_image_identities=runtime["immutableImageIdentities"],
             subject_capabilities=frozenset(
                 capability
@@ -538,6 +542,7 @@ def run_cell(config, task, **kwargs):
         harness_revision="sha256:harness-fixture",
         task_revision="sha256:task-fixture",
         verifier_identities={"task-a": "sha256:verifier-fixture"},
+        host_memory_bytes=64 * 1024**3,
         immutable_image_identities={
             "task-a": {
                 "agent": "sha256:agent-image",
@@ -627,10 +632,12 @@ def run_cell(config, task, **kwargs):
         "fixture_capture_initial_context": kwargs["capture_initial_context"],
         "fixture_config_leaf": str(kwargs["config_leaf"]),
         "fixture_config_root": str(kwargs["config_root"]),
+        "fixture_container_labels": dict(kwargs["container_labels"]),
         "fixture_credential_routes": list(kwargs["credential_routes"]),
         "fixture_output_cell": str(kwargs["output_cell"]),
         "fixture_persist_result_file": kwargs["persist_result_file"],
         "fixture_persist_result_index": kwargs["persist_result_index"],
+        "fixture_resource_policy": dict(kwargs["resource_policy"]),
         "fixture_rpc_quiescence": kwargs["rpc_quiescence"],
         "fixture_runner_path": str(Path(__file__).resolve()),
         "fixture_timeout": kwargs["agent_timeout"],
@@ -703,6 +710,7 @@ def test_confirmed_execution_rejects_legacy_config_before_subject_call(
         harness_revision="sha256:harness-fixture",
         task_revision="sha256:task-fixture",
         verifier_identities={"task-a": "sha256:verifier-fixture"},
+        host_memory_bytes=64 * 1024**3,
         immutable_image_identities={
             "task-a": {
                 "agent": "sha256:agent-image",
@@ -761,8 +769,15 @@ def test_execute_command_consumes_only_reviewed_plan_and_confirmation(
 
     assert len(runner.calls) == 1
     assert runner.calls[0].launch_plan_identity == compiled.plan.identity
+    assert runner.calls[0].resources == LaunchResourcePolicy()
     result = json.loads(runner.calls[0].result_path.read_text())
     assert result["launch_plan_identity"] == compiled.plan.identity
+    assert result["resource_policy"] == {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 12.0,
+        "verifier_memory_gib": 12.0,
+    }
 
 
 def test_execute_command_default_pi_runner_uses_planned_workspace(
@@ -808,6 +823,22 @@ def test_execute_command_default_pi_runner_uses_planned_workspace(
     assert result["fixture_rpc_quiescence"] == 4.5
     assert result["fixture_capture_initial_context"] is False
     assert result["fixture_credential_routes"] == ["FIXTURE_CREDENTIAL"]
+    registered_state = _registered_state_path(state_root, "confirmed-fixture")
+    assert result["fixture_resource_policy"] == {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 12.0,
+        "verifier_memory_gib": 12.0,
+    }
+    assert result["fixture_container_labels"] == {
+        "deep-swe-bench.cell-id": "task-a/baseline@1.0.0/rep0",
+        "deep-swe-bench.host-reserve-bytes": "12884901888",
+        "deep-swe-bench.managed": "true",
+        "deep-swe-bench.plan-identity": compiled.plan.identity,
+        "deep-swe-bench.role": "subject",
+        "deep-swe-bench.run-key": registered_state.name,
+        "deep-swe-bench.state-path": str(registered_state),
+    }
 
     manifest = json.loads(
         (
@@ -818,6 +849,152 @@ def test_execute_command_default_pi_runner_uses_planned_workspace(
     assert manifest["agent_timeout_s"] == 321.0
     assert manifest["rpc_quiescence_s"] == 4.5
     assert manifest["capture_initial_context"] is False
+
+
+def test_confirmed_launch_retries_verifier_memory_exhaustion(
+    tmp_path: Path,
+) -> None:
+    """Verifier OOM evidence retries before any canonical result is written."""
+    compiled, _, _, _, _ = _compile_single_cell_launch(
+        tmp_path,
+        cell_retries=1,
+    )
+
+    class ExhaustOnceRunner(FakeConfirmedPiRunner):
+        """Return one infrastructure-invalid verifier result, then pass."""
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            """Mark only the first verifier attempt as memory exhausted."""
+            record = super().run_confirmed_pi_cell(cell)
+            if len(self.calls) == 1:
+                record.update(
+                    {
+                        "verifier_exit": "memory_limit",
+                        "verifier_resource_exhausted": True,
+                    }
+                )
+            return record
+
+    runner = ExhaustOnceRunner(_planned_launch_plan_path(compiled))
+
+    execution = execute_confirmed_launch(
+        compiled.plan,
+        confirmation_identity=compiled.plan.identity,
+        runtime_resolver=_runtime_resolver_for(compiled),
+        pi_runner=runner,
+    )
+
+    assert len(runner.calls) == 2
+    result = json.loads(execution.result_path.read_text())
+    assert result["verifier_exit"] == 0
+    assert "verifier_resource_exhausted" not in result
+    evidence_path = (
+        execution.result_path.parent
+        / "logs"
+        / "verifier-resource-events.ndjson"
+    )
+    evidence = json.loads(evidence_path.read_text().splitlines()[0])
+    assert evidence["verifier_resource_exhausted"] is True
+    assert evidence["launch_plan_identity"] == compiled.plan.identity
+
+
+def test_confirmed_launch_pauses_before_rep_when_resource_halt_exists(
+    tmp_path: Path,
+) -> None:
+    """A supervisor halt record prevents any new confirmed subject call."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(tmp_path)
+    state_path = Path(compiled.plan.to_document()["paths"]["statePath"])
+    state_path.mkdir(parents=True)
+    (state_path / "resource-halt.json").write_text(
+        json.dumps(
+            {
+                "reason": "host memory reserve breached",
+                "run_key": state_path.name,
+            }
+        )
+        + "\n"
+    )
+    runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
+
+    with pytest.raises(
+        LaunchResourceHaltError,
+        match="host memory reserve breached",
+    ):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+
+    assert runner.calls == []
+    status = json.loads(
+        (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "status.json"
+        ).read_text()
+    )
+    assert status["state"] == "paused"
+    events = [
+        json.loads(line)
+        for line in (state_path / "events.ndjson").read_text().splitlines()
+    ]
+    pause = next(event for event in events if event["event"] == "run_paused")
+    assert pause["reason"] == "host memory reserve breached"
+
+
+def test_confirmed_launch_pauses_when_supervisor_interrupts_active_rep(
+    tmp_path: Path,
+) -> None:
+    """An active process error becomes a pause when a halt record now exists."""
+    compiled, _, _, _, state_root = _compile_single_cell_launch(tmp_path)
+    state_path = Path(compiled.plan.to_document()["paths"]["statePath"])
+
+    class ResourceInterruptedRunner:
+        """Simulate Docker failure after the supervisor records containment."""
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            """Create the halt record, then surface the interrupted process."""
+            cell.state_path.mkdir(parents=True, exist_ok=True)
+            (cell.state_path / "resource-halt.json").write_text(
+                json.dumps(
+                    {
+                        "reason": "host memory reserve breached",
+                        "run_key": cell.run_key,
+                    }
+                )
+                + "\n"
+            )
+            raise RuntimeError("docker exec exited 137")
+
+    with pytest.raises(
+        LaunchResourceHaltError,
+        match="host memory reserve breached",
+    ):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=ResourceInterruptedRunner(),
+        )
+
+    status = json.loads(
+        (
+            _registered_state_path(state_root, "confirmed-fixture")
+            / "status.json"
+        ).read_text()
+    )
+    assert status["state"] == "paused"
+    cell = status["cells"]["task-a/baseline@1.0.0/rep0"]
+    assert cell["outcome"] == "exit=resource_halt"
+    assert cell["exit_code"] == "resource_halt"
+    assert state_path.joinpath("resource-halt.json").is_file()
 
 
 def test_confirmed_launch_resumes_after_transient_without_rerunning_rep(
@@ -2849,6 +3026,7 @@ def test_execute_confirmed_launch_stops_before_config_lock_drifted_rep(
     [
         "subject-version",
         "harness-revision",
+        "host-memory",
         "task-revision",
         "verifier-identity",
         "immutable-image-identity",
@@ -2879,12 +3057,15 @@ def test_execute_confirmed_launch_stops_before_runtime_drifted_rep(
         subject_version = approved.subject_version
         harness_revision = approved.harness_revision
         task_revision = approved.task_revision
+        host_memory_bytes = approved.host_memory_bytes
         subject_capabilities = approved.subject_capabilities
         available_credential_routes = approved.available_credential_routes
         if changed_category == "subject-version":
             subject_version = "pi@drifted-fixture"
         elif changed_category == "harness-revision":
             harness_revision = "sha256:drifted-harness"
+        elif changed_category == "host-memory":
+            host_memory_bytes -= 1024**3
         elif changed_category == "task-revision":
             task_revision = "sha256:drifted-task"
         elif changed_category == "verifier-identity":
@@ -2900,6 +3081,7 @@ def test_execute_confirmed_launch_stops_before_runtime_drifted_rep(
             harness_revision=harness_revision,
             task_revision=task_revision,
             verifier_identities=verifier_identities,
+            host_memory_bytes=host_memory_bytes,
             immutable_image_identities=image_identities,
             subject_capabilities=subject_capabilities,
             available_credential_routes=available_credential_routes,
@@ -2937,6 +3119,7 @@ def test_execute_confirmed_launch_stops_before_runtime_drifted_rep(
     expected_inputs = {
         "subject-version": "pi",
         "harness-revision": str((tmp_path / "repository").resolve()),
+        "host-memory": "physical-memory",
         "task-revision": "selected-tasks",
         "verifier-identity": "task-a",
         "immutable-image-identity": "task-a:agent",
@@ -2971,6 +3154,7 @@ def test_execute_confirmed_launch_records_every_changed_input(
             harness_revision="sha256:drifted-harness",
             task_revision="sha256:drifted-task",
             verifier_identities={"task-a": "sha256:drifted-verifier"},
+            host_memory_bytes=runtime_resolver.identity.host_memory_bytes,
             immutable_image_identities={
                 "task-a": {
                     "agent": "sha256:drifted-agent",

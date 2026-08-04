@@ -33,6 +33,16 @@ def test_classify_result_matches_progress_labels():
     assert classify_result({"agent_exit": 0, "verifier_exit": "skipped_empty_patch"}) == "empty"
     assert classify_result({"agent_exit": 0, "verifier_exit": 0, "agent_timed_out": True}) == "timeout"
     assert classify_result({"agent_exit": 75, "transient_model_error": True}) == "transient"
+    assert (
+        classify_result(
+            {
+                "agent_exit": 0,
+                "verifier_exit": "memory_limit",
+                "verifier_resource_exhausted": True,
+            }
+        )
+        == "verifier_resource_exhausted"
+    )
     assert classify_result({"agent_exit": 2, "verifier_exit": None}) == "exit=2"
 
 

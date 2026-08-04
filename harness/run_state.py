@@ -29,7 +29,9 @@ BASE_SUMMARY_FIELDS = {
     "agent_wall_s",
     "agent_exit",
     "agent_timed_out",
+    "agent_resource_exhausted",
     "verifier_exit",
+    "verifier_resource_exhausted",
     "total_tokens",
     "input_tokens",
     "output_tokens",
@@ -139,6 +141,8 @@ def classify_result(record: dict[str, Any]) -> str:
         return "transient"
     if record.get("agent_timed_out") or record.get("agent_exit") == "timeout":
         return "timeout"
+    if record.get("verifier_resource_exhausted"):
+        return "verifier_resource_exhausted"
     agent_exit = record.get("agent_exit")
     verifier_exit = record.get("verifier_exit")
     if agent_exit in (0, "0") and verifier_exit in (0, "0", "skipped_empty_patch"):

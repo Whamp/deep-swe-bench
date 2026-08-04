@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import json
 import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import cast
 
@@ -16,6 +17,10 @@ from harness import (
     confirmed_preflight,
     result_provenance,
     run_state,
+)
+from harness.container_resources import (
+    container_memory_result_fields,
+    read_resource_halt_reason,
 )
 from harness.launch_contract import (
     ConfirmedLaunchExecution,
@@ -28,14 +33,18 @@ from harness.launch_contract import (
     LaunchPlanDocument,
     LaunchPreflightError,
     LaunchRequest,
+    LaunchResourceHaltError,
+    LaunchResourcePolicy,
     LaunchRuntimeResolver,
     LaunchTaskSelection,
     LaunchTransientModelError,
     LaunchTransientResumer,
+    LaunchVerifierResourceError,
     _ConfirmedSubjectRunner,
 )
 from harness.launch_planning import (
     _validate_launch_policies,
+    _validate_launch_resources,
     canonical_launch_plan_json,
     confirmed_launch_run_key,
     parse_launch_plan_json,
@@ -170,6 +179,8 @@ def _confirmed_subject_cell(
         thinking=document["thinking"],
         result_path=Path(result_path),
         rpc_quiescence_s=policies.rpc_quiescence_s,
+        run_key=Path(document["paths"]["statePath"]).name,
+        state_path=Path(document["paths"]["statePath"]),
         subject=subject["name"],
         subject_behavior=dict(subject_behavior),
         subject_runner=Path(subject["runner"]),
@@ -187,6 +198,7 @@ def _confirmed_subject_cell(
             str(name): str(identity) for name, identity in image_identities.items()
         },
         launch_plan_identity=document["planIdentity"],
+        resources=_confirmed_launch_request(document).resources,
         reuse_provenance=(
             cast(Mapping[str, object], cell_document["reuseProvenance"])
             if isinstance(cell_document.get("reuseProvenance"), Mapping)
@@ -239,6 +251,7 @@ def _confirmed_cell_provenance(
         "launch_plan_identity": cell.launch_plan_identity,
         "model": cell.model,
         "rep": cell.rep,
+        "resource_policy": asdict(cell.resources),
         "subject": cell.subject,
         "subject_version": cell.subject_version,
         "task": cell.task,
@@ -323,6 +336,7 @@ def _confirmed_run_manifest(
             "config_identities": [config["identity"] for config in document["configs"]],
             "launch_plan_identity": document["planIdentity"],
             "launch_plan_path": "launch-plan.json",
+            "resources": dict(document["resources"]),
             "results_root": document["paths"]["resultsRoot"],
             "run_key": state_path.name,
             "state_root": document["paths"]["stateRoot"],
@@ -342,6 +356,24 @@ def _append_confirmed_cell_log(
         log_file.write(
             f"cell={cell.task}/{cell.config_identity}/rep{cell.rep} {message}\n"
         )
+
+
+def _record_verifier_resource_failure(
+    cell: ConfirmedSubjectCell,
+    runner_record: Mapping[str, object],
+) -> None:
+    """Persist infrastructure-invalid verifier evidence outside result.json."""
+    evidence_path = (
+        cell.result_path.parent / "logs" / "verifier-resource-events.ndjson"
+    )
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence = {
+        "cell": f"{cell.task}/{cell.config_identity}/rep{cell.rep}",
+        "launch_plan_identity": cell.launch_plan_identity,
+        **container_memory_result_fields(runner_record),
+    }
+    with evidence_path.open("a", encoding="utf-8") as evidence_file:
+        evidence_file.write(json.dumps(evidence, sort_keys=True) + "\n")
 
 
 def _resolved_plan_config_leaf(
@@ -441,6 +473,11 @@ def _confirmed_launch_request(
     """Reconstruct only the resolved request needed for runtime observation."""
     selection = document["selection"]
     policies = document["policies"]
+    resources = document.get("resources")
+    if not isinstance(resources, Mapping):
+        raise TypeError(
+            "Confirmed launch resources invalid: expected a resolved object"
+        )
     selected_tasks = selection.get("tasks")
     selection_kind = selection.get("kind")
     selection_name = selection.get("name")
@@ -463,6 +500,23 @@ def _confirmed_launch_request(
     max_quota_wait_s = policies.get("max_quota_wait_s")
     quota_poll_s = policies.get("quota_poll_s")
     rate_limit_backoff_s = policies.get("rate_limit_backoff_s")
+    subject_memory_gib = resources.get("subject_memory_gib")
+    verifier_memory_gib = resources.get("verifier_memory_gib")
+    additional_swap_gib = resources.get("additional_swap_gib")
+    host_reserve_gib = resources.get("host_reserve_gib")
+    resource_values = (
+        subject_memory_gib,
+        verifier_memory_gib,
+        additional_swap_gib,
+        host_reserve_gib,
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int | float)
+        for value in resource_values
+    ):
+        raise TypeError(
+            "Confirmed launch resources invalid: expected resolved numbers"
+        )
     if (
         not all(
             isinstance(policy, str)
@@ -518,8 +572,15 @@ def _confirmed_launch_request(
             quota_poll_s=float(quota_poll_s),
             rate_limit_backoff_s=float(rate_limit_backoff_s),
         ),
+        resources=LaunchResourcePolicy(
+            subject_memory_gib=float(subject_memory_gib),
+            verifier_memory_gib=float(verifier_memory_gib),
+            additional_swap_gib=float(additional_swap_gib),
+            host_reserve_gib=float(host_reserve_gib),
+        ),
     )
     _validate_launch_policies(request)
+    _validate_launch_resources(request)
     return request
 
 
@@ -611,6 +672,12 @@ def _runtime_input_drift_changes(
         observed.harness_revision,
     )
     compare(
+        "host-memory",
+        "physical-memory",
+        approved["hostMemoryBytes"],
+        observed.host_memory_bytes,
+    )
+    compare(
         "task-revision",
         "selected-tasks",
         approved["taskRevision"],
@@ -644,6 +711,15 @@ def _runtime_input_drift_changes(
     return changes
 
 
+def _resource_halt_error(state_path: Path) -> LaunchResourceHaltError | None:
+    """Return the durable supervisor halt error for one run, when present."""
+    try:
+        reason = read_resource_halt_reason(state_path)
+    except (TypeError, ValueError) as error:
+        return LaunchResourceHaltError(str(error))
+    return None if reason is None else LaunchResourceHaltError(reason)
+
+
 class _ApprovedLaunchInputVerifier:
     """Stop runner submissions when current inputs differ from the plan."""
 
@@ -661,6 +737,9 @@ class _ApprovedLaunchInputVerifier:
 
     def require_unchanged_before_rep(self, cell: ConfirmedSubjectCell) -> None:
         """Recheck inputs before each resumed, new, or retried submission."""
+        halt_error = _resource_halt_error(cell.state_path)
+        if halt_error is not None:
+            raise halt_error
         with self._verification_lock:
             if self._drift_message is not None:
                 raise LaunchInputDriftError(self._drift_message)
@@ -717,6 +796,18 @@ def _run_confirmed_subject_cell(
             ConfirmedOmpRunner,
             subject_runner,
         ).run_confirmed_omp_cell(cell)
+    verifier_resource_error = (
+        runner_record.get("verifier_resource_exhausted") is True
+        or runner_record.get("verifier_resource_evidence_unavailable") is True
+    )
+    if verifier_resource_error:
+        _record_verifier_resource_failure(cell, runner_record)
+        diagnostic = runner_record.get("verifier_resource_diagnostic")
+        raise LaunchVerifierResourceError(
+            "Verifier resource evidence invalid: "
+            f"{cell.task}/{cell.config_identity}/rep{cell.rep}; "
+            f"diagnostic={diagnostic!r}"
+        )
     result_record = _confirmed_result_record(cell, runner_record)
     run_state.atomic_write_json(cell.result_path, result_record)
     _append_confirmed_cell_log(log_path, cell, "completed")
@@ -821,8 +912,16 @@ def _execute_confirmed_preflight_cell(
         raise RuntimeError(
             "Confirmed launch stopped after transient model error"
         ) from error
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
         # Subject adapters may raise arbitrary provider or process failures.
+        halt_error = _resource_halt_error(cell.state_path)
+        if halt_error is not None:
+            state.preflight_attempt_paused(
+                state_cell,
+                log_path=context.log_path,
+                reason=str(halt_error),
+            )
+            raise halt_error from error
         exit_code = "exception"
         diagnostics.append(
             confirmed_preflight.preflight_diagnostic(
@@ -930,6 +1029,19 @@ def _execute_confirmed_batch_cell(
                 "Confirmed launch stopped after transient model error"
             ) from error
         except Exception as error:
+            halt_error = _resource_halt_error(cell.state_path)
+            if halt_error is not None:
+                _append_confirmed_cell_log(
+                    context.log_path,
+                    cell,
+                    f"paused: {halt_error}",
+                )
+                state.cell_finished(
+                    state_cell,
+                    log_path=context.log_path,
+                    exit_code="resource_halt",
+                )
+                raise halt_error from error
             _append_confirmed_cell_log(
                 context.log_path,
                 cell,
@@ -1237,6 +1349,9 @@ def execute_confirmed_launch_with_heartbeat(
                     execution_context,
                     launch_request.concurrency,
                 )
+            except LaunchResourceHaltError as error:
+                state.run_paused(reason=str(error))
+                raise
             except LaunchTransientModelError:
                 if (
                     not launch_request.policies.auto_resume

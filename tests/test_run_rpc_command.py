@@ -1,5 +1,6 @@
 """Verify direct subject-runner and RPC command contracts."""
 
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -161,6 +162,202 @@ class SubjectRunnerConfigResolutionTests(unittest.TestCase):
         self.assertIn("Config leaf ambiguous:", message)
         self.assertIn(str(direct_leaf), message)
         self.assertIn(str(worker_leaf), message)
+
+
+class ContainerResourceCommandTests(unittest.TestCase):
+    """Verify subject containers receive confirmed aggregate memory limits."""
+
+    def test_pi_subject_docker_run_enforces_confirmed_resource_policy(self) -> None:
+        """Pi applies cgroup memory, no-extra-swap, and ownership labels."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            task_root = root / "task"
+            task_root.mkdir()
+            (task_root / "instruction.md").write_text("Fix it.\n")
+            (task_root / "pre_artifacts.sh").write_text("#!/bin/sh\n")
+            task = type(
+                "Task",
+                (),
+                {
+                    "agent_timeout_s": 30.0,
+                    "dir": task_root,
+                    "env_image": "fixture-env",
+                    "language": "python",
+                },
+            )()
+            config_root = root / "config"
+            config_leaf = config_root / "model" / "low"
+            config_leaf.mkdir(parents=True)
+            config = {
+                "advisor_json": None,
+                "dir": config_root,
+                "env": {},
+                "leaf_rel": "model/low",
+                "models_json": None,
+                "settings_json": None,
+            }
+            docker_failure = subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="fixture stop",
+            )
+            with (
+                patch.dict(run.os.environ, {}, clear=True),
+                patch.object(run, "load_task", return_value=task),
+                patch.object(run, "load_resolved_config", return_value=config),
+                patch.object(run, "ensure_env_image"),
+                patch.object(run, "ensure_pi_image", return_value="pi-image"),
+                patch.object(run, "agent_auth_mount", return_value=([], None)),
+                patch.object(run, "sh", return_value=docker_failure) as shell,
+                self.assertRaisesRegex(SystemExit, "docker run failed"),
+            ):
+                run.run_cell(
+                    "cfg@1.0.0",
+                    "task-a",
+                    model="provider/model",
+                    thinking="low",
+                    rep=0,
+                    agent_timeout=30,
+                    keep=False,
+                    pass_openai_codex_oauth=False,
+                    rpc_quiescence=2,
+                    output_cell=root / "cell",
+                    config_root=config_root,
+                    config_leaf=config_leaf,
+                    resource_policy={
+                        "additional_swap_gib": 0.0,
+                        "host_reserve_gib": 12.0,
+                        "subject_memory_gib": 12.0,
+                        "verifier_memory_gib": 10.0,
+                    },
+                    container_labels={
+                        "deep-swe-bench.managed": "true",
+                        "deep-swe-bench.role": "subject",
+                        "deep-swe-bench.state-path": str(root / "state"),
+                    },
+                )
+
+        docker_run = shell.call_args.args[0]
+        self.assertEqual(docker_run[:4], ["docker", "run", "-d", "--name"])
+        self.assertIn("--memory", docker_run)
+        self.assertEqual(
+            docker_run[docker_run.index("--memory") + 1],
+            "12884901888",
+        )
+        self.assertEqual(
+            docker_run[docker_run.index("--memory-swap") + 1],
+            "12884901888",
+        )
+        self.assertIn("deep-swe-bench.managed=true", docker_run)
+        self.assertIn("deep-swe-bench.role=subject", docker_run)
+
+    def test_omp_subject_docker_run_enforces_confirmed_resource_policy(self) -> None:
+        """OMP applies the same aggregate memory controls as Pi."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            task_root = root / "task"
+            task_root.mkdir()
+            (task_root / "instruction.md").write_text("Fix it.\n")
+            (task_root / "pre_artifacts.sh").write_text("#!/bin/sh\n")
+            task = type(
+                "Task",
+                (),
+                {
+                    "agent_timeout_s": 30.0,
+                    "dir": task_root,
+                    "env_image": "fixture-env",
+                    "language": "python",
+                },
+            )()
+            config_root = root / "config"
+            config_leaf = config_root / "model" / "low"
+            config_leaf.mkdir(parents=True)
+            config = {
+                "dir": config_root,
+                "env": {},
+                "leaf_rel": "model/low",
+                "pi_flags": [],
+                "skill_dirs": [],
+                "advisor_json": None,
+                "models_json": None,
+                "settings_json": None,
+            }
+            docker_failure = subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="fixture stop",
+            )
+            with (
+                patch.object(run_omp, "load_task", return_value=task),
+                patch.object(
+                    run_omp,
+                    "load_resolved_config",
+                    return_value=config,
+                ),
+                patch.object(run_omp, "ensure_env_image"),
+                patch.object(
+                    run_omp,
+                    "ensure_pi_image",
+                    return_value="omp-image",
+                ),
+                patch.object(
+                    run_omp,
+                    "create_filtered_omp_agent_db",
+                ),
+                patch.object(
+                    run_omp,
+                    "sh",
+                    return_value=docker_failure,
+                ) as shell,
+                self.assertRaisesRegex(SystemExit, "docker run failed"),
+            ):
+                run_omp.run_cell(
+                    "cfg@1.0.0",
+                    "task-a",
+                    model="openai-codex/model",
+                    thinking="low",
+                    rep=0,
+                    agent_timeout=30,
+                    keep=False,
+                    pass_openai_codex_oauth=True,
+                    rpc_quiescence=2,
+                    output_cell=root / "cell",
+                    config_root=config_root,
+                    config_leaf=config_leaf,
+                    subject_behavior={
+                        "appendSystemPrompt": "",
+                        "extensions": [],
+                        "overlay": None,
+                        "systemPrompt": None,
+                        "toolWhitelist": ["read", "bash"],
+                    },
+                    omp_binary_path=root / "omp",
+                    resource_policy={
+                        "additional_swap_gib": 1.0,
+                        "host_reserve_gib": 12.0,
+                        "subject_memory_gib": 8.0,
+                        "verifier_memory_gib": 10.0,
+                    },
+                    container_labels={
+                        "deep-swe-bench.managed": "true",
+                        "deep-swe-bench.role": "subject",
+                        "deep-swe-bench.state-path": str(root / "state"),
+                    },
+                )
+
+        docker_run = shell.call_args.args[0]
+        self.assertEqual(
+            docker_run[docker_run.index("--memory") + 1],
+            "8589934592",
+        )
+        self.assertEqual(
+            docker_run[docker_run.index("--memory-swap") + 1],
+            "9663676416",
+        )
+        self.assertIn("deep-swe-bench.managed=true", docker_run)
+        self.assertIn("deep-swe-bench.role=subject", docker_run)
 
 
 class ProbeCommandTests(unittest.TestCase):

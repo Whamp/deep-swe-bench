@@ -18,6 +18,22 @@ from harness.launch_contract import (
 )
 
 
+def _host_memory_bytes() -> int:
+    """Return physical host RAM used for confirmed launch admission."""
+    page_count = os.sysconf("SC_PHYS_PAGES")
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    if not isinstance(page_count, int) or not isinstance(page_size, int):
+        raise TypeError(
+            "Launch host memory unresolved: sysconf returned non-integers"
+        )
+    host_memory_bytes = page_count * page_size
+    if host_memory_bytes <= 0:
+        raise RuntimeError(
+            "Launch host memory unresolved: physical memory must be positive"
+        )
+    return host_memory_bytes
+
+
 def _identity_files(paths: Iterable[Path]) -> list[Path]:
     files: set[Path] = set()
     for path in paths:
@@ -267,6 +283,7 @@ class RepositoryLaunchRuntimeResolver:
             subject_version=subject_version,
             harness_revision=self._harness_revision(),
             task_revision=self._task_revision(tasks),
+            host_memory_bytes=_host_memory_bytes(),
             verifier_identities=verifier_identities,
             immutable_image_identities=image_identities,
             task_revision_aliases=self._task_revision_aliases(tasks),

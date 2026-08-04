@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -37,6 +38,16 @@ import parse_usage  # noqa: E402
 import results_tree  # noqa: E402
 from config_lock import require_matching_config_lock  # noqa: E402
 from config_resolution import resolve_config_leaf  # noqa: E402
+from container_resources import (  # noqa: E402
+    VERIFIER_MEMORY_EVENTS_SHELL_COMMAND,
+    container_memory_result_fields,
+    inspect_docker_container_oom,
+    managed_container_start_guard,
+    planned_container_resource_docker_args,
+    record_subject_container_memory_status,
+    run_managed_container_and_wait,
+    verifier_container_memory_status,
+)
 from lib import (  # noqa: E402
     REPO,
     load_task,
@@ -461,6 +472,8 @@ def run_cell(
     rpc_quiescence: float,
     capture_initial_context: bool = True,
     credential_routes: tuple[str, ...] = (),
+    resource_policy: Mapping[str, object] | None = None,
+    container_labels: Mapping[str, str] | None = None,
     output_cell: Path | None = None,
     persist_result_file: bool = True,
     persist_result_index: bool = True,
@@ -539,7 +552,13 @@ def run_cell(
     task_public = tempfile.mkdtemp(prefix="dsw-task-public-")
     shutil.copy2(task.dir / "instruction.md", Path(task_public) / "instruction.md")
     shutil.copy2(task.dir / "pre_artifacts.sh", Path(task_public) / "pre_artifacts.sh")
-    run_args = ["docker", "run", "-d", "--name", cname, "--platform", "linux/amd64",
+    run_args = ["docker", "run", "-d", "--name", cname,
+                *planned_container_resource_docker_args(
+                    resource_policy,
+                    container_labels,
+                    role="subject",
+                ),
+                "--platform", "linux/amd64",
                 "-w", "/app",
                 "-v", f"{task_public}:/task:ro",
                 "-v", f"{cell}:/out",
@@ -549,7 +568,8 @@ def run_cell(
                 "-v", f"{cell}:/logs",
                 *auth_mount,
                 *env_flag, pi_image, "sleep", str(int(agent_timeout + 600))]
-    r = sh(run_args)
+    with managed_container_start_guard(container_labels):
+        r = sh(run_args)
     if r.returncode != 0:
         for d in (auth_tmp, task_public):
             if d:
@@ -596,6 +616,12 @@ def run_cell(
         if rpc_result.timed_out:
             status["agent_timed_out"] = True
         status["agent_wall_s"] = round(time.time() - started, 1)
+        status.update(
+            record_subject_container_memory_status(
+                cname,
+                cell / "logs" / "subject-memory-events.json",
+            )
+        )
 
         sh(["docker", "exec", cname, "bash", "-lc",
             "mkdir -p /out/pi-agent; "
@@ -651,18 +677,43 @@ def run_cell(
     reward = {"reward": -1, "partial": 0.0}
     patch_bytes = status.get("patch_bytes", 0)
     if isinstance(patch_bytes, int | float) and patch_bytes > 0:
+        ensure_verifier_image(task)
+        verifier_cname = f"{cname}-verifier"
+        verifier_memory_events_path = (
+            cell / "verifier" / "memory-events.txt"
+        )
+        verifier_memory_events_path.unlink(missing_ok=True)
         try:
-            ensure_verifier_image(task)
-            r = sh(["docker", "run", "--rm", "--network", "none", "--platform", "linux/amd64",
+            r = run_managed_container_and_wait(
+                ["docker", "run", "-d", "--name", verifier_cname,
+                    *planned_container_resource_docker_args(
+                        resource_policy,
+                        container_labels,
+                        role="verifier",
+                    ),
+                    "--network", "none", "--platform", "linux/amd64",
                     "-v", f"{cell}:/logs",
-                    task.verifier_image, "bash", "/tests/test.sh"],
-                   timeout=task.verifier_timeout_s + 300)
+                    task.verifier_image,
+                    "bash", "-lc",
+                        VERIFIER_MEMORY_EVENTS_SHELL_COMMAND],
+                container_labels=container_labels,
+                container_name=verifier_cname,
+                timeout=task.verifier_timeout_s + 300,
+            )
             verifier_stdout = compact_verifier_stdout(r.stdout + r.stderr, cell / "verifier")
             (cell / "logs" / "verifier.stdout.txt").write_text(verifier_stdout)
             status["verifier_exit"] = r.returncode
             reward = read_reward(cell / "verifier")
         except subprocess.TimeoutExpired:
             status["verifier_exit"] = "timeout"
+        finally:
+            status.update(
+                verifier_container_memory_status(
+                    verifier_memory_events_path,
+                    oom_evidence=inspect_docker_container_oom(verifier_cname),
+                )
+            )
+            sh(["docker", "rm", "-f", verifier_cname])
     else:
         status["verifier_exit"] = "skipped_empty_patch"
 
@@ -707,6 +758,7 @@ def run_cell(
         agent_timed_out=status.get("agent_timed_out", False),
         verifier_exit=status.get("verifier_exit"),
         agent_wall_s=status.get("agent_wall_s"),
+        **container_memory_result_fields(status),
         **usage,
     )
     if persist_result_file:

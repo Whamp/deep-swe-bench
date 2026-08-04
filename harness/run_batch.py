@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
@@ -22,6 +23,7 @@ from typing import Protocol, TypedDict, cast
 from harness import (
     config_lock,
     config_resolution,
+    container_resources,
     launch,
     lib,
     quota,
@@ -69,11 +71,20 @@ def _planned_subject_arguments(
     task_root: Path,
 ) -> dict[str, object]:
     """Serialize only plan-resolved arguments for the isolated runner."""
+    cell_identity = f"{cell.task}/{cell.config_identity}/rep{cell.rep}"
     arguments: dict[str, object] = {
         "agent_timeout": cell.agent_timeout_s,
         "capture_initial_context": cell.capture_initial_context,
         "config_leaf": str(cell.config_leaf),
         "config_root": str(cell.config_root),
+        "container_labels": container_resources.confirmed_container_labels(
+            cell_identity=cell_identity,
+            host_reserve_gib=cell.resources.host_reserve_gib,
+            launch_plan_identity=cell.launch_plan_identity,
+            role="subject",
+            run_key=cell.run_key,
+            state_path=str(cell.state_path),
+        ),
         "credential_routes": list(cell.credential_routes),
         "keep": False,
         "model": cell.model,
@@ -84,6 +95,7 @@ def _planned_subject_arguments(
         "persist_result_file": False,
         "persist_result_index": False,
         "rep": cell.rep,
+        "resource_policy": asdict(cell.resources),
         "rpc_quiescence": cell.rpc_quiescence_s,
         "task_root": str(task_root),
         "thinking": cell.thinking,
@@ -943,6 +955,10 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
         dest="rate_limit_backoff_s",
     )
     plan_parser.add_argument("--cell-retries", type=int, default=1)
+    plan_parser.add_argument("--subject-memory-gib", type=float, default=12.0)
+    plan_parser.add_argument("--verifier-memory-gib", type=float, default=12.0)
+    plan_parser.add_argument("--additional-swap-gib", type=float, default=0.0)
+    plan_parser.add_argument("--host-reserve-gib", type=float, default=12.0)
     plan_parser.add_argument("--agent-timeout", type=float)
     plan_parser.add_argument("--rpc-quiescence", type=float, default=2.0)
     plan_parser.add_argument(
@@ -1044,6 +1060,12 @@ def _plan_confirmed_launch(
             max_quota_wait_s=args.max_quota_wait_s,
             quota_poll_s=args.quota_poll_s,
             rate_limit_backoff_s=args.rate_limit_backoff_s,
+        ),
+        resources=launch.LaunchResourcePolicy(
+            subject_memory_gib=args.subject_memory_gib,
+            verifier_memory_gib=args.verifier_memory_gib,
+            additional_swap_gib=args.additional_swap_gib,
+            host_reserve_gib=args.host_reserve_gib,
         ),
     )
     compiled = launch.compile_launch_request(

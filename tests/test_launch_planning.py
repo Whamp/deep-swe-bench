@@ -19,6 +19,7 @@ from harness import config_lock, launch, run_batch
 from harness.launch import (
     LaunchExecutionPolicies,
     LaunchRequest,
+    LaunchResourcePolicy,
     LaunchRuntimeIdentity,
     LaunchTaskSelection,
     RepositoryLaunchRuntimeResolver,
@@ -138,6 +139,7 @@ def _runtime_identity(
         harness_revision="git:harness-fixture",
         task_revision="git:tasks-fixture",
         verifier_identities={task: f"sha256:verifier-{task}" for task in tasks},
+        host_memory_bytes=64 * 1024**3,
         immutable_image_identities={
             task: {
                 "agent": f"sha256:agent-{task}",
@@ -344,6 +346,14 @@ def test_plan_command_writes_review_artifacts_without_execution(
             "pause",
             "--cell-retries",
             "1",
+            "--subject-memory-gib",
+            "11",
+            "--verifier-memory-gib",
+            "9",
+            "--additional-swap-gib",
+            "0",
+            "--host-reserve-gib",
+            "13",
             "--agent-timeout",
             "321",
             "--rpc-quiescence",
@@ -367,7 +377,15 @@ def test_plan_command_writes_review_artifacts_without_execution(
 
     plan = parse_launch_plan_json(plan_path.read_text())
     assert plan.identity.startswith("sha256:")
-    policies = plan.to_document()["policies"]
+    document = plan.to_document()
+    policies = document["policies"]
+    resources = document["resources"]
+    assert resources == {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 13.0,
+        "subject_memory_gib": 11.0,
+        "verifier_memory_gib": 9.0,
+    }
     assert policies["agent_timeout_s"] == 321.0
     assert policies["rpc_quiescence_s"] == 4.5
     assert policies["capture_initial_context"] is False
@@ -378,6 +396,10 @@ def test_plan_command_writes_review_artifacts_without_execution(
     receipt = receipt_path.read_text()
     assert f"Plan: {plan.identity}" in receipt
     assert "agent timeout=321.0" in receipt
+    assert "subject memory=11.0 GiB" in receipt
+    assert "verifier memory=9.0 GiB" in receipt
+    assert "additional swap=0.0 GiB" in receipt
+    assert "host reserve=13.0 GiB" in receipt
     assert "RPC quiescence=4.5s" in receipt
     assert "initial context=not captured" in receipt
     assert "auto resume=enabled" in receipt
@@ -388,6 +410,39 @@ def test_plan_command_writes_review_artifacts_without_execution(
     assert len(runtime_resolver.requests) == 1
     assert not results_root.exists()
     assert not state_root.exists()
+
+
+def test_planning_rejects_resource_reservation_above_host_capacity(
+    tmp_path: Path,
+) -> None:
+    """Concurrent hard limits must leave the confirmed host reserve intact."""
+    repository_root, tasks_root, results_root, state_root = _write_launch_fixture(
+        tmp_path
+    )
+    request = replace(
+        _launch_request(),
+        concurrency=2,
+        resources=LaunchResourcePolicy(
+            subject_memory_gib=12.0,
+            verifier_memory_gib=12.0,
+            additional_swap_gib=0.0,
+            host_reserve_gib=12.0,
+        ),
+    )
+    runtime = replace(_runtime_identity(), host_memory_bytes=32 * 1024**3)
+
+    with pytest.raises(
+        ValueError,
+        match="Launch resource capacity invalid",
+    ):
+        compile_launch_request(
+            request,
+            repository_root=repository_root,
+            tasks_root=tasks_root,
+            results_root=results_root,
+            state_root=state_root,
+            runtime_resolver=FakeLaunchRuntimeResolver(runtime),
+        )
 
 
 def test_plan_command_reuses_results_from_a_nested_subset(
@@ -441,6 +496,12 @@ def test_plan_command_reuses_results_from_a_nested_subset(
                     ),
                     "model": "provider/model",
                     "rep": rep,
+                    "resource_policy": {
+                        "additional_swap_gib": 0.0,
+                        "host_reserve_gib": 12.0,
+                        "subject_memory_gib": 12.0,
+                        "verifier_memory_gib": 12.0,
+                    },
                     "subject": "pi",
                     "subject_version": runtime.subject_version,
                     "task": "task-a",
@@ -886,6 +947,7 @@ def test_omp_launch_rejects_reuse_from_different_binary(
         )
 
     assert "subject_runtime_identity" in str(raised.value)
+    assert "resource_policy" in str(raised.value)
     assert str(result_path) in str(raised.value)
 
 
@@ -1538,6 +1600,7 @@ def test_compile_launch_request_is_deterministic_without_execution(
     }
     assert plan["runtime"] == {
         "harnessRevision": "git:harness-fixture",
+        "hostMemoryBytes": 64 * 1024**3,
         "immutableImageIdentities": runtime_identity.immutable_image_identities,
         "taskRevision": "git:tasks-fixture",
         "taskRevisionAliases": {},

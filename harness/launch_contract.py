@@ -35,6 +35,14 @@ class LaunchTransientModelError(RuntimeError):
     """Pause a confirmed run after a transient provider or quota failure."""
 
 
+class LaunchResourceHaltError(RuntimeError):
+    """Pause a confirmed run after its host resource supervisor intervenes."""
+
+
+class LaunchVerifierResourceError(RuntimeError):
+    """Retry a rep whose verifier exhausted its confirmed memory budget."""
+
+
 class LaunchConfigDocument(TypedDict):
     """Resolved config fields stored in a canonical launch plan."""
 
@@ -76,10 +84,20 @@ class LaunchPathsDocument(TypedDict):
     workspace: str
 
 
+class LaunchResourceDocument(TypedDict):
+    """Confirmed container and host memory limits measured in GiB."""
+
+    additional_swap_gib: float
+    host_reserve_gib: float
+    subject_memory_gib: float
+    verifier_memory_gib: float
+
+
 class LaunchRuntimeDocument(TypedDict):
     """Exact harness, task, verifier, and immutable image identities."""
 
     harnessRevision: str
+    hostMemoryBytes: int
     immutableImageIdentities: dict[str, dict[str, str]]
     taskRevision: str
     taskRevisionAliases: dict[str, list[str]]
@@ -111,6 +129,7 @@ class LaunchPlanDocument(TypedDict):
     planIdentity: str
     policies: dict[str, object]
     preflightCells: list[dict[str, object]]
+    resources: LaunchResourceDocument
     runId: str
     runtime: LaunchRuntimeDocument
     selection: dict[str, object]
@@ -125,6 +144,16 @@ class LaunchTaskSelection:
     kind: str
     tasks: tuple[str, ...]
     name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchResourcePolicy:
+    """Bound aggregate container memory and preserve host headroom."""
+
+    subject_memory_gib: float = 12.0
+    verifier_memory_gib: float = 12.0
+    additional_swap_gib: float = 0.0
+    host_reserve_gib: float = 12.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +198,7 @@ class LaunchRequest:
     concurrency: int
     run_id: str
     policies: LaunchExecutionPolicies
+    resources: LaunchResourcePolicy = LaunchResourcePolicy()
     reuse_decisions: tuple[ExplicitResultReuseDecision, ...] = ()
 
 
@@ -181,6 +211,7 @@ class LaunchRuntimeIdentity:
     task_revision: str
     verifier_identities: Mapping[str, str]
     immutable_image_identities: Mapping[str, Mapping[str, str]]
+    host_memory_bytes: int
     task_revision_aliases: Mapping[str, frozenset[str]] = field(default_factory=dict)
     subject_capabilities: frozenset[str] = frozenset()
     available_credential_routes: frozenset[str] = frozenset()
@@ -240,6 +271,8 @@ class ConfirmedSubjectCell:
     thinking: str
     result_path: Path
     rpc_quiescence_s: float
+    run_key: str
+    state_path: Path
     subject: str
     subject_behavior: Mapping[str, object]
     subject_runner: Path
@@ -250,6 +283,7 @@ class ConfirmedSubjectCell:
     verifier_identity: str
     immutable_image_identities: Mapping[str, str]
     launch_plan_identity: str
+    resources: LaunchResourcePolicy
     reuse_provenance: Mapping[str, object] | None
     reuse_reason: str | None
     reuse_result_identity: str | None

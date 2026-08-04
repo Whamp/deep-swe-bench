@@ -180,6 +180,38 @@ def test_load_results_rejects_incompatible_selected_provenance(
     assert "harness_revision" in str(raised.value)
 
 
+def test_load_results_rejects_mixed_resource_policies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A comparison cannot combine reps produced under different limits."""
+    _write_result(tmp_path, "baseline@1.0.0", 0, 0.1, 100)
+    _write_result(tmp_path, "other@1.0.0", 0, 0.2, 200)
+    result_paths = sorted(tmp_path.glob("results/*/*/*/*/rep*/result.json"))
+    for index, result_path in enumerate(result_paths):
+        record = json.loads(result_path.read_text())
+        record["resource_policy"] = {
+            "additional_swap_gib": 0.0,
+            "host_reserve_gib": 12.0,
+            "subject_memory_gib": float(8 + index * 4),
+            "verifier_memory_gib": 12.0,
+        }
+        result_path.write_text(json.dumps(record))
+    monkeypatch.setattr(lib, "REPO", tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Comparison result provenance mismatch:",
+    ) as raised:
+        analyze.load_results(
+            MODEL,
+            "high",
+            ["baseline@1.0.0", "other@1.0.0"],
+        )
+
+    assert "resource_policy" in str(raised.value)
+
+
 def test_load_results_rejects_mixed_omp_binary_identities(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

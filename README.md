@@ -100,6 +100,10 @@ python3 -m harness.run_batch plan \
   --reps 1 \
   --workers 2 \
   --cell-retries 1 \
+  --subject-memory-gib 12 \
+  --verifier-memory-gib 12 \
+  --additional-swap-gib 0 \
+  --host-reserve-gib 12 \
   --agent-timeout 150 \
   --rpc-quiescence 2 \
   --run-id ponytail-review \
@@ -109,10 +113,11 @@ python3 -m harness.run_batch plan \
 ```
 
 Review the receipt, including warnings, model roles, credential and billing
-routes, tested subject versions, worker count, retry limit, agent timeout, RPC
-quiescence, initial-context capture, preflight cells, conditional batch fan-out,
-behavior differences, and exact paths. After approving the printed plan
-identity, execute only that stored plan:
+routes, tested subject versions, worker count, retry limit, subject/verifier
+memory limits, swap allowance, host reserve, agent timeout, RPC quiescence,
+initial-context capture, preflight cells, conditional batch fan-out, behavior
+differences, and exact paths. After approving the printed plan identity,
+execute only that stored plan:
 
 ```sh
 python3 -m harness.run_batch execute \
@@ -156,35 +161,47 @@ Open `http://127.0.0.1:8765/`. Detail levels are `summary`, `operational`, and
 inlining large raw logs. Existing `scripts/open_runboard.py` / `track.out` flows
 still work; the dashboard also lists legacy `runs/*/track.out` files when found.
 
-### Container memory watchdog
+### Container resource supervisor
 
-`scripts/container_memory_watchdog.py` is a host-side safety tool for active
-benchmark containers. It monitors running `dsw-*` containers and, after a
-sustained memory spike, kills the largest non-protected child process inside the
-container. It protects `pi`, `sleep`, shells, and zombies; if `pi` is the largest
-process, it logs an alert only. The script does not edit `result.json` or any
-official result artifact.
+Confirmed plans enforce aggregate Docker cgroup limits on every subject and
+verifier container. Equal memory and memory-swap limits disable extra swap by
+default. Planning rejects worker counts whose hard limits would consume the
+confirmed host reserve.
 
-Use it for long or high-concurrency batches when a pathological agent-written
-test could consume host RAM before `--agent-timeout` fires. Current conservative
-emergency policy:
+`scripts/container_resource_supervisor.py` is the second line of defense. It
+discovers managed containers by Docker label and never kills individual
+processes. A managed container without a hard limit fails closed. After three
+consecutive two-second samples below the plan's host reserve, the supervisor
+writes `resource-halt.json` to the run state and stops every container owned by
+the selected run. It logs outside canonical result artifacts.
+
+Run one persistent singleton through the user service manager before executing
+a benchmark plan:
 
 ```sh
-nohup setsid python3 scripts/container_memory_watchdog.py \
-  --cap-gb 12 \
-  --interval 5 \
-  --consecutive 3 \
-  --grace 10 \
-  --target 'dsw-*' \
-  --manual-log runs/container-memory-watchdog/manual_interventions.ndjson \
-  --peak-log runs/container-memory-watchdog/container_peaks.ndjson \
-  --pidfile runs/container-memory-watchdog/watchdog.pid \
-  > runs/container-memory-watchdog/watchdog.out 2>&1 < /dev/null &
+systemd-run --user \
+  --unit=deep-swe-container-resource-supervisor \
+  --property=Restart=always \
+  --property=RestartSec=2 \
+  --working-directory="$PWD" \
+  /usr/bin/python3 "$PWD/scripts/container_resource_supervisor.py"
+
+systemctl --user status deep-swe-container-resource-supervisor
 ```
 
-Run with `--dry-run` first when changing the policy. The separate logs are for
-future reference and manual-intervention auditing, not official benchmark
-reporting.
+The old `scripts/container_memory_watchdog.py` entrypoint invokes the new
+supervisor for compatibility; its per-PID policy and flags are retired.
+
+A halted run cannot schedule another rep. After fixing the pressure source,
+archive and clear the halt with an explicit reason:
+
+```sh
+python3 scripts/container_resource_supervisor.py \
+  --clear-halt results/_runs/<run-key> \
+  --clearance-reason 'reduced confirmed memory limits'
+```
+
+See [ADR-0008](docs/adr/0008-enforce-container-resource-policy.md).
 
 ### Codex OAuth models
 
@@ -362,10 +379,11 @@ Completed run summaries and social-card graphics are under `reports/`.
 - `harness/analyze.py` — paired summaries + Wilcoxon/Holm where enough pairs exist.
 - `harness/parse_usage.py` — native-session token/cost parser (+ advisor tool-usage path).
 - `harness/lib.py` — shared helpers incl. `model_leaf()`.
+- `harness/container_resources.py` — confirmed Docker limits, labels, and cgroup OOM evidence.
 - `harness/Dockerfile.pi-agent` — task image + pinned pi layer.
 - `scripts/run_dashboard.py` — polling web dashboard for `results/_runs` and legacy track files.
 - `scripts/materialize_configs.py` — build `configs/` from provenance.
 - `scripts/migrate_results.py` — migrate `runs/` -> `results/`.
-- `scripts/container_memory_watchdog.py` — host-side emergency RAM watchdog for
-  running `dsw-*` benchmark containers.
+- `scripts/container_resource_supervisor.py` — singleton run-level host memory containment.
+- `scripts/container_memory_watchdog.py` — compatibility entrypoint for the resource supervisor.
 - `docs/result-quarantine.md` — local quarantine policy for invalid/diagnostic result dirs.

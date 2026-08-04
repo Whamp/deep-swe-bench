@@ -25,11 +25,13 @@ _COMMON_RESULT_PROVENANCE_FIELDS = (
 )
 RESULT_PROVENANCE_FIELDS = (
     *_COMMON_RESULT_PROVENANCE_FIELDS,
+    "resource_policy",
     "subject_runtime_identity",
 )
 _COMPARISON_SHARED_FIELDS = (
     "harness_revision",
     "model",
+    "resource_policy",
     "subject",
     "subject_runtime_identity",
     "subject_version",
@@ -63,6 +65,7 @@ class ResultProvenance(TypedDict):
     immutable_image_identities: dict[str, str]
     model: str
     rep: int
+    resource_policy: NotRequired[dict[str, object]]
     subject: str
     subject_runtime_identity: NotRequired[dict[str, object]]
     subject_version: str
@@ -144,7 +147,7 @@ def _required_result_provenance_fields(
 ) -> tuple[str, ...]:
     """Require subject-specific runtime identity only where it exists."""
     if record.get("subject") == "omp":
-        return RESULT_PROVENANCE_FIELDS
+        return (*_COMMON_RESULT_PROVENANCE_FIELDS, "subject_runtime_identity")
     return _COMMON_RESULT_PROVENANCE_FIELDS
 
 

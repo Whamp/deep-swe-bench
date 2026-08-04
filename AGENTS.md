@@ -23,7 +23,7 @@ Use project skills instead of re-reading long cautionary prose:
   when more than the main executor model is involved. It is the source of truth
   for the confirmation table, credential preflight, thinking-level evidence,
   OpenRouter/default-provider rules, structured run-dashboard state, post-launch
-  verification, and whether to run the container memory watchdog.
+  verification, and container resource supervisor checks.
 - **runboard** — use when the user explicitly asks for a Herdr/tail view. For
   new batch launches, prefer the structured dashboard written under
   `results/_runs/<run_id>/` and served with `scripts/run_dashboard.py`; runboard
@@ -85,11 +85,12 @@ concrete support experiments.
 - For benchmark launches, “working” means the smoke gate passed and left evidence
   in the result tree. A live process, dashboard heartbeat, or an `ok` line is not
   enough.
-- For long or high-concurrency benchmark batches, consider
-  `scripts/container_memory_watchdog.py`. It is a host-side safety tool for
-  active `dsw-*` containers, logs manual interventions separately under
-  `runs/container-memory-watchdog/`, and must not mutate official `result.json`
-  artifacts.
+- Every confirmed launch must declare subject/verifier memory, additional swap,
+  and host reserve in its approved plan. Verify the persistent
+  `scripts/container_resource_supervisor.py` singleton before execution. It
+  contains complete labeled runs, writes halt evidence under structured state,
+  logs interventions separately under `runs/container-resource-supervisor/`,
+  and must not mutate official `result.json` artifacts. See ADR-0008.
 - Do not include `results/_contaminated/` in normal efficacy analyses. See
   `docs/result-quarantine.md` before using quarantined runs; those directories
   are diagnostic/harness-failure artifacts unless an analysis explicitly targets

@@ -79,23 +79,29 @@ confirmation and must not execute canonical reps.
    - Completion: every role has an available declared credential route and a
      proven thinking condition.
 
-6. **Review the atomic preflight and host safety plan.**
+6. **Review the atomic preflight and enforced resource policy.**
    - One confirmation covers the receipt's preflight cells and only the stated
      conditional fan-out. No second approval is requested after preflight.
    - Confirm each config's durable smoke contract covers generic subject health,
      native session evidence, compact usage evidence for every role, RPC
      transport, and config-owned structured assertions or stable machine markers.
-   - For long or high-concurrency launches, decide whether to run
-     `scripts/container_memory_watchdog.py`. The conservative policy remains
-     `--cap-gb 12 --interval 5 --consecutive 3 --grace 10`; its logs stay outside
-     official result artifacts.
-   - Completion: preflight, conditional fan-out, and watchdog decision are
-     explicit before any paid call.
+   - Review the plan's subject/verifier memory limits, additional swap, host
+     reserve, confirmed physical host memory, and admission arithmetic. These
+     values are behavior-defining and require renewed approval when changed.
+   - Verify the singleton `scripts/container_resource_supervisor.py` is active
+     through the host user service manager. It must discover containers by the
+     `deep-swe-bench.managed=true` label. Its logs stay outside official result
+     artifacts.
+   - A prior `resource-halt.json` blocks resume. Clear it only with
+     `--clear-halt <state-path> --clearance-reason <reason>` after the pressure
+     source is fixed; clearance archives the original halt.
+   - Completion: preflight, conditional fan-out, cgroup limits, host admission,
+     and supervisor liveness are explicit before any paid call.
 
 7. **Ask for exact-plan confirmation.**
    - Present the receipt, plan file, receipt file, plan identity, role table,
      credentials, thinking evidence, preflight contract, paths, dashboard
-     command/URL, and watchdog decision.
+     command/URL, resource policy, host admission, and supervisor status.
    - Ask the operator to approve the exact `sha256:...` plan identity. Do not
      execute until that approval appears in the current conversation.
    - Any changed behavior or plan identity requires a new receipt and renewed
@@ -129,7 +135,8 @@ confirmation and must not execute canonical reps.
    - Inspect `launch-plan.json`, `manifest.json`, `status.json`, `events.ndjson`,
      preflight diagnostics, result provenance, native sessions, role usage
      evidence, transport logs, result counts, and dashboard projection in the
-     same turn. Verify watchdog pid/log evidence when selected.
+     same turn. Verify hard Docker limits and labels on active subject and
+     verifier containers, plus supervisor process and event-log evidence.
    - Process liveness, heartbeat, a subject exit of zero, or source inspection is
      not correctness evidence.
    - Completion: plan, state, smoke evidence, provenance, fan-out, counts, and

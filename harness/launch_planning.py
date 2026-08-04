@@ -33,7 +33,7 @@ from harness.launch_contract import (
 from harness.launch_runtime import RepositoryLaunchRuntimeResolver
 from harness.run_state import sanitize_run_id
 
-_LAUNCH_PLAN_SCHEMA_VERSION = 1
+_LAUNCH_PLAN_SCHEMA_VERSION = 2
 _PI_THINKING_LEVELS = frozenset(
     {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
@@ -269,6 +269,37 @@ def _validate_launch_policies(request: LaunchRequest) -> None:
             )
 
 
+def _validate_launch_resources(request: LaunchRequest) -> None:
+    """Require finite positive memory limits and a non-negative swap limit."""
+    positive_limits = {
+        "subject memory": request.resources.subject_memory_gib,
+        "verifier memory": request.resources.verifier_memory_gib,
+        "host reserve": request.resources.host_reserve_gib,
+    }
+    for resource_name, resource_value in positive_limits.items():
+        if (
+            isinstance(resource_value, bool)
+            or not isinstance(resource_value, int | float)
+            or not math.isfinite(resource_value)
+            or resource_value <= 0
+        ):
+            raise ValueError(
+                "Launch resource policy invalid: expected finite positive GiB "
+                f"for {resource_name}; got {resource_value!r}"
+            )
+    additional_swap_gib = request.resources.additional_swap_gib
+    if (
+        isinstance(additional_swap_gib, bool)
+        or not isinstance(additional_swap_gib, int | float)
+        or not math.isfinite(additional_swap_gib)
+        or additional_swap_gib < 0
+    ):
+        raise ValueError(
+            "Launch resource policy invalid: expected finite non-negative GiB "
+            f"for additional swap; got {additional_swap_gib!r}"
+        )
+
+
 def _validate_launch_request(request: LaunchRequest) -> tuple[str, ...]:
     try:
         sanitize_run_id(request.run_id)
@@ -286,6 +317,7 @@ def _validate_launch_request(request: LaunchRequest) -> tuple[str, ...]:
             f"got {request.concurrency}"
         )
     _validate_launch_policies(request)
+    _validate_launch_resources(request)
     _require_supported_value(
         request.task_selection.kind,
         _TASK_SELECTION_KINDS,
@@ -300,6 +332,37 @@ def _validate_launch_request(request: LaunchRequest) -> tuple[str, ...]:
             "Launch task selection invalid: duplicate tasks are not allowed"
         )
     return tasks
+
+
+def _validate_launch_resource_capacity(
+    request: LaunchRequest,
+    runtime: LaunchRuntimeIdentity,
+) -> None:
+    """Reject concurrent hard limits that consume confirmed host headroom."""
+    if (
+        isinstance(runtime.host_memory_bytes, bool)
+        or not isinstance(runtime.host_memory_bytes, int)
+        or runtime.host_memory_bytes <= 0
+    ):
+        raise ValueError(
+            "Launch runtime identity unresolved: host memory must be positive"
+        )
+    per_worker_gib = max(
+        request.resources.subject_memory_gib,
+        request.resources.verifier_memory_gib,
+    )
+    reserved_gib = request.concurrency * per_worker_gib
+    required_bytes = int(
+        (reserved_gib + request.resources.host_reserve_gib) * 1024**3
+    )
+    if required_bytes > runtime.host_memory_bytes:
+        host_memory_gib = runtime.host_memory_bytes / 1024**3
+        raise ValueError(
+            "Launch resource capacity invalid: concurrent container limits "
+            f"reserve {reserved_gib:.1f} GiB plus "
+            f"{request.resources.host_reserve_gib:.1f} GiB host reserve, "
+            f"but the confirmed host has {host_memory_gib:.1f} GiB"
+        )
 
 
 def _validate_selected_tasks(tasks_root: Path, tasks: Sequence[str]) -> None:
@@ -1319,6 +1382,12 @@ def _planned_result_provenance(
         "immutable_image_identities": dict(runtime.immutable_image_identities[task]),
         "model": request.model,
         "rep": rep,
+        "resource_policy": {
+            "additional_swap_gib": request.resources.additional_swap_gib,
+            "host_reserve_gib": request.resources.host_reserve_gib,
+            "subject_memory_gib": request.resources.subject_memory_gib,
+            "verifier_memory_gib": request.resources.verifier_memory_gib,
+        },
         "subject": request.subject,
         "subject_version": runtime.subject_version,
         "task": task,
@@ -1816,6 +1885,7 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
     warnings = _receipt_warnings(document)
     subject_behavior_lines = _render_subject_behavior_lines(configs)
     policies = document["policies"]
+    resources = document["resources"]
     preflight_result_paths = {cell["resultPath"] for cell in document["preflightCells"]}
     preflight_overlap_count = sum(
         cell["resultPath"] in preflight_result_paths for cell in document["batchCells"]
@@ -1856,6 +1926,15 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
                 "Preflight-covered batch entries: "
                 f"{preflight_overlap_count}; successful preflight makes no "
                 "second subject call"
+            ),
+            (
+                "Resources: "
+                f"subject memory={resources['subject_memory_gib']} GiB; "
+                f"verifier memory={resources['verifier_memory_gib']} GiB; "
+                f"additional swap={resources['additional_swap_gib']} GiB; "
+                f"host reserve={resources['host_reserve_gib']} GiB; "
+                "confirmed host memory="
+                f"{document['runtime']['hostMemoryBytes'] / 1024**3:.1f} GiB"
             ),
             (
                 "Execution: "
@@ -1977,6 +2056,7 @@ def compile_launch_request(
         )
     runtime = runtime_resolver.resolve_launch_runtime(request, tasks)
     _require_runtime_identity(runtime, tasks)
+    _validate_launch_resource_capacity(request, runtime)
     if request.subject == "omp" and not runtime.subject_runtime_identity:
         raise ValueError(
             "Launch runtime identity unresolved: OMP binary identity missing"
@@ -2038,9 +2118,16 @@ def compile_launch_request(
         "planIdentity": "",
         "policies": cast(dict[str, object], asdict(request.policies)),
         "preflightCells": preflight_cells,
+        "resources": {
+            "additional_swap_gib": request.resources.additional_swap_gib,
+            "host_reserve_gib": request.resources.host_reserve_gib,
+            "subject_memory_gib": request.resources.subject_memory_gib,
+            "verifier_memory_gib": request.resources.verifier_memory_gib,
+        },
         "runId": request.run_id,
         "runtime": {
             "harnessRevision": runtime.harness_revision,
+            "hostMemoryBytes": runtime.host_memory_bytes,
             "immutableImageIdentities": {
                 task: dict(identities)
                 for task, identities in (runtime.immutable_image_identities.items())
