@@ -2,7 +2,7 @@
 
 ## Status
 
-Full-population semantic annotation is **blocked**. Neither GPT-5.6 Luna nor ZAI GLM-5.2 passed both hand-adjudicated accuracy and two-run repeatability at any supported reasoning level. Each gate selected no level and used no fallback.
+Full-population semantic annotation is **blocked**. GPT-5.6 Luna, ZAI GLM-5.2, and GPT-5.6 SOL each failed to pass both hand-adjudicated accuracy and two-run repeatability at any tested reasoning level. Every gate selected no level and used no fallback.
 
 This directory contains calibration evidence, not model efficacy results. Do not compute model rates from the purposive 24-unit sample or from deterministic candidate counts.
 
@@ -14,8 +14,9 @@ This directory contains calibration evidence, not model efficacy results. Do not
 4. `calibration/gold-adjudication.json` contains manual labels for the sample.
 5. `calibration/runs/<level>/run-{1,2}.json` contains two valid Luna classifications for each reasoning level.
 6. `calibration/models/zai-glm-5.2/<level>/run-{1,2}.json` contains the four valid GLM-5.2 classifications.
-7. Each model root has an `evaluation.json` that scores its runs against gold and each pair against itself.
-8. Each model root has a `selection.json` that records its fail-closed decision.
+7. `calibration/models/openai-codex-gpt-5.6-sol/<level>/run-{1,2}.json` contains the four valid SOL classifications.
+8. Each model root has an `evaluation.json` that scores its runs against gold and each pair against itself.
+9. Each model root has a `selection.json` that records its fail-closed decision.
 
 Raw facts and semantic labels never share a field:
 
@@ -54,7 +55,16 @@ ZAI GLM-5.2 used only its supported `high` and `max` levels:
 | `high` | 8 | 10 | 13 | No |
 | `max` | 9 | 11 | 10 | No |
 
-Observation and candidate-disposition labels were generally stable across both model families. GLM-5.2 also met or nearly met several action and immediate-response thresholds, but bounded outcome and especially revalidation labels remained below the gate. Its best pairwise repeatability was 13/24 exact units at `high`; each individual run also stayed below the required 14/24 exact units. Thinking level was not monotonic.
+GPT-5.6 SOL was tested at `low` and `medium`:
+
+| GPT-5.6 SOL level | Run 1 | Run 2 | Repeatability | Passed |
+| --- | ---: | ---: | ---: | --- |
+| `low` | 12 | 12 | 23 | No |
+| `medium` | 13 | 14 | 20 | No |
+
+SOL passed the full repeatability gate at both levels. Candidate disposition, observation class, action purpose, immediate response, bounded outcome, and plan revision were also strong. It remained blocked because revalidation scope scored 16/24 in both `low` runs and 17/24 in both `medium` runs, below the declared 20/24 threshold. The second `medium` run reached the 14/24 exact-unit threshold but also scored only 16/24 on uncertainty reasons.
+
+Across model families, observation and candidate-disposition labels were generally stable. GLM-5.2 met or nearly met several action and immediate-response thresholds, but bounded outcome and especially revalidation labels remained below the gate. Its best pairwise repeatability was 13/24 exact units at `high`; each individual run also stayed below the required 14/24 exact units. Thinking level was not monotonic.
 
 ## Rebuild and validate
 
@@ -81,6 +91,12 @@ uv run python run_feedback_uptake_calibration.py \
   --model zai/glm-5.2 \
   --levels high max \
   --force
+
+# GPT-5.6 SOL
+uv run python run_feedback_uptake_calibration.py \
+  --model openai-codex/gpt-5.6-sol \
+  --levels low medium \
+  --force
 ```
 
 Every run receives the same no-tool context: fixed instructions, formal schema, sample manifest, and sample units. The gold file is never attached. Nondefault model artifacts are isolated under `calibration/models/<model>/`.
@@ -98,4 +114,4 @@ Full-population annotation may begin only when the intended annotator's `selecti
 }
 ```
 
-Both current selection files contain `selected_level: null` and `full_population_authorized: false`. Do not run semantic fan-out or integrate feedback-uptake rates into the report while that remains true.
+All current selection files contain `selected_level: null` and `full_population_authorized: false`. Do not run semantic fan-out or integrate feedback-uptake rates into the report while that remains true.
