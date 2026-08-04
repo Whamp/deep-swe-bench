@@ -176,7 +176,12 @@ def _confirmed_subject_cell(
         subject_runtime_identity=dict(subject_runtime_identity),
         subject_version=subject["version"],
         harness_revision=document["runtime"]["harnessRevision"],
-        task_revision=document["runtime"]["taskRevision"],
+        task_revision=str(
+            cell_document.get(
+                "taskRevision",
+                document["runtime"]["taskRevision"],
+            )
+        ),
         verifier_identity=verifier_identity,
         immutable_image_identities={
             str(name): str(identity) for name, identity in image_identities.items()
@@ -610,6 +615,15 @@ def _runtime_input_drift_changes(
         "selected-tasks",
         approved["taskRevision"],
         observed.task_revision,
+    )
+    compare(
+        "task-revision-aliases",
+        "selected-subsets",
+        approved.get("taskRevisionAliases", {}),
+        {
+            revision: sorted(alias_tasks)
+            for revision, alias_tasks in sorted(observed.task_revision_aliases.items())
+        },
     )
     for task in sorted(tasks):
         compare(

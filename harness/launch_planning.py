@@ -37,9 +37,7 @@ _LAUNCH_PLAN_SCHEMA_VERSION = 1
 _PI_THINKING_LEVELS = frozenset(
     {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
-_OMP_THINKING_LEVELS = frozenset(
-    {"off", "minimal", "low", "medium", "high", "xhigh"}
-)
+_OMP_THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh"})
 _THINKING_LEVELS = _PI_THINKING_LEVELS | _OMP_THINKING_LEVELS
 _TASK_SELECTION_KINDS = frozenset({"tasks", "subset", "range", "all"})
 _PREFLIGHT_POLICIES = frozenset({"disabled", "new-configs", "required"})
@@ -356,6 +354,17 @@ def _require_runtime_identity(
         )
         unresolved.extend(
             requirement for missing, requirement in task_requirements if missing
+        )
+    selected_tasks = frozenset(tasks)
+    invalid_aliases = {
+        revision: sorted(alias_tasks)
+        for revision, alias_tasks in runtime.task_revision_aliases.items()
+        if not revision or not alias_tasks or not alias_tasks <= selected_tasks
+    }
+    if invalid_aliases:
+        raise ValueError(
+            "Launch runtime identity invalid: task revision aliases must be "
+            f"non-empty selected-task sets; aliases={invalid_aliases!r}"
         )
     if unresolved:
         raise ValueError(
@@ -1299,6 +1308,8 @@ def _planned_result_provenance(
     config: LaunchConfigDocument,
     task: str,
     rep: int,
+    *,
+    task_revision: str | None = None,
 ) -> result_provenance.ResultProvenance:
     """Build the exact modern provenance required for automatic reuse."""
     provenance: result_provenance.ResultProvenance = {
@@ -1311,7 +1322,7 @@ def _planned_result_provenance(
         "subject": request.subject,
         "subject_version": runtime.subject_version,
         "task": task,
-        "task_revision": runtime.task_revision,
+        "task_revision": task_revision or runtime.task_revision,
         "thinking_level": request.thinking,
         "verifier_identity": runtime.verifier_identities[task],
     }
@@ -1320,14 +1331,108 @@ def _planned_result_provenance(
     return provenance
 
 
+def _task_revision_matches_alias(
+    runtime: LaunchRuntimeIdentity,
+    task: str,
+    revision: object,
+) -> bool:
+    """Return whether a recorded revision reproduces a selected nested subset."""
+    return isinstance(revision, str) and task in runtime.task_revision_aliases.get(
+        revision, frozenset()
+    )
+
+
+def _planned_task_revisions(
+    results_root: Path,
+    request: LaunchRequest,
+    tasks: tuple[str, ...],
+    configs: Sequence[LaunchConfigDocument],
+    comparison_baseline: LaunchConfigDocument,
+    runtime: LaunchRuntimeIdentity,
+) -> dict[str, str]:
+    """Keep one verified task revision across selected and baseline configs."""
+    config_documents = {config["identity"]: config for config in configs}
+    config_documents.setdefault(
+        comparison_baseline["identity"],
+        comparison_baseline,
+    )
+    revisions: dict[str, str] = {}
+    for task in tasks:
+        candidates: set[str] = set()
+        for config_identity, config in config_documents.items():
+            for rep in range(request.reps):
+                result_path = _cell_result_path(
+                    results_root,
+                    request,
+                    config_identity,
+                    task,
+                    rep,
+                )
+                if not result_path.is_file():
+                    continue
+                record = result_provenance.read_result_record(result_path)
+                planned_provenance = _planned_result_provenance(
+                    request,
+                    runtime,
+                    config,
+                    task,
+                    rep,
+                )
+                mismatches = result_provenance.result_provenance_mismatches(
+                    record,
+                    planned_provenance,
+                )
+                explicit_decision, _ = _matching_explicit_reuse_decision(
+                    result_path,
+                    record,
+                    request.reuse_decisions,
+                )
+                if explicit_decision is not None:
+                    candidates.add(runtime.task_revision)
+                    continue
+                recorded_revision = record.get("task_revision")
+                if not mismatches:
+                    candidates.add(runtime.task_revision)
+                    continue
+                if set(mismatches) == {"task_revision"} and (
+                    _task_revision_matches_alias(
+                        runtime,
+                        task,
+                        recorded_revision,
+                    )
+                ):
+                    candidates.add(cast(str, recorded_revision))
+                    continue
+                raise ValueError(
+                    f"Result provenance mismatch: path={result_path}; "
+                    f"incompatible fields={mismatches!r}"
+                )
+        if len(candidates) > 1:
+            raise ValueError(
+                "Result provenance mismatch: conflicting compatible task "
+                f"revisions for task={task!r}; revisions={sorted(candidates)!r}"
+            )
+        revisions[task] = next(iter(candidates), runtime.task_revision)
+    return revisions
+
+
 def _batch_cells(
     results_root: Path,
     request: LaunchRequest,
     tasks: tuple[str, ...],
     configs: Sequence[LaunchConfigDocument],
+    comparison_baseline: LaunchConfigDocument,
     runtime: LaunchRuntimeIdentity,
 ) -> list[dict[str, object]]:
     configs_by_identity = {config["identity"]: config for config in configs}
+    task_revisions = _planned_task_revisions(
+        results_root,
+        request,
+        tasks,
+        configs,
+        comparison_baseline,
+        runtime,
+    )
     matched_decisions: set[Path] = set()
     cells: list[dict[str, object]] = []
     for task in tasks:
@@ -1352,6 +1457,7 @@ def _batch_cells(
                         configs_by_identity[config_identity],
                         task,
                         rep,
+                        task_revision=task_revisions[task],
                     )
                     mismatches = result_provenance.result_provenance_mismatches(
                         record,
@@ -1376,7 +1482,11 @@ def _batch_cells(
                         )
                     elif request.policies.existing_results == "require-compatible":
                         reuse_provenance = planned_provenance
-                        reuse_reason = "compatible_existing_result"
+                        reuse_reason = (
+                            "compatible_nested_subset_result"
+                            if task_revisions[task] != runtime.task_revision
+                            else "compatible_existing_result"
+                        )
                         reuse_result_identity = result_provenance.result_file_identity(
                             result_path
                         )
@@ -1392,6 +1502,7 @@ def _batch_cells(
                         "reuseReason": reuse_reason,
                         "reuseResultIdentity": reuse_result_identity,
                         "task": task,
+                        "taskRevision": task_revisions[task],
                     }
                 )
     unmatched_decisions = sorted(
@@ -1472,6 +1583,7 @@ def _preflight_cells(
                 "reuseReason": batch_cell.get("reuseReason"),
                 "reuseResultIdentity": batch_cell.get("reuseResultIdentity"),
                 "task": task,
+                "taskRevision": batch_cell.get("taskRevision"),
             }
         )
     return cells
@@ -1558,10 +1670,7 @@ def _role_call_summary(role: Mapping[str, object]) -> str:
                 f"{calls_per_rep} executor {session_label}/rep; "
                 f"max concurrency {max_concurrency}"
             )
-        return (
-            f"{calls_per_rep} calls/rep; "
-            f"max concurrency {max_concurrency}"
-        )
+        return f"{calls_per_rep} calls/rep; max concurrency {max_concurrency}"
     return (
         f"max {behavior.get('maxCallsPerRep', '-')} calls/rep; "
         f"max concurrency {max_concurrency}"
@@ -1688,6 +1797,8 @@ def _render_planned_cell_lines(
         )
         if include_smoke:
             line += f" | smoke={cell.get('contractPath') or '-'}"
+        if cell.get("reuseReason") is not None:
+            line += f" | reuse={cell.get('reuseReason')}"
         lines.append(line)
     return lines
 
@@ -1705,12 +1816,12 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
     warnings = _receipt_warnings(document)
     subject_behavior_lines = _render_subject_behavior_lines(configs)
     policies = document["policies"]
-    preflight_result_paths = {
-        cell["resultPath"] for cell in document["preflightCells"]
-    }
+    preflight_result_paths = {cell["resultPath"] for cell in document["preflightCells"]}
     preflight_overlap_count = sum(
-        cell["resultPath"] in preflight_result_paths
-        for cell in document["batchCells"]
+        cell["resultPath"] in preflight_result_paths for cell in document["batchCells"]
+    )
+    reusable_batch_count = sum(
+        cell.get("reuseReason") is not None for cell in document["batchCells"]
     )
     lines = ["LAUNCH RECEIPT", "WARNINGS"]
     lines.extend(f"- {warning}" for warning in warnings)
@@ -1735,6 +1846,11 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
             (
                 f"Cells: {counts['preflightCells']} preflight; "
                 f"{counts['batchCells']} batch"
+            ),
+            f"Reusable completed batch entries: {reusable_batch_count}",
+            (
+                "Remaining batch attempts: "
+                f"{counts['batchCells'] - reusable_batch_count}"
             ),
             (
                 "Preflight-covered batch entries: "
@@ -1871,6 +1987,7 @@ def compile_launch_request(
         request,
         tasks,
         config_plans,
+        comparison_baseline,
         runtime,
     )
     preflight_cells = _preflight_cells(
@@ -1929,6 +2046,12 @@ def compile_launch_request(
                 for task, identities in (runtime.immutable_image_identities.items())
             },
             "taskRevision": runtime.task_revision,
+            "taskRevisionAliases": {
+                revision: sorted(alias_tasks)
+                for revision, alias_tasks in sorted(
+                    runtime.task_revision_aliases.items()
+                )
+            },
             "verifierIdentities": dict(runtime.verifier_identities),
         },
         "selection": selection,

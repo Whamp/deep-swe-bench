@@ -82,6 +82,7 @@ class LaunchRuntimeDocument(TypedDict):
     harnessRevision: str
     immutableImageIdentities: dict[str, dict[str, str]]
     taskRevision: str
+    taskRevisionAliases: dict[str, list[str]]
     verifierIdentities: dict[str, str]
 
 
@@ -180,6 +181,7 @@ class LaunchRuntimeIdentity:
     task_revision: str
     verifier_identities: Mapping[str, str]
     immutable_image_identities: Mapping[str, Mapping[str, str]]
+    task_revision_aliases: Mapping[str, frozenset[str]] = field(default_factory=dict)
     subject_capabilities: frozenset[str] = frozenset()
     available_credential_routes: frozenset[str] = frozenset()
     subject_runtime_identity: Mapping[str, object] = field(default_factory=dict)

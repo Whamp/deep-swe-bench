@@ -33,11 +33,11 @@ _COMPARISON_SHARED_FIELDS = (
     "subject",
     "subject_runtime_identity",
     "subject_version",
-    "task_revision",
     "thinking_level",
 )
 _COMPARISON_TASK_FIELDS = (
     "immutable_image_identities",
+    "task_revision",
     "verifier_identity",
 )
 _MODERN_PROVENANCE_MARKERS = frozenset(
@@ -113,9 +113,7 @@ def recorded_result_provenance(
 ) -> dict[str, object]:
     """Retain only provenance actually recorded by a result artifact."""
     return {
-        field: record[field]
-        for field in RESULT_PROVENANCE_FIELDS
-        if field in record
+        field: record[field] for field in RESULT_PROVENANCE_FIELDS if field in record
     }
 
 
@@ -201,9 +199,7 @@ def _comparison_shared_mismatches(
     """Compare provenance fixed across every result in a comparison."""
     current = {field: record.get(field) for field in _COMPARISON_SHARED_FIELDS}
     mismatches = (
-        {}
-        if reference is None
-        else _reference_field_mismatches(current, reference)
+        {} if reference is None else _reference_field_mismatches(current, reference)
     )
     return current, mismatches
 
@@ -231,10 +227,8 @@ def _comparison_task_mismatches(
     selected: ComparisonResult,
     task_provenance: dict[str, dict[str, object]],
 ) -> dict[str, object]:
-    """Compare verifier and image identity within one paired task."""
-    current = {
-        field: selected.record.get(field) for field in _COMPARISON_TASK_FIELDS
-    }
+    """Compare task revision, verifier, and images within one paired task."""
+    current = {field: selected.record.get(field) for field in _COMPARISON_TASK_FIELDS}
     reference = task_provenance.setdefault(selected.task, current)
     return _reference_field_mismatches(current, reference)
 
@@ -324,9 +318,7 @@ def require_compatible_comparison_results(
             shared_reference = current_shared
         mismatches.update(shared_mismatches)
         mismatches.update(_comparison_lock_mismatches(selected, config_locks))
-        mismatches.update(
-            _comparison_task_mismatches(selected, task_provenance)
-        )
+        mismatches.update(_comparison_task_mismatches(selected, task_provenance))
         if mismatches:
             raise _comparison_provenance_error(
                 selected.result_path,

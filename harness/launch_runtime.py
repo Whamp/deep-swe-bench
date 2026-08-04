@@ -154,6 +154,34 @@ class RepositoryLaunchRuntimeResolver:
             [self.tasks_root / task for task in tasks],
         )
 
+    def _task_revision_aliases(
+        self,
+        tasks: tuple[str, ...],
+    ) -> dict[str, frozenset[str]]:
+        """Map reproducible nested-subset revisions to their selected tasks."""
+        selected_tasks = frozenset(tasks)
+        aliases: dict[str, set[str]] = {self._task_revision(tasks): set(selected_tasks)}
+        subsets_root = self.repository_root / "subsets"
+        if not subsets_root.is_dir():
+            return {
+                revision: frozenset(alias_tasks)
+                for revision, alias_tasks in aliases.items()
+            }
+        for subset_path in sorted(subsets_root.glob("*.txt")):
+            subset_tasks = tuple(
+                line
+                for raw_line in subset_path.read_text().splitlines()
+                if (line := raw_line.strip()) and not line.startswith("#")
+            )
+            if not subset_tasks or not frozenset(subset_tasks) <= selected_tasks:
+                continue
+            revision = self._task_revision(subset_tasks)
+            aliases.setdefault(revision, set()).update(subset_tasks)
+        return {
+            revision: frozenset(alias_tasks)
+            for revision, alias_tasks in aliases.items()
+        }
+
     def _verifier_identity(self, task: str) -> str:
         verifier_root = self.tasks_root / task / "tests"
         if not verifier_root.is_dir():
@@ -241,6 +269,7 @@ class RepositoryLaunchRuntimeResolver:
             task_revision=self._task_revision(tasks),
             verifier_identities=verifier_identities,
             immutable_image_identities=image_identities,
+            task_revision_aliases=self._task_revision_aliases(tasks),
             subject_capabilities=subject_capabilities,
             available_credential_routes=self._available_credential_routes(
                 request.subject
