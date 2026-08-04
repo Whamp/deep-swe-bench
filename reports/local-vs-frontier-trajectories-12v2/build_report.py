@@ -10,6 +10,7 @@ from typing import Any
 
 REPORT_ROOT = Path(__file__).resolve().parent
 ANALYSIS_PATH = REPORT_ROOT / "analysis.json"
+FEEDBACK_ANALYSIS_PATH = REPORT_ROOT / "feedback-uptake/analysis-v2.json"
 MODEL_LABELS = {
     "frontier": "GPT-5.6 SOL",
     "agentworld": "AgentWorld",
@@ -200,6 +201,30 @@ def render_timing_rows(analysis: dict[str, Any]) -> str:
     return "".join(rows)
 
 
+def render_feedback_uptake_rows(feedback: dict[str, Any]) -> str:
+    """Render unseen feedback candidates with explicit event-level denominators."""
+    rows = []
+    for model_key in ("frontier", "agentworld", "thinkingcap"):
+        summary = feedback["models"][model_key]
+        density = feedback["candidate_density"][model_key]
+        outcomes = summary["window_outcome_counts"]
+        rows.append(
+            "<tr>"
+            f"<td><strong>{MODEL_LABELS[model_key]}</strong></td>"
+            f"<td class='num'>{summary['candidate_units']}</td>"
+            f"<td class='num'>{density['candidate_units_per_100_tool_calls']:.1f}</td>"
+            f"<td class='num'>{summary['negative_feedback']}</td>"
+            f"<td class='num'>{outcomes.get('recovered', 0)} <span class='muted'>({format_percent(summary['recovery_rate'], 1)})</span></td>"
+            f"<td class='num'>{outcomes.get('progressed', 0)}</td>"
+            f"<td class='num'>{outcomes.get('not_recovered', 0)} <span class='muted'>({format_percent(summary['not_recovered_rate'], 1)})</span></td>"
+            f"<td class='num'>{format_percent(summary['relevant_change_rate'], 1)}</td>"
+            f"<td class='num'>{format_percent(summary['post_change_validation_rate'], 1)}</td>"
+            f"<td class='num'>{summary['schema_invalid_tool_arguments']}</td>"
+            "</tr>"
+        )
+    return "".join(rows)
+
+
 def render_decision_cards(analysis: dict[str, Any]) -> str:
     """Render selected task packets with concrete decision divergence evidence."""
     cards = []
@@ -346,6 +371,7 @@ def render_gap_pair_rows(analysis: dict[str, Any]) -> str:
 def build_report() -> str:
     """Build the complete self-contained frontier-gap report."""
     analysis = json.loads(ANALYSIS_PATH.read_text())
+    feedback = json.loads(FEEDBACK_ANALYSIS_PATH.read_text())
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Local-model trajectory gaps against GPT-5.6 SOL</title>
@@ -357,8 +383,8 @@ def build_report() -> str:
 <header class="hero">
 <span class="eyebrow">12 tasks · 3 repetitions · 3 models · 108 trajectories</span>
 <h1>The local gap opens before validation.</h1>
-<p class="subtitle">Every model ran every task three times. The aggregate comparison uses all 36 trajectories per model. GPT‑5.6 SOL usually builds a broader repository model before editing; AgentWorld repeatedly rereads a narrower surface; ThinkingCap explores more broadly but commits to an architecture earlier. A separate tool-result audit finds a real edit-call problem—especially for AgentWorld—alongside ordinary failing tests and shell commands.</p>
-<div class="pillrow"><span class="pill caution">AgentWorld · 43% frontier-file overlap</span><span class="pill caution">ThinkingCap · 61% overlap</span><span class="pill neutral">Frontier · 24/36 solved</span><span class="pill neutral">47 model/rep gap comparisons</span><span class="pill neutral">Nine detailed examples</span></div>
+<p class="subtitle">Every model ran every task three times. The aggregate comparison uses all 36 trajectories per model. GPT‑5.6 SOL usually builds a broader repository model before editing; AgentWorld repeatedly rereads a narrower surface; ThinkingCap explores more broadly but commits to an architecture earlier. A separate 108-trajectory feedback audit shows that the locals usually react to negative results, but less often close the issue before moving on.</p>
+<div class="pillrow"><span class="pill caution">AgentWorld · 43% frontier-file overlap</span><span class="pill caution">ThinkingCap · 61% overlap</span><span class="pill neutral">Frontier · 24/36 solved</span><span class="pill neutral">47 model/rep gap comparisons</span><span class="pill neutral">1,165 unseen feedback cases</span><span class="pill neutral">Nine detailed examples</span></div>
 <div class="stats">
 <div class="stat"><span class="label">AgentWorld median files</span><span class="value">11.5 vs 16.5</span><span class="sub">local vs aligned frontier</span></div>
 <div class="stat"><span class="label">ThinkingCap median files</span><span class="value">14 vs 16</span><span class="sub">local vs aligned frontier</span></div>
@@ -408,6 +434,17 @@ def build_report() -> str:
 <div class="callout good"><strong>What is and is not broken:</strong> the server successfully parsed these calls and there were no raw tool-call leaks. The malformed calls are valid JSON with the wrong <code>edit</code> schema. A conservative adapter could repair the two unambiguous shapes, but that would only save wasted turns; it would not fix the larger repository-understanding failures.</div>
 </section>
 
+<section><div class="section-head"><div><h2>What happens after negative feedback</h2><p>A deterministic detector found 1,237 bounded candidate windows across all 108 trajectories. The 72 cases used to develop or test the rubric are excluded below. Luna‑xhigh—selected only after two passing accuracy runs and a passing repeatability check—classified the remaining 1,165 unseen cases. These are flagged events, not independent task episodes.</p></div></div>
+<div class="table-wrap"><table><thead><tr><th>Model</th><th class="num">Unseen candidates</th><th class="num">Flagged / 100 calls</th><th class="num">Visible negative</th><th class="num">Recovered</th><th class="num">Progressed</th><th class="num">Not recovered</th><th class="num">Relevant change</th><th class="num">Validated after change</th><th class="num">Bad tool arguments</th></tr></thead><tbody>{render_feedback_uptake_rows(feedback)}</tbody></table></div>
+<div class="grid-2">
+<div class="callout good"><strong>The local models usually react.</strong> Among visible negative events, {format_percent(feedback["models"]["agentworld"]["progress_or_recovery_rate"], 1)} of AgentWorld cases and {format_percent(feedback["models"]["thinkingcap"]["progress_or_recovery_rate"], 1)} of ThinkingCap cases either progressed or recovered. “The locals ignore tool feedback” is not supported.</div>
+<div class="callout caution"><strong>They close fewer loops.</strong> Event-level recovery was {format_percent(feedback["models"]["frontier"]["recovery_rate"], 1)} for GPT‑5.6, {format_percent(feedback["models"]["agentworld"]["recovery_rate"], 1)} for AgentWorld, and {format_percent(feedback["models"]["thinkingcap"]["recovery_rate"], 1)} for ThinkingCap. Equal-weighted trajectory medians were {format_percent(feedback["models"]["frontier"]["trajectory_median_recovery_rate"], 1)}, {format_percent(feedback["models"]["agentworld"]["trajectory_median_recovery_rate"], 1)}, and {format_percent(feedback["models"]["thinkingcap"]["trajectory_median_recovery_rate"], 1)}.</div>
+<div class="callout"><strong>ThinkingCap does test after changing code.</strong> Among events with a relevant change, post-change validation appeared in {format_percent(feedback["models"]["thinkingcap"]["post_change_validation_rate"], 1)} of ThinkingCap cases versus {format_percent(feedback["models"]["frontier"]["post_change_validation_rate"], 1)} for GPT‑5.6. AgentWorld was lower at {format_percent(feedback["models"]["agentworld"]["post_change_validation_rate"], 1)}. This reinforces the earlier result: generic “run more tests” guidance is not the main ThinkingCap intervention.</div>
+<div class="callout caution"><strong>AgentWorld absorbs tool-shape mistakes, but pays for them.</strong> The unseen corpus contains {feedback["models"]["agentworld"]["schema_invalid_tool_arguments"]} AgentWorld schema-invalid calls: {feedback["models"]["agentworld"]["schema_invalid_outcome_counts"].get("recovered", 0)} recovered, {feedback["models"]["agentworld"]["schema_invalid_outcome_counts"].get("progressed", 0)} progressed, and {feedback["models"]["agentworld"]["schema_invalid_outcome_counts"].get("not_recovered", 0)} did not recover. ThinkingCap had {feedback["models"]["thinkingcap"]["schema_invalid_tool_arguments"]} such cases.</div>
+</div>
+<div class="callout caution"><strong>Interpretation limit:</strong> candidate windows can overlap, and models encounter different mixes of failures. The “flagged per 100 calls” column uses all detector candidates; semantic rates use only the 1,165 unseen annotations. These numbers describe feedback handling, not solve probability or a causal model comparison. <a href="feedback-uptake/analysis-v2.json">Download the feedback dataset</a>.</div>
+</section>
+
 <section><div class="section-head"><div><h2>Recurring task-analysis patterns</h2><p>These patterns combine the 47-pair aggregate with direct evidence from the nine packets below.</p></div></div>
 <div class="grid-3">
 <article class="pattern"><div class="number">01</div><h3>Requirements become a checklist, not a dependency model</h3><p>Local reasoning often restates every requirement accurately, then implements each near the first plausible file. Frontier trajectories trace producers, consumers, persistence, round trips, and error attribution before choosing seams.</p></article>
@@ -440,7 +477,8 @@ def build_report() -> str:
 <section><div class="section-head"><div><h2>Provenance and limits</h2></div></div>
 <div class="callout"><strong>Reference role:</strong> GPT-5.6 SOL high is a capability reference, not an expected peer. The stock-Pi 36_v2 run supplies all 36 matching trajectories and solves 24. Both local subjects supply all 36 trajectories.</div>
 <div class="callout caution"><strong>Artifact compatibility:</strong> user prompts match exactly and every completed verifier surface has matching F2P/P2P denominators. The frontier run predates embedded harness, task, verifier, and Pi-version identities, so compatibility is evidenced but not cryptographically sealed. System-prompt differences are limited to later Pi environment-variable documentation.</div>
-<div class="callout"><strong>Measurement limit:</strong> file coverage records successful exact content targets. It cannot prove comprehension, and shell parsing can undercount dynamic paths. Decision classifications combine those metrics with patches, validation commands, final summaries, and verifier failures.</div></section>
+<div class="callout"><strong>Measurement limit:</strong> file coverage records successful exact content targets. It cannot prove comprehension, and shell parsing can undercount dynamic paths. Decision classifications combine those metrics with patches, validation commands, final summaries, and verifier failures.</div>
+<div class="callout"><strong>Feedback-label calibration:</strong> the first clarified rubric round remained blocked. One predeclared repair round then used new worked examples and a fresh held-out sample that excluded every earlier test case. Luna‑xhigh passed at 15/24 and 14/24 exact units, with 18/24 repeatability; GLM‑5.2 max did not pass. All 72 development or held-out cases across the three calibration sets are excluded from the 1,165-event semantic analysis.</div></section>
 
 <div class="foot">Derived from canonical result artifacts, Pi session JSONL, model patches, initial-context captures, task metadata, and CTRF verifier output. <a href="analysis.json">Download the analysis dataset</a>. Packet links provide per-cell evidence.</div>
 </div></body></html>"""
