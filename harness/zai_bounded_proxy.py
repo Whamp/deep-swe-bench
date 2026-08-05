@@ -114,8 +114,8 @@ def extract_usage(response_body: bytes, content_type: str) -> dict[str, object] 
     return _json_usage(response_body)
 
 
-def requests_use_zai_max_thinking(path: Path) -> bool:
-    """Return whether every admitted request used ZAI's maximum thinking shape."""
+def summarize_zai_request_thinking(path: Path) -> dict[str, int | bool]:
+    """Separate tool-enabled executor requests from tool-free maintenance calls."""
     admitted_requests: list[dict[str, object]] = []
     if path.exists():
         for line in path.read_text().splitlines():
@@ -125,10 +125,24 @@ def requests_use_zai_max_thinking(path: Path) -> bool:
                 continue
             if isinstance(record, dict) and record.get("event") == "request_admitted":
                 admitted_requests.append(record)
-    return bool(admitted_requests) and all(
-        record.get("enableThinking") is True and record.get("reasoningEffort") is None
+    executor_requests = [
+        record
         for record in admitted_requests
-    )
+        if isinstance(record.get("toolCount"), int) and record["toolCount"] > 0
+    ]
+    max_thinking_requests = [
+        record
+        for record in executor_requests
+        if record.get("enableThinking") is True
+        and record.get("reasoningEffort") is None
+    ]
+    return {
+        "executor_requests": len(executor_requests),
+        "executor_max_thinking_requests": len(max_thinking_requests),
+        "executor_wire_max_thinking": bool(executor_requests)
+        and len(max_thinking_requests) == len(executor_requests),
+        "maintenance_requests": len(admitted_requests) - len(executor_requests),
+    }
 
 
 def aggregate_usage(path: Path) -> dict[str, int]:
@@ -240,12 +254,14 @@ def make_server(
                 request_document = {}
             if not isinstance(request_document, dict):
                 request_document = {}
+            tools = request_document.get("tools")
             usage_log.append(
                 {
                     "event": "request_admitted",
                     "request": request_number,
                     "enableThinking": request_document.get("enable_thinking"),
                     "reasoningEffort": request_document.get("reasoning_effort"),
+                    "toolCount": len(tools) if isinstance(tools, list) else 0,
                 }
             )
             upstream_request = urllib.request.Request(

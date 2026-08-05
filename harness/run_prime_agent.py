@@ -526,6 +526,9 @@ def run_cell(
         if isinstance(admitted_requests, int)
         else provider_usage["requests"]
     )
+    request_thinking = zai_bounded_proxy.summarize_zai_request_thinking(
+        cell / ZAI_PROXY_USAGE_PATH
+    )
     rec = result_record(
         task,
         config,
@@ -544,9 +547,14 @@ def run_cell(
         prime_agent_reasoning_tokens=provider_usage["reasoning"],
         prime_agent_requests_admitted=status.get("prime_agent_requests_admitted"),
         prime_agent_peak_concurrency=status.get("prime_agent_peak_concurrency"),
-        prime_agent_wire_max_thinking=zai_bounded_proxy.requests_use_zai_max_thinking(
-            cell / ZAI_PROXY_USAGE_PATH
-        ),
+        prime_agent_executor_requests=request_thinking["executor_requests"],
+        prime_agent_executor_max_thinking_requests=request_thinking[
+            "executor_max_thinking_requests"
+        ],
+        prime_agent_executor_wire_max_thinking=request_thinking[
+            "executor_wire_max_thinking"
+        ],
+        prime_agent_maintenance_requests=request_thinking["maintenance_requests"],
         system_preamble_chars=len(cfg.get("system_preamble") or ""),
         orchestration_chars=len(cfg.get("orchestration") or ""),
         append_system_prompt_chars=len(append_text),

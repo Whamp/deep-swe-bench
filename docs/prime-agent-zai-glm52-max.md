@@ -65,6 +65,13 @@ real CLI: `enable_thinking: true` with `reasoning_effort` absent. Prime Agent's
 session metadata labeled that run `high`, so release 1.1.0 validates the provider
 request instead of relying on that inconsistent session label.
 
+Prime Agent also makes tool-free maintenance calls for automatic refinement.
+Its source deliberately disables reasoning for those calls because they must
+return machine-readable JSON. A live 1.1.0 preflight recorded 66 tool-enabled
+coding requests with maximum thinking and three tool-free maintenance requests
+with thinking disabled. The smoke contract checks maximum thinking only on the
+tool-enabled coding requests. It still counts every request toward usage.
+
 The provider-response probes in the project Z.ai reference exercised the same
 coding endpoint and captured reasoning content and reasoning-token usage:
 
@@ -97,9 +104,10 @@ Prime Agent 0.7.0 exposes no native total-child or live-child concurrency
 setting. Release 1.1.0 sends every ZAI call through a local accounting proxy
 without limiting the total request count. The proxy allows at most eight calls
 at once to stay within the subscription's concurrency allowance. It writes
-status, reasoning controls, and usage only; it does not persist prompts,
-streamed text, tool calls, or responses. The task's normal agent timeout and
-container resource policy remain the outer limits.
+status, reasoning controls, tool count, and usage only; it does not persist
+prompts, streamed text, tool definitions, tool arguments, or responses. The
+task's normal agent timeout and container resource policy remain the outer
+limits.
 
 Release 1.0.0 used an experimental 64-request cutoff. Its first live preflight
 reached that cutoff, so the run stopped before batch fan-out and the release was
