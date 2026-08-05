@@ -211,6 +211,21 @@ class RepositoryConfirmedOmpRunner:
         return dict(_run_planned_subject_process(cell, self.task_root))
 
 
+class RepositoryConfirmedPrimeAgentRunner:
+    """Run Prime Agent using only inputs from a confirmed launch plan."""
+
+    def __init__(self, task_root: Path) -> None:
+        """Bind confirmed Prime Agent execution to the planned task corpus."""
+        self.task_root = task_root
+
+    def run_confirmed_prime_agent_cell(
+        self,
+        cell: launch.ConfirmedPrimeAgentCell,
+    ) -> dict[str, object]:
+        """Execute one plan-resolved Prime Agent rep without raw writes."""
+        return dict(_run_planned_subject_process(cell, self.task_root))
+
+
 class RepositoryConfirmedPiRunner:
     """Run Pi with only config and cell paths resolved by a confirmed plan."""
 
@@ -387,6 +402,8 @@ def runner_script(args) -> Path:
         return HERE / "run.py"
     if agent == "omp":
         return HERE / "run_omp.py"
+    if agent == "prime-agent":
+        return HERE / "run_prime_agent.py"
     raise ValueError(f"unknown benchmark agent: {agent}")
 
 
@@ -794,7 +811,7 @@ def _legacy_main() -> None:
     ap.add_argument("--tasks", help="comma list of task ids")
     ap.add_argument("--range", help="range over sorted task ids, e.g. 0:10")
     ap.add_argument("--subset", help="named subset in subsets/<name>.txt (one task id per line)")
-    ap.add_argument("--agent", choices=["pi", "omp"], default="pi",
+    ap.add_argument("--agent", choices=["pi", "omp", "prime-agent"], default="pi",
                     help="coding agent runner to use inside task containers (default: pi)")
     ap.add_argument("--model", default="openrouter/deepseek/deepseek-v4-flash")
     ap.add_argument("--thinking", default="high",
@@ -898,7 +915,9 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
         "plan",
         help="compile a model-free launch plan and review receipt",
     )
-    plan_parser.add_argument("--subject", choices=["pi", "omp"], required=True)
+    plan_parser.add_argument(
+        "--subject", choices=["pi", "omp", "prime-agent"], required=True
+    )
     plan_parser.add_argument("--model", required=True)
     plan_parser.add_argument(
         "--thinking",
@@ -1089,6 +1108,7 @@ def main(
     runtime_resolver: launch.LaunchRuntimeResolver | None = None,
     pi_runner: launch.ConfirmedPiRunner | None = None,
     omp_runner: launch.ConfirmedOmpRunner | None = None,
+    prime_agent_runner: launch.ConfirmedPrimeAgentRunner | None = None,
 ) -> None:
     """Prepare or execute canonical batches through the confirmed-plan seam."""
     arguments = list(argv) if argv is not None else sys.argv[1:]
@@ -1130,6 +1150,8 @@ def main(
         pi_runner = RepositoryConfirmedPiRunner(task_root)
     if subject == "omp" and omp_runner is None:
         omp_runner = RepositoryConfirmedOmpRunner(task_root)
+    if subject == "prime-agent" and prime_agent_runner is None:
+        prime_agent_runner = RepositoryConfirmedPrimeAgentRunner(task_root)
     try:
         execution = launch.execute_confirmed_launch(
             plan,
@@ -1137,6 +1159,7 @@ def main(
             runtime_resolver=runtime_resolver,
             pi_runner=pi_runner,
             omp_runner=omp_runner,
+            prime_agent_runner=prime_agent_runner,
             transient_resumer=transient_resumer,
         )
     except launch.LaunchTransientModelError as error:

@@ -38,7 +38,10 @@ _PI_THINKING_LEVELS = frozenset(
     {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
 _OMP_THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh"})
-_THINKING_LEVELS = _PI_THINKING_LEVELS | _OMP_THINKING_LEVELS
+_PRIME_AGENT_THINKING_LEVELS = frozenset({"max"})
+_THINKING_LEVELS = (
+    _PI_THINKING_LEVELS | _OMP_THINKING_LEVELS | _PRIME_AGENT_THINKING_LEVELS
+)
 _TASK_SELECTION_KINDS = frozenset({"tasks", "subset", "range", "all"})
 _PREFLIGHT_POLICIES = frozenset({"disabled", "new-configs", "required"})
 _EXISTING_RESULT_POLICIES = frozenset({"require-compatible", "rerun"})
@@ -158,14 +161,23 @@ def _require_supported_value(
 def _validate_launch_subject(request: LaunchRequest) -> None:
     _require_supported_value(
         request.subject,
-        frozenset({"pi", "omp"}),
-        f"Launch subject invalid: expected 'pi' or 'omp'; got {request.subject!r}",
+        frozenset({"pi", "omp", "prime-agent"}),
+        "Launch subject invalid: expected 'pi', 'omp', or 'prime-agent'; "
+        f"got {request.subject!r}",
     )
     if not request.model.strip():
         raise ValueError("Launch model invalid: model cannot be empty")
-    subject_thinking_levels = (
-        _PI_THINKING_LEVELS if request.subject == "pi" else _OMP_THINKING_LEVELS
-    )
+    if request.subject == "pi":
+        subject_thinking_levels = _PI_THINKING_LEVELS
+    elif request.subject == "omp":
+        subject_thinking_levels = _OMP_THINKING_LEVELS
+    else:
+        subject_thinking_levels = _PRIME_AGENT_THINKING_LEVELS
+        if request.model != "zai/glm-5.2":
+            raise ValueError(
+                "Prime Agent launch model invalid: expected 'zai/glm-5.2'; "
+                f"got {request.model!r}"
+            )
     expected_thinking_levels = ", ".join(sorted(subject_thinking_levels))
     _require_supported_value(
         request.thinking,
@@ -381,6 +393,8 @@ def _subject_runner_path(repository_root: Path, subject: str) -> Path:
         runner = repository_root / "harness" / "run.py"
     elif subject == "omp":
         runner = repository_root / "harness" / "run_omp.py"
+    elif subject == "prime-agent":
+        runner = repository_root / "harness" / "run_prime_agent.py"
     else:
         raise ValueError(f"Launch subject invalid: unsupported subject {subject!r}")
     if not runner.is_file():

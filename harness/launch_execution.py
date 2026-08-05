@@ -26,6 +26,7 @@ from harness.launch_contract import (
     ConfirmedLaunchExecution,
     ConfirmedOmpRunner,
     ConfirmedPiRunner,
+    ConfirmedPrimeAgentRunner,
     ConfirmedSubjectCell,
     LaunchExecutionPolicies,
     LaunchInputDriftError,
@@ -87,7 +88,7 @@ def _confirmed_subject_cell(
     cell_document: Mapping[str, object],
 ) -> ConfirmedSubjectCell:
     subject = document["subject"]
-    if subject["name"] not in {"pi", "omp"}:
+    if subject["name"] not in {"pi", "omp", "prime-agent"}:
         raise ValueError(
             "Confirmed subject execution mismatch: "
             f"unsupported subject {subject['name']!r}"
@@ -791,11 +792,16 @@ def _run_confirmed_subject_cell(
             ConfirmedPiRunner,
             subject_runner,
         ).run_confirmed_pi_cell(cell)
-    else:
+    elif cell.subject == "omp":
         runner_record = cast(
             ConfirmedOmpRunner,
             subject_runner,
         ).run_confirmed_omp_cell(cell)
+    else:
+        runner_record = cast(
+            ConfirmedPrimeAgentRunner,
+            subject_runner,
+        ).run_confirmed_prime_agent_cell(cell)
     verifier_resource_error = (
         runner_record.get("verifier_resource_exhausted") is True
         or runner_record.get("verifier_resource_evidence_unavailable") is True
@@ -1253,6 +1259,7 @@ def execute_confirmed_launch_with_heartbeat(
     runtime_resolver: LaunchRuntimeResolver,
     pi_runner: ConfirmedPiRunner | None,
     omp_runner: ConfirmedOmpRunner | None,
+    prime_agent_runner: ConfirmedPrimeAgentRunner | None,
     transient_resumer: LaunchTransientResumer | None,
     heartbeat_interval_s: float,
 ) -> ConfirmedLaunchExecution:
@@ -1272,6 +1279,13 @@ def execute_confirmed_launch_with_heartbeat(
                 "Confirmed OMP runner missing: an OMP plan requires omp_runner"
             )
         subject_runner = omp_runner
+    elif subject == "prime-agent":
+        if prime_agent_runner is None:
+            raise ValueError(
+                "Confirmed Prime Agent runner missing: a Prime Agent plan "
+                "requires prime_agent_runner"
+            )
+        subject_runner = prime_agent_runner
     else:
         raise ValueError(
             f"Confirmed subject runner missing: unsupported subject {subject!r}"
@@ -1315,7 +1329,11 @@ def execute_confirmed_launch_with_heartbeat(
         state.start()
     stored_plan_path.write_text(plan.canonical_json)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    subject_label = "Pi" if subject == "pi" else "OMP"
+    subject_label = {
+        "pi": "Pi",
+        "omp": "OMP",
+        "prime-agent": "Prime Agent",
+    }[subject]
     log_path.write_text(
         f"Confirmed {subject_label} cell execution\n"
         f"launch_plan_identity={document['planIdentity']}\n"

@@ -17,6 +17,7 @@ REPO = Path(__file__).resolve().parents[1]
 # cached per-task pi images. v2 added ripgrep/fd-find; v3 updated Pi to 0.81.1
 # for GPT-5.6-SOL; v4 updates Pi to 0.83.0 for max thinking support.
 PI_IMAGE_REV = "v4-pi0830-tools"
+PRIME_AGENT_IMAGE_REV = "v1-prime-agent070"
 
 # Tasks live in the sibling DeepSWE checkout (~/evals/deep-swe/tasks).
 # Override with the DEEP_SWE_TASKS env var to point elsewhere.
@@ -45,6 +46,12 @@ class Task:
         # one env image per task; tag a pi-augmented layer off it.
         slug = re.sub(r"[^a-zA-Z0-9_.-]", "-", self.env_image.split(":")[-1])
         return f"deep-swe-pi:{PI_IMAGE_REV}-{slug}"
+
+    @property
+    def prime_agent_image(self) -> str:
+        """Return the task-specific Prime Agent 0.7.0 image reference."""
+        slug = re.sub(r"[^a-zA-Z0-9_.-]", "-", self.env_image.split(":")[-1])
+        return f"deep-swe-prime-agent:{PRIME_AGENT_IMAGE_REV}-{slug}"
 
     @property
     def verifier_image(self) -> str:
