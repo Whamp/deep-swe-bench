@@ -296,6 +296,7 @@ class RepositoryLaunchRuntimeResolver:
                     "prime-agent-rlm-depth-one",
                     "recursive-child-usage",
                     "zai-bounded-proxy-usage",
+                    "zai-concurrency-limited-proxy-usage",
                 }
             )
         else:

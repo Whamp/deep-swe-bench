@@ -42,7 +42,37 @@ def test_prime_agent_proxy_models_redirects_only_zai_to_local_guard() -> None:
         }
     }
     assert run_prime_agent.ZAI_MAX_CONCURRENCY == 8
-    assert run_prime_agent.ZAI_MAX_REQUESTS_PER_CELL == 64
+    assert not hasattr(run_prime_agent, "ZAI_MAX_REQUESTS_PER_CELL")
+
+
+def test_start_zai_proxy_has_no_total_request_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_sh(command: list[str], **_kwargs: object) -> Result:
+        commands.append(command)
+        return Result()
+
+    monkeypatch.setattr(run_prime_agent, "sh", fake_sh)
+
+    run_prime_agent.start_zai_proxy("prime-cell")
+
+    start_command = commands[0]
+    assert start_command[:5] == [
+        "docker",
+        "exec",
+        "-d",
+        "prime-cell",
+        "zai-bounded-proxy",
+    ]
+    assert "--max-requests" not in start_command
+    assert start_command[-2:] == ["--port", "8765"]
 
 
 def test_prime_agent_cmd_rejects_non_zai_glm52_model() -> None:

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Bound and account direct ZAI requests made by one benchmark subject cell.
+"""Account direct ZAI requests and limit only their simultaneous concurrency.
 
 The proxy never records request or response content. It forwards only to the
-fixed ZAI Coding Plan endpoint and writes compact request status and usage data.
+fixed ZAI Coding Plan endpoint and writes compact request status, reasoning
+controls, and usage data. Total requests are not limited.
 """
 
 from __future__ import annotations
@@ -33,17 +34,12 @@ _HOP_BY_HOP_HEADERS = {
 }
 
 
-class RequestLimitExceeded(Exception):
-    """Raised when a cell has consumed its complete provider-request budget."""
+class RequestConcurrencyLimit:
+    """Limit simultaneous requests without imposing a total request cutoff."""
 
-
-class RequestBudget:
-    """Enforce a total request limit and a simultaneous request limit."""
-
-    def __init__(self, *, max_requests: int, max_concurrency: int) -> None:
-        if max_requests < 1 or max_concurrency < 1:
-            raise ValueError("request limits must be positive")
-        self.max_requests = max_requests
+    def __init__(self, *, max_concurrency: int) -> None:
+        if max_concurrency < 1:
+            raise ValueError("request concurrency limit must be positive")
         self.max_concurrency = max_concurrency
         self._semaphore = threading.BoundedSemaphore(max_concurrency)
         self._lock = threading.Lock()
@@ -54,8 +50,6 @@ class RequestBudget:
     @contextmanager
     def admit(self) -> Iterator[int]:
         with self._lock:
-            if self.requests_admitted >= self.max_requests:
-                raise RequestLimitExceeded
             self.requests_admitted += 1
             request_number = self.requests_admitted
         self._semaphore.acquire()
@@ -120,21 +114,21 @@ def extract_usage(response_body: bytes, content_type: str) -> dict[str, object] 
     return _json_usage(response_body)
 
 
-def request_limit_was_exceeded(path: Path) -> bool:
-    """Return whether the proxy rejected any request after exhausting the budget."""
-    if not path.exists():
-        return False
-    for line in path.read_text().splitlines():
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if (
-            record.get("event") == "request_rejected"
-            and record.get("reason") == "max_requests_exceeded"
-        ):
-            return True
-    return False
+def requests_use_zai_max_thinking(path: Path) -> bool:
+    """Return whether every admitted request used ZAI's maximum thinking shape."""
+    admitted_requests: list[dict[str, object]] = []
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and record.get("event") == "request_admitted":
+                admitted_requests.append(record)
+    return bool(admitted_requests) and all(
+        record.get("enableThinking") is True and record.get("reasoningEffort") is None
+        for record in admitted_requests
+    )
 
 
 def aggregate_usage(path: Path) -> dict[str, int]:
@@ -195,14 +189,10 @@ def make_server(
     port: int,
     upstream_base_url: str,
     usage_log_path: Path,
-    max_requests: int,
     max_concurrency: int,
 ) -> ThreadingHTTPServer:
-    """Create a bounded proxy server; exposed separately for focused tests."""
-    budget = RequestBudget(
-        max_requests=max_requests,
-        max_concurrency=max_concurrency,
-    )
+    """Create a concurrency-limited proxy server for focused tests and runs."""
+    request_limit = RequestConcurrencyLimit(max_concurrency=max_concurrency)
     usage_log = CompactUsageLog(usage_log_path)
     upstream_base_url = upstream_base_url.rstrip("/")
 
@@ -219,10 +209,9 @@ def make_server(
             payload = json.dumps(
                 {
                     "ok": True,
-                    "maxRequests": budget.max_requests,
-                    "maxConcurrency": budget.max_concurrency,
-                    "requestsAdmitted": budget.requests_admitted,
-                    "peakConcurrency": budget.peak_concurrency,
+                    "maxConcurrency": request_limit.max_concurrency,
+                    "requestsAdmitted": request_limit.requests_admitted,
+                    "peakConcurrency": request_limit.peak_concurrency,
                 }
             ).encode()
             self.send_response(200)
@@ -232,33 +221,8 @@ def make_server(
             self.wfile.write(payload)
 
         def do_POST(self) -> None:
-            try:
-                with budget.admit() as request_number:
-                    self._forward(request_number)
-            except RequestLimitExceeded:
-                usage_log.append(
-                    {
-                        "event": "request_rejected",
-                        "reason": "max_requests_exceeded",
-                        "maxRequests": budget.max_requests,
-                    }
-                )
-                payload = json.dumps(
-                    {
-                        "error": {
-                            "message": (
-                                "Prime Agent benchmark request limit exceeded: "
-                                f"maximum {budget.max_requests} requests per cell"
-                            ),
-                            "type": "benchmark_request_limit",
-                        }
-                    }
-                ).encode()
-                self.send_response(429)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
+            with request_limit.admit() as request_number:
+                self._forward(request_number)
 
         def _forward(self, request_number: int) -> None:
             started = time.monotonic()
@@ -270,10 +234,18 @@ def make_server(
             }
             # Keep SSE usage records readable without storing response content.
             headers["Accept-Encoding"] = "identity"
+            try:
+                request_document = json.loads(body)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                request_document = {}
+            if not isinstance(request_document, dict):
+                request_document = {}
             usage_log.append(
                 {
                     "event": "request_admitted",
                     "request": request_number,
+                    "enableThinking": request_document.get("enable_thinking"),
+                    "reasoningEffort": request_document.get("reasoning_effort"),
                 }
             )
             upstream_request = urllib.request.Request(
@@ -353,7 +325,7 @@ def make_server(
             )
 
     server = ThreadingHTTPServer((host, port), Handler)
-    server.request_budget = budget  # type: ignore[attr-defined]
+    server.request_concurrency_limit = request_limit  # type: ignore[attr-defined]
     return server
 
 
@@ -362,7 +334,6 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--usage-log", type=Path, required=True)
-    parser.add_argument("--max-requests", type=int, default=64)
     parser.add_argument("--max-concurrency", type=int, default=8)
     args = parser.parse_args()
     server = make_server(
@@ -370,7 +341,6 @@ def main() -> None:
         port=args.port,
         upstream_base_url=ZAI_CODING_BASE_URL,
         usage_log_path=args.usage_log,
-        max_requests=args.max_requests,
         max_concurrency=args.max_concurrency,
     )
     server.serve_forever()

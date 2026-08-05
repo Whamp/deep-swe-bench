@@ -1,7 +1,9 @@
 # Prime Agent 0.7.0 with direct Z.ai GLM-5.2 max thinking
 
 This note fixes the provider and thinking contract for the
-`prime-agent@1.0.0` benchmark config.
+`prime-agent@1.0.0` and `prime-agent@1.1.0` benchmark configs. Release 1.1.0
+removes the experimental 64-request cutoff while retaining usage accounting and
+eight-at-once subscription protection.
 
 ## Sources
 
@@ -58,6 +60,11 @@ provider adapter against a localhost SSE server. It made no provider call:
 - `analysis/prime_agent_zai_glm52_max_request_probe.mjs`
 - `analysis/prime-agent-zai-glm52-max-request-probe.jsonl`
 
+A live `prime-agent@1.0.0` preflight also captured the same wire shape from the
+real CLI: `enable_thinking: true` with `reasoning_effort` absent. Prime Agent's
+session metadata labeled that run `high`, so release 1.1.0 validates the provider
+request instead of relying on that inconsistent session label.
+
 The provider-response probes in the project Z.ai reference exercised the same
 coding endpoint and captured reasoning content and reasoning-token usage:
 
@@ -77,21 +84,26 @@ persist the raw RPC event stream.
 
 The config declares two model roles:
 
-1. `executor`: one root session, billed to Z.ai subscription quota.
-2. `rlm-child`: inherited direct Z.ai GLM-5.2 max calls, billed to the same
-   subscription quota and accounted from `child_usage_attributed` records.
+1. `executor`: the root session, billed to Z.ai subscription quota.
+2. `rlm-child`: model-directed, inherited direct Z.ai GLM-5.2 max calls, billed
+   to the same subscription quota and accounted from `child_usage_attributed`
+   records when Prime Agent chooses to delegate.
+
+Prime Agent decides whether to create child agents. The benchmark does not add
+instructions, require delegation, or fail a task merely because no child was
+created.
 
 Prime Agent 0.7.0 exposes no native total-child or live-child concurrency
-setting. The benchmark runner therefore sends every ZAI call through a local
-pass-through guard. Each cell admits at most 64 provider requests and runs at
-most eight simultaneously. Request 65 receives HTTP 429 and the result records
-that the limit was reached. The guard writes status and usage only; it does not
-persist prompts, streamed text, tool calls, or responses.
+setting. Release 1.1.0 sends every ZAI call through a local accounting proxy
+without limiting the total request count. The proxy allows at most eight calls
+at once to stay within the subscription's concurrency allowance. It writes
+status, reasoning controls, and usage only; it does not persist prompts,
+streamed text, tool calls, or responses. The task's normal agent timeout and
+container resource policy remain the outer limits.
 
-The 64-request budget covers the root agent, RLM children, compaction, retries,
-and auto-refine together. RLM children can consume at most 63 requests because
-the root must make at least one. The normal subject timeout and container
-resource policy remain additional outer boundaries.
+Release 1.0.0 used an experimental 64-request cutoff. Its first live preflight
+reached that cutoff, so the run stopped before batch fan-out and the release was
+retired rather than rewritten.
 
 ## Config rules
 

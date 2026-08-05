@@ -1,4 +1,5 @@
 """Shared helpers: parse a DeepSWE task.toml into a Task, tag images, read reward."""
+
 from __future__ import annotations
 
 import json
@@ -17,12 +18,14 @@ REPO = Path(__file__).resolve().parents[1]
 # cached per-task pi images. v2 added ripgrep/fd-find; v3 updated Pi to 0.81.1
 # for GPT-5.6-SOL; v4 updates Pi to 0.83.0 for max thinking support.
 PI_IMAGE_REV = "v4-pi0830-tools"
-PRIME_AGENT_IMAGE_REV = "v1-prime-agent070"
+PRIME_AGENT_IMAGE_REV = "v2-prime-agent070-unlimited"
+
 
 # Tasks live in the sibling DeepSWE checkout (~/evals/deep-swe/tasks).
 # Override with the DEEP_SWE_TASKS env var to point elsewhere.
 def tasks_root() -> Path:
     import os
+
     env = os.environ.get("DEEP_SWE_TASKS")
     if env:
         return Path(env)

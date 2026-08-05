@@ -8,30 +8,24 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import pytest
-
 from harness.zai_bounded_proxy import (
-    RequestBudget,
-    RequestLimitExceeded,
+    RequestConcurrencyLimit,
     aggregate_usage,
     make_server,
-    request_limit_was_exceeded,
+    requests_use_zai_max_thinking,
 )
 
 
-def test_request_budget_rejects_request_65() -> None:
-    budget = RequestBudget(max_requests=64, max_concurrency=8)
+def test_request_concurrency_limit_allows_more_than_64_requests() -> None:
+    limit = RequestConcurrencyLimit(max_concurrency=8)
 
-    for expected_request_number in range(1, 65):
-        with budget.admit() as request_number:
+    for expected_request_number in range(1, 130):
+        with limit.admit() as request_number:
             assert request_number == expected_request_number
 
-    with pytest.raises(RequestLimitExceeded), budget.admit():
-        pass
 
-
-def test_request_budget_never_exceeds_eight_concurrent_requests() -> None:
-    budget = RequestBudget(max_requests=64, max_concurrency=8)
+def test_request_concurrency_limit_never_exceeds_eight_requests() -> None:
+    limit = RequestConcurrencyLimit(max_concurrency=8)
     release = threading.Event()
     admitted = 0
     admitted_lock = threading.Lock()
@@ -39,7 +33,7 @@ def test_request_budget_never_exceeds_eight_concurrent_requests() -> None:
 
     def request() -> None:
         nonlocal admitted
-        with budget.admit():
+        with limit.admit():
             with admitted_lock:
                 admitted += 1
                 if admitted == 8:
@@ -50,14 +44,14 @@ def test_request_budget_never_exceeds_eight_concurrent_requests() -> None:
         futures = [executor.submit(request) for _ in range(16)]
         assert first_eight_admitted.wait(timeout=1)
         time.sleep(0.05)
-        assert budget.active_requests == 8
+        assert limit.active_requests == 8
         assert admitted == 8
         release.set()
         for future in futures:
             future.result(timeout=2)
 
-    assert budget.peak_concurrency == 8
-    assert budget.requests_admitted == 16
+    assert limit.peak_concurrency == 8
+    assert limit.requests_admitted == 16
 
 
 def test_proxy_forwards_sse_and_logs_only_compact_usage(tmp_path: Path) -> None:
@@ -87,7 +81,6 @@ def test_proxy_forwards_sse_and_logs_only_compact_usage(tmp_path: Path) -> None:
         port=0,
         upstream_base_url=f"http://127.0.0.1:{upstream.server_port}",
         usage_log_path=usage_log,
-        max_requests=64,
         max_concurrency=8,
     )
     threads = [
@@ -96,7 +89,10 @@ def test_proxy_forwards_sse_and_logs_only_compact_usage(tmp_path: Path) -> None:
     ]
     for thread in threads:
         thread.start()
-    request_body = b'{"messages":[{"content":"secret-prompt-marker"}]}'
+    request_body = (
+        b'{"model":"glm-5.2","enable_thinking":true,'
+        b'"messages":[{"content":"secret-prompt-marker"}]}'
+    )
     request = urllib.request.Request(
         f"http://127.0.0.1:{proxy.server_port}/chat/completions",
         data=request_body,
@@ -125,6 +121,14 @@ def test_proxy_forwards_sse_and_logs_only_compact_usage(tmp_path: Path) -> None:
     assert "secret-key-marker" not in compact_log
     assert '"content":"OK"' not in compact_log
     assert aggregate_usage(usage_log)["total_tokens"] == 5
+    assert requests_use_zai_max_thinking(usage_log) is True
+    admitted = json.loads(usage_log.read_text().splitlines()[0])
+    assert admitted == {
+        "event": "request_admitted",
+        "request": 1,
+        "enableThinking": True,
+        "reasoningEffort": None,
+    }
 
 
 def test_aggregate_usage_uses_pi_ai_token_semantics(tmp_path: Path) -> None:
@@ -153,11 +157,9 @@ def test_aggregate_usage_uses_pi_ai_token_semantics(tmp_path: Path) -> None:
                 "completion_tokens": 5,
             },
         },
-        {"event": "request_rejected", "reason": "max_requests_exceeded"},
     ]
     log.write_text("".join(json.dumps(record) + "\n" for record in records))
 
-    assert request_limit_was_exceeded(log) is True
     assert aggregate_usage(log) == {
         "requests": 2,
         "input": 110,

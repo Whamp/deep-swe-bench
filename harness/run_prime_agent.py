@@ -70,7 +70,6 @@ PRIME_AGENT_SETTINGS_KEYS = frozenset(
 )
 PRIME_AGENT_CONFIG_DIR = "/root/.prime/agent"
 ZAI_PROXY_PORT = 8765
-ZAI_MAX_REQUESTS_PER_CELL = 64
 ZAI_MAX_CONCURRENCY = 8
 ZAI_PROXY_USAGE_PATH = Path("logs/zai-proxy-usage.jsonl")
 
@@ -122,8 +121,6 @@ def start_zai_proxy(container_name: str) -> None:
             "zai-bounded-proxy",
             "--usage-log",
             f"/out/{ZAI_PROXY_USAGE_PATH}",
-            "--max-requests",
-            str(ZAI_MAX_REQUESTS_PER_CELL),
             "--max-concurrency",
             str(ZAI_MAX_CONCURRENCY),
             "--port",
@@ -387,7 +384,6 @@ def run_cell(
             status["agent_timed_out"] = True
         status["agent_wall_s"] = round(time.time() - started, 1)
         proxy_health = read_zai_proxy_health(cname)
-        status["prime_agent_request_limit"] = ZAI_MAX_REQUESTS_PER_CELL
         status["prime_agent_concurrency_limit"] = ZAI_MAX_CONCURRENCY
         status["prime_agent_requests_admitted"] = proxy_health.get("requestsAdmitted")
         status["prime_agent_peak_concurrency"] = proxy_health.get("peakConcurrency")
@@ -405,17 +401,8 @@ def run_cell(
         transient_paths += [
             p for p in (cell / "session").glob("*.jsonl") if p not in pre_session_paths
         ]
-        request_limit_exceeded = zai_bounded_proxy.request_limit_was_exceeded(
-            cell / ZAI_PROXY_USAGE_PATH
-        )
-        if request_limit_exceeded:
-            status["prime_agent_request_limit_exceeded"] = True
         transient = transient_model_error(transient_paths)
-        if (
-            transient
-            and not request_limit_exceeded
-            and status.get("agent_exit") != "timeout"
-        ):
+        if transient and status.get("agent_exit") != "timeout":
             status["transient_model_error"] = transient
             (cell / "transient_error.json").write_text(json.dumps(status, indent=2))
             print(
@@ -552,14 +539,13 @@ def run_cell(
         prime_agent_builtin_skills=True,
         prime_agent_auto_compaction=True,
         prime_agent_auto_refine=True,
-        prime_agent_request_limit=ZAI_MAX_REQUESTS_PER_CELL,
         prime_agent_concurrency_limit=ZAI_MAX_CONCURRENCY,
         prime_agent_provider_requests=provider_request_count,
         prime_agent_reasoning_tokens=provider_usage["reasoning"],
         prime_agent_requests_admitted=status.get("prime_agent_requests_admitted"),
         prime_agent_peak_concurrency=status.get("prime_agent_peak_concurrency"),
-        prime_agent_request_limit_exceeded=status.get(
-            "prime_agent_request_limit_exceeded", False
+        prime_agent_wire_max_thinking=zai_bounded_proxy.requests_use_zai_max_thinking(
+            cell / ZAI_PROXY_USAGE_PATH
         ),
         system_preamble_chars=len(cfg.get("system_preamble") or ""),
         orchestration_chars=len(cfg.get("orchestration") or ""),

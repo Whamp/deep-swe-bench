@@ -2265,6 +2265,96 @@ def test_launch_planning_requires_clarification_for_unbounded_role_calls(
     assert not state_root.exists()
 
 
+def test_launch_planning_accepts_time_bounded_calls_and_model_directed_role(
+    tmp_path: Path,
+) -> None:
+    """A confirmed plan may disclose calls limited only by the task timeout."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    config_identity = "review-assistant@1.0.0"
+    lock_path = (
+        repository_root
+        / "configs"
+        / config_identity
+        / "model"
+        / "low"
+        / "config-lock.json"
+    )
+    previous_lock = json.loads(lock_path.read_text())
+    executor = dict(previous_lock["declaredRoles"][0])
+    executor["callBehavior"] = {
+        "kind": "time-bounded",
+        "maxConcurrency": 8,
+        "timeoutSource": "task-agent-timeout",
+    }
+    child = {
+        "activationPolicy": "model-directed",
+        "billingCategory": "subscription quota",
+        "callBehavior": {
+            "kind": "time-bounded",
+            "maxConcurrency": 8,
+            "timeoutSource": "task-agent-timeout",
+        },
+        "credentialRoute": executor["credentialRoute"],
+        "modelSelection": {"kind": "inherited", "role": "executor"},
+        "name": "recursive-child",
+        "roleKind": "recursive-child",
+        "usageSource": {
+            "format": "native-session",
+            "path": "session/*.jsonl",
+            "recordSelector": {"type": "child_usage_attributed"},
+            "resultAccounting": {
+                "calls": "recursive_child_calls",
+                "totalTokens": "recursive_child_total_tokens",
+            },
+        },
+    }
+    lock_path.unlink()
+    _write_fixture_config_lock(
+        repository_root,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {
+            "credentialRoutes": previous_lock["credentialRoutes"],
+            "declaredRoles": [executor, child],
+            "testedSubjectVersions": previous_lock["testedSubjectVersions"],
+            "usageSources": previous_lock["usageSources"],
+        },
+    )
+
+    compiled = compile_launch_request(
+        _launch_request(),
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+    )
+
+    assert (
+        "calls limited only by task timeout; max concurrency 8"
+        in compiled.receipt
+    )
+    assert (
+        "review-assistant@1.0.0 permits model calls until the task timeout; "
+        "there is no per-rep request cap"
+        in compiled.receipt
+    )
+    child_role = next(
+        role
+        for role in compiled.plan.to_document()["configs"][1]["declaredRoles"]
+        if role["name"] == "recursive-child"
+    )
+    assert child_role["activationPolicy"] == "model-directed"
+    assert (
+        "calls limited only by task timeout; max concurrency 8 | model-directed"
+        in compiled.receipt
+    )
+
+
 def test_launch_planning_requires_clarification_for_unbounded_model_selection(
     tmp_path: Path,
 ) -> None:
