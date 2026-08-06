@@ -1,9 +1,10 @@
 # Prime Agent 0.7.0 with direct Z.ai GLM-5.2 max thinking
 
-This note fixes the provider and thinking contract for the
-`prime-agent@1.0.0` and `prime-agent@1.1.0` benchmark configs. Release 1.1.0
-removes the experimental 64-request cutoff while retaining usage accounting and
-eight-at-once subscription protection.
+This note fixes the provider and thinking contract for the Prime Agent config
+series through `prime-agent@1.1.1`. Release 1.1.0 removed the experimental
+64-request cutoff. Release 1.1.1 corrects the smoke test so Prime Agent's
+non-reasoning maintenance calls are not mistaken for coding-agent calls. Both
+releases retain usage accounting and eight-at-once subscription protection.
 
 ## Sources
 
@@ -62,7 +63,7 @@ provider adapter against a localhost SSE server. It made no provider call:
 
 A live `prime-agent@1.0.0` preflight also captured the same wire shape from the
 real CLI: `enable_thinking: true` with `reasoning_effort` absent. Prime Agent's
-session metadata labeled that run `high`, so release 1.1.0 validates the provider
+session metadata labeled that run `high`, so release 1.1.1 validates the provider
 request instead of relying on that inconsistent session label.
 
 Prime Agent also makes tool-free maintenance calls for automatic refinement.
@@ -101,7 +102,7 @@ instructions, require delegation, or fail a task merely because no child was
 created.
 
 Prime Agent 0.7.0 exposes no native total-child or live-child concurrency
-setting. Release 1.1.0 sends every ZAI call through a local accounting proxy
+setting. Release 1.1.x sends every ZAI call through a local accounting proxy
 without limiting the total request count. The proxy allows at most eight calls
 at once to stay within the subscription's concurrency allowance. It writes
 status, reasoning controls, tool count, and usage only; it does not persist
