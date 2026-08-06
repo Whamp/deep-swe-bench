@@ -1017,6 +1017,9 @@ def test_confirmed_launch_resumes_after_transient_without_rerunning_rep(
         ) -> dict[str, object]:
             if cell.rep == 1:
                 self.calls.append(cell)
+                interrupted_log = cell.result_path.parent / "logs" / "attempt.jsonl"
+                interrupted_log.parent.mkdir(parents=True, exist_ok=True)
+                interrupted_log.write_text('{"attempt":1}\n')
                 raise LaunchTransientModelError("fixture quota window")
             return super().run_confirmed_pi_cell(cell)
 
@@ -1043,6 +1046,24 @@ def test_confirmed_launch_resumes_after_transient_without_rerunning_rep(
     )
 
     assert [cell.rep for cell in resumed_runner.calls] == [1]
+    resumed_cell_root = resumed_runner.calls[0].result_path.parent
+    assert not (resumed_cell_root / "logs" / "attempt.jsonl").exists()
+    results_root = Path(compiled.plan.to_document()["paths"]["resultsRoot"])
+    quarantined_logs = list(
+        results_root.glob(
+            "_contaminated/harness-failure/incomplete-cell-attempts/**/attempt.jsonl"
+        )
+    )
+    assert len(quarantined_logs) == 1
+    assert quarantined_logs[0].read_text() == '{"attempt":1}\n'
+    quarantine_manifest = results_root / "_contaminated" / "manifest.jsonl"
+    quarantine_records = [
+        json.loads(line) for line in quarantine_manifest.read_text().splitlines()
+    ]
+    assert quarantine_records[-1]["category"] == "harness-failure"
+    assert quarantine_records[-1]["reason"].startswith(
+        "Incomplete confirmed cell attempt"
+    )
     resumed_status = json.loads((state_path / "status.json").read_text())
     assert resumed_status["state"] == "completed"
     assert resumed_status["counts"]["batch_skipped"] == 1

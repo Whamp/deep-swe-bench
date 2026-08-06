@@ -6,8 +6,10 @@ import concurrent.futures
 import hashlib
 import json
 import threading
+import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -771,6 +773,7 @@ class _ConfirmedLaunchExecutionContext:
     """Hold plan-owned dependencies shared by confirmed execution stages."""
 
     state_path: Path
+    results_root: Path
     state: run_state.RunStateWriter
     input_verifier: _ApprovedLaunchInputVerifier
     subject_runner: _ConfirmedSubjectRunner
@@ -779,12 +782,66 @@ class _ConfirmedLaunchExecutionContext:
     policies: LaunchExecutionPolicies
 
 
+_QUARANTINE_MANIFEST_LOCK = threading.Lock()
+
+
+def _quarantine_incomplete_confirmed_cell(
+    cell: ConfirmedSubjectCell,
+    results_root: Path,
+) -> Path | None:
+    """Move result-less artifacts aside before a confirmed cell attempt."""
+    cell_root = cell.result_path.parent
+    if cell.result_path.exists() or not cell_root.is_dir():
+        return None
+    if not any(cell_root.iterdir()):
+        return None
+
+    relative_cell = cell_root.resolve().relative_to(results_root.resolve())
+    attempt_id = (
+        datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    )
+    quarantine_root = (
+        results_root / "_contaminated" / "harness-failure" / "incomplete-cell-attempts"
+    )
+    quarantine_path = quarantine_root / relative_cell / attempt_id
+    quarantine_path.parent.mkdir(parents=True, exist_ok=True)
+    cell_root.rename(quarantine_path)
+    cell_root.mkdir(parents=True, exist_ok=True)
+    verifier_resource_events = (
+        quarantine_path / "logs" / "verifier-resource-events.ndjson"
+    )
+    if verifier_resource_events.is_file():
+        retained_events = cell_root / "logs" / verifier_resource_events.name
+        retained_events.parent.mkdir(parents=True, exist_ok=True)
+        retained_events.write_bytes(verifier_resource_events.read_bytes())
+
+    reason = (
+        "Incomplete confirmed cell attempt had artifacts without result.json; "
+        "moved before retry to prevent mixed-attempt usage and session accounting."
+    )
+    record = {
+        "category": "harness-failure",
+        "original_path": str(cell_root),
+        "quarantine_path": str(quarantine_path),
+        "reason": reason,
+        "run_key": cell.run_key,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    manifest_path = results_root / "_contaminated" / "manifest.jsonl"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with _QUARANTINE_MANIFEST_LOCK, manifest_path.open("a") as manifest:
+        manifest.write(json.dumps(record, sort_keys=True) + "\n")
+    return quarantine_path
+
+
 def _run_confirmed_subject_cell(
     cell: ConfirmedSubjectCell,
     subject_runner: _ConfirmedSubjectRunner,
     log_path: Path,
+    results_root: Path,
 ) -> dict[str, object]:
     """Run one exact planned cell and persist its provenance-bearing result."""
+    _quarantine_incomplete_confirmed_cell(cell, results_root)
     cell.result_path.parent.mkdir(parents=True, exist_ok=True)
     _append_confirmed_cell_log(log_path, cell, "started")
     if cell.subject == "pi":
@@ -888,6 +945,7 @@ def _execute_confirmed_preflight_cell(
                 cell,
                 context.subject_runner,
                 context.log_path,
+                context.results_root,
             )
         raw_exit = result_record.get("agent_exit")
         exit_code = raw_exit if isinstance(raw_exit, int | str) else None
@@ -1014,6 +1072,7 @@ def _execute_confirmed_batch_cell(
                 cell,
                 context.subject_runner,
                 context.log_path,
+                context.results_root,
             )
         except LaunchTransientModelError as error:
             _append_confirmed_cell_log(
@@ -1345,6 +1404,7 @@ def execute_confirmed_launch_with_heartbeat(
     )
     execution_context = _ConfirmedLaunchExecutionContext(
         state_path=state_path,
+        results_root=Path(document["paths"]["resultsRoot"]),
         state=state,
         input_verifier=input_verifier,
         subject_runner=subject_runner,

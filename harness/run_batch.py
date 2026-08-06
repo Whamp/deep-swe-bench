@@ -655,7 +655,7 @@ class QuotaResumer:
         state: QuotaWaitState,
         msg: str | None,
     ) -> QuotaResumeDecision:
-        windows, source = quota.codex_windows(self.args.model)
+        windows, source = quota.provider_windows(self.args.model)
         if not windows:
             reason = f"quota limit but no usage data available (source={source}): {msg!r}"
             print(f"[resume] {reason}", flush=True)
@@ -715,7 +715,7 @@ class QuotaResumer:
             print(f"[resume] waiting for quota reset: {mins}m remaining (re-check in {int(chunk)}s)", flush=True)
             time.sleep(chunk)
             # Re-check: the window may reset early or the plan may change.
-            windows, _ = quota.codex_windows(self.args.model)
+            windows, _ = quota.provider_windows(self.args.model)
             if not quota.exhausted_windows(windows):
                 print("[resume] quota windows no longer exhausted; resuming early", flush=True)
                 break

@@ -13,9 +13,13 @@ results/_contaminated/
 Categories:
 
 - `harness-failure/` — invalid because harness/config plumbing was broken.
-  Current example: the old `pi-recursive-compromised-readonly-tools-20260702`
-  run, where recursive child read-only `grep`/`find` tools lacked working
-  `rg`/`fd` binaries.
+  Current examples include the old
+  `pi-recursive-compromised-readonly-tools-20260702` run, where recursive child
+  read-only `grep`/`find` tools lacked working `rg`/`fd` binaries. Confirmed
+  execution also moves a result-less cell containing partial attempt artifacts
+  under `harness-failure/incomplete-cell-attempts/` before retrying it. This
+  prevents native sessions and provider usage from separate attempts being
+  combined into one canonical result.
 - `om-no-executor-projection/` — stock headless pi-observational-memory runs
   that recorded/folded observations and reflections but did not project OM
   content into the executor context during single-shot DeepSWE task execution.

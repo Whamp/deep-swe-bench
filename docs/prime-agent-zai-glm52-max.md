@@ -12,6 +12,7 @@ releases retain usage accounting and eight-at-once subscription protection.
 - Prime Agent provider setup: <https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/providers.md>
 - Z.ai GLM-5.2 guide: <https://docs.z.ai/guides/llm/glm-5.2>
 - Z.ai chat completions API: <https://docs.z.ai/api-reference/llm/chat-completion>
+- Z.ai Coding Plan usage query plugin: <https://docs.z.ai/devpack/extension/usage-query-plugin>
 - Project Z.ai reference and live probes: [`zai-glm52-thinking.md`](zai-glm52-thinking.md)
 
 ## Runtime identity
@@ -113,6 +114,26 @@ limits.
 Release 1.0.0 used an experimental 64-request cutoff. Its first live preflight
 reached that cutoff, so the run stopped before batch fan-out and the release was
 retired rather than rewritten.
+
+## Subscription quota monitoring
+
+Confirmed auto-resume selects quota data by model provider. Direct `zai/*`
+models query `GET https://api.z.ai/api/monitor/usage/quota/limit` with the same
+`ZAI_API_KEY` credential route used by Prime Agent. The harness reads only
+`TOKENS_LIMIT` percentage and reset-time fields for the rolling five-hour and
+weekly windows. It does not use the operator's unrelated OpenAI Codex quota.
+
+A live metadata-only probe returned the expected five-hour and weekly token
+windows without making a model inference or storing a secret:
+
+- `analysis/zai-coding-plan-quota-probe.json`
+
+When a transient attempt leaves artifacts but no `result.json`, confirmed
+execution moves that entire incomplete cell under
+`results/_contaminated/harness-failure/incomplete-cell-attempts/` before a
+retry. This prevents native sessions and proxy usage from separate attempts
+being aggregated into one rep. The harness retains verifier resource-event
+records across infrastructure retries.
 
 ## Config rules
 

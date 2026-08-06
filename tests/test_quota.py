@@ -22,7 +22,77 @@ def _ts(seconds_from_now: int) -> int:
     return int((NOW + timedelta(seconds=seconds_from_now)).timestamp())
 
 
-# --- parse_codex_usage ---------------------------------------------------- #
+# --- provider usage parsing ---------------------------------------------- #
+
+
+class TestParseZaiUsage:
+    def test_personal_coding_plan_token_windows(self):
+        data = {
+            "code": 200,
+            "success": True,
+            "data": {
+                "limits": [
+                    {
+                        "type": "TOKENS_LIMIT",
+                        "unit": 3,
+                        "number": 5,
+                        "percentage": 4,
+                        "nextResetTime": 1786040812384,
+                    },
+                    {
+                        "type": "TOKENS_LIMIT",
+                        "unit": 6,
+                        "number": 1,
+                        "percentage": 40,
+                        "nextResetTime": 1786142541997,
+                    },
+                    {
+                        "type": "TIME_LIMIT",
+                        "unit": 5,
+                        "number": 1,
+                        "percentage": 0,
+                        "nextResetTime": 1788216141995,
+                    },
+                ]
+            },
+        }
+
+        windows = quota.parse_zai_usage(data)
+
+        assert [(window.label, window.used_percent) for window in windows] == [
+            ("5h", 4),
+            ("Week", 40),
+        ]
+        assert windows[0].reset_at == datetime(
+            2026, 8, 6, 18, 26, 52, 384000, tzinfo=timezone.utc
+        )
+
+    def test_zai_windows_uses_environment_api_key(self, monkeypatch):
+        monkeypatch.setenv("ZAI_API_KEY", "fixture-key")
+        calls = []
+
+        def fetcher(api_key):
+            calls.append(api_key)
+            return {
+                "data": {
+                    "limits": [
+                        {
+                            "type": "TOKENS_LIMIT",
+                            "unit": 3,
+                            "number": 5,
+                            "percentage": 12,
+                        }
+                    ]
+                }
+            }
+
+        windows, source = quota.zai_windows(fetcher=fetcher)
+
+        assert source == "zai-api"
+        assert calls == ["fixture-key"]
+        assert [(window.label, window.used_percent) for window in windows] == [
+            ("5h", 12)
+        ]
 
 
 class TestParseCodexUsage:
