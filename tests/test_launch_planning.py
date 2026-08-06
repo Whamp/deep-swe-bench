@@ -30,6 +30,42 @@ from harness.launch import (
 )
 
 
+def test_plan_cli_loads_exact_explicit_result_reuse_decisions(tmp_path: Path) -> None:
+    result_path = tmp_path / "result.json"
+    decisions_path = tmp_path / "reuse-decisions.json"
+    decisions_path.write_text(
+        json.dumps(
+            [
+                {
+                    "resultPath": str(result_path),
+                    "priorConfigIdentity": "prime-agent@1.1.1",
+                    "resultIdentity": "sha256:fixture-result",
+                    "recordedProvenance": {
+                        "config_identity": "prime-agent@1.1.1",
+                        "harness_revision": "prior-revision",
+                    },
+                    "rationale": "Reviewed successful result is unaffected by retry fixes.",
+                }
+            ]
+        )
+    )
+
+    decisions = run_batch._load_explicit_result_reuse_decisions(decisions_path)
+
+    assert decisions == (
+        launch.ExplicitResultReuseDecision(
+            result_path=result_path.resolve(),
+            prior_config_identity="prime-agent@1.1.1",
+            result_identity="sha256:fixture-result",
+            recorded_provenance={
+                "config_identity": "prime-agent@1.1.1",
+                "harness_revision": "prior-revision",
+            },
+            rationale="Reviewed successful result is unaffected by retry fixes.",
+        ),
+    )
+
+
 def _write_fixture_config_lock(
     repository_root: Path,
     config_identity: str,

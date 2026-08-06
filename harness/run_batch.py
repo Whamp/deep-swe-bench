@@ -989,6 +989,11 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--repository", type=Path, default=REPO)
     plan_parser.add_argument("--tasks-root", type=Path, default=TASKS)
     plan_parser.add_argument("--results-root", type=Path)
+    plan_parser.add_argument(
+        "--reuse-decisions",
+        type=Path,
+        help="JSON file containing exact explicit result reuse decisions",
+    )
     plan_parser.add_argument("--state-root", type=Path, required=True)
     plan_parser.add_argument("--plan-out", type=Path, required=True)
     plan_parser.add_argument("--receipt-out", type=Path, required=True)
@@ -1000,6 +1005,68 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
     execute_parser.add_argument("--plan", type=Path, required=True)
     execute_parser.add_argument("--confirm", required=True)
     return parser
+
+
+def _load_explicit_result_reuse_decisions(
+    path: Path | None,
+) -> tuple[launch.ExplicitResultReuseDecision, ...]:
+    """Load exact earlier-result reuse decisions from a reviewed JSON file."""
+    if path is None:
+        return ()
+    try:
+        raw_decisions = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Explicit result reuse decisions unreadable: path={path}; error={error}"
+        ) from error
+    if not isinstance(raw_decisions, list):
+        raise ValueError(
+            "Explicit result reuse decisions invalid: expected a JSON array; "
+            f"path={path}"
+        )
+
+    decisions: list[launch.ExplicitResultReuseDecision] = []
+    required_keys = {
+        "resultPath",
+        "priorConfigIdentity",
+        "resultIdentity",
+        "recordedProvenance",
+        "rationale",
+    }
+    for index, raw_decision in enumerate(raw_decisions):
+        if not isinstance(raw_decision, dict) or set(raw_decision) != required_keys:
+            raise ValueError(
+                "Explicit result reuse decision invalid: expected exact keys "
+                f"{sorted(required_keys)!r}; path={path}; index={index}"
+            )
+        result_path = raw_decision["resultPath"]
+        prior_config_identity = raw_decision["priorConfigIdentity"]
+        result_identity = raw_decision["resultIdentity"]
+        recorded_provenance = raw_decision["recordedProvenance"]
+        rationale = raw_decision["rationale"]
+        if (
+            not isinstance(result_path, str)
+            or not isinstance(prior_config_identity, str)
+            or not isinstance(result_identity, str)
+            or not isinstance(recorded_provenance, dict)
+            or not isinstance(rationale, str)
+            or not rationale.strip()
+        ):
+            raise ValueError(
+                "Explicit result reuse decision invalid: expected nonempty string "
+                "identity/path/rationale fields and object recordedProvenance; "
+                f"path={path}; index={index}"
+            )
+        decisions.append(
+            launch.ExplicitResultReuseDecision(
+                result_path=Path(result_path).expanduser().resolve(),
+                prior_config_identity=prior_config_identity,
+                result_identity=result_identity,
+                recorded_provenance=recorded_provenance,
+                rationale=rationale,
+            )
+        )
+    return tuple(decisions)
 
 
 def _launch_task_selection(
@@ -1085,6 +1152,9 @@ def _plan_confirmed_launch(
             verifier_memory_gib=args.verifier_memory_gib,
             additional_swap_gib=args.additional_swap_gib,
             host_reserve_gib=args.host_reserve_gib,
+        ),
+        reuse_decisions=_load_explicit_result_reuse_decisions(
+            args.reuse_decisions
         ),
     )
     compiled = launch.compile_launch_request(
