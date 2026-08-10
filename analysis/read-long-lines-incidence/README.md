@@ -75,33 +75,37 @@ native but rarely-read source (`pest`, `meriyah`, `obsidian`, `tengo`, and one
 `textual`). This scope is for discovery only; config and model heterogeneity make
 its aggregate rate unsuitable as a clean-stock estimate.
 
-## Context-pollution opportunity
+## Why malformed long lines matter
 
-Seven tasks produced long reads from temporary/tool artifacts or source files
-containing agent-created corruption. The human-reviewed classification is in
-`context-pollution-classifications.csv`; the compact rep evidence is under
-`data/context-pollution-opportunity/`.
+In several saved trajectories, the agent accidentally wrote an edit payload or
+part of its own transcript into a source file. A later `read` returned that
+malformed line. For example, the `textual` trajectory returned one corrupted
+27,549-character source line.
 
-Across eight exposed reps:
+Stock Pi puts the complete returned line into that turn's tool result. The
+extension would put the first 2,000 characters plus a recovery notice into the
+tool result. It would not prevent or repair the bad edit. It would only keep the
+remaining 25,549 characters out of that read result unless the agent explicitly
+requested the full line with `limit=1`.
+
+The corpus contains eight such artifact or corruption exposures:
 
 - 12 affected read results
-- 54,100 source characters beyond the preview
 - 52,808 net characters removable after notices
 - 180 subsequent assistant messages
 - 18,910,581 recorded executor tokens after the first exposure
 
-Five reps read corrupted source containing serialized edit payloads or model
-transcript text. Those reads could remove 29,199 net characters; the trajectories
-continued for 98 assistant messages and 9,463,873 recorded tokens. All five reps
-were unsolved. Three reps read temporary or serialized tool artifacts; those
-could remove 23,609 net characters and all three reps solved.
+The last number is **not** an estimate of tokens the extension would save. It
+only proves that the trajectories continued after reading the oversized payload,
+so the payload had opportunities to remain in later context and prompt-cache
+prefixes. A paired run is required to measure actual token savings.
 
-This is exposure evidence, not a causal reward comparison or token-savings
-estimate. The tasks, models, and configs differ, and post-activation usage
-includes all subsequent behavior and prompt-cache effects. The extension can
-shield later context from a long corrupted line, but it cannot repair the
-underlying file corruption and might hide evidence the model needs. Recovery
-behavior must therefore be measured directly.
+Five corrupted-source reps were unsolved, but this does not show that the long
+line caused failure or that truncation would fix it. The tasks, models, and
+configs differ. Truncation could also hide the evidence an agent needs to notice
+and repair corruption. The human-reviewed classification is in
+`context-pollution-classifications.csv`; compact rep evidence is under
+`data/context-pollution-opportunity/`.
 
 ## Recommended paired evaluation
 
@@ -111,16 +115,24 @@ core task set. Compare stock Pi with a versioned config containing only the
 
 Recommended three-rep pilot:
 
-- `gpt-5.6-sol/low`
-- `gpt-5.6-sol/medium`
-- `gpt-5.6-sol/high`
-- `deepseek-v4-flash/high`
-- optional local contrast: `Qwen3.6-27B-AWQ-BF16-INT4/high`
+- `openai-codex/gpt-5.6-sol` at `low`
+- `openai-codex/gpt-5.6-terra` at `low`
+- `openai-codex/gpt-5.6-luna` at `low`
+- `openrouter/deepseek/deepseek-v4-flash-0731` at `low`
+- `zai/glm-5.2` at `max` through the direct Z.ai subscription route
 
-The four-leaf core is 48 reps: 2 tasks × 2 configs × 4 model/thinking leaves ×
-3 reps. Adding Qwen makes 60 reps. Expand an activating task/leaf to ten total
-reps only after reviewing the pilot; keep intention-to-treat results primary and
-show activation-conditioned results as a secondary view.
+This is 60 reps: 2 tasks × 2 configs × 5 model/thinking leaves × 3 reps. GLM's
+`max` leaf is a deliberate subscription-model contrast, not part of a
+reasoning-level sweep. Establish fresh stock-Pi baseline cells for all five
+leaves under the same subject version and locks as the extension cells. Existing
+results either lack modern provenance, use a different Pi version, omit the two
+target tasks, or use Flash 0731 at `max` instead of `low`.
+
+Do not run medium or high thinking yet. First inspect activation rates, token
+deltas, recovery reads, and behavioral flips at the chosen levels. Add another
+thinking level only if the low-thinking result leaves a specific question that
+reasoning effort could answer. Keep intention-to-treat results primary and show
+activation-conditioned results as a secondary view.
 
 Separate deterministic payload reduction from realized trajectory efficiency:
 
