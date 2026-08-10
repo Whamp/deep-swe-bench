@@ -13,5 +13,5 @@ def test_pi_image_revision_tracks_pinned_pi_version():
 
     assert match is not None
     version = match.group(1)
-    assert version == "0.83.0"
+    assert version == "0.84.0"
     assert f"pi{version.replace('.', '')}" in PI_IMAGE_REV
