@@ -33,3 +33,9 @@
 - Reporter: "pi"
 
 > Confirmed-launch planning accepted versioned config identity pi-check@1.0.0, but subject runners copied the identity into Docker container names without sanitizing '@'. The first real preflight failed before Docker start and model use. Fixed in c278293 with shared Pi/OMP name sanitization, exact regression coverage, property tests, and a Docker parser check. Planning should eventually validate all derived runtime identifiers before approval.
+
+## 2026-07-31T13:17:30.278312229Z — medium
+
+- Reporter: "pi"
+
+> Benchmark launch planning accepted a structured state root of results/ instead of results/_runs/ without warning. The run executed successfully, but the live dashboard wrapper under results/_runs/ had no manifest/status/events, so graphs disappeared until the dashboard learned to resolve launch-plan paths.statePath. The confirmation/prepare path should warn or reject dashboard-incompatible state roots.
