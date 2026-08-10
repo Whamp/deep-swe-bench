@@ -196,11 +196,15 @@ def _runtime_identity(
     )
 
 
-def _launch_request(*, run_id: str = "fixture-run") -> LaunchRequest:
+def _launch_request(
+    *,
+    run_id: str = "fixture-run",
+    thinking: str = "low",
+) -> LaunchRequest:
     return LaunchRequest(
         subject="pi",
         model="provider/model",
-        thinking="low",
+        thinking=thinking,
         configs=("baseline@1.0.0", "review-assistant@1.0.0"),
         baseline_config="baseline@1.0.0",
         task_selection=LaunchTaskSelection(
@@ -222,8 +226,8 @@ def _launch_request(*, run_id: str = "fixture-run") -> LaunchRequest:
 def _write_launch_fixture(
     tmp_path: Path,
     *,
-    review_smoke_contract: Mapping[str, object] | None = None,
     thinking: str = "low",
+    review_smoke_contract: Mapping[str, object] | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     repository_root = tmp_path / "repository"
     tasks_root = tmp_path / "tasks"
@@ -414,6 +418,7 @@ def test_plan_command_writes_review_artifacts_without_execution(
     plan = parse_launch_plan_json(plan_path.read_text())
     assert plan.identity.startswith("sha256:")
     document = plan.to_document()
+    assert document["thinking"] == thinking
     policies = document["policies"]
     resources = document["resources"]
     assert resources == {
