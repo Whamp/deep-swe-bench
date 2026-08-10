@@ -44,33 +44,89 @@ systemctl --user start deep-swe-bench-vite.service
 ## Pages
 
 ### Overview (`/`)
-Grid of run cards. Each card shows run_id, state, model/thinking, progress (done/total), active count, bad count, heartbeat age, stale-cell count, and oldest cell age. Click a card to see run detail.
+An operational monitor, not an archive wall:
+
+- **Ongoing** is the default. Truly running sessions get rich health cards with
+  phase, progress, active workers, task-level solve rate, and heartbeat age.
+  Preflight is labeled explicitly instead of showing a misleading `0 active`.
+- **Needs attention** shows only recent stalled/failed runs as compact rows;
+  older incidents stay hidden unless requested. A stale declared `running`
+  state is reclassified to **stalled** after 3× its configured heartbeat cadence
+  (with a 15-minute floor), so abandoned processes never look live.
+- **History** keeps completed, paused, old failed/stalled, and legacy runs in a
+  dense row list rather than full cards.
+- Search filters by run id/key, model, thinking level, or config. When no run is
+  active, the page says so plainly and offers direct links to attention/history.
 
 ### Run detail (`/run/:runId`)
-Single run view with metrics row, progress bar, preflight/smoke table, active cells table (with cell age and stale flag), recent finished cells, and file links. Three detail levels (summary, operational, diagnostic).
+The live-monitoring centerpiece. Three things at a glance:
+
+- **Live score hero** — one big solve-rate number (green/amber/red by band), a
+  running *Δ vs a baseline* (auto-paired on the same model+thinking from
+  `results/`, with a flip count: new solves / regressions), cumulative +
+  projected cost, cost-per-solve, throughput (cells/hr), throughput-based ETA,
+  and a failure-mode breakdown. Four fixed-size plots track solved-vs-finished,
+  cost, cumulative mean partial reward, and cumulative tool-call error rate.
+  Mean partial uses the same 0–1 aggregate as the headline. Native tool errors
+  are `toolResult.isError`; Fabric uses failed/aborted/timed-out inner trace
+  operations, falling back to the outer result when trace telemetry is absent.
+  Reused cells are excluded from the operational error-rate denominator.
+  Updates every 5s from the event log plus mtime-cached compact session summaries.
+- **What the agents are doing** — the *Active cells* table is sorted
+  anomaly-first (stale, then oldest). Click **view session** on any cell to
+  open a drill-in that parses the agent's session transcript (server-side) into
+  a **turn timeline**: each turn shows the agent's self-narrated intent (from
+  its `thinking` block), the tools/files it touched, and its token/cost delta.
+  Works for both native-pi (`read`/`edit`/`bash`) and pi-fabric (`fabric_exec`
+  wrapping JS) sessions — fabric's inner tool calls are unwrapped with a
+  tolerant regex. A `LIVE` dot confirms the transcript is still being written.
+- **Recent results** — failures first as rows; a quiet `N ok` summary when
+  nothing needs attention. Three detail levels (summary, operational,
+  diagnostic) toggle the raw `status.json` / `manifest.json` / events tail.
 
 ### Compare (`/compare`)
-Interactive charts reading real benchmark data from all `results/` directories:
-- **Pareto frontier** — solve rate vs median cost (upper-left = better)
-- **Solve rate by run** — bar chart
-- **Mean partial vs median cost** — scatter
-- **Difficulty stratification** — solve rate by hard/medium/easy bucket
-- **Median tokens per task** — bar chart
+A scoped two-config workspace for answering whether one config beats another on
+matched evidence:
 
-Click run names in the selector to toggle which runs are visible. Note: `/api/compare`
-aggregates **every** cell in a config group, so if a config ran on multiple subsets its
-numbers mix subsets — use the Leaderboard page for clean per-subset comparisons.
+- **Scope first:** subset, rep cap, and model+thinking must match. The default is
+  `36_v2`, first rep per task, full coverage only.
+- **Reference versus challenger:** the default pair is the canonical `baseline`
+  and strongest full-coverage challenger in the largest comparable group. Both
+  sides remain changeable; partial evidence requires an explicit opt-in.
+- **Paired task result:** tasks are intersected before comparison. The verdict
+  reports B-only gains, A-only losses, net flips, both solved, neither solved,
+  shared-task partial reward, and the discordant sample size. These are
+  descriptive measurements, not significance claims.
+- **Per-task evidence:** the partial-reward scatter defaults to the observed
+  variation range and retains a full 0–100% toggle. Every discordant task and
+  every shared task remain inspectable.
+- **Honest secondary metrics:** task success and rep success keep separate
+  denominators. `$0` cost is shown as untracked rather than free. Empty
+  difficulty buckets show `—`, not 0%.
+
+`/api/compare` rows represent aggregated config paths, not individual launches.
+Subset and rep parameters constrain that aggregation; Compare does not claim
+batch-level isolation or statistical significance.
 
 ### Leaderboard (`/leaderboard`)
-Ranks every config on a single fixed dataset (subset) for an apples-to-apples comparison:
-- **Dataset selector** — pick any subset (`36_v2`, `12_v2`, `113_v0`, …); cells are filtered to
-  that task set so cross-subset contamination is eliminated.
-- **Reps cap** — optionally keep only the first N reps per task for fairness.
-- **Hide partial-coverage runs** — on by default; a run only qualifies if it has data for every
-  task in the subset (distinct task count, not raw cell count, so 3-reps-on-12-of-36 is excluded).
-- **Pareto scatter** — solve rate vs median cost, with frontier points starred.
-- **Sortable ranked table** — solve %, mean partial, median/total cost, median tokens, n. Click
-  any column header to sort.
+A decision surface for choosing a config on one fixed subset:
+
+- **Measured standouts** name the balanced frontier pick, highest rep solve rate,
+  lowest cost per successful rep, and largest solve-rate lift over the canonical
+  `baseline` at the same model and thinking level. Each card states its rule;
+  none claims statistical significance.
+- **Rep and task success stay separate.** A config can solve one of three reps on
+  every task: 33% rep success but 100% task coverage. Cards and rows show both.
+- **Value frontier** plots rep solve rate against either cost per successful rep
+  or median rep cost. Frontier membership follows the selected axis. `$0` means
+  cost untracked, so those configs remain in the table but never appear in cost
+  cards or charts.
+- **Filters** cover subset, rep cap, full/partial coverage, model+thinking, and
+  search across config/run/model/thinking. Mobile shows the balanced pick first
+  and collapses advanced filters.
+- **Ranked evidence** defaults to rep solve rate and shows same-group baseline
+  delta, median cost, cost per successful rep, task success, and `tasks × reps`.
+  Mean partial, tokens, wall time, and total cost stay behind **More metrics**.
 
 ## API endpoints
 
@@ -78,7 +134,9 @@ Ranks every config on a single fixed dataset (subset) for an apples-to-apples co
 |---|---|
 | `GET /api/runs?detail=summary\|operational\|diagnostic` | List all discovered runs |
 | `GET /api/runs/<id>?detail=...` | Detailed projection of a single run |
+| `GET /api/runs/<id>/score` | Live score replay (solve/partial rates, tool-call error rate, cost, throughput, ETA, timeline, per-task results) |
 | `GET /api/runs/<id>/events?limit=N` | Events tail |
+| `GET /api/cell-session?path=&tail=N` | Agent session turn timeline for one cell (intent + tools + token/cost deltas) |
 | `GET /api/compare?subset=&reps=N` | Aggregated cross-run metrics, optionally filtered to a subset |
 | `GET /api/subsets` | List available task subsets |
 | `GET /api/file?path=&tail=N` | Tail a file (repo-allowlisted) |

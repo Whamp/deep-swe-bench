@@ -1,12 +1,14 @@
-import { useState } from 'react'
-import { useParams, Link } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
-import { fetchRun, ApiError } from '@/lib/api'
-import type { RunDetail as RunDetailData, Cell, DetailLevel } from '@/lib/types'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Progress } from '@/components/ui/progress'
-import { StateBadge, OutcomeBadge, Badge } from '@/components/ui/badge'
-import { ErrorState } from '@/components/error-state'
+import { useState, useMemo } from "react";
+import { useParams, Link } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { fetchRun, ApiError } from "@/lib/api";
+import type { RunDetail as RunDetailData, Cell, DetailLevel } from "@/lib/types";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
+import { StateBadge, OutcomeBadge, Badge } from "@/components/ui/badge";
+import { ErrorState } from "@/components/error-state";
+import { LiveScore } from "@/components/live-score";
+import { CellSessionPanel } from "@/components/cell-session";
 import {
   Table,
   TableHeader,
@@ -14,43 +16,44 @@ import {
   TableRow,
   TableHead,
   TableCell,
-} from '@/components/ui/table'
-import { fmtSeconds, fmtTokens, fmtCost } from '@/lib/metrics'
+} from "@/components/ui/table";
+import { fmtSeconds, fmtTokens, fmtCost, fmtPercent } from "@/lib/metrics";
 
-const DETAIL_OPTIONS: DetailLevel[] = ['summary', 'operational', 'diagnostic']
+const DETAIL_OPTIONS: DetailLevel[] = ["summary", "operational", "diagnostic"];
 
 export default function RunDetail() {
-  const { runId } = useParams<{ runId: string }>()
-  const [detail, setDetail] = useState<DetailLevel>('operational')
+  const { runId } = useParams<{ runId: string }>();
+  const [detail, setDetail] = useState<DetailLevel>("operational");
+  const [sessionCell, setSessionCell] = useState<Cell | null>(null);
 
   const {
     data: run,
     isLoading,
     error,
   } = useQuery({
-    queryKey: ['run', runId, detail],
+    queryKey: ["run", runId, detail],
     queryFn: () => fetchRun(runId!, detail),
     enabled: !!runId,
     refetchInterval: 5000,
-  })
+  });
 
-  if (!runId) return <p className="text-muted-foreground">No run selected.</p>
-  if (isLoading) return <p className="text-muted-foreground">Loading…</p>
+  if (!runId) return <p className="text-muted-foreground">No run selected.</p>;
+  if (isLoading) return <p className="text-muted-foreground">Loading…</p>;
   if (error) {
-    const isNotFound = error instanceof ApiError && error.status === 404
+    const isNotFound = error instanceof ApiError && error.status === 404;
     return (
       <ErrorState
-        title={isNotFound ? 'Run not found' : 'Unable to load run'}
-        message={isNotFound ? 'This run does not exist or has been removed.' : String(error)}
+        title={isNotFound ? "Run not found" : "Unable to load run"}
+        message={isNotFound ? "This run does not exist or has been removed." : String(error)}
         runId={runId}
       />
-    )
+    );
   }
-  if (!run) return <ErrorState runId={runId} />
+  if (!run) return <ErrorState runId={runId} />;
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-4">
         <Link to="/" className="text-sm text-muted-foreground hover:text-foreground">
           ← Overview
         </Link>
@@ -74,73 +77,70 @@ export default function RunDetail() {
         </div>
       </div>
 
+      <LiveScore run={run} />
       <RunSummary run={run} />
-      <CellTable
-        title="Preflight / smoke"
-        cells={Object.values(run.preflight || {})}
-        showAge={false}
-      />
-      <CellTable title="Active cells" cells={run.active_cells || []} showAge={true} />
-      <CellTable title="Recent finished" cells={run.recent_finished || []} showAge={false} />
 
-      {detail === 'diagnostic' && <DiagnosticPanels run={run} />}
+      <ActiveCells cells={run.active_cells || []} onOpenSession={setSessionCell} />
+      <PreflightSmokeResults
+        cells={Object.values(run.preflight || {})}
+        onOpenSession={setSessionCell}
+      />
+      <FinishedRepResults
+        cells={run.finished_cells || run.recent_finished || []}
+        onOpenSession={setSessionCell}
+      />
+
+      {detail === "diagnostic" && <DiagnosticPanels run={run} />}
+
+      {sessionCell && <CellSessionPanel cell={sessionCell} onClose={() => setSessionCell(null)} />}
     </div>
-  )
+  );
 }
 
 function RunSummary({ run }: { run: RunDetailData }) {
-  const c = run.counts || {}
+  const c = run.counts || {};
   return (
     <Card>
-      <CardContent className="space-y-4 p-4">
-        <div className="text-sm text-muted-foreground">
-          {run.model || run.kind} {run.thinking || ''} · configs:{' '}
-          {(run.configs || []).join(', ') || '—'}
-        </div>
-        <div className="flex flex-wrap gap-2">
+      <CardContent className="space-y-3 p-4">
+        <div className="flex flex-wrap items-center gap-2">
           <Badge>
-            {run.launch_plan_identity ? `plan ${run.launch_plan_identity}` : run.launch_metadata}
+            {run.model || run.kind} {run.thinking || ""}
           </Badge>
-          <Badge variant={run.preflight_state === 'failed' ? 'failed' : 'default'}>
+          <Badge>
+            {run.launch_plan_identity
+              ? `plan ${run.launch_plan_identity.slice(0, 19)}`
+              : run.launch_metadata}
+          </Badge>
+          <Badge variant={run.preflight_state === "failed" ? "failed" : "default"}>
             preflight {run.preflight_state}
           </Badge>
-        </div>
-        <div className="text-xs text-muted-foreground">
-          updated {run.updated_at || 'unknown'} · heartbeat {fmtSeconds(run.heartbeat_age_s)}
-        </div>
-        <div className="text-xs text-muted-foreground">
-          <span className="font-medium text-foreground">Workspace:</span>{' '}
-          <code className="break-all">{run.workspace || '—'}</code>
+          {(run.configs || []).map((cfg) => (
+            <Badge key={cfg}>{cfg}</Badge>
+          ))}
         </div>
         <div>
           <Progress value={c.batch_done || 0} max={c.batch_total || 1} />
-          <div className="mt-1 text-xs text-muted-foreground">
-            {c.batch_done || 0}/{c.batch_total || 0} done
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+            <span>
+              {c.batch_done || 0}/{c.batch_total || 0} done
+            </span>
+            <span>updated {fmtSeconds(run.heartbeat_age_s)} ago</span>
+            {run.stale_cell_count > 0 && (
+              <Badge variant="stale">{run.stale_cell_count} stale</Badge>
+            )}
+            {run.max_cell_age_s != null && run.max_cell_age_s > 0 && (
+              <span>oldest active {fmtSeconds(run.max_cell_age_s)}</span>
+            )}
           </div>
         </div>
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-7">
-          <Metric label="Active" value={String(run.active_count || c.batch_running || 0)} />
-          <Metric label="OK / empty" value={`${c.ok || 0} / ${c.empty || 0}`} />
-          <Metric label="Skipped" value={String(c.batch_skipped || 0)} />
-          <Metric label="Timeout / transient" value={`${c.timeout || 0} / ${c.transient || 0}`} />
-          <Metric label="Failed" value={String(c.failed || 0)} />
-          <Metric label="ETA" value={fmtSeconds(run.eta_s)} />
-          <Metric
-            label="Stale / oldest"
-            value={
-              run.stale_cell_count > 0
-                ? `${run.stale_cell_count} / ${fmtSeconds(run.max_cell_age_s)}`
-                : '0'
-            }
-          />
+        <div className="flex flex-wrap gap-4 text-xs">
+          <FileLink path={run.paths?.manifest} label="manifest" />
+          <FileLink path={run.paths?.status} label="status" />
+          <FileLink path={run.paths?.events} label="events" />
+          <span className="text-muted-foreground">
+            workspace <code className="break-all">{run.workspace || "—"}</code>
+          </span>
         </div>
-        {run.paths && (
-          <div className="flex flex-wrap gap-4 text-xs">
-            <FileLink path={run.paths.manifest} label="manifest" />
-            <FileLink path={run.paths.status} label="status" />
-            <FileLink path={run.paths.events} label="events" />
-          </div>
-        )}
         {run.failure_buckets && Object.keys(run.failure_buckets).length > 0 && (
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-muted-foreground">Failures:</span>
@@ -153,20 +153,350 @@ function RunSummary({ run }: { run: RunDetailData }) {
         )}
       </CardContent>
     </Card>
-  )
+  );
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+/** Active cells, sorted anomaly-first (stale, then oldest). */
+function ActiveCells({
+  cells,
+  onOpenSession,
+}: {
+  cells: Cell[];
+  onOpenSession: (cell: Cell) => void;
+}) {
+  const sorted = useMemo(
+    () =>
+      [...cells].sort((a, b) => {
+        const sa = a.potentially_stale ? 1 : 0;
+        const sb = b.potentially_stale ? 1 : 0;
+        if (sa !== sb) return sb - sa; // stale first
+        return (b.cell_age_s ?? 0) - (a.cell_age_s ?? 0); // then oldest
+      }),
+    [cells],
+  );
+  if (sorted.length === 0) return null;
   return (
-    <div className="rounded-md border border-border bg-background/50 p-2">
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="text-lg font-semibold">{value}</div>
-    </div>
-  )
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+          Active cells · {sorted.length}
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Task</TableHead>
+              <TableHead>Rep</TableHead>
+              <TableHead>Age</TableHead>
+              <TableHead>Activity</TableHead>
+              <TableHead>Files</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {sorted.map((cell, i) => {
+              const s = cell.summary || {};
+              return (
+                <TableRow key={`${cell.cell_id || "cell"}-${i}`}>
+                  <TableCell className="font-medium">{cell.task || "—"}</TableCell>
+                  <TableCell>{cell.rep ?? "—"}</TableCell>
+                  <TableCell>
+                    {cell.potentially_stale ? (
+                      <Badge variant="stale">{fmtSeconds(cell.cell_age_s)}</Badge>
+                    ) : cell.cell_age_s != null ? (
+                      fmtSeconds(cell.cell_age_s)
+                    ) : (
+                      "—"
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    <button
+                      onClick={() => onOpenSession(cell)}
+                      className="rounded-md border border-border bg-background/60 px-2 py-1 text-xs text-primary hover:bg-accent hover:text-foreground"
+                    >
+                      view session →
+                    </button>
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    <CellFiles cell={cell} summary={s} />
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** Finished reps remain individually inspectable after leaving the active set. */
+function FinishedRepResults({
+  cells,
+  onOpenSession,
+}: {
+  cells: Cell[];
+  onOpenSession: (cell: Cell) => void;
+}) {
+  const sorted = useMemo(
+    () =>
+      [...cells].sort((a, b) => {
+        const aNeedsAttention = a.outcome !== "ok" && a.outcome !== "skipped" ? 1 : 0;
+        const bNeedsAttention = b.outcome !== "ok" && b.outcome !== "skipped" ? 1 : 0;
+        if (aNeedsAttention !== bNeedsAttention) return bNeedsAttention - aNeedsAttention;
+        return String(b.finished_at || "").localeCompare(String(a.finished_at || ""));
+      }),
+    [cells],
+  );
+  if (sorted.length === 0) return null;
+  const solved = sorted.filter((cell) => Number(cell.summary?.reward_binary) >= 1).length;
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+          Finished reps · {sorted.length} · {solved} solved
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="max-h-[36rem] overflow-auto">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Task</TableHead>
+              <TableHead>Rep</TableHead>
+              <TableHead>Outcome</TableHead>
+              <TableHead>Result</TableHead>
+              <TableHead>Partial</TableHead>
+              <TableHead>F2P</TableHead>
+              <TableHead>P2P</TableHead>
+              <TableHead>Output tokens</TableHead>
+              <TableHead>Wall time</TableHead>
+              <TableHead>Tool errors</TableHead>
+              <TableHead>Files</TableHead>
+              <TableHead>Inspect</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {sorted.map((cell, i) => {
+              const summary = cell.summary || {};
+              const rewardBinary = summary.reward_binary;
+              return (
+                <TableRow key={`${cell.cell_id || "cell"}-${i}`}>
+                  <TableCell className="font-medium">{cell.task || "—"}</TableCell>
+                  <TableCell>{cell.rep ?? "—"}</TableCell>
+                  <TableCell>
+                    <OutcomeBadge outcome={cell.outcome} />
+                  </TableCell>
+                  <TableCell>
+                    {rewardBinary === undefined ? (
+                      "—"
+                    ) : Number(rewardBinary) >= 1 ? (
+                      <Badge variant="ok">solved</Badge>
+                    ) : (
+                      <Badge variant="empty">not solved</Badge>
+                    )}
+                  </TableCell>
+                  <TableCell>{fmtPercent(summary.reward_partial as number | undefined)}</TableCell>
+                  <TableCell>{fmtPercent(summary.f2p as number | undefined)}</TableCell>
+                  <TableCell>{fmtPercent(summary.p2p as number | undefined)}</TableCell>
+                  <TableCell>{fmtTokens(summary.output_tokens as number | undefined)}</TableCell>
+                  <TableCell>{fmtSeconds(summary.agent_wall_s as number | undefined)}</TableCell>
+                  <TableCell className="whitespace-nowrap text-xs">
+                    <FinishedCellToolErrors summary={summary} />
+                  </TableCell>
+                  <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+                    <CellFiles cell={cell} summary={summary} />
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    <SessionLink cell={cell} onOpen={onOpenSession} />
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
+}
+
+function FinishedCellToolErrors({
+  summary,
+}: {
+  summary: Record<string, number | boolean | string | null | undefined>;
+}) {
+  const calls = summary.tool_calls;
+  if (typeof calls !== "number" || calls <= 0) return "—";
+  const errors = typeof summary.tool_call_errors === "number" ? summary.tool_call_errors : 0;
+  const rate =
+    typeof summary.tool_call_error_rate === "number" ? summary.tool_call_error_rate : null;
+  return `${errors}/${calls} · ${fmtPercent(rate)}`;
+}
+
+function CellFiles({
+  cell,
+  summary,
+  metrics,
+}: {
+  cell: Cell;
+  summary: Record<string, number | boolean | string | null | undefined>;
+  metrics?: boolean;
+}) {
+  const bits: string[] = [];
+  if (metrics) {
+    if (summary.total_tokens !== undefined)
+      bits.push(`tok ${fmtTokens(summary.total_tokens as number)}`);
+    if (summary.cost_usd !== undefined) bits.push(`${fmtCost(summary.cost_usd as number)}`);
+    if (summary.agent_wall_s !== undefined)
+      bits.push(`${fmtSeconds(summary.agent_wall_s as number)}`);
+  }
+  return (
+    <span className="text-muted-foreground">
+      {bits.length > 0 && <span>{bits.join(" · ")} </span>}
+      {cell.result_path && (
+        <a
+          href={`/api/file?path=${encodeURIComponent(cell.result_path)}&tail=50`}
+          target="_blank"
+          rel="noreferrer"
+          className="text-primary hover:underline"
+        >
+          result
+        </a>
+      )}
+      {cell.result_path && cell.log_path && " · "}
+      {cell.log_path && (
+        <a
+          href={`/api/file?path=${encodeURIComponent(cell.log_path)}&tail=200`}
+          target="_blank"
+          rel="noreferrer"
+          className="text-primary hover:underline"
+        >
+          log
+        </a>
+      )}
+    </span>
+  );
+}
+
+function SessionLink({ cell, onOpen }: { cell: Cell; onOpen: (cell: Cell) => void }) {
+  if (!cell.result_path) return <span className="text-muted-foreground">unavailable</span>;
+  return (
+    <button
+      onClick={() => onOpen(cell)}
+      className="rounded-md border border-border bg-background/60 px-2 py-1 text-xs text-primary hover:bg-accent hover:text-foreground"
+    >
+      view session →
+    </button>
+  );
+}
+
+/** Preflight smoke reps expose both agent execution and smoke-contract evidence. */
+function PreflightSmokeResults({
+  cells,
+  onOpenSession,
+}: {
+  cells: Cell[];
+  onOpenSession: (cell: Cell) => void;
+}) {
+  if (cells.length === 0) return null;
+  const passed = cells.filter((cell) => cell.state === "passed").length;
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+          Preflight / smoke · {cells.length} · {passed} passed
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="max-h-[36rem] overflow-auto">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Task</TableHead>
+              <TableHead>Config</TableHead>
+              <TableHead>Rep</TableHead>
+              <TableHead>Contract verdict</TableHead>
+              <TableHead>Execution outcome</TableHead>
+              <TableHead>Task result</TableHead>
+              <TableHead>Partial pass</TableHead>
+              <TableHead>Usage / evidence</TableHead>
+              <TableHead>Contract diagnostics</TableHead>
+              <TableHead>Inspect</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {cells.map((cell, i) => {
+              const summary = cell.summary || {};
+              const rewardBinary = summary.reward_binary;
+              return (
+                <TableRow key={`${cell.cell_id || "preflight"}-${i}`}>
+                  <TableCell className="font-medium">{cell.task || "—"}</TableCell>
+                  <TableCell>{cell.config || "—"}</TableCell>
+                  <TableCell>{cell.rep ?? "—"}</TableCell>
+                  <TableCell>
+                    <StateBadge state={cell.state} />
+                  </TableCell>
+                  <TableCell>
+                    <OutcomeBadge outcome={cell.outcome} />
+                  </TableCell>
+                  <TableCell>
+                    {rewardBinary === undefined ? (
+                      "—"
+                    ) : Number(rewardBinary) >= 1 ? (
+                      <Badge variant="ok">solved</Badge>
+                    ) : (
+                      <Badge variant="empty">not solved</Badge>
+                    )}
+                  </TableCell>
+                  <TableCell>{fmtPercent(summary.reward_partial as number | undefined)}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    <div className="space-y-1">
+                      <CellFiles cell={cell} summary={summary} metrics />
+                      <FileLink path={cell.contract_path} label="contract" />
+                    </div>
+                  </TableCell>
+                  <TableCell className="min-w-64 text-xs">
+                    <PreflightContractDiagnostics diagnostics={cell.diagnostics || []} />
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    <SessionLink cell={cell} onOpen={onOpenSession} />
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
+}
+
+function PreflightContractDiagnostics({
+  diagnostics,
+}: {
+  diagnostics: NonNullable<Cell["diagnostics"]>;
+}) {
+  if (diagnostics.length === 0) return <span className="text-muted-foreground">none</span>;
+  return (
+    <details>
+      <summary className="cursor-pointer text-red-400">
+        {diagnostics.length} contract {diagnostics.length === 1 ? "failure" : "failures"}
+      </summary>
+      <ul className="mt-2 space-y-2">
+        {diagnostics.map((diagnostic, index) => (
+          <li key={`${diagnostic.requirement || "diagnostic"}-${diagnostic.target || index}`}>
+            <div className="font-medium">
+              {diagnostic.requirement || "unknown requirement"} ·{" "}
+              {diagnostic.target || "unknown target"}
+            </div>
+            <div className="text-muted-foreground">{diagnostic.reason || "no reason recorded"}</div>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
 }
 
 function FileLink({ path, label }: { path?: string; label: string }) {
-  if (!path) return <span className="text-muted-foreground">{label}: —</span>
+  if (!path) return <span className="text-muted-foreground">{label}: —</span>;
   return (
     <a
       href={`/api/file?path=${encodeURIComponent(path)}&tail=200`}
@@ -176,99 +506,7 @@ function FileLink({ path, label }: { path?: string; label: string }) {
     >
       {label}
     </a>
-  )
-}
-
-function CellTable({ title, cells, showAge }: { title: string; cells: Cell[]; showAge: boolean }) {
-  if (!cells || cells.length === 0) return null
-  return (
-    <Card>
-      <CardHeader className="pb-2">
-        <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
-          {title}
-        </CardTitle>
-      </CardHeader>
-      <CardContent>
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Task</TableHead>
-              <TableHead>Config</TableHead>
-              <TableHead>Rep</TableHead>
-              <TableHead>State</TableHead>
-              {showAge && <TableHead>Age</TableHead>}
-              <TableHead>Outcome</TableHead>
-              <TableHead>Metrics</TableHead>
-              <TableHead>Files</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {cells.map((cell, i) => {
-              const s = cell.summary || {}
-              const bits: string[] = []
-              if (s.reward_partial !== undefined) bits.push(`partial=${s.reward_partial}`)
-              if (s.reward_binary !== undefined) bits.push(`binary=${s.reward_binary}`)
-              if (s.total_tokens !== undefined)
-                bits.push(`tok=${fmtTokens(s.total_tokens as number)}`)
-              if (s.combined_total_tokens !== undefined)
-                bits.push(`combined=${fmtTokens(s.combined_total_tokens as number)}`)
-              if (s.cost_usd !== undefined) bits.push(`$=${fmtCost(s.cost_usd as number)}`)
-              if (s.agent_wall_s !== undefined)
-                bits.push(`wall=${fmtSeconds(s.agent_wall_s as number)}`)
-              return (
-                <TableRow key={`${cell.cell_id || 'cell'}-${i}`}>
-                  <TableCell className="font-medium">{cell.task || '—'}</TableCell>
-                  <TableCell>{cell.config || '—'}</TableCell>
-                  <TableCell>{cell.rep ?? '—'}</TableCell>
-                  <TableCell>{cell.state || '—'}</TableCell>
-                  {showAge && (
-                    <TableCell>
-                      {cell.potentially_stale ? (
-                        <Badge variant="stale">{fmtSeconds(cell.cell_age_s)}</Badge>
-                      ) : cell.cell_age_s != null ? (
-                        fmtSeconds(cell.cell_age_s)
-                      ) : (
-                        '—'
-                      )}
-                    </TableCell>
-                  )}
-                  <TableCell>
-                    <OutcomeBadge outcome={cell.outcome} />
-                  </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
-                    {bits.join(' · ')}
-                  </TableCell>
-                  <TableCell className="text-xs">
-                    {cell.result_path && (
-                      <a
-                        href={`/api/file?path=${encodeURIComponent(cell.result_path)}&tail=50`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-primary hover:underline"
-                      >
-                        result
-                      </a>
-                    )}
-                    {cell.result_path && cell.log_path && ' · '}
-                    {cell.log_path && (
-                      <a
-                        href={`/api/file?path=${encodeURIComponent(cell.log_path)}&tail=200`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-primary hover:underline"
-                      >
-                        log
-                      </a>
-                    )}
-                  </TableCell>
-                </TableRow>
-              )
-            })}
-          </TableBody>
-        </Table>
-      </CardContent>
-    </Card>
-  )
+  );
 }
 
 function DiagnosticPanels({ run }: { run: RunDetailData }) {
@@ -283,7 +521,7 @@ function DiagnosticPanels({ run }: { run: RunDetailData }) {
           </CardHeader>
           <CardContent>
             <pre className="max-h-96 overflow-auto rounded-md border border-border bg-background/80 p-3 text-xs">
-              {run.events_tail.map((e) => JSON.stringify(e)).join('\n')}
+              {run.events_tail.map((e) => JSON.stringify(e)).join("\n")}
             </pre>
           </CardContent>
         </Card>
@@ -317,5 +555,5 @@ function DiagnosticPanels({ run }: { run: RunDetailData }) {
         </Card>
       )}
     </>
-  )
+  );
 }

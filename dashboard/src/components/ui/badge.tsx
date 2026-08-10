@@ -1,52 +1,55 @@
-import { type HTMLAttributes } from 'react'
-import { cva, type VariantProps } from 'class-variance-authority'
-import { cn } from '@/lib/utils'
-import type { RunState, CellState, CellOutcome } from '@/lib/types'
+import { type HTMLAttributes } from "react";
+import { cva, type VariantProps } from "class-variance-authority";
+import { cn } from "@/lib/utils";
+import type { RunState, CellState, CellOutcome } from "@/lib/types";
 
 const badgeVariants = cva(
-  'inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium transition-colors',
+  "inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium transition-colors",
   {
     variants: {
       variant: {
-        default: 'border-border text-muted-foreground',
-        running: 'border-green-500/50 text-green-400',
-        completed: 'border-green-500/50 text-green-400',
-        paused: 'border-yellow-500/50 text-yellow-400',
-        failed: 'border-red-500/50 text-red-400',
-        stale: 'border-yellow-500/50 bg-yellow-500/10 text-yellow-400',
-        ok: 'border-green-500/50 text-green-400',
-        timeout: 'border-red-500/50 text-red-400',
-        transient: 'border-orange-500/50 text-orange-400',
-        empty: 'border-muted text-muted-foreground',
-        skipped: 'border-muted text-muted-foreground',
+        default: "border-border text-muted-foreground",
+        running: "border-green-500/50 text-green-400",
+        stalled: "border-amber-500/50 bg-amber-500/10 text-amber-400",
+        completed: "border-green-500/50 text-green-400",
+        passed: "border-green-500/50 text-green-400",
+        paused: "border-yellow-500/50 text-yellow-400",
+        failed: "border-red-500/50 text-red-400",
+        stale: "border-yellow-500/50 bg-yellow-500/10 text-yellow-400",
+        ok: "border-green-500/50 text-green-400",
+        timeout: "border-red-500/50 text-red-400",
+        transient: "border-orange-500/50 text-orange-400",
+        empty: "border-muted text-muted-foreground",
+        skipped: "border-muted text-muted-foreground",
       },
     },
-    defaultVariants: { variant: 'default' },
+    defaultVariants: { variant: "default" },
   },
-)
+);
 
 export interface BadgeProps
-  extends HTMLAttributes<HTMLSpanElement>,
-    VariantProps<typeof badgeVariants> {}
+  extends HTMLAttributes<HTMLSpanElement>, VariantProps<typeof badgeVariants> {}
 
 export function Badge({ className, variant, ...props }: BadgeProps) {
-  return <span className={cn(badgeVariants({ variant }), className)} {...props} />
+  return <span className={cn(badgeVariants({ variant }), className)} {...props} />;
 }
 
 export function StateBadge({ state }: { state: RunState | CellState | string | undefined }) {
-  if (!state) return null
-  const variant = (['running', 'completed', 'paused', 'failed'] as const).includes(state as never)
-    ? (state as 'running' | 'completed' | 'paused' | 'failed')
-    : 'default'
-  return <Badge variant={variant}>{state}</Badge>
+  if (!state) return null;
+  const variant = (
+    ["running", "stalled", "completed", "passed", "paused", "failed"] as const
+  ).includes(state as never)
+    ? (state as "running" | "stalled" | "completed" | "passed" | "paused" | "failed")
+    : "default";
+  return <Badge variant={variant}>{state}</Badge>;
 }
 
 export function OutcomeBadge({ outcome }: { outcome: CellOutcome | string | undefined }) {
-  if (!outcome) return null
-  const variant = (['ok', 'timeout', 'transient', 'empty', 'skipped', 'failed'] as const).includes(
+  if (!outcome) return null;
+  const variant = (["ok", "timeout", "transient", "empty", "skipped", "failed"] as const).includes(
     outcome as never,
   )
-    ? (outcome as 'ok' | 'timeout' | 'transient' | 'empty' | 'skipped' | 'failed')
-    : 'default'
-  return <Badge variant={variant}>{outcome}</Badge>
+    ? (outcome as "ok" | "timeout" | "transient" | "empty" | "skipped" | "failed")
+    : "default";
+  return <Badge variant={variant}>{outcome}</Badge>;
 }
