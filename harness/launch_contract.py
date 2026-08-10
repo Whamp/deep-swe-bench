@@ -123,6 +123,7 @@ class LaunchPlanDocument(TypedDict):
     concurrency: int
     configs: list[LaunchConfigDocument]
     counts: LaunchCountsDocument
+    executionConfigs: NotRequired[list[str]]
     identityExclusions: list[str]
     model: str
     paths: LaunchPathsDocument

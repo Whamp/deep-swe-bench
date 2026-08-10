@@ -54,6 +54,16 @@ from harness.launch_planning import (
 )
 
 
+def _execution_config_identities(
+    document: LaunchPlanDocument,
+) -> tuple[str, ...]:
+    """Return configs allowed to reach the subject, with legacy-plan fallback."""
+    configured = document.get("executionConfigs")
+    if configured is None:
+        return tuple(config["identity"] for config in document["configs"])
+    return tuple(configured)
+
+
 def _confirmed_plan_document(
     plan: LaunchPlan,
     confirmation_identity: str | None,
@@ -73,8 +83,11 @@ def _confirmed_plan_document(
             f"plan={parsed_plan.identity!r}"
         )
     document = parsed_plan.to_document()
+    execution_configs = set(_execution_config_identities(document))
     legacy_configs = [
-        config["identity"] for config in document["configs"] if config["legacy"]
+        config["identity"]
+        for config in document["configs"]
+        if config["identity"] in execution_configs and config["legacy"]
     ]
     if legacy_configs:
         raise ValueError(
@@ -322,7 +335,7 @@ def _confirmed_run_manifest(
         cwd=document["paths"]["workspace"],
         model=document["model"],
         thinking=document["thinking"],
-        configs=[config["identity"] for config in document["configs"]],
+        configs=list(_execution_config_identities(document)),
         selection=dict(document["selection"]),
         runs=int(document["counts"]["reps"]),
         workers=int(document["concurrency"]),
@@ -336,8 +349,12 @@ def _confirmed_run_manifest(
     manifest.update(
         {
             "capture_initial_context": policies.capture_initial_context,
-            "config_identities": [config["identity"] for config in document["configs"]],
+            "config_identities": list(_execution_config_identities(document)),
             "launch_plan_identity": document["planIdentity"],
+            "reference_baseline_config": document["baselineConfig"],
+            "reviewed_config_identities": [
+                config["identity"] for config in document["configs"]
+            ],
             "launch_plan_path": "launch-plan.json",
             "resources": dict(document["resources"]),
             "results_root": document["paths"]["resultsRoot"],
@@ -398,7 +415,10 @@ def _config_lock_drift_changes(
 ) -> list[dict[str, object]]:
     """Compare every approved config lock with its current document."""
     changes: list[dict[str, object]] = []
+    execution_configs = set(_execution_config_identities(document))
     for config in document["configs"]:
+        if config["identity"] not in execution_configs or config["legacy"]:
+            continue
         approved_identity = config["lockIdentity"]
         lock_path = Path(config["configLeaf"]) / "config-lock.json"
         resolved = _resolved_plan_config_leaf(config)
@@ -442,7 +462,10 @@ def _config_input_drift_changes(
 ) -> list[dict[str, object]]:
     """Compare every approved config input with its current fingerprint."""
     changes: list[dict[str, object]] = []
+    execution_configs = set(_execution_config_identities(document))
     for config in document["configs"]:
+        if config["identity"] not in execution_configs:
+            continue
         resolved = _resolved_plan_config_leaf(config)
         approved_by_path = {
             str(item["path"]): item for item in config["behaviorInputs"]
@@ -550,7 +573,7 @@ def _confirmed_launch_request(
         subject=document["subject"]["name"],
         model=document["model"],
         thinking=document["thinking"],
-        configs=tuple(config["identity"] for config in document["configs"]),
+        configs=_execution_config_identities(document),
         baseline_config=document["baselineConfig"],
         task_selection=LaunchTaskSelection(
             kind=selection_kind,

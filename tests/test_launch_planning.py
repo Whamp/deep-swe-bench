@@ -1655,6 +1655,49 @@ def test_compile_launch_request_is_deterministic_without_execution(
     assert not state_root.exists()
 
 
+def test_launch_plan_keeps_reference_baseline_out_of_execution(
+    tmp_path: Path,
+) -> None:
+    """A reference-only baseline receives no preflight or batch reps."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    request = replace(
+        _launch_request(),
+        configs=("review-assistant@1.0.0",),
+        baseline_config="baseline@1.0.0",
+    )
+
+    compiled = compile_launch_request(
+        request,
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+    )
+
+    plan = compiled.plan.to_document()
+    assert plan["comparisonBaseline"]["identity"] == "baseline@1.0.0"
+    assert [config["identity"] for config in plan["configs"]] == [
+        "review-assistant@1.0.0",
+    ]
+    assert plan["counts"] == {
+        "batchCells": 2,
+        "configs": 1,
+        "preflightCells": 1,
+        "reps": 2,
+        "tasks": 1,
+    }
+    assert {cell["config"] for cell in plan["batchCells"]} == {
+        "review-assistant@1.0.0"
+    }
+    assert {cell["config"] for cell in plan["preflightCells"]} == {
+        "review-assistant@1.0.0"
+    }
+    assert "Comparison baseline: baseline@1.0.0 (reference only)" in compiled.receipt
+
+
 def test_launch_plan_resolves_and_renders_declared_model_role_patterns(
     tmp_path: Path,
 ) -> None:
