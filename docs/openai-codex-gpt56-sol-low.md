@@ -3,9 +3,10 @@
 This note validates `openai-codex/gpt-5.6-sol` at Pi thinking `low`, `medium`,
 and `high` for DeepSWE benchmark configs.
 
-Validated on 2026-07-23 against official OpenAI documentation, Pi model
-metadata and request behavior, and tiny live calls through Will's Codex
-subscription OAuth.
+Originally validated on 2026-07-23 with Pi `0.81.1` and revalidated for the
+read-long-lines pilot on 2026-08-10 with Pi `0.84.1`. The evidence covers
+official OpenAI documentation, Pi model metadata and request behavior, and the
+existing tiny live calls through Will's Codex subscription OAuth.
 
 ## Provider/API path
 
@@ -40,20 +41,18 @@ or an accepted Pi CLI flag alone is not sufficient evidence.
 
 ## Required Pi version
 
-Pi `0.80.2`, previously pinned in `harness/Dockerfile.pi-agent`, does not list
-`gpt-5.6-sol`. Pi `0.81.1` does list it under `openai-codex` with reasoning
-support. The benchmark image is pinned to `0.81.1`, and `PI_IMAGE_REV` includes
-that version so existing per-task images cannot be reused accidentally.
-
-Artifact:
-
-```text
-analysis/openai-codex-gpt56-sol-model-registry.json
-```
+Pi `0.80.2` did not list `gpt-5.6-sol`; Pi `0.81.1` introduced the route used by
+the original validation. The read-long-lines pilot pins Pi `0.84.1` under a new
+`PI_IMAGE_REV`. Its local mock record in
+`analysis/read-long-lines-pilot/provider-evidence/request-probe.jsonl` confirms the model remains
+available and sends explicit `reasoning.effort: "low"` with one tool. The
+original registry artifact remains at
+`analysis/openai-codex-gpt56-sol-model-registry.json`.
 
 ## Request-shape probes
 
-Pi `0.81.1` `before_provider_request` captures recorded these request fields:
+The original Pi `0.81.1` captures and the Pi `0.84.1` pilot probe recorded the
+same low request field:
 
 ```json
 {"model":"gpt-5.6-sol","reasoning":{"effort":"low","summary":"auto"},"stream":true,"store":false}

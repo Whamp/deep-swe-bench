@@ -59,7 +59,8 @@ Pi's maintained built-in `zai/glm-5.2` metadata currently uses:
     "low": "high",
     "medium": "high",
     "high": "high",
-    "xhigh": "max"
+    "xhigh": "max",
+    "max": "max"
   }
 }
 ```
@@ -73,6 +74,12 @@ Expected Pi-to-Z.ai request shape:
 | `medium` | `thinking: {"type":"enabled"}`, `reasoning_effort: "high"` |
 | `high` | `thinking: {"type":"enabled"}`, `reasoning_effort: "high"` |
 | `xhigh` | `thinking: {"type":"enabled"}`, `reasoning_effort: "max"` |
+| `max` | `thinking: {"type":"enabled"}`, `reasoning_effort: "max"` |
+
+The Pi `0.84.1` record in
+`analysis/read-long-lines-pilot/provider-evidence/request-probe.jsonl` proves that requesting
+`max` remains `max` and sends both enabled thinking and explicit
+`reasoning_effort: "max"` with one tool.
 
 Therefore, for GLM-5.2, `low`, `medium`, and `high` are not independent provider
 modes. The meaningful direct-ZAI comparison is usually `off` vs `high` vs
@@ -113,7 +120,8 @@ not use stale compatibility data. At minimum, GLM-5.2 needs:
             "low": "high",
             "medium": "high",
             "high": "high",
-            "xhigh": "max"
+            "xhigh": "max",
+            "max": "max"
           },
           "input": ["text"],
           "contextWindow": 1000000,
