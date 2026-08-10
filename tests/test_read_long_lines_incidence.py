@@ -103,6 +103,46 @@ def test_scan_rep_counts_ordinary_long_line_counterfactual(tmp_path: Path) -> No
     assert reads[0]["ordinary_affected"] == 1
 
 
+def test_select_result_paths_filters_full_corpus_scope(tmp_path: Path) -> None:
+    results_root = tmp_path / "results"
+    result_paths = [
+        results_root
+        / "deepseek"
+        / "high"
+        / "baseline"
+        / "task-a"
+        / "rep0"
+        / "result.json",
+        results_root
+        / "deepseek"
+        / "high"
+        / "advisor"
+        / "task-a"
+        / "rep1"
+        / "result.json",
+        results_root
+        / "other-model"
+        / "high"
+        / "baseline"
+        / "task-a"
+        / "rep0"
+        / "result.json",
+    ]
+    for result_path in result_paths:
+        result_path.parent.mkdir(parents=True)
+        result_path.write_text("{}")
+
+    selected = scan_read_long_lines.select_result_paths(
+        results_root,
+        configs=None,
+        model_leaves={"deepseek"},
+        thinking_levels={"high"},
+        rep_numbers={0},
+    )
+
+    assert selected == [result_paths[0]]
+
+
 def test_scan_rep_exempts_limit_one_full_line_read(tmp_path: Path) -> None:
     result_path = (
         tmp_path

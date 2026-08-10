@@ -45,6 +45,37 @@ def notice_length(source_line: int, original_length: int) -> int:
     return utf16_len(notice)
 
 
+def select_result_paths(
+    results_root: Path,
+    *,
+    configs: set[str] | None,
+    model_leaves: set[str] | None = None,
+    thinking_levels: set[str] | None = None,
+    rep_numbers: set[int] | None = None,
+) -> list[Path]:
+    """Select result records for a reproducible corpus scope."""
+    selected = []
+    for path in results_root.glob("*/*/*/*/rep*/result.json"):
+        model_leaf = path.parts[-6]
+        thinking_level = path.parts[-5]
+        try:
+            rep_number = int(path.parts[-2].removeprefix("rep"))
+            result = json.loads(path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        config = result.get("config", path.parts[-4])
+        if configs is not None and config not in configs:
+            continue
+        if model_leaves is not None and model_leaf not in model_leaves:
+            continue
+        if thinking_levels is not None and thinking_level not in thinking_levels:
+            continue
+        if rep_numbers is not None and rep_number not in rep_numbers:
+            continue
+        selected.append(path)
+    return sorted(selected)
+
+
 def scan_rep(result_path: Path) -> tuple[dict, list[dict], list[dict]]:
     result = json.loads(result_path.read_text())
     rep_dir = result_path.parent
@@ -290,19 +321,25 @@ def canonicalize_result_artifact_paths(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results", type=Path, default=Path("results"))
-    parser.add_argument("--configs", nargs="+", required=True)
+    config_scope = parser.add_mutually_exclusive_group(required=True)
+    config_scope.add_argument("--configs", nargs="+")
+    config_scope.add_argument("--all-configs", action="store_true")
+    parser.add_argument("--model-leaves", nargs="+")
+    parser.add_argument("--thinking-levels", nargs="+")
+    parser.add_argument("--rep-numbers", nargs="+", type=int)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
-    result_paths = []
-    for path in args.results.glob("*/*/*/*/rep*/result.json"):
-        try:
-            result = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if result.get("config", path.parts[-4]) in set(args.configs):
-            result_paths.append(path)
+    result_paths = select_result_paths(
+        args.results,
+        configs=set(args.configs) if args.configs is not None else None,
+        model_leaves=set(args.model_leaves) if args.model_leaves is not None else None,
+        thinking_levels=set(args.thinking_levels)
+        if args.thinking_levels is not None
+        else None,
+        rep_numbers=set(args.rep_numbers) if args.rep_numbers is not None else None,
+    )
 
     rep_rows: list[dict] = []
     activation_rows: list[dict] = []
@@ -319,7 +356,9 @@ def main() -> None:
             print(f"scanned {index}/{len(result_paths)}", flush=True)
 
     summary = {
-        "configs": args.configs,
+        "configs": args.configs
+        if args.configs is not None
+        else sorted({row["config"] for row in rep_rows}),
         "reps": len(rep_rows),
         "sessions": sum(bool(row["session_path"]) for row in rep_rows),
         "tasks": len({row["task"] for row in rep_rows}),
@@ -352,6 +391,16 @@ def main() -> None:
             (row["max_line_characters"] for row in rep_rows), default=0
         ),
     }
+    if any(
+        value is not None
+        for value in (args.model_leaves, args.thinking_levels, args.rep_numbers)
+    ):
+        summary["selection"] = {
+            "model_leaves": args.model_leaves,
+            "thinking_levels": args.thinking_levels,
+            "rep_numbers": args.rep_numbers,
+        }
+
     summary["rep_activation_rate"] = (
         summary["activated_reps"] / summary["reps"] if summary["reps"] else 0
     )
