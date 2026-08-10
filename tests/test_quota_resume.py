@@ -49,6 +49,26 @@ class _FakeState:
 
 
 class TestQuotaResumerQuota:
+    def test_zai_model_uses_zai_quota_windows(self):
+        resumer = run_batch.QuotaResumer(_args(model="zai/glm-5.2"))
+        state = _FakeState()
+        windows = [Window("5h", 4, NOW + timedelta(hours=4))]
+        with mock.patch.object(
+            run_batch, "_latest_transient_error_msg", return_value="usage limit reached"
+        ), mock.patch.object(
+            run_batch.quota,
+            "provider_windows",
+            return_value=(windows, "zai-api"),
+        ) as provider_windows, mock.patch.object(
+            run_batch.quota,
+            "codex_windows",
+            side_effect=AssertionError("ZAI quota must not query Codex"),
+        ):
+            decision = resumer.on_transient_pause(state)
+        assert decision["retry"] is True
+        assert decision["reason"].startswith("quota available")
+        provider_windows.assert_called_once_with("zai/glm-5.2")
+
     def test_quota_near_reset_retries_and_sets_quota_wait(self):
         resumer = run_batch.QuotaResumer(_args())
         state = _FakeState()

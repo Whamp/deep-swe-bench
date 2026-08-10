@@ -211,6 +211,21 @@ class RepositoryConfirmedOmpRunner:
         return dict(_run_planned_subject_process(cell, self.task_root))
 
 
+class RepositoryConfirmedPrimeAgentRunner:
+    """Run Prime Agent using only inputs from a confirmed launch plan."""
+
+    def __init__(self, task_root: Path) -> None:
+        """Bind confirmed Prime Agent execution to the planned task corpus."""
+        self.task_root = task_root
+
+    def run_confirmed_prime_agent_cell(
+        self,
+        cell: launch.ConfirmedPrimeAgentCell,
+    ) -> dict[str, object]:
+        """Execute one plan-resolved Prime Agent rep without raw writes."""
+        return dict(_run_planned_subject_process(cell, self.task_root))
+
+
 class RepositoryConfirmedPiRunner:
     """Run Pi with only config and cell paths resolved by a confirmed plan."""
 
@@ -387,6 +402,8 @@ def runner_script(args) -> Path:
         return HERE / "run.py"
     if agent == "omp":
         return HERE / "run_omp.py"
+    if agent == "prime-agent":
+        return HERE / "run_prime_agent.py"
     raise ValueError(f"unknown benchmark agent: {agent}")
 
 
@@ -638,7 +655,7 @@ class QuotaResumer:
         state: QuotaWaitState,
         msg: str | None,
     ) -> QuotaResumeDecision:
-        windows, source = quota.codex_windows(self.args.model)
+        windows, source = quota.provider_windows(self.args.model)
         if not windows:
             reason = f"quota limit but no usage data available (source={source}): {msg!r}"
             print(f"[resume] {reason}", flush=True)
@@ -698,7 +715,7 @@ class QuotaResumer:
             print(f"[resume] waiting for quota reset: {mins}m remaining (re-check in {int(chunk)}s)", flush=True)
             time.sleep(chunk)
             # Re-check: the window may reset early or the plan may change.
-            windows, _ = quota.codex_windows(self.args.model)
+            windows, _ = quota.provider_windows(self.args.model)
             if not quota.exhausted_windows(windows):
                 print("[resume] quota windows no longer exhausted; resuming early", flush=True)
                 break
@@ -794,7 +811,7 @@ def _legacy_main() -> None:
     ap.add_argument("--tasks", help="comma list of task ids")
     ap.add_argument("--range", help="range over sorted task ids, e.g. 0:10")
     ap.add_argument("--subset", help="named subset in subsets/<name>.txt (one task id per line)")
-    ap.add_argument("--agent", choices=["pi", "omp"], default="pi",
+    ap.add_argument("--agent", choices=["pi", "omp", "prime-agent"], default="pi",
                     help="coding agent runner to use inside task containers (default: pi)")
     ap.add_argument("--model", default="openrouter/deepseek/deepseek-v4-flash")
     ap.add_argument("--thinking", default="high",
@@ -898,7 +915,9 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
         "plan",
         help="compile a model-free launch plan and review receipt",
     )
-    plan_parser.add_argument("--subject", choices=["pi", "omp"], required=True)
+    plan_parser.add_argument(
+        "--subject", choices=["pi", "omp", "prime-agent"], required=True
+    )
     plan_parser.add_argument("--model", required=True)
     plan_parser.add_argument(
         "--thinking",
@@ -970,6 +989,11 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--repository", type=Path, default=REPO)
     plan_parser.add_argument("--tasks-root", type=Path, default=TASKS)
     plan_parser.add_argument("--results-root", type=Path)
+    plan_parser.add_argument(
+        "--reuse-decisions",
+        type=Path,
+        help="JSON file containing exact explicit result reuse decisions",
+    )
     plan_parser.add_argument("--state-root", type=Path, required=True)
     plan_parser.add_argument("--plan-out", type=Path, required=True)
     plan_parser.add_argument("--receipt-out", type=Path, required=True)
@@ -981,6 +1005,68 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
     execute_parser.add_argument("--plan", type=Path, required=True)
     execute_parser.add_argument("--confirm", required=True)
     return parser
+
+
+def _load_explicit_result_reuse_decisions(
+    path: Path | None,
+) -> tuple[launch.ExplicitResultReuseDecision, ...]:
+    """Load exact earlier-result reuse decisions from a reviewed JSON file."""
+    if path is None:
+        return ()
+    try:
+        raw_decisions = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Explicit result reuse decisions unreadable: path={path}; error={error}"
+        ) from error
+    if not isinstance(raw_decisions, list):
+        raise ValueError(
+            "Explicit result reuse decisions invalid: expected a JSON array; "
+            f"path={path}"
+        )
+
+    decisions: list[launch.ExplicitResultReuseDecision] = []
+    required_keys = {
+        "resultPath",
+        "priorConfigIdentity",
+        "resultIdentity",
+        "recordedProvenance",
+        "rationale",
+    }
+    for index, raw_decision in enumerate(raw_decisions):
+        if not isinstance(raw_decision, dict) or set(raw_decision) != required_keys:
+            raise ValueError(
+                "Explicit result reuse decision invalid: expected exact keys "
+                f"{sorted(required_keys)!r}; path={path}; index={index}"
+            )
+        result_path = raw_decision["resultPath"]
+        prior_config_identity = raw_decision["priorConfigIdentity"]
+        result_identity = raw_decision["resultIdentity"]
+        recorded_provenance = raw_decision["recordedProvenance"]
+        rationale = raw_decision["rationale"]
+        if (
+            not isinstance(result_path, str)
+            or not isinstance(prior_config_identity, str)
+            or not isinstance(result_identity, str)
+            or not isinstance(recorded_provenance, dict)
+            or not isinstance(rationale, str)
+            or not rationale.strip()
+        ):
+            raise ValueError(
+                "Explicit result reuse decision invalid: expected nonempty string "
+                "identity/path/rationale fields and object recordedProvenance; "
+                f"path={path}; index={index}"
+            )
+        decisions.append(
+            launch.ExplicitResultReuseDecision(
+                result_path=Path(result_path).expanduser().resolve(),
+                prior_config_identity=prior_config_identity,
+                result_identity=result_identity,
+                recorded_provenance=recorded_provenance,
+                rationale=rationale,
+            )
+        )
+    return tuple(decisions)
 
 
 def _launch_task_selection(
@@ -1067,6 +1153,9 @@ def _plan_confirmed_launch(
             additional_swap_gib=args.additional_swap_gib,
             host_reserve_gib=args.host_reserve_gib,
         ),
+        reuse_decisions=_load_explicit_result_reuse_decisions(
+            args.reuse_decisions
+        ),
     )
     compiled = launch.compile_launch_request(
         request,
@@ -1089,6 +1178,7 @@ def main(
     runtime_resolver: launch.LaunchRuntimeResolver | None = None,
     pi_runner: launch.ConfirmedPiRunner | None = None,
     omp_runner: launch.ConfirmedOmpRunner | None = None,
+    prime_agent_runner: launch.ConfirmedPrimeAgentRunner | None = None,
 ) -> None:
     """Prepare or execute canonical batches through the confirmed-plan seam."""
     arguments = list(argv) if argv is not None else sys.argv[1:]
@@ -1130,6 +1220,8 @@ def main(
         pi_runner = RepositoryConfirmedPiRunner(task_root)
     if subject == "omp" and omp_runner is None:
         omp_runner = RepositoryConfirmedOmpRunner(task_root)
+    if subject == "prime-agent" and prime_agent_runner is None:
+        prime_agent_runner = RepositoryConfirmedPrimeAgentRunner(task_root)
     try:
         execution = launch.execute_confirmed_launch(
             plan,
@@ -1137,6 +1229,7 @@ def main(
             runtime_resolver=runtime_resolver,
             pi_runner=pi_runner,
             omp_runner=omp_runner,
+            prime_agent_runner=prime_agent_runner,
             transient_resumer=transient_resumer,
         )
     except launch.LaunchTransientModelError as error:

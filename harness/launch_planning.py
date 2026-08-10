@@ -38,7 +38,10 @@ _PI_THINKING_LEVELS = frozenset(
     {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
 _OMP_THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh"})
-_THINKING_LEVELS = _PI_THINKING_LEVELS | _OMP_THINKING_LEVELS
+_PRIME_AGENT_THINKING_LEVELS = frozenset({"max"})
+_THINKING_LEVELS = (
+    _PI_THINKING_LEVELS | _OMP_THINKING_LEVELS | _PRIME_AGENT_THINKING_LEVELS
+)
 _TASK_SELECTION_KINDS = frozenset({"tasks", "subset", "range", "all"})
 _PREFLIGHT_POLICIES = frozenset({"disabled", "new-configs", "required"})
 _EXISTING_RESULT_POLICIES = frozenset({"require-compatible", "rerun"})
@@ -158,14 +161,23 @@ def _require_supported_value(
 def _validate_launch_subject(request: LaunchRequest) -> None:
     _require_supported_value(
         request.subject,
-        frozenset({"pi", "omp"}),
-        f"Launch subject invalid: expected 'pi' or 'omp'; got {request.subject!r}",
+        frozenset({"pi", "omp", "prime-agent"}),
+        "Launch subject invalid: expected 'pi', 'omp', or 'prime-agent'; "
+        f"got {request.subject!r}",
     )
     if not request.model.strip():
         raise ValueError("Launch model invalid: model cannot be empty")
-    subject_thinking_levels = (
-        _PI_THINKING_LEVELS if request.subject == "pi" else _OMP_THINKING_LEVELS
-    )
+    if request.subject == "pi":
+        subject_thinking_levels = _PI_THINKING_LEVELS
+    elif request.subject == "omp":
+        subject_thinking_levels = _OMP_THINKING_LEVELS
+    else:
+        subject_thinking_levels = _PRIME_AGENT_THINKING_LEVELS
+        if request.model != "zai/glm-5.2":
+            raise ValueError(
+                "Prime Agent launch model invalid: expected 'zai/glm-5.2'; "
+                f"got {request.model!r}"
+            )
     expected_thinking_levels = ", ".join(sorted(subject_thinking_levels))
     _require_supported_value(
         request.thinking,
@@ -381,6 +393,8 @@ def _subject_runner_path(repository_root: Path, subject: str) -> Path:
         runner = repository_root / "harness" / "run.py"
     elif subject == "omp":
         runner = repository_root / "harness" / "run_omp.py"
+    elif subject == "prime-agent":
+        runner = repository_root / "harness" / "run_prime_agent.py"
     else:
         raise ValueError(f"Launch subject invalid: unsupported subject {subject!r}")
     if not runner.is_file():
@@ -626,7 +640,7 @@ def _validate_role_call_behavior(
     call_behavior: object,
 ) -> None:
     call_kind = call_behavior.get("kind") if isinstance(call_behavior, dict) else None
-    if call_kind not in {"fixed", "bounded"}:
+    if call_kind not in {"fixed", "bounded", "time-bounded"}:
         raise LaunchClarificationError(
             [
                 {
@@ -638,16 +652,31 @@ def _validate_role_call_behavior(
             ]
         )
     call_document = cast(dict[str, object], call_behavior)
+    max_concurrency = call_document.get("maxConcurrency")
+    valid_concurrency = (
+        isinstance(max_concurrency, int)
+        and not isinstance(max_concurrency, bool)
+        and max_concurrency > 0
+    )
+    if call_kind == "time-bounded":
+        if (
+            call_document.get("timeoutSource") != "task-agent-timeout"
+            or not valid_concurrency
+        ):
+            raise ValueError(
+                "Launch model role invalid: "
+                f"config={config_identity!r}; role={role_name!r}; "
+                "time-bounded calls require task-agent-timeout and a positive "
+                "maxConcurrency"
+            )
+        return
     calls_field = "callsPerRep" if call_kind == "fixed" else "maxCallsPerRep"
     calls = call_document.get(calls_field)
-    max_concurrency = call_document.get("maxConcurrency")
     if (
         not isinstance(calls, int)
         or isinstance(calls, bool)
         or calls < 1
-        or not isinstance(max_concurrency, int)
-        or isinstance(max_concurrency, bool)
-        or max_concurrency < 1
+        or not valid_concurrency
     ):
         raise ValueError(
             "Launch model role invalid: "
@@ -709,7 +738,20 @@ def _resolve_declared_roles(
             role_name,
             selection,
         )
+        activation_policy = role.get("activationPolicy", "required")
+        if activation_policy not in {"required", "model-directed"}:
+            raise ValueError(
+                "Launch model role invalid: "
+                f"config={config_identity!r}; role={role_name!r}; "
+                f"activationPolicy={activation_policy!r}"
+            )
+        if role.get("roleKind") == "executor" and activation_policy != "required":
+            raise ValueError(
+                "Launch model role invalid: executor activationPolicy must be required"
+            )
         resolved_role = dict(role)
+        if "activationPolicy" in role:
+            resolved_role["activationPolicy"] = activation_policy
         models = _resolved_role_models(
             config_identity,
             role_name,
@@ -904,6 +946,8 @@ def _validate_secondary_role_usage_evidence(
                 "secondary usageSource requires recordSelector and "
                 "resultAccounting calls/totalTokens fields"
             )
+        if role.get("activationPolicy") == "model-directed":
+            continue
         structured_selector = cast(Mapping[str, object], record_selector)
         matching_assertion = any(
             _smoke_usage_assertion_matches(
@@ -1671,6 +1715,19 @@ def _receipt_warnings(document: LaunchPlanDocument) -> list[str]:
         )
     if document["policies"]["preflight"] == "disabled":
         warnings.append("preflight is disabled")
+    for config in document["configs"]:
+        call_behaviors = [
+            role.get("callBehavior") for role in config["declaredRoles"]
+        ]
+        if any(
+            isinstance(behavior, Mapping)
+            and behavior.get("kind") == "time-bounded"
+            for behavior in call_behaviors
+        ):
+            warnings.append(
+                f"{config['identity']} permits model calls until the task timeout; "
+                "there is no per-rep request cap"
+            )
     return warnings
 
 
@@ -1731,6 +1788,8 @@ def _role_model_columns(role: Mapping[str, object]) -> tuple[str, str, str]:
 def _role_call_summary(role: Mapping[str, object]) -> str:
     behavior = cast(Mapping[str, object], role["callBehavior"])
     max_concurrency = behavior.get("maxConcurrency", "-")
+    if behavior.get("kind") == "time-bounded":
+        return f"calls limited only by task timeout; max concurrency {max_concurrency}"
     if behavior.get("kind") == "fixed":
         calls_per_rep = behavior.get("callsPerRep", "-")
         if role.get("roleKind") == "executor":
@@ -1750,14 +1809,14 @@ def _render_role_lines(configs: Sequence[LaunchConfigDocument]) -> list[str]:
     lines = [
         (
             "config | role | kind | selection | provider | model | thinking | "
-            "credential | billing | usage | bounds"
+            "credential | billing | usage | bounds | activation"
         )
     ]
     for config in configs:
         roles = config["declaredRoles"]
         if not roles:
             lines.append(
-                f"{config['identity']} | undeclared | - | - | - | - | - | - | - | - | -"
+                f"{config['identity']} | undeclared | - | - | - | - | - | - | - | - | - | -"
             )
             continue
         for role in roles:
@@ -1778,6 +1837,7 @@ def _render_role_lines(configs: Sequence[LaunchConfigDocument]) -> list[str]:
                         str(role.get("billingCategory", "-")),
                         usage,
                         _role_call_summary(role),
+                        str(role.get("activationPolicy", "required")),
                     ]
                 )
             )

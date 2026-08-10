@@ -115,7 +115,9 @@ def execute_confirmed_subject_request(
     request = _read_request(request_path)
     runner_path = request.get("runner")
     subject = request.get("subject")
-    if not isinstance(runner_path, str) or subject not in {"pi", "omp"}:
+    if not isinstance(runner_path, str) or subject not in {
+        "pi", "omp", "prime-agent"
+    }:
         raise TypeError(
             "Confirmed subject request invalid: runner and subject must be "
             "resolved"

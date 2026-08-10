@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Parse pi token/cost/turn usage from compact, final-state sources.
 
 pi writes its native session to ``session/*.jsonl`` (``--session-dir``). Each
@@ -289,14 +290,66 @@ def parse_advisor_stream(*, path: Path | None = None, text: str | None = None) -
     return acc
 
 
-def parse_recursive_child_sessions(*, session_dir: Path) -> dict:
-    """Read pi-recursive child usage from current-attempt shared sessions.
+def parse_prime_agent_child_attributions(*, path: Path | None = None,
+                                         text: str | None = None) -> dict:
+    """Read Prime Agent child usage attribution records from root session JSONL.
 
-    Child sessions are normal Pi session JSONL files, but their usage is a
-    secondary LLM role rather than root executor usage. Parse all current-run
-    child sessions and store them under recursive_child_* fields.
+    Prime Agent persists one ``child_usage_attributed`` record per completed
+    direct child. The root assistant message retains only its own original
+    usage on disk, so these records are the compact, non-duplicated source for
+    recursive child billing.
     """
-    _root, children = _current_root_and_recursive_children(Path(session_dir))
+    if path is not None:
+        raw = Path(path).read_text(encoding="utf-8", errors="ignore")
+    elif text is not None:
+        raw = text
+    else:
+        raise ValueError(
+            "parse_prime_agent_child_attributions requires path= or text="
+        )
+
+    acc = _new_acc()
+    for record in _iter_jsonl(raw):
+        if record.get("type") != "child_usage_attributed":
+            continue
+        usage = record.get("childUsage")
+        if not isinstance(usage, dict):
+            continue
+        input_tokens = int(usage.get("input") or 0)
+        output_tokens = int(usage.get("output") or 0)
+        cache_read_tokens = int(usage.get("cacheRead") or 0)
+        cache_write_tokens = int(usage.get("cacheWrite") or 0)
+        component_total = (
+            input_tokens
+            + output_tokens
+            + cache_read_tokens
+            + cache_write_tokens
+        )
+        cost = usage.get("cost")
+        acc["recursive_child_calls"] += 1
+        acc["recursive_child_input_tokens"] += input_tokens
+        acc["recursive_child_output_tokens"] += output_tokens
+        acc["recursive_child_cache_read_tokens"] += cache_read_tokens
+        acc["recursive_child_cache_write_tokens"] += cache_write_tokens
+        acc["recursive_child_reported_total_tokens"] += component_total
+        if isinstance(cost, dict):
+            acc["recursive_child_cost_usd"] += float(cost.get("total") or 0.0)
+    _finalize(acc)
+    return acc
+
+
+def parse_recursive_child_sessions(*, session_dir: Path) -> dict:
+    """Read current-attempt recursive child usage from its native source.
+
+    Prime Agent stores compact child attributions in the root session. Legacy
+    pi-recursive stores ordinary child session files alongside the root. Prefer
+    attributions when present so the two formats can never be double-counted.
+    """
+    root, children = _current_root_and_recursive_children(Path(session_dir))
+    attributed = parse_prime_agent_child_attributions(path=root)
+    if attributed["recursive_child_calls"]:
+        return attributed
+
     acc = _new_acc()
     for child in children:
         child_usage = parse_session(path=child)

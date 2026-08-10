@@ -7,6 +7,8 @@ from harness.launch_contract import (  # noqa: F401 - public re-exports
     ConfirmedOmpRunner,
     ConfirmedPiCell,
     ConfirmedPiRunner,
+    ConfirmedPrimeAgentCell,
+    ConfirmedPrimeAgentRunner,
     ConfirmedSubjectCell,
     ExplicitResultReuseDecision,
     LaunchClarificationError,
@@ -49,6 +51,7 @@ def execute_confirmed_launch(
     runtime_resolver: LaunchRuntimeResolver,
     pi_runner: ConfirmedPiRunner | None = None,
     omp_runner: ConfirmedOmpRunner | None = None,
+    prime_agent_runner: ConfirmedPrimeAgentRunner | None = None,
     transient_resumer: LaunchTransientResumer | None = None,
 ) -> ConfirmedLaunchExecution:
     """Execute one plan using the public heartbeat test and tuning seam."""
@@ -58,6 +61,7 @@ def execute_confirmed_launch(
         runtime_resolver=runtime_resolver,
         pi_runner=pi_runner,
         omp_runner=omp_runner,
+        prime_agent_runner=prime_agent_runner,
         transient_resumer=transient_resumer,
         heartbeat_interval_s=_CONFIRMED_HEARTBEAT_INTERVAL_S,
     )

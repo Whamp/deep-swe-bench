@@ -89,6 +89,26 @@ class RepositoryLaunchRuntimeResolver:
             )
         return f"pi@{match.group('version')}"
 
+    def _prime_agent_subject_version(self) -> str:
+        """Read the pinned Prime Agent version without starting the subject."""
+        dockerfile = self.repository_root / "harness" / "Dockerfile.prime-agent"
+        if not dockerfile.is_file():
+            raise ValueError(
+                "Launch runtime identity unresolved: Prime Agent Dockerfile "
+                f"missing at {dockerfile}"
+            )
+        match = re.search(
+            r"^ARG PRIME_AGENT_VERSION=(?P<version>\S+)$",
+            dockerfile.read_text(),
+            re.MULTILINE,
+        )
+        if match is None:
+            raise ValueError(
+                "Launch runtime identity unresolved: PRIME_AGENT_VERSION is "
+                f"not pinned in {dockerfile}"
+            )
+        return f"prime-agent@{match.group('version')}"
+
     @staticmethod
     def _image_identity(image_reference: str) -> str:
         completed = subprocess.run(
@@ -230,9 +250,11 @@ class RepositoryLaunchRuntimeResolver:
         routes = frozenset(name for name, value in os.environ.items() if value.strip())
         if subject == "omp":
             credential_available = cls._omp_codex_credential_available()
-        else:
+        elif subject == "pi":
             oauth_path = Path.home() / ".pi" / "agent" / "auth.json"
             credential_available = oauth_path.is_file()
+        else:
+            credential_available = False
         if credential_available:
             return routes | {"OPENAI_CODEX_OAUTH"}
         return routes
@@ -264,6 +286,19 @@ class RepositoryLaunchRuntimeResolver:
                     "omp-tools",
                 }
             )
+        elif request.subject == "prime-agent":
+            subject_version = self._prime_agent_subject_version()
+            subject_runtime_identity = {}
+            subject_capabilities = frozenset(
+                {
+                    "native-session-usage",
+                    "prime-agent-rpc",
+                    "prime-agent-rlm-depth-one",
+                    "recursive-child-usage",
+                    "zai-bounded-proxy-usage",
+                    "zai-concurrency-limited-proxy-usage",
+                }
+            )
         else:
             raise ValueError(
                 "Launch runtime identity unresolved: unsupported subject "
@@ -274,8 +309,13 @@ class RepositoryLaunchRuntimeResolver:
         for task_id in tasks:
             task = lib.load_task(task_id, root=self.tasks_root)
             verifier_identities[task_id] = self._verifier_identity(task_id)
+            agent_image = (
+                task.prime_agent_image
+                if request.subject == "prime-agent"
+                else task.pi_image
+            )
             image_identities[task_id] = {
-                "agent": self._image_identity(task.pi_image),
+                "agent": self._image_identity(agent_image),
                 "environment": self._image_identity(task.env_image),
                 "verifier": self._image_identity(task.verifier_image),
             }

@@ -3,7 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import harness.parse_usage as parse_usage
+from hypothesis import given
+from hypothesis import strategies as st
+
+from harness import parse_usage
 
 
 def message(role="assistant", *, input_tokens=0, output_tokens=0, cache_read=0,
@@ -19,6 +22,31 @@ def message(role="assistant", *, input_tokens=0, output_tokens=0, cache_read=0,
             "cost": {"total": cost},
         }
     return {"type": "message", "message": msg}
+
+
+def child_usage_attributed(*, input_tokens=0, output_tokens=0, cache_read=0,
+                           cache_write=0, cost=0.0):
+    total_tokens = input_tokens + output_tokens + cache_read + cache_write
+    return {
+        "type": "child_usage_attributed",
+        "targetId": "parent-assistant",
+        "childUsage": {
+            "input": input_tokens,
+            "output": output_tokens,
+            "cacheRead": cache_read,
+            "cacheWrite": cache_write,
+            "totalTokens": total_tokens,
+            "cost": {"total": cost},
+        },
+        "aggregateUsage": {
+            "input": input_tokens,
+            "output": output_tokens,
+            "cacheRead": cache_read,
+            "cacheWrite": cache_write,
+            "totalTokens": total_tokens,
+            "cost": {"total": cost},
+        },
+    }
 
 
 def write_jsonl(path: Path, records, mtime_ns: int):
@@ -167,6 +195,31 @@ class ParseUsageRecursiveSessionsTests(unittest.TestCase):
             self.assertEqual(parsed["recursive_child_total_tokens"], 34)
             self.assertEqual(parsed["combined_total_tokens"], 110)
 
+    def test_parse_prime_agent_child_usage_attributions(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = Path(td)
+            root = session / "2026-08-05T00-00-01-000Z_root.jsonl"
+            write_jsonl(root, [
+                message(input_tokens=100, output_tokens=7, cost=1.07),
+                child_usage_attributed(input_tokens=30, output_tokens=5,
+                                       cache_read=4, cost=0.39),
+                child_usage_attributed(input_tokens=20, output_tokens=3,
+                                       cache_write=2, cost=0.25),
+            ], 1_000)
+
+            parsed = parse_usage.parse(session_dir=session)
+
+            self.assertEqual(parsed["total_tokens"], 107)
+            self.assertEqual(parsed["recursive_child_calls"], 2)
+            self.assertEqual(parsed["recursive_child_input_tokens"], 50)
+            self.assertEqual(parsed["recursive_child_output_tokens"], 8)
+            self.assertEqual(parsed["recursive_child_cache_read_tokens"], 4)
+            self.assertEqual(parsed["recursive_child_cache_write_tokens"], 2)
+            self.assertEqual(parsed["recursive_child_total_tokens"], 64)
+            self.assertAlmostEqual(parsed["recursive_child_cost_usd"], 0.64)
+            self.assertEqual(parsed["combined_total_tokens"], 171)
+            self.assertAlmostEqual(parsed["combined_cost_usd"], 1.71)
+
     def test_parse_session_ignores_recursive_child_when_it_is_newer_than_root(self):
         with tempfile.TemporaryDirectory() as td:
             session = Path(td)
@@ -181,6 +234,32 @@ class ParseUsageRecursiveSessionsTests(unittest.TestCase):
             self.assertEqual(parsed["total_tokens"], 12)
             self.assertEqual(parsed["input_tokens"], 11)
             self.assertEqual(parsed["output_tokens"], 1)
+
+
+@given(st.lists(st.tuples(
+    st.integers(min_value=0, max_value=1_000_000),
+    st.integers(min_value=0, max_value=1_000_000),
+    st.integers(min_value=0, max_value=1_000_000),
+    st.integers(min_value=0, max_value=1_000_000),
+), max_size=20))
+def test_child_usage_attribution_totals_are_additive(usages):
+    records = [message(input_tokens=1, output_tokens=1)]
+    records.extend(
+        child_usage_attributed(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read=cache_read,
+            cache_write=cache_write,
+        )
+        for input_tokens, output_tokens, cache_read, cache_write in usages
+    )
+
+    parsed = parse_usage.parse_prime_agent_child_attributions(text="\n".join(
+        json.dumps(record) for record in records
+    ))
+
+    assert parsed["recursive_child_calls"] == len(usages)
+    assert parsed["recursive_child_total_tokens"] == sum(sum(usage) for usage in usages)
 
 
 if __name__ == "__main__":
