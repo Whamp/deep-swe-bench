@@ -35,6 +35,27 @@ The builder rejects missing pairs, model/thinking mismatches, provenance drift,
 unexpected Pi flags, baseline/treatment settings differences, config-authored
 prompt text, or missing extension registration telemetry.
 
+## Primary estimands
+
+The report answers activation efficiency at two narrow boundaries:
+
+1. **Activated read result.** Extension telemetry identifies the exact read and
+   reconstructs the unshortened result from omitted characters minus inserted
+   notice overhead. A paired baseline result is treated as an independent exact
+   match only when normalized path, offset, and limit all agree.
+2. **Exploration through first mutation.** Native assistant-message usage is
+   summed from session start through the assistant message containing the first
+   `edit` or `write` call. That message is included because its provider request
+   and generated tool call consume tokens before the mutation executes. Input,
+   cache-read, output, reasoning, total tokens, and cost remain separately
+   available in the snapshot.
+
+Whole-session usage is retained only as a downstream sensitivity metric because
+implementation and validation divergence can dwarf a small read-result change.
+The current five-pair activated cohort was manually checked for source-mutating
+shell commands before the `edit`/`write` boundary; none were found. Repeat that
+check when adding a new model cohort.
+
 ## Artifacts
 
 - `index.html` — self-contained report
