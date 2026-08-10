@@ -60,8 +60,8 @@ config behavior. It covers 7,779 reps, 7,761 readable sessions, all 113 tasks,
 - 14 tasks activate anywhere
 - 85 reps activate (1.09%)
 - 92 read results activate (0.0721%)
-- 235,880 source characters would be omitted
-- 218,715 net characters would be removed (0.0377% of read-result characters)
+- 235,879 source characters would be omitted
+- 218,714 net characters would be removed (0.0377% of read-result characters)
 
 Only two tasks activate repeatedly:
 
@@ -74,6 +74,70 @@ native but rarely-read source (`pest`, `meriyah`, `obsidian`, `tengo`, and one
 (`dateutil`, `actionlint`, `boa`, `goreleaser`, `kgateway`, `koota`, and
 `textual`). This scope is for discovery only; config and model heterogeneity make
 its aggregate rate unsuitable as a clean-stock estimate.
+
+## Context-pollution opportunity
+
+Seven tasks produced long reads from temporary/tool artifacts or source files
+containing agent-created corruption. The human-reviewed classification is in
+`context-pollution-classifications.csv`; the compact rep evidence is under
+`data/context-pollution-opportunity/`.
+
+Across eight exposed reps:
+
+- 12 affected read results
+- 54,100 source characters beyond the preview
+- 52,808 net characters removable after notices
+- 180 subsequent assistant messages
+- 18,910,581 recorded executor tokens after the first exposure
+
+Five reps read corrupted source containing serialized edit payloads or model
+transcript text. Those reads could remove 29,199 net characters; the trajectories
+continued for 98 assistant messages and 9,463,873 recorded tokens. All five reps
+were unsolved. Three reps read temporary or serialized tool artifacts; those
+could remove 23,609 net characters and all three reps solved.
+
+This is exposure evidence, not a causal reward comparison or token-savings
+estimate. The tasks, models, and configs differ, and post-activation usage
+includes all subsequent behavior and prompt-cache effects. The extension can
+shield later context from a long corrupted line, but it cannot repair the
+underlying file corruption and might hide evidence the model needs. Recovery
+behavior must therefore be measured directly.
+
+## Recommended paired evaluation
+
+Use `fd-deterministic-multi-key-sorting` and `abs-module-cache-flags` as the
+core task set. Compare stock Pi with a versioned config containing only the
+`read-long-lines` extension; add no config-authored prompt text.
+
+Recommended three-rep pilot:
+
+- `gpt-5.6-sol/low`
+- `gpt-5.6-sol/medium`
+- `gpt-5.6-sol/high`
+- `deepseek-v4-flash/high`
+- optional local contrast: `Qwen3.6-27B-AWQ-BF16-INT4/high`
+
+The four-leaf core is 48 reps: 2 tasks × 2 configs × 4 model/thinking leaves ×
+3 reps. Adding Qwen makes 60 reps. Expand an activating task/leaf to ten total
+reps only after reviewing the pilot; keep intention-to-treat results primary and
+show activation-conditioned results as a secondary view.
+
+Separate deterministic payload reduction from realized trajectory efficiency:
+
+- characters omitted and notice overhead
+- exact executor input, cache-read, cache-write, output, and total tokens
+- usage from the first activation onward
+- turns, read calls, repeated reads, and `offset=N, limit=1` recoveries
+- reward, partial reward, f2p, p2p, timeout, wall time, and tool errors
+- paired trajectory packets for every solve flip, material grading change, or
+  suspected missed-tail failure
+
+For context-pollution resilience, use a separate noncanonical diagnostic rather
+than hoping rare corruption recurs naturally. Pre-seed the exact observed
+`goreleaser` serialized-edit line and `textual` transcript line into disposable
+task workspaces, retain the original task prompts, and compare baseline against
+the extension. Measure whether the model reads, propagates, diagnoses, or repairs
+the corruption. Keep those results outside normal DeepSWE efficacy totals.
 
 ## Original clean-stock estimate
 
@@ -102,6 +166,8 @@ The original three activating tasks were `fd-deterministic-multi-key-sorting`,
 - `data/full-corpus-deepseek-triplet/`: matched rep-0 matrix across all 113 tasks
   and three `deepseek-v4-flash/high` configs.
 - `data/all-results-discovery/`: every available result record; discovery only.
+- `data/context-pollution-opportunity/`: compact post-exposure usage and outcome
+  evidence for human-classified temporary/tool artifacts and corrupted source.
 
 Each directory contains `summary.json`, `by-task.csv`,
 `by-model-thinking-config.csv`, and `activations.csv`. Raw session text remains
@@ -113,8 +179,9 @@ in the canonical results tree.
 matching the selection rule in `harness/parse_usage.py`. It pairs assistant
 `read` tool calls with `toolResult` records by tool-call id.
 
-For every returned text line, the scanner uses JavaScript-compatible UTF-16
-code-unit length. An ordinary read line of length `L > 2,000` contributes
+For every returned text line, the scanner counts Unicode code points, matching
+the extension's `Array.from(line)` implementation. An ordinary read line of
+length `L > 2,000` contributes
 `L - 2,000` omitted characters. A read with `limit=1` is exempt because the
 active read implementation returns that line in full.
 
@@ -148,4 +215,11 @@ python3 analysis/read-long-lines-incidence/scan_read_long_lines.py \
   --thinking-levels high \
   --rep-numbers 0 \
   --out /tmp/read-long-lines-full-corpus-triplet
+
+# Human-classified context-pollution exposure.
+python3 analysis/read-long-lines-incidence/analyze_context_pollution.py \
+  --results /home/will/evals/deep-swe-bench/results \
+  --activations analysis/read-long-lines-incidence/data/all-results-discovery/activations.csv \
+  --classifications analysis/read-long-lines-incidence/context-pollution-classifications.csv \
+  --out /tmp/read-long-lines-context-pollution
 ```

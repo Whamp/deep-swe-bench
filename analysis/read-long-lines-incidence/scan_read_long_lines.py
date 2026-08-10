@@ -13,8 +13,9 @@ FIRST_LINE_CENSORED_RE = re.compile(r"^\[Line (\d+) is ([^,]+), exceeds 50KB lim
 LONG_LINE_LIMIT = 2_000
 
 
-def utf16_len(value: str) -> int:
-    return len(value.encode("utf-16-le")) // 2
+def unicode_character_len(value: str) -> int:
+    """Count Unicode code points like the extension's Array.from(value).length."""
+    return len(value)
 
 
 def newest_root_session(session_dir: Path) -> Path | None:
@@ -42,7 +43,7 @@ def notice_length(source_line: int, original_length: int) -> int:
         f"[Line {source_line} shortened: showing 2,000 of {original_length:,} characters. "
         f"Use offset={source_line}, limit=1 to read the complete line.]"
     )
-    return utf16_len(notice)
+    return unicode_character_len(notice)
 
 
 def select_result_paths(
@@ -133,7 +134,7 @@ def scan_rep(result_path: Path) -> tuple[dict, list[dict], list[dict]]:
             args = call.get("arguments") or {}
             text = text_content(message)
             lines = text.split("\n")
-            line_lengths = [utf16_len(line) for line in lines]
+            line_lengths = [unicode_character_len(line) for line in lines]
             long_indices = [
                 index
                 for index, length in enumerate(line_lengths)
@@ -161,7 +162,7 @@ def scan_rep(result_path: Path) -> tuple[dict, list[dict], list[dict]]:
             censored = any(FIRST_LINE_CENSORED_RE.match(line) for line in lines)
 
             rep_row["read_results"] += 1
-            rep_row["read_result_characters"] += utf16_len(text)
+            rep_row["read_result_characters"] += unicode_character_len(text)
             rep_row["max_line_characters"] = max(
                 rep_row["max_line_characters"], max(line_lengths, default=0)
             )
@@ -197,7 +198,7 @@ def scan_rep(result_path: Path) -> tuple[dict, list[dict], list[dict]]:
                     "path": args.get("path", args.get("file_path", "")),
                     "offset": args.get("offset", ""),
                     "limit": args.get("limit", ""),
-                    "result_characters": utf16_len(text),
+                    "result_characters": unicode_character_len(text),
                     "line_count": len(lines),
                     "long_line_count": len(long_indices),
                     "ordinary_affected": int(bool(long_indices) and not exempt),

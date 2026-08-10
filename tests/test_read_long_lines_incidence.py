@@ -20,9 +20,8 @@ SPEC.loader.exec_module(scan_read_long_lines)
 
 
 @given(st.text())
-def test_utf16_len_matches_javascript_string_length(value: str) -> None:
-    expected = sum(2 if ord(character) > 0xFFFF else 1 for character in value)
-    assert scan_read_long_lines.utf16_len(value) == expected
+def test_unicode_character_len_matches_extension_array_from(value: str) -> None:
+    assert scan_read_long_lines.unicode_character_len(value) == len(value)
 
 
 def write_synthetic_read_session(
