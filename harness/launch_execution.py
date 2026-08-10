@@ -6,8 +6,10 @@ import concurrent.futures
 import hashlib
 import json
 import threading
+import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -26,6 +28,7 @@ from harness.launch_contract import (
     ConfirmedLaunchExecution,
     ConfirmedOmpRunner,
     ConfirmedPiRunner,
+    ConfirmedPrimeAgentRunner,
     ConfirmedSubjectCell,
     LaunchExecutionPolicies,
     LaunchInputDriftError,
@@ -51,6 +54,16 @@ from harness.launch_planning import (
 )
 
 
+def _execution_config_identities(
+    document: LaunchPlanDocument,
+) -> tuple[str, ...]:
+    """Return configs allowed to reach the subject, with legacy-plan fallback."""
+    configured = document.get("executionConfigs")
+    if configured is None:
+        return tuple(config["identity"] for config in document["configs"])
+    return tuple(configured)
+
+
 def _confirmed_plan_document(
     plan: LaunchPlan,
     confirmation_identity: str | None,
@@ -70,8 +83,11 @@ def _confirmed_plan_document(
             f"plan={parsed_plan.identity!r}"
         )
     document = parsed_plan.to_document()
+    execution_configs = set(_execution_config_identities(document))
     legacy_configs = [
-        config["identity"] for config in document["configs"] if config["legacy"]
+        config["identity"]
+        for config in document["configs"]
+        if config["identity"] in execution_configs and config["legacy"]
     ]
     if legacy_configs:
         raise ValueError(
@@ -87,7 +103,7 @@ def _confirmed_subject_cell(
     cell_document: Mapping[str, object],
 ) -> ConfirmedSubjectCell:
     subject = document["subject"]
-    if subject["name"] not in {"pi", "omp"}:
+    if subject["name"] not in {"pi", "omp", "prime-agent"}:
         raise ValueError(
             "Confirmed subject execution mismatch: "
             f"unsupported subject {subject['name']!r}"
@@ -319,7 +335,7 @@ def _confirmed_run_manifest(
         cwd=document["paths"]["workspace"],
         model=document["model"],
         thinking=document["thinking"],
-        configs=[config["identity"] for config in document["configs"]],
+        configs=list(_execution_config_identities(document)),
         selection=dict(document["selection"]),
         runs=int(document["counts"]["reps"]),
         workers=int(document["concurrency"]),
@@ -333,8 +349,12 @@ def _confirmed_run_manifest(
     manifest.update(
         {
             "capture_initial_context": policies.capture_initial_context,
-            "config_identities": [config["identity"] for config in document["configs"]],
+            "config_identities": list(_execution_config_identities(document)),
             "launch_plan_identity": document["planIdentity"],
+            "reference_baseline_config": document["baselineConfig"],
+            "reviewed_config_identities": [
+                config["identity"] for config in document["configs"]
+            ],
             "launch_plan_path": "launch-plan.json",
             "resources": dict(document["resources"]),
             "results_root": document["paths"]["resultsRoot"],
@@ -395,7 +415,10 @@ def _config_lock_drift_changes(
 ) -> list[dict[str, object]]:
     """Compare every approved config lock with its current document."""
     changes: list[dict[str, object]] = []
+    execution_configs = set(_execution_config_identities(document))
     for config in document["configs"]:
+        if config["identity"] not in execution_configs or config["legacy"]:
+            continue
         approved_identity = config["lockIdentity"]
         lock_path = Path(config["configLeaf"]) / "config-lock.json"
         resolved = _resolved_plan_config_leaf(config)
@@ -439,7 +462,10 @@ def _config_input_drift_changes(
 ) -> list[dict[str, object]]:
     """Compare every approved config input with its current fingerprint."""
     changes: list[dict[str, object]] = []
+    execution_configs = set(_execution_config_identities(document))
     for config in document["configs"]:
+        if config["identity"] not in execution_configs:
+            continue
         resolved = _resolved_plan_config_leaf(config)
         approved_by_path = {
             str(item["path"]): item for item in config["behaviorInputs"]
@@ -547,7 +573,7 @@ def _confirmed_launch_request(
         subject=document["subject"]["name"],
         model=document["model"],
         thinking=document["thinking"],
-        configs=tuple(config["identity"] for config in document["configs"]),
+        configs=_execution_config_identities(document),
         baseline_config=document["baselineConfig"],
         task_selection=LaunchTaskSelection(
             kind=selection_kind,
@@ -770,6 +796,7 @@ class _ConfirmedLaunchExecutionContext:
     """Hold plan-owned dependencies shared by confirmed execution stages."""
 
     state_path: Path
+    results_root: Path
     state: run_state.RunStateWriter
     input_verifier: _ApprovedLaunchInputVerifier
     subject_runner: _ConfirmedSubjectRunner
@@ -778,12 +805,66 @@ class _ConfirmedLaunchExecutionContext:
     policies: LaunchExecutionPolicies
 
 
+_QUARANTINE_MANIFEST_LOCK = threading.Lock()
+
+
+def _quarantine_incomplete_confirmed_cell(
+    cell: ConfirmedSubjectCell,
+    results_root: Path,
+) -> Path | None:
+    """Move result-less artifacts aside before a confirmed cell attempt."""
+    cell_root = cell.result_path.parent
+    if cell.result_path.exists() or not cell_root.is_dir():
+        return None
+    if not any(cell_root.iterdir()):
+        return None
+
+    relative_cell = cell_root.resolve().relative_to(results_root.resolve())
+    attempt_id = (
+        datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    )
+    quarantine_root = (
+        results_root / "_contaminated" / "harness-failure" / "incomplete-cell-attempts"
+    )
+    quarantine_path = quarantine_root / relative_cell / attempt_id
+    quarantine_path.parent.mkdir(parents=True, exist_ok=True)
+    cell_root.rename(quarantine_path)
+    cell_root.mkdir(parents=True, exist_ok=True)
+    verifier_resource_events = (
+        quarantine_path / "logs" / "verifier-resource-events.ndjson"
+    )
+    if verifier_resource_events.is_file():
+        retained_events = cell_root / "logs" / verifier_resource_events.name
+        retained_events.parent.mkdir(parents=True, exist_ok=True)
+        retained_events.write_bytes(verifier_resource_events.read_bytes())
+
+    reason = (
+        "Incomplete confirmed cell attempt had artifacts without result.json; "
+        "moved before retry to prevent mixed-attempt usage and session accounting."
+    )
+    record = {
+        "category": "harness-failure",
+        "original_path": str(cell_root),
+        "quarantine_path": str(quarantine_path),
+        "reason": reason,
+        "run_key": cell.run_key,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    manifest_path = results_root / "_contaminated" / "manifest.jsonl"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with _QUARANTINE_MANIFEST_LOCK, manifest_path.open("a") as manifest:
+        manifest.write(json.dumps(record, sort_keys=True) + "\n")
+    return quarantine_path
+
+
 def _run_confirmed_subject_cell(
     cell: ConfirmedSubjectCell,
     subject_runner: _ConfirmedSubjectRunner,
     log_path: Path,
+    results_root: Path,
 ) -> dict[str, object]:
     """Run one exact planned cell and persist its provenance-bearing result."""
+    _quarantine_incomplete_confirmed_cell(cell, results_root)
     cell.result_path.parent.mkdir(parents=True, exist_ok=True)
     _append_confirmed_cell_log(log_path, cell, "started")
     if cell.subject == "pi":
@@ -791,11 +872,16 @@ def _run_confirmed_subject_cell(
             ConfirmedPiRunner,
             subject_runner,
         ).run_confirmed_pi_cell(cell)
-    else:
+    elif cell.subject == "omp":
         runner_record = cast(
             ConfirmedOmpRunner,
             subject_runner,
         ).run_confirmed_omp_cell(cell)
+    else:
+        runner_record = cast(
+            ConfirmedPrimeAgentRunner,
+            subject_runner,
+        ).run_confirmed_prime_agent_cell(cell)
     verifier_resource_error = (
         runner_record.get("verifier_resource_exhausted") is True
         or runner_record.get("verifier_resource_evidence_unavailable") is True
@@ -882,6 +968,7 @@ def _execute_confirmed_preflight_cell(
                 cell,
                 context.subject_runner,
                 context.log_path,
+                context.results_root,
             )
         raw_exit = result_record.get("agent_exit")
         exit_code = raw_exit if isinstance(raw_exit, int | str) else None
@@ -1008,6 +1095,7 @@ def _execute_confirmed_batch_cell(
                 cell,
                 context.subject_runner,
                 context.log_path,
+                context.results_root,
             )
         except LaunchTransientModelError as error:
             _append_confirmed_cell_log(
@@ -1253,6 +1341,7 @@ def execute_confirmed_launch_with_heartbeat(
     runtime_resolver: LaunchRuntimeResolver,
     pi_runner: ConfirmedPiRunner | None,
     omp_runner: ConfirmedOmpRunner | None,
+    prime_agent_runner: ConfirmedPrimeAgentRunner | None,
     transient_resumer: LaunchTransientResumer | None,
     heartbeat_interval_s: float,
 ) -> ConfirmedLaunchExecution:
@@ -1272,6 +1361,13 @@ def execute_confirmed_launch_with_heartbeat(
                 "Confirmed OMP runner missing: an OMP plan requires omp_runner"
             )
         subject_runner = omp_runner
+    elif subject == "prime-agent":
+        if prime_agent_runner is None:
+            raise ValueError(
+                "Confirmed Prime Agent runner missing: a Prime Agent plan "
+                "requires prime_agent_runner"
+            )
+        subject_runner = prime_agent_runner
     else:
         raise ValueError(
             f"Confirmed subject runner missing: unsupported subject {subject!r}"
@@ -1315,7 +1411,11 @@ def execute_confirmed_launch_with_heartbeat(
         state.start()
     stored_plan_path.write_text(plan.canonical_json)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    subject_label = "Pi" if subject == "pi" else "OMP"
+    subject_label = {
+        "pi": "Pi",
+        "omp": "OMP",
+        "prime-agent": "Prime Agent",
+    }[subject]
     log_path.write_text(
         f"Confirmed {subject_label} cell execution\n"
         f"launch_plan_identity={document['planIdentity']}\n"
@@ -1327,6 +1427,7 @@ def execute_confirmed_launch_with_heartbeat(
     )
     execution_context = _ConfirmedLaunchExecutionContext(
         state_path=state_path,
+        results_root=Path(document["paths"]["resultsRoot"]),
         state=state,
         input_verifier=input_verifier,
         subject_runner=subject_runner,

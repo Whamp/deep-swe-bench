@@ -3,6 +3,7 @@ from pathlib import Path
 
 from harness.run_state import (
     RunStateWriter,
+    _score_snapshot,
     base_manifest,
     classify_result,
     make_cell,
@@ -30,9 +31,18 @@ def write_result(path: Path, **overrides) -> Path:
 
 def test_classify_result_matches_progress_labels():
     assert classify_result({"agent_exit": 0, "verifier_exit": 0}) == "ok"
-    assert classify_result({"agent_exit": 0, "verifier_exit": "skipped_empty_patch"}) == "empty"
-    assert classify_result({"agent_exit": 0, "verifier_exit": 0, "agent_timed_out": True}) == "timeout"
-    assert classify_result({"agent_exit": 75, "transient_model_error": True}) == "transient"
+    assert (
+        classify_result({"agent_exit": 0, "verifier_exit": "skipped_empty_patch"})
+        == "empty"
+    )
+    assert (
+        classify_result({"agent_exit": 0, "verifier_exit": 0, "agent_timed_out": True})
+        == "timeout"
+    )
+    assert (
+        classify_result({"agent_exit": 75, "transient_model_error": True})
+        == "transient"
+    )
     assert (
         classify_result(
             {
@@ -46,14 +56,38 @@ def test_classify_result_matches_progress_labels():
     assert classify_result({"agent_exit": 2, "verifier_exit": None}) == "exit=2"
 
 
+def test_score_snapshot_is_task_level_across_reps():
+    snapshot = _score_snapshot(
+        {
+            "a0": {"task": "task-a", "summary": {"reward_binary": 1}},
+            "a1": {"task": "task-a", "summary": {"reward_binary": 0}},
+            "b0": {"task": "task-b", "summary": {"reward_binary": 0}},
+        }
+    )
+    assert snapshot == {"solved": 1, "finished": 2, "solve_rate": 50.0}
+
+
 def test_run_state_writer_keeps_preflight_and_batch_counts_separate(tmp_path):
     state_root = tmp_path / "results" / "_runs"
-    result = write_result(tmp_path / "results" / "model" / "high" / "cfg" / "task-a" / "rep0" / "result.json")
+    result = write_result(
+        tmp_path
+        / "results"
+        / "model"
+        / "high"
+        / "cfg"
+        / "task-a"
+        / "rep0"
+        / "result.json"
+    )
     log = tmp_path / "results" / "model" / "high" / "logs" / "task-a__cfg__rep0.log"
     log.parent.mkdir(parents=True)
     log.write_text("compact log path only")
-    batch_cell = make_cell(task="task-a", config="cfg", rep=0, result_path=result, log_path=log)
-    preflight_cell = make_cell(task="task-a", config="cfg", rep=0, result_path=result, log_path=log)
+    batch_cell = make_cell(
+        task="task-a", config="cfg", rep=0, result_path=result, log_path=log
+    )
+    preflight_cell = make_cell(
+        task="task-a", config="cfg", rep=0, result_path=result, log_path=log
+    )
     manifest = base_manifest(
         run_id="state-test",
         command=["python3", "harness/run_batch.py"],
@@ -94,7 +128,10 @@ def test_run_state_writer_keeps_preflight_and_batch_counts_separate(tmp_path):
     assert cell["summary"]["reward_partial"] == 0.7
     assert cell["summary"]["total_tokens"] == 456
 
-    events = [json.loads(line) for line in (run_dir / "events.ndjson").read_text().splitlines()]
+    events = [
+        json.loads(line)
+        for line in (run_dir / "events.ndjson").read_text().splitlines()
+    ]
     assert [event["event"] for event in events] == [
         "run_started",
         "preflight_skipped",
@@ -169,7 +206,9 @@ def test_project_structured_run_detail_levels_do_not_inline_logs(tmp_path):
     result = write_result(tmp_path / "result.json")
     log = tmp_path / "huge.log"
     log.write_text("SECRET RAW LOG\n" * 20)
-    cell = make_cell(task="task-a", config="cfg", rep=0, result_path=result, log_path=log)
+    cell = make_cell(
+        task="task-a", config="cfg", rep=0, result_path=result, log_path=log
+    )
     manifest = base_manifest(
         run_id="detail-test",
         command=["cmd"],
@@ -192,7 +231,9 @@ def test_project_structured_run_detail_levels_do_not_inline_logs(tmp_path):
     writer.cell_finished(cell, result_path=result, log_path=log, exit_code=0)
 
     summary = project_structured_run(state_root / "detail-test", detail="summary")
-    operational = project_structured_run(state_root / "detail-test", detail="operational")
+    operational = project_structured_run(
+        state_root / "detail-test", detail="operational"
+    )
     diagnostic = project_structured_run(state_root / "detail-test", detail="diagnostic")
 
     assert "active_cells" not in summary
@@ -202,3 +243,49 @@ def test_project_structured_run_detail_levels_do_not_inline_logs(tmp_path):
     assert "status" in diagnostic
     assert "events_tail" in diagnostic
     assert "SECRET RAW LOG" not in json.dumps(operational)
+
+
+def test_operational_projection_keeps_every_finished_cell_inspectable(tmp_path):
+    state_root = tmp_path / "results" / "_runs"
+    result = write_result(
+        tmp_path / "result.json", reward_binary=1, reward_partial=0.875
+    )
+    log = tmp_path / "agent.log"
+    log.write_text("finished cell log")
+    cells = [
+        make_cell(
+            task=f"task-{index:02d}",
+            config="cfg",
+            rep=0,
+            result_path=result,
+            log_path=log,
+        )
+        for index in range(31)
+    ]
+    manifest = base_manifest(
+        run_id="all-finished-cells",
+        command=["cmd"],
+        cwd=tmp_path,
+        model="model",
+        thinking="high",
+        configs=["cfg"],
+        selection={"mode": "tasks", "tasks": [cell["task"] for cell in cells]},
+        runs=1,
+        workers=1,
+        agent_timeout_s=None,
+        rpc_quiescence_s=None,
+        progress_interval_s=15,
+        batch_cells=cells,
+        preflight=[],
+    )
+    writer = RunStateWriter(state_root, manifest)
+    writer.start()
+    for cell in cells:
+        writer.cell_finished(cell, result_path=result, log_path=log, exit_code=0)
+
+    operational = project_structured_run(writer.run_dir, detail="operational")
+
+    assert len(operational["finished_cells"]) == 31
+    assert len(operational["recent_finished"]) == 30
+    assert operational["finished_cells"][0]["task"] == "task-00"
+    assert operational["finished_cells"][-1]["summary"]["reward_partial"] == 0.875

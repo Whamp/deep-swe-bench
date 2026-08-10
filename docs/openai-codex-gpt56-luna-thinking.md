@@ -1,8 +1,8 @@
 # OpenAI Codex GPT-5.6 Luna thinking validation
 
-Originally validated 2026-07-31 for benchmark configs using Pi `0.83.0` and
-`openai-codex/gpt-5.6-luna`. The `low` route was revalidated with a local mock
-on Pi `0.84.1` for the read-long-lines pilot on 2026-08-10.
+Validated 2026-07-31 for benchmark configs using Pi `0.83.0` and
+`openai-codex/gpt-5.6-luna`. The low route was revalidated with a local mock on
+Pi `0.84.1` for the read-long-lines pilot on 2026-08-10.
 
 ## Official model contract
 
@@ -39,7 +39,7 @@ public API limit. This avoids claiming context that the tested Codex route does
 not expose.
 
 The isolated registry artifact is
-[`analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/model-registry.json`](../analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/model-registry.json).
+[`analysis/openai-codex-gpt56-luna/model-registry.json`](../analysis/openai-codex-gpt56-luna/model-registry.json).
 It disables model-network refresh and custom `models.json` loading, so the
 record reflects the pinned Pi package.
 
@@ -57,10 +57,10 @@ matching `reasoning.effort`:
 
 Artifacts:
 
-- [`analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/low/request-probe.jsonl`](../analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/low/request-probe.jsonl)
-- [`analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/high/request-probe.jsonl`](../analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/high/request-probe.jsonl)
-- [`analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/max/request-probe.jsonl`](../analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/max/request-probe.jsonl)
-- Reproducer: [`analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/request-probe.mjs`](../analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/request-probe.mjs)
+- [`analysis/openai-codex-gpt56-luna/low/request-probe.jsonl`](../analysis/openai-codex-gpt56-luna/low/request-probe.jsonl)
+- [`analysis/openai-codex-gpt56-luna/high/request-probe.jsonl`](../analysis/openai-codex-gpt56-luna/high/request-probe.jsonl)
+- [`analysis/openai-codex-gpt56-luna/max/request-probe.jsonl`](../analysis/openai-codex-gpt56-luna/max/request-probe.jsonl)
+- Reproducer: [`analysis/openai-codex-gpt56-luna/request-probe.mjs`](../analysis/openai-codex-gpt56-luna/request-probe.mjs)
 
 ## Live validation
 
@@ -70,24 +70,26 @@ The records contain compact final usage only, not raw per-event streams.
 
 Artifacts:
 
-- [`analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/low/live-probe.jsonl`](../analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/low/live-probe.jsonl)
-- [`analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/high/live-probe.jsonl`](../analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/high/live-probe.jsonl)
-- [`analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/max/live-probe.jsonl`](../analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/max/live-probe.jsonl)
-- Reproducer: [`analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/live-probe.mjs`](../analysis/read-long-lines-pilot/provider-evidence/openai-codex-gpt56-luna/live-probe.mjs)
+- [`analysis/openai-codex-gpt56-luna/low/live-probe.jsonl`](../analysis/openai-codex-gpt56-luna/low/live-probe.jsonl)
+- [`analysis/openai-codex-gpt56-luna/high/live-probe.jsonl`](../analysis/openai-codex-gpt56-luna/high/live-probe.jsonl)
+- [`analysis/openai-codex-gpt56-luna/max/live-probe.jsonl`](../analysis/openai-codex-gpt56-luna/max/live-probe.jsonl)
+- Reproducer: [`analysis/openai-codex-gpt56-luna/live-probe.mjs`](../analysis/openai-codex-gpt56-luna/live-probe.mjs)
 
 ## Pi 0.84.1 pilot revalidation
 
-`analysis/read-long-lines-pilot/provider-evidence/request-probe.jsonl` exercises Pi `0.84.1`'s
-real Codex Responses adapter against a local mock. The `low` record preserves
-`low` and sends `reasoning: {"effort":"low","summary":"auto"}` with one tool.
-No provider call was made for this revalidation.
+`analysis/read-long-lines-pilot/provider-evidence/request-probe.jsonl` exercises
+Pi `0.84.1`'s real Codex Responses adapter against a local mock. The low record
+preserves `low` and sends `reasoning: {"effort":"low","summary":"auto"}` with
+one tool. No provider call was made for this revalidation.
 
-The existing Pi `0.83.0` live probe proves the subscription route accepted Luna.
-The confirmed read-long-lines preflight must prove the Pi `0.84.1` end-to-end
-route before fan-out.
+The existing Pi `0.83.0` live probe proves the subscription route accepted
+Luna. The confirmed read-long-lines preflight must prove the Pi `0.84.1`
+end-to-end route before fan-out.
 
 ## Benchmark implication
 
-Each config leaf must pin its thinking level, assert the native session's
-`thinking_level_change` record, and assert captured provider requests contain
-`model: "gpt-5.6-luna"` with the matching `reasoning.effort`.
+The route is validated for `baseline@1.0.0` and `pi-check@1.0.1` comparisons
+at `low`, `high`, and `max`. Each config leaf must pin its thinking level,
+assert the native
+session's `thinking_level_change` record, and assert captured provider requests
+contain `model: "gpt-5.6-luna"` with the matching `reasoning.effort`.

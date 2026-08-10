@@ -6,8 +6,12 @@ module queries the provider's usage API to find (a) which window is exhausted
 and (b) when it resets, so ``run_batch`` can sleep until the reset and resume
 automatically instead of requiring a manual command re-run.
 
-Currently supports OpenAI Codex (the OpenAI Codex subscription), using the same
-endpoint and credential path as ``@marckrenn/pi-sub-core``'s ``CodexProvider``:
+Supports direct ZAI Coding Plan models through ZAI's subscription usage endpoint
+and OpenAI Codex subscription models through the same endpoint and credential
+path as ``@marckrenn/pi-sub-core``'s ``CodexProvider``.
+
+ZAI uses ``GET https://api.z.ai/api/monitor/usage/quota/limit`` with
+``ZAI_API_KEY``. OpenAI Codex uses:
 
     GET https://chatgpt.com/backend-api/wham/usage
     Authorization: Bearer <access>   (from ~/.pi/agent/auth.json["openai-codex"].access)
@@ -29,6 +33,7 @@ The raw response shape is::
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.request
@@ -37,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 DEFAULT_AUTH_PATH = Path.home() / ".pi" / "agent" / "auth.json"
 DEFAULT_SUBCORE_CACHE = Path.home() / ".pi" / "agent" / "cache" / "sub-core" / "cache.json"
 
@@ -119,6 +125,46 @@ def _add_rate(windows: list[Window], rate: dict | None, prefix: str | None = Non
         return
     _push_window(windows, rate.get("primary_window"), 18000, prefix)
     _push_window(windows, rate.get("secondary_window"), 604800, prefix)
+
+
+def _zai_window_label(number: object, unit: object) -> str:
+    """Name the ZAI Coding Plan duration units used by its quota endpoint."""
+    count = number if isinstance(number, int | float) else 0
+    if unit == 3:
+        return f"{count:g}h"
+    if unit == 4:
+        return "Day" if count == 1 else f"{count:g} days"
+    if unit == 5:
+        return "Month" if count == 1 else f"{count:g} months"
+    if unit == 6:
+        return "Week" if count == 1 else f"{count:g} weeks"
+    return f"ZAI unit {unit}"
+
+
+def parse_zai_usage(data: dict) -> list[Window]:
+    """Parse ZAI Coding Plan token windows without retaining account content."""
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        return []
+    windows: list[Window] = []
+    for limit in payload.get("limits") or []:
+        if not isinstance(limit, dict) or limit.get("type") != "TOKENS_LIMIT":
+            continue
+        percentage = limit.get("percentage")
+        if not isinstance(percentage, int | float):
+            continue
+        reset_at: datetime | None = None
+        reset_ms = limit.get("nextResetTime")
+        if isinstance(reset_ms, int | float) and reset_ms > 0:
+            reset_at = datetime.fromtimestamp(reset_ms / 1000, tz=timezone.utc)
+        windows.append(
+            Window(
+                label=_zai_window_label(limit.get("number"), limit.get("unit")),
+                used_percent=float(percentage),
+                reset_at=reset_at,
+            )
+        )
+    return windows
 
 
 def parse_codex_usage(data: dict) -> list[Window]:
@@ -212,6 +258,42 @@ def load_codex_credentials(auth_path: Path = DEFAULT_AUTH_PATH) -> dict | None:
     return {"access_token": entry["access"], "account_id": entry.get("accountId")}
 
 
+def fetch_zai_usage(
+    api_key: str,
+    *,
+    url: str = ZAI_USAGE_URL,
+    timeout: float = HTTP_TIMEOUT_S,
+) -> dict:
+    """Call the ZAI Coding Plan quota endpoint and return parsed JSON."""
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(
+        request,
+        timeout=timeout,
+    ) as response:
+        return json.loads(response.read())
+
+
+def zai_windows(
+    *,
+    api_key: str | None = None,
+    fetcher=fetch_zai_usage,
+) -> tuple[list[Window], str]:
+    """Return ZAI Coding Plan token quota windows from the live usage API."""
+    credential = api_key or os.environ.get("ZAI_API_KEY")
+    if not credential:
+        return [], "none"
+    try:
+        return parse_zai_usage(fetcher(credential)), "zai-api"
+    except (urllib.error.URLError, OSError, ValueError, KeyError):
+        return [], "none"
+
+
 def fetch_codex_usage(
     access_token: str,
     account_id: str | None = None,
@@ -287,6 +369,15 @@ def codex_windows(
     if cached:
         return relevant_windows(cached, model), "cache"
     return [], "none"
+
+
+def provider_windows(model: str) -> tuple[list[Window], str]:
+    """Query the subscription quota source selected by the model provider."""
+    if model.startswith("zai/"):
+        return zai_windows()
+    if model.startswith("openai-codex/"):
+        return codex_windows(model)
+    return [], "unsupported-provider"
 
 
 def describe_pause(windows: list[Window], *, now: datetime) -> str:

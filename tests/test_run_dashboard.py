@@ -12,18 +12,33 @@ from scripts import run_dashboard
 
 def make_state(tmp_path: Path, run_id: str = "dash-test") -> Path:
     state_root = tmp_path / "results" / "_runs"
-    result = tmp_path / "results" / "model" / "high" / "cfg" / "task-a" / "rep0" / "result.json"
+    result = (
+        tmp_path
+        / "results"
+        / "model"
+        / "high"
+        / "cfg"
+        / "task-a"
+        / "rep0"
+        / "result.json"
+    )
     result.parent.mkdir(parents=True, exist_ok=True)
-    result.write_text(json.dumps({
-        "agent_exit": 0,
-        "verifier_exit": 0,
-        "reward_partial": 0.5,
-        "total_tokens": 100,
-    }))
+    result.write_text(
+        json.dumps(
+            {
+                "agent_exit": 0,
+                "verifier_exit": 0,
+                "reward_partial": 0.5,
+                "total_tokens": 100,
+            }
+        )
+    )
     log = tmp_path / "results" / "model" / "high" / "logs" / "task-a__cfg__rep0.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("raw log content should stay behind a link\n")
-    cell = make_cell(task="task-a", config="cfg", rep=0, result_path=result, log_path=log)
+    cell = make_cell(
+        task="task-a", config="cfg", rep=0, result_path=result, log_path=log
+    )
     manifest = base_manifest(
         run_id=run_id,
         command=["cmd"],
@@ -51,9 +66,13 @@ def test_dashboard_discovers_structured_and_incomplete_runs(tmp_path):
     state_root = make_state(tmp_path, "dash-test")
     incomplete = state_root / "incomplete"
     incomplete.mkdir(parents=True)
-    (incomplete / "status.json").write_text(json.dumps({"run_id": "incomplete", "state": "running"}))
+    (incomplete / "status.json").write_text(
+        json.dumps({"run_id": "incomplete", "state": "running"})
+    )
 
-    runs = run_dashboard.load_dashboard_runs(state_root, detail="summary", include_legacy=False, legacy_root=None)
+    runs = run_dashboard.load_dashboard_runs(
+        state_root, detail="summary", include_legacy=False, legacy_root=None
+    )
 
     ids = {run["run_id"] for run in runs}
     assert {"dash-test", "incomplete"} <= ids
@@ -63,6 +82,41 @@ def test_dashboard_discovers_structured_and_incomplete_runs(tmp_path):
     assert dash["launch_plan_identity"] is None
     assert dash["preflight_state"] == "not_required"
     assert "active_cells" not in dash
+
+
+def test_operational_run_detail_includes_finished_cell_tool_error_metrics(tmp_path):
+    state_root = make_state(tmp_path, "tool-metrics-run")
+    result = (
+        tmp_path
+        / "results"
+        / "model"
+        / "high"
+        / "cfg"
+        / "task-a"
+        / "rep0"
+        / "result.json"
+    )
+    _write_session(
+        result.parent / "session" / "s.jsonl",
+        [
+            _tool_result("read", is_error=False),
+            _tool_result("bash", is_error=True),
+        ],
+    )
+    run_dashboard._SESSION_CACHE.clear()
+
+    run = run_dashboard.load_dashboard_run(
+        "tool-metrics-run",
+        state_root,
+        detail="operational",
+        legacy_root=None,
+        repo_root=tmp_path,
+    )
+
+    summary = run["finished_cells"][0]["summary"]
+    assert summary["tool_calls"] == 2
+    assert summary["tool_call_errors"] == 1
+    assert summary["tool_call_error_rate"] == 0.5
 
 
 def test_dashboard_ignores_malformed_run_without_hiding_healthy_run(
@@ -92,8 +146,15 @@ def test_dashboard_detail_projection_and_legacy_track(tmp_path):
     track.parent.mkdir(parents=True)
     track.write_text("running 1 cells: cfg\n[1/1] task-a / cfg / rep0  ok\ndone: 1/1\n")
 
-    structured = run_dashboard.load_dashboard_run("dash-test", state_root, detail="operational", legacy_root=legacy_root)
-    legacy = run_dashboard.load_dashboard_run("legacy-old-comparison", state_root, detail="operational", legacy_root=legacy_root)
+    structured = run_dashboard.load_dashboard_run(
+        "dash-test", state_root, detail="operational", legacy_root=legacy_root
+    )
+    legacy = run_dashboard.load_dashboard_run(
+        "legacy-old-comparison",
+        state_root,
+        detail="operational",
+        legacy_root=legacy_root,
+    )
 
     assert structured is not None
     assert structured["recent_finished"][0]["summary"]["total_tokens"] == 100
@@ -111,12 +172,103 @@ def test_safe_file_links_are_allowlisted_and_tailed(tmp_path):
     path.parent.mkdir(parents=True)
     path.write_text("one\ntwo\nthree\n")
 
-    resolved = run_dashboard.resolve_dashboard_path("results/x.log", repo_root=repo, state_root=state_root)
+    resolved = run_dashboard.resolve_dashboard_path(
+        "results/x.log", repo_root=repo, state_root=state_root
+    )
 
     assert resolved == path.resolve()
     assert run_dashboard.tail_file(resolved, lines=2) == "two\nthree\n"
     with pytest.raises(ValueError):
-        run_dashboard.resolve_dashboard_path(str(tmp_path / "outside.log"), repo_root=repo, state_root=state_root)
+        run_dashboard.resolve_dashboard_path(
+            str(tmp_path / "outside.log"), repo_root=repo, state_root=state_root
+        )
+
+
+def test_dashboard_follows_launch_plan_structured_state_path(tmp_path: Path) -> None:
+    """A launch wrapper under _runs can point at live state under results/."""
+    run_id = "external-state-run"
+    state_root = make_state(tmp_path, run_id)
+    source = state_root / run_id
+    target = tmp_path / "results" / f"{run_id}--plan-hash"
+    source.rename(target)
+    manifest_path = target / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["run_key"] = target.name
+    manifest_path.write_text(json.dumps(manifest))
+    wrapper = state_root / run_id
+    wrapper.mkdir()
+    (wrapper / "launch-plan.json").write_text(
+        json.dumps(
+            {
+                "runId": run_id,
+                "paths": {
+                    "statePath": str(target),
+                    "stateRoot": str(tmp_path / "results"),
+                },
+            }
+        )
+    )
+
+    server = run_dashboard.make_server(
+        host="127.0.0.1",
+        port=0,
+        state_root=state_root,
+        detail="summary",
+        repo_root=tmp_path,
+        legacy_root=tmp_path / "runs",
+        results_root=tmp_path / "results",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(f"{base}/api/runs", timeout=5) as response:
+            runs = json.loads(response.read().decode("utf-8"))["runs"]
+        projected = next(run for run in runs if run["run_id"] == run_id)
+        assert projected["counts"]["batch_done"] == 1
+        assert projected["run_key"] == target.name
+
+        with urllib.request.urlopen(
+            f"{base}/api/runs/{target.name}?detail=operational", timeout=5
+        ) as response:
+            detail = json.loads(response.read().decode("utf-8"))
+        assert detail["counts"]["batch_done"] == 1
+
+        with urllib.request.urlopen(
+            f"{base}/api/runs/{target.name}/score", timeout=5
+        ) as response:
+            score = json.loads(response.read().decode("utf-8"))["score"]
+        assert score["finished"] == 1
+        assert len(score["timeline"]) == 1
+
+        with urllib.request.urlopen(
+            f"{base}/api/runs/{target.name}/events", timeout=5
+        ) as response:
+            events = json.loads(response.read().decode("utf-8"))["events"]
+        assert any(event["event"] == "cell_finished" for event in events)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_dashboard_refuses_launch_plan_state_path_outside_results(tmp_path: Path) -> None:
+    state_root = tmp_path / "repo" / "results" / "_runs"
+    wrapper = state_root / "guarded-run"
+    wrapper.mkdir(parents=True)
+    outside = tmp_path / "outside-state"
+    outside.mkdir()
+    (outside / "manifest.json").write_text(json.dumps({"run_id": "guarded-run"}))
+    (wrapper / "launch-plan.json").write_text(
+        json.dumps(
+            {
+                "runId": "guarded-run",
+                "paths": {"statePath": str(outside)},
+            }
+        )
+    )
+
+    assert run_dashboard.resolve_dashboard_run_state_dir("guarded-run", state_root) == wrapper
 
 
 def test_dashboard_http_api_smoke(tmp_path):
@@ -145,6 +297,7 @@ def test_dashboard_http_api_smoke(tmp_path):
 # ---------------------------------------------------------------------------
 # Comparison / subset filtering
 # ---------------------------------------------------------------------------
+
 
 def _make_result(path: Path, *, reward_binary=0, reward_partial=0.0, task="", rep=0):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -183,17 +336,44 @@ def test_load_subset_tasks_missing_returns_none(tmp_path):
 
 
 def test_rep_from_parts():
-    assert run_dashboard._rep_from_parts(("m", "t", "c", "task", "rep2", "result.json")) == 2
-    assert run_dashboard._rep_from_parts(("m", "t", "c", "task", "rep0", "result.json")) == 0
-    assert run_dashboard._rep_from_parts(("m", "t", "c", "task", "weird", "result.json")) == 0
+    assert (
+        run_dashboard._rep_from_parts(("m", "t", "c", "task", "rep2", "result.json"))
+        == 2
+    )
+    assert (
+        run_dashboard._rep_from_parts(("m", "t", "c", "task", "rep0", "result.json"))
+        == 0
+    )
+    assert (
+        run_dashboard._rep_from_parts(("m", "t", "c", "task", "weird", "result.json"))
+        == 0
+    )
 
 
 def test_comparison_subset_filter_excludes_other_tasks(tmp_path):
     res = tmp_path / "results"
     # config has cells for task-a (in subset) and task-z (not in subset)
-    _make_result(res / "gpt-5.5" / "low" / "baseline" / "task-a" / "rep0" / "result.json", reward_binary=1, reward_partial=1.0, task="task-a", rep=0)
-    _make_result(res / "gpt-5.5" / "low" / "baseline" / "task-a" / "rep1" / "result.json", reward_binary=0, reward_partial=0.0, task="task-a", rep=1)
-    _make_result(res / "gpt-5.5" / "low" / "baseline" / "task-z" / "rep0" / "result.json", reward_binary=1, reward_partial=1.0, task="task-z", rep=0)
+    _make_result(
+        res / "gpt-5.5" / "low" / "baseline" / "task-a" / "rep0" / "result.json",
+        reward_binary=1,
+        reward_partial=1.0,
+        task="task-a",
+        rep=0,
+    )
+    _make_result(
+        res / "gpt-5.5" / "low" / "baseline" / "task-a" / "rep1" / "result.json",
+        reward_binary=0,
+        reward_partial=0.0,
+        task="task-a",
+        rep=1,
+    )
+    _make_result(
+        res / "gpt-5.5" / "low" / "baseline" / "task-z" / "rep0" / "result.json",
+        reward_binary=1,
+        reward_partial=1.0,
+        task="task-z",
+        rep=0,
+    )
 
     # No filter: all 3 cells
     all_runs = run_dashboard.load_comparison_data(res)
@@ -234,8 +414,24 @@ def test_comparison_discovers_symlinked_config_directory(tmp_path):
 def test_comparison_max_reps_caps_per_task(tmp_path):
     res = tmp_path / "results"
     for rep in range(5):
-        _make_result(res / "gpt-5.5" / "low" / "baseline" / "task-a" / f"rep{rep}" / "result.json", reward_binary=1, task="task-a", rep=rep)
-    _make_result(res / "gpt-5.5" / "low" / "baseline" / "task-b" / "rep0" / "result.json", reward_binary=0, task="task-b", rep=0)
+        _make_result(
+            res
+            / "gpt-5.5"
+            / "low"
+            / "baseline"
+            / "task-a"
+            / f"rep{rep}"
+            / "result.json",
+            reward_binary=1,
+            task="task-a",
+            rep=rep,
+        )
+    _make_result(
+        res / "gpt-5.5" / "low" / "baseline" / "task-b" / "rep0" / "result.json",
+        reward_binary=0,
+        task="task-b",
+        rep=0,
+    )
 
     capped = run_dashboard.load_comparison_data(res, max_reps=2)
     # task-a keeps rep0, rep1 (2 of 5); task-b keeps rep0 -> total 3
@@ -247,17 +443,696 @@ def test_comparison_max_reps_caps_per_task(tmp_path):
 def test_comparison_subset_and_reps_combined(tmp_path):
     res = tmp_path / "results"
     for rep in range(4):
-        _make_result(res / "gpt-5.5" / "low" / "baseline" / "task-a" / f"rep{rep}" / "result.json", reward_binary=1, task="task-a", rep=rep)
+        _make_result(
+            res
+            / "gpt-5.5"
+            / "low"
+            / "baseline"
+            / "task-a"
+            / f"rep{rep}"
+            / "result.json",
+            reward_binary=1,
+            task="task-a",
+            rep=rep,
+        )
     out = run_dashboard.load_comparison_data(res, subset_tasks={"task-a"}, max_reps=3)
     assert out[0]["total_cells"] == 3
 
 
 def test_comparison_contaminated_skipped(tmp_path):
     res = tmp_path / "results"
-    _make_result(res / "gpt-5.5" / "low" / "baseline" / "task-a" / "rep0" / "result.json", reward_binary=1, task="task-a")
-    _make_result(res / "_contaminated" / "gpt-5.5" / "low" / "bad" / "task-a" / "rep0" / "result.json", reward_binary=1, task="task-a")
+    _make_result(
+        res / "gpt-5.5" / "low" / "baseline" / "task-a" / "rep0" / "result.json",
+        reward_binary=1,
+        task="task-a",
+    )
+    _make_result(
+        res
+        / "_contaminated"
+        / "gpt-5.5"
+        / "low"
+        / "bad"
+        / "task-a"
+        / "rep0"
+        / "result.json",
+        reward_binary=1,
+        task="task-a",
+    )
     out = run_dashboard.load_comparison_data(res)
     assert {r["config"] for r in out} == {"baseline"}
+
+
+# ---------------------------------------------------------------------------
+# Live run scoring (events.ndjson replay)
+# ---------------------------------------------------------------------------
+
+
+def _make_scored_run(tmp_path: Path, run_id: str = "score-test") -> Path:
+    """Build a run with several finished cells carrying real summaries."""
+    state_root = tmp_path / "results" / "_runs"
+    cells = []
+    outcomes = [
+        ("task-a", 0, 1, 1.0, 0.5, "ok"),  # solved
+        ("task-a", 1, 1, 1.0, 0.6, "ok"),  # solved (rep1)
+        ("task-b", 0, 0, 0.2, 0.7, "ok"),  # not solved
+        ("task-c", 0, 0, 0.0, 0.0, "timeout"),  # failure
+    ]
+    for task, rep, rb, rp, cost, _ in outcomes:
+        result = (
+            tmp_path
+            / "results"
+            / "model"
+            / "high"
+            / "cfg"
+            / task
+            / f"rep{rep}"
+            / "result.json"
+        )
+        result.parent.mkdir(parents=True, exist_ok=True)
+        timed_out = _ == "timeout"
+        result.write_text(
+            json.dumps(
+                {
+                    "agent_exit": 0,
+                    "verifier_exit": 0,
+                    "agent_timed_out": timed_out,
+                    "reward_binary": rb,
+                    "reward_partial": rp,
+                    "combined_cost_usd": cost,
+                    "cost_usd": cost,
+                    "total_tokens": 1000,
+                    "agent_wall_s": 0.0,
+                }
+            )
+        )
+        log = result.parent / "cell.log"
+        log.write_text("log\n")
+        cell = make_cell(
+            task=task, config="cfg", rep=rep, result_path=result, log_path=log
+        )
+        cells.append((cell, result, log))
+    manifest = base_manifest(
+        run_id=run_id,
+        command=["cmd"],
+        cwd=tmp_path,
+        model="model",
+        thinking="high",
+        configs=["cfg"],
+        selection={"mode": "tasks", "tasks": ["task-a", "task-b", "task-c"]},
+        runs=1,
+        workers=1,
+        agent_timeout_s=None,
+        rpc_quiescence_s=None,
+        progress_interval_s=15,
+        batch_cells=[c for c, _, _ in cells],
+        preflight=[],
+    )
+    writer = RunStateWriter(state_root, manifest)
+    writer.start()
+    for cell, result, log in cells:
+        writer.cell_started(cell)
+        writer.cell_finished(cell, result_path=result, log_path=log, exit_code=0)
+    return state_root / run_id
+
+
+def test_load_run_score_aggregates_events(tmp_path):
+    run_dir = _make_scored_run(tmp_path)
+    score = run_dashboard.load_run_score(run_dir)
+    assert score["finished"] == 4  # done cells (finished + skipped)
+    assert score["solved"] == 2  # rep-level solved cells (task-a x2)
+    assert score["processed"] == 4  # all real finishes here (no skips)
+    # Solve rate is TASK-LEVEL: task-a solved, task-b/c not -> 1/3.
+    assert score["tasks_total"] == 3
+    assert score["tasks_solved"] == 1
+    assert abs(score["solve_rate"] - 33.33) < 1e-6
+    assert score["active"] == 0
+    assert score["failure_breakdown"] == {"timeout": 1}
+    by_task = {t["task"]: t for t in score["tasks"]}
+    assert by_task["task-a"]["solved"] is True
+    assert by_task["task-a"]["reps"] == 2
+    assert by_task["task-b"]["solved"] is False
+    assert by_task["task-c"]["last_outcome"] == "timeout"
+    assert len(score["timeline"]) == 4
+    # timeline.solved is the running task-level solved count (1 task solved).
+    assert score["timeline"][-1]["solved"] == 1
+
+
+def test_load_run_score_empty_run(tmp_path):
+    run_dir = tmp_path / "empty-run"
+    run_dir.mkdir()
+    (run_dir / "events.ndjson").write_text("")
+    score = run_dashboard.load_run_score(run_dir)
+    assert score["finished"] == 0
+    assert score["solve_rate"] == 0.0
+    assert score["tool_calls"] == 0
+    assert score["tool_call_errors"] == 0
+    assert score["tool_call_error_rate"] is None
+    assert score["tasks"] == []
+    assert score["timeline"] == []
+
+
+def test_load_run_score_plots_mean_partial_and_tool_call_error_rate(tmp_path):
+    run_dir = _make_scored_run(tmp_path)
+    events = [
+        json.loads(line)
+        for line in (run_dir / "events.ndjson").read_text().splitlines()
+    ]
+    finished = [event for event in events if event.get("event") == "cell_finished"]
+    for index, event in enumerate(finished):
+        result = Path(event["result_path"])
+        _write_session(
+            result.parent / "session" / "s.jsonl",
+            [
+                _tool_result("read", is_error=False),
+                _tool_result("bash", is_error=index == len(finished) - 1),
+            ],
+        )
+
+    run_dashboard._SESSION_CACHE.clear()
+    score = run_dashboard.load_run_score(
+        run_dir,
+        repo_root=tmp_path,
+        state_root=tmp_path / "results" / "_runs",
+    )
+
+    assert [point["mean_partial"] for point in score["timeline"]] == [
+        1.0,
+        1.0,
+        0.7333,
+        0.55,
+    ]
+    assert score["tool_calls"] == 8
+    assert score["tool_call_errors"] == 1
+    assert score["tool_call_error_rate"] == 0.125
+    assert score["timeline"][-1]["tool_call_error_rate"] == 0.125
+
+
+def test_load_run_score_excludes_skips_from_cost_and_throughput(tmp_path):
+    """Reused (skipped) cells count toward progress + task solve rate, but NOT
+    toward this-run cost, throughput, or the timeline. Regression for the
+    reuse-heavy run shape where skips otherwise double-count prior spend and
+    inflate the finish rate."""
+    state_root = tmp_path / "results" / "_runs"
+    # task-a: real finish, solved, $0.50 this-run spend
+    ra = tmp_path / "results" / "m" / "h" / "c" / "task-a" / "rep0" / "result.json"
+    ra.parent.mkdir(parents=True, exist_ok=True)
+    ra.write_text(
+        json.dumps(
+            {
+                "agent_exit": 0,
+                "verifier_exit": 0,
+                "reward_binary": 1,
+                "reward_partial": 1.0,
+                "combined_cost_usd": 0.5,
+                "cost_usd": 0.5,
+            }
+        )
+    )
+    # task-b: SKIPPED (reused) — prior result solved, but carries $0.30 PRIOR cost
+    rb = tmp_path / "results" / "m" / "h" / "c" / "task-b" / "rep0" / "result.json"
+    rb.parent.mkdir(parents=True, exist_ok=True)
+    rb.write_text(
+        json.dumps(
+            {
+                "agent_exit": 0,
+                "verifier_exit": 0,
+                "reward_binary": 1,
+                "reward_partial": 1.0,
+                "combined_cost_usd": 0.3,
+                "cost_usd": 0.3,
+            }
+        )
+    )
+    # task-c: real finish, not solved, $0.20 this-run spend
+    rc = tmp_path / "results" / "m" / "h" / "c" / "task-c" / "rep0" / "result.json"
+    rc.parent.mkdir(parents=True, exist_ok=True)
+    rc.write_text(
+        json.dumps(
+            {
+                "agent_exit": 0,
+                "verifier_exit": 0,
+                "reward_binary": 0,
+                "reward_partial": 0.0,
+                "combined_cost_usd": 0.2,
+                "cost_usd": 0.2,
+            }
+        )
+    )
+    cells = []
+    for task_name, result in [
+        ("task-a", ra),
+        ("task-b", rb),
+        ("task-c", rc),
+    ]:
+        log = result.parent / "l"
+        log.write_text("x")
+        cells.append(
+            (
+                make_cell(
+                    task=task_name,
+                    config="c",
+                    rep=0,
+                    result_path=result,
+                    log_path=log,
+                ),
+                result,
+                log,
+            )
+        )
+    manifest = base_manifest(
+        run_id="reuse-run",
+        command=["cmd"],
+        cwd=tmp_path,
+        model="m",
+        thinking="h",
+        configs=["c"],
+        selection={"mode": "tasks", "tasks": ["task-a", "task-b", "task-c"]},
+        runs=1,
+        workers=1,
+        agent_timeout_s=None,
+        rpc_quiescence_s=None,
+        progress_interval_s=15,
+        batch_cells=[c for c, _, _ in cells],
+        preflight=[],
+    )
+    writer = RunStateWriter(state_root, manifest)
+    writer.start()
+    writer.cell_started(cells[0][0])
+    writer.cell_finished(cells[0][0], result_path=ra, log_path=cells[0][2], exit_code=0)
+    writer.cell_skipped(cells[1][0], reason="existing_result")  # reused
+    writer.cell_started(cells[2][0])
+    writer.cell_finished(cells[2][0], result_path=rc, log_path=cells[2][2], exit_code=0)
+
+    score = run_dashboard.load_run_score(state_root / "reuse-run")
+    assert score["finished"] == 3  # skip counts as done
+    assert score["processed"] == 2  # only the two real finishes
+    assert score["tasks_total"] == 3 and score["tasks_solved"] == 2  # a + b solved
+    assert abs(score["solve_rate"] - 66.67) < 1e-6
+    # Cost excludes the skip's prior $0.30 -> 0.5 + 0.2 = 0.7.
+    assert abs(score["cumulative_cost"] - 0.7) < 1e-6
+    assert score["timeline"][-1]["cost"] == round(0.7, 4)
+    # Timeline only has real-finish points (2), and the skip's task still counts.
+    assert len(score["timeline"]) == 2
+
+
+def test_load_run_score_solve_rate_is_task_level_on_multi_rep(tmp_path):
+    """With multiple reps, task-level solve rate diverges from rep-level.
+    Two tasks, each 3 reps, each solved in exactly 1 of 3 reps:
+    rep-level = 33%, task-level (any-rep) = 100%. The hero must show task-level
+    so it is comparable to the baseline's any-rep rate."""
+    state_root = tmp_path / "results" / "_runs"
+    cells = []
+    for task in ("task-a", "task-b"):
+        for rep in range(3):
+            solved = 1 if rep == 0 else 0
+            result = (
+                tmp_path
+                / "results"
+                / "m"
+                / "h"
+                / "c"
+                / task
+                / f"rep{rep}"
+                / "result.json"
+            )
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_text(
+                json.dumps(
+                    {
+                        "agent_exit": 0,
+                        "verifier_exit": 0,
+                        "reward_binary": solved,
+                        "reward_partial": float(solved),
+                        "cost_usd": 0.1,
+                        "combined_cost_usd": 0.1,
+                    }
+                )
+            )
+            log = result.parent / "l"
+            log.write_text("x")
+            cells.append(
+                (
+                    make_cell(
+                        task=task, config="c", rep=rep, result_path=result, log_path=log
+                    ),
+                    result,
+                    log,
+                )
+            )
+    manifest = base_manifest(
+        run_id="multirep-run",
+        command=["cmd"],
+        cwd=tmp_path,
+        model="m",
+        thinking="h",
+        configs=["c"],
+        selection={"mode": "tasks", "tasks": ["task-a", "task-b"]},
+        runs=1,
+        workers=1,
+        agent_timeout_s=None,
+        rpc_quiescence_s=None,
+        progress_interval_s=15,
+        batch_cells=[c for c, _, _ in cells],
+        preflight=[],
+    )
+    writer = RunStateWriter(state_root, manifest)
+    writer.start()
+    for cell, result, log in cells:
+        writer.cell_started(cell)
+        writer.cell_finished(cell, result_path=result, log_path=log, exit_code=0)
+    score = run_dashboard.load_run_score(state_root / "multirep-run")
+    assert score["finished"] == 6 and score["solved"] == 2  # 2 solved cells of 6
+    assert score["tasks_total"] == 2 and score["tasks_solved"] == 2
+    assert score["solve_rate"] == 100.0  # task-level, not 33%
+
+
+def test_http_api_score_endpoint(tmp_path):
+    _make_scored_run(tmp_path)
+    server = run_dashboard.make_server(
+        host="127.0.0.1",
+        port=0,
+        state_root=tmp_path / "results" / "_runs",
+        detail="summary",
+        repo_root=tmp_path,
+        legacy_root=tmp_path / "runs",
+        results_root=tmp_path / "results",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(
+            f"{base}/api/runs/score-test/score", timeout=5
+        ) as r:
+            score = json.loads(r.read().decode("utf-8"))["score"]
+        assert score["finished"] == 4
+        assert score["solved"] == 2
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Cell session activity (JSONL turn timeline)
+# ---------------------------------------------------------------------------
+
+
+def _write_session(path: Path, turns: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "type": "session",
+                    "version": 3,
+                    "id": "s1",
+                    "timestamp": "2026-01-01T00:00:00.000Z",
+                    "cwd": "/app",
+                }
+            )
+            + "\n"
+        )
+        for t in turns:
+            fh.write(json.dumps(t) + "\n")
+
+
+def _assistant_turn(content, *, ts="2026-01-01T00:00:01.000Z", usage=None):
+    return {
+        "type": "message",
+        "message": {
+            "role": "assistant",
+            "content": content,
+            "usage": usage or {"totalTokens": 100, "cost": {"total": 0.01}},
+            "timestamp": ts,
+        },
+    }
+
+
+def _tool_result(
+    tool_name: str,
+    *,
+    is_error: bool,
+    details: dict | None = None,
+):
+    return {
+        "type": "message",
+        "message": {
+            "role": "toolResult",
+            "toolName": tool_name,
+            "toolCallId": "call-1",
+            "content": [{"type": "text", "text": "result"}],
+            "isError": is_error,
+            "details": details,
+            "timestamp": 1_767_225_601_000,
+        },
+    }
+
+
+def test_cell_session_native_pi_extracts_tools_and_intent(tmp_path):
+    result = tmp_path / "results" / "m" / "h" / "c" / "task" / "rep0" / "result.json"
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text("{}")
+    _write_session(
+        result.parent / "session" / "s.jsonl",
+        [
+            _assistant_turn(
+                [
+                    {
+                        "type": "thinking",
+                        "thinking": "**Reading the main module** to understand it",
+                    },
+                    {
+                        "type": "toolCall",
+                        "id": "1",
+                        "name": "read",
+                        "arguments": {"path": "src/main.go"},
+                    },
+                    {
+                        "type": "toolCall",
+                        "id": "2",
+                        "name": "bash",
+                        "arguments": {"command": "go test ./..."},
+                    },
+                ]
+            ),
+            _assistant_turn(
+                [{"type": "text", "text": "Done."}],
+                usage={"totalTokens": 50, "cost": {"total": 0.005}},
+            ),
+        ],
+    )
+    run_dashboard._SESSION_CACHE.clear()
+    out = run_dashboard.load_cell_session(
+        str(result), repo_root=tmp_path, state_root=tmp_path / "results" / "_runs"
+    )
+    assert out["found"] is True
+    assert out["turns"] == 2
+    assert set(out["distinct_tools"]) == {"read", "bash"}
+    # last_intent reflects the most recent turn (the final summary text).
+    assert out["last_intent"] == "Done."
+    first = out["turns_list"][0]
+    assert first["intent"] == "Reading the main module to understand it"
+    assert first["tools"] == ["read", "bash"]
+    assert first["targets"] == ["src/main.go", "go test ./..."]
+
+
+def test_cell_session_counts_native_tool_call_errors(tmp_path):
+    result = tmp_path / "results" / "m" / "h" / "c" / "task" / "rep0" / "result.json"
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text("{}")
+    _write_session(
+        result.parent / "session" / "s.jsonl",
+        [
+            _tool_result("read", is_error=False),
+            _tool_result("bash", is_error=True),
+        ],
+    )
+    run_dashboard._SESSION_CACHE.clear()
+    out = run_dashboard.load_cell_session(
+        str(result), repo_root=tmp_path, state_root=tmp_path / "results" / "_runs"
+    )
+    assert out["tool_calls"] == 2
+    assert out["tool_call_errors"] == 1
+    assert out["tool_call_error_rate"] == 0.5
+
+
+def test_cell_session_counts_fabric_inner_operation_errors(tmp_path):
+    result = tmp_path / "results" / "m" / "h" / "c" / "task" / "rep0" / "result.json"
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text("{}")
+    details = {
+        "success": True,
+        "trace": {
+            "operations": [
+                {"type": "call", "ref": "pi.read", "outcome": "succeeded"},
+                {"type": "call", "ref": "pi.bash", "outcome": "failed"},
+                {"type": "call", "ref": "pi.grep", "outcome": "aborted"},
+            ]
+        },
+    }
+    _write_session(
+        result.parent / "session" / "s.jsonl",
+        [_tool_result("fabric_exec", is_error=False, details=details)],
+    )
+    run_dashboard._SESSION_CACHE.clear()
+    out = run_dashboard.load_cell_session(
+        str(result), repo_root=tmp_path, state_root=tmp_path / "results" / "_runs"
+    )
+    assert out["tool_calls"] == 3
+    assert out["tool_call_errors"] == 2
+    assert abs(out["tool_call_error_rate"] - 2 / 3) < 1e-4
+
+
+def test_cell_session_fabric_exec_unwraps_inner_tools(tmp_path):
+    result = tmp_path / "results" / "m" / "h" / "c" / "task" / "rep0" / "result.json"
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text("{}")
+    code = (
+        "const r = await Promise.all([\n"
+        "  pi.bash({cmd:'git status --short'}),\n"
+        "  pi.grep({pattern:'TODO', path:'src'}),\n"
+        "  pi.read({path:'config.yml'})\n"
+        "]);"
+    )
+    _write_session(
+        result.parent / "session" / "s.jsonl",
+        [
+            _assistant_turn(
+                [
+                    {"type": "thinking", "thinking": "Surveying the repo"},
+                    {
+                        "type": "toolCall",
+                        "id": "1",
+                        "name": "fabric_exec",
+                        "arguments": {"code": code},
+                    },
+                ]
+            ),
+        ],
+    )
+    run_dashboard._SESSION_CACHE.clear()
+    out = run_dashboard.load_cell_session(
+        str(result), repo_root=tmp_path, state_root=tmp_path / "results" / "_runs"
+    )
+    assert out["turns"] == 1
+    assert set(out["distinct_tools"]) == {"bash", "grep", "read"}
+    turn = out["turns_list"][0]
+    assert turn["tools"] == ["bash", "grep", "read"]
+    assert "src" in turn["targets"]
+    assert "config.yml" in turn["targets"]
+
+
+def test_cell_session_not_found(tmp_path):
+    result = tmp_path / "results" / "m" / "h" / "c" / "task" / "rep0" / "result.json"
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text("{}")
+    out = run_dashboard.load_cell_session(
+        str(result), repo_root=tmp_path, state_root=tmp_path / "results" / "_runs"
+    )
+    assert out["found"] is False
+
+
+def test_cell_session_cache_invalidates_on_mtime(tmp_path):
+    import os
+    import time as _time
+
+    result = tmp_path / "results" / "m" / "h" / "c" / "task" / "rep0" / "result.json"
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text("{}")
+    p = result.parent / "session" / "s.jsonl"
+    _write_session(p, [_assistant_turn([{"type": "thinking", "thinking": "first"}])])
+    run_dashboard._SESSION_CACHE.clear()
+    first = run_dashboard.load_cell_session(
+        str(result), repo_root=tmp_path, state_root=tmp_path / "results" / "_runs"
+    )
+    assert first["turns"] == 1
+    _write_session(
+        p,
+        [
+            _assistant_turn([{"type": "thinking", "thinking": "first"}]),
+            _assistant_turn([{"type": "thinking", "thinking": "second"}]),
+        ],
+    )
+    future = _time.time() + 5
+    os.utime(p, (future, future))
+    second = run_dashboard.load_cell_session(
+        str(result),
+        repo_root=tmp_path,
+        state_root=tmp_path / "results" / "_runs",
+        now_ts=future + 1,
+    )
+    assert second["turns"] == 2
+    assert second["last_intent"] == "second"
+
+
+def test_http_api_cell_session_endpoint(tmp_path):
+    result = tmp_path / "results" / "m" / "h" / "c" / "task" / "rep0" / "result.json"
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text("{}")
+    _write_session(
+        result.parent / "session" / "s.jsonl",
+        [
+            _assistant_turn([{"type": "thinking", "thinking": "hello"}]),
+        ],
+    )
+    run_dashboard._SESSION_CACHE.clear()
+    server = run_dashboard.make_server(
+        host="127.0.0.1",
+        port=0,
+        state_root=tmp_path / "results" / "_runs",
+        detail="summary",
+        repo_root=tmp_path,
+        legacy_root=tmp_path / "runs",
+        results_root=tmp_path / "results",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        rel = "results/m/h/c/task/rep0/result.json"
+        with urllib.request.urlopen(
+            f"{base}/api/cell-session?path={rel}&tail=5", timeout=5
+        ) as r:
+            session = json.loads(r.read().decode("utf-8"))["session"]
+        assert session["found"] is True
+        assert session["turns"] == 1
+        assert session["last_intent"] == "hello"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_stale_running_run_is_reclassified_as_stalled(tmp_path):
+    """A run whose heartbeat went stale was abandoned; project it as 'stalled',
+    not 'running', while preserving the declared state for transparency."""
+    from datetime import UTC, datetime, timedelta
+
+    state_root = tmp_path / "results" / "_runs"
+    run_dir = state_root / "abandoned"
+    run_dir.mkdir(parents=True)
+    old = (datetime.now(UTC) - timedelta(hours=2)).isoformat(timespec="seconds")
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"run_id": "abandoned", "progress_interval_s": 15})
+    )
+    (run_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "run_id": "abandoned",
+                "state": "running",
+                "heartbeat_at": old,
+                "cells": {},
+                "active_cell_ids": [],
+            }
+        )
+    )
+    proj = run_dashboard.load_dashboard_run(
+        "abandoned", state_root, detail="summary", legacy_root=None
+    )
+    assert proj is not None
+    assert proj["state"] == "stalled"
+    assert proj["declared_state"] == "running"
 
 
 def test_http_api_subsets_and_compare_subset(tmp_path):
@@ -267,8 +1142,13 @@ def test_http_api_subsets_and_compare_subset(tmp_path):
     (tmp_path / "subsets").mkdir()
     (tmp_path / "subsets" / "mini.txt").write_text("task-a\n")
     server = run_dashboard.make_server(
-        host="127.0.0.1", port=0, state_root=state_root, detail="summary",
-        repo_root=tmp_path, legacy_root=tmp_path / "runs", results_root=tmp_path / "results",
+        host="127.0.0.1",
+        port=0,
+        state_root=state_root,
+        detail="summary",
+        repo_root=tmp_path,
+        legacy_root=tmp_path / "runs",
+        results_root=tmp_path / "results",
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

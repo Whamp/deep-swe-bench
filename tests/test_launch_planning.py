@@ -30,6 +30,42 @@ from harness.launch import (
 )
 
 
+def test_plan_cli_loads_exact_explicit_result_reuse_decisions(tmp_path: Path) -> None:
+    result_path = tmp_path / "result.json"
+    decisions_path = tmp_path / "reuse-decisions.json"
+    decisions_path.write_text(
+        json.dumps(
+            [
+                {
+                    "resultPath": str(result_path),
+                    "priorConfigIdentity": "prime-agent@1.1.1",
+                    "resultIdentity": "sha256:fixture-result",
+                    "recordedProvenance": {
+                        "config_identity": "prime-agent@1.1.1",
+                        "harness_revision": "prior-revision",
+                    },
+                    "rationale": "Reviewed successful result is unaffected by retry fixes.",
+                }
+            ]
+        )
+    )
+
+    decisions = run_batch._load_explicit_result_reuse_decisions(decisions_path)
+
+    assert decisions == (
+        launch.ExplicitResultReuseDecision(
+            result_path=result_path.resolve(),
+            prior_config_identity="prime-agent@1.1.1",
+            result_identity="sha256:fixture-result",
+            recorded_provenance={
+                "config_identity": "prime-agent@1.1.1",
+                "harness_revision": "prior-revision",
+            },
+            rationale="Reviewed successful result is unaffected by retry fixes.",
+        ),
+    )
+
+
 def _write_fixture_config_lock(
     repository_root: Path,
     config_identity: str,
@@ -160,11 +196,15 @@ def _runtime_identity(
     )
 
 
-def _launch_request(*, run_id: str = "fixture-run") -> LaunchRequest:
+def _launch_request(
+    *,
+    run_id: str = "fixture-run",
+    thinking: str = "low",
+) -> LaunchRequest:
     return LaunchRequest(
         subject="pi",
         model="provider/model",
-        thinking="low",
+        thinking=thinking,
         configs=("baseline@1.0.0", "review-assistant@1.0.0"),
         baseline_config="baseline@1.0.0",
         task_selection=LaunchTaskSelection(
@@ -186,8 +226,8 @@ def _launch_request(*, run_id: str = "fixture-run") -> LaunchRequest:
 def _write_launch_fixture(
     tmp_path: Path,
     *,
-    review_smoke_contract: Mapping[str, object] | None = None,
     thinking: str = "low",
+    review_smoke_contract: Mapping[str, object] | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     repository_root = tmp_path / "repository"
     tasks_root = tmp_path / "tasks"
@@ -378,6 +418,7 @@ def test_plan_command_writes_review_artifacts_without_execution(
     plan = parse_launch_plan_json(plan_path.read_text())
     assert plan.identity.startswith("sha256:")
     document = plan.to_document()
+    assert document["thinking"] == thinking
     policies = document["policies"]
     resources = document["resources"]
     assert resources == {
@@ -1619,6 +1660,49 @@ def test_compile_launch_request_is_deterministic_without_execution(
     assert not state_root.exists()
 
 
+def test_launch_plan_keeps_reference_baseline_out_of_execution(
+    tmp_path: Path,
+) -> None:
+    """A reference-only baseline receives no preflight or batch reps."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    request = replace(
+        _launch_request(),
+        configs=("review-assistant@1.0.0",),
+        baseline_config="baseline@1.0.0",
+    )
+
+    compiled = compile_launch_request(
+        request,
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+    )
+
+    plan = compiled.plan.to_document()
+    assert plan["comparisonBaseline"]["identity"] == "baseline@1.0.0"
+    assert [config["identity"] for config in plan["configs"]] == [
+        "review-assistant@1.0.0",
+    ]
+    assert plan["counts"] == {
+        "batchCells": 2,
+        "configs": 1,
+        "preflightCells": 1,
+        "reps": 2,
+        "tasks": 1,
+    }
+    assert {cell["config"] for cell in plan["batchCells"]} == {
+        "review-assistant@1.0.0"
+    }
+    assert {cell["config"] for cell in plan["preflightCells"]} == {
+        "review-assistant@1.0.0"
+    }
+    assert "Comparison baseline: baseline@1.0.0 (reference only)" in compiled.receipt
+
+
 def test_launch_plan_resolves_and_renders_declared_model_role_patterns(
     tmp_path: Path,
 ) -> None:
@@ -2263,6 +2347,96 @@ def test_launch_planning_requires_clarification_for_unbounded_role_calls(
     )
     assert not results_root.exists()
     assert not state_root.exists()
+
+
+def test_launch_planning_accepts_time_bounded_calls_and_model_directed_role(
+    tmp_path: Path,
+) -> None:
+    """A confirmed plan may disclose calls limited only by the task timeout."""
+    repository_root, tasks_root, results_root, state_root = (
+        _write_launch_fixture(tmp_path)
+    )
+    config_identity = "review-assistant@1.0.0"
+    lock_path = (
+        repository_root
+        / "configs"
+        / config_identity
+        / "model"
+        / "low"
+        / "config-lock.json"
+    )
+    previous_lock = json.loads(lock_path.read_text())
+    executor = dict(previous_lock["declaredRoles"][0])
+    executor["callBehavior"] = {
+        "kind": "time-bounded",
+        "maxConcurrency": 8,
+        "timeoutSource": "task-agent-timeout",
+    }
+    child = {
+        "activationPolicy": "model-directed",
+        "billingCategory": "subscription quota",
+        "callBehavior": {
+            "kind": "time-bounded",
+            "maxConcurrency": 8,
+            "timeoutSource": "task-agent-timeout",
+        },
+        "credentialRoute": executor["credentialRoute"],
+        "modelSelection": {"kind": "inherited", "role": "executor"},
+        "name": "recursive-child",
+        "roleKind": "recursive-child",
+        "usageSource": {
+            "format": "native-session",
+            "path": "session/*.jsonl",
+            "recordSelector": {"type": "child_usage_attributed"},
+            "resultAccounting": {
+                "calls": "recursive_child_calls",
+                "totalTokens": "recursive_child_total_tokens",
+            },
+        },
+    }
+    lock_path.unlink()
+    _write_fixture_config_lock(
+        repository_root,
+        config_identity,
+        "provider/model",
+        "low",
+        "rerun",
+        {
+            "credentialRoutes": previous_lock["credentialRoutes"],
+            "declaredRoles": [executor, child],
+            "testedSubjectVersions": previous_lock["testedSubjectVersions"],
+            "usageSources": previous_lock["usageSources"],
+        },
+    )
+
+    compiled = compile_launch_request(
+        _launch_request(),
+        repository_root=repository_root,
+        tasks_root=tasks_root,
+        results_root=results_root,
+        state_root=state_root,
+        runtime_resolver=FakeLaunchRuntimeResolver(_runtime_identity()),
+    )
+
+    assert (
+        "calls limited only by task timeout; max concurrency 8"
+        in compiled.receipt
+    )
+    assert (
+        "review-assistant@1.0.0 permits model calls until the task timeout; "
+        "there is no per-rep request cap"
+        in compiled.receipt
+    )
+    child_role = next(
+        role
+        for role in compiled.plan.to_document()["configs"][1]["declaredRoles"]
+        if role["name"] == "recursive-child"
+    )
+    assert child_role["activationPolicy"] == "model-directed"
+    assert (
+        "calls limited only by task timeout; max concurrency 8 | model-directed"
+        in compiled.receipt
+    )
 
 
 def test_launch_planning_requires_clarification_for_unbounded_model_selection(

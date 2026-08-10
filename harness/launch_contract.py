@@ -123,6 +123,7 @@ class LaunchPlanDocument(TypedDict):
     concurrency: int
     configs: list[LaunchConfigDocument]
     counts: LaunchCountsDocument
+    executionConfigs: NotRequired[list[str]]
     identityExclusions: list[str]
     model: str
     paths: LaunchPathsDocument
@@ -291,6 +292,7 @@ class ConfirmedSubjectCell:
 
 ConfirmedPiCell = ConfirmedSubjectCell
 ConfirmedOmpCell = ConfirmedSubjectCell
+ConfirmedPrimeAgentCell = ConfirmedSubjectCell
 
 
 class ConfirmedPiRunner(Protocol):
@@ -313,6 +315,16 @@ class ConfirmedOmpRunner(Protocol):
         """Return one complete result record without writing result.json."""
 
 
+class ConfirmedPrimeAgentRunner(Protocol):
+    """Execute one plan-resolved Prime Agent cell without resolving inputs."""
+
+    def run_confirmed_prime_agent_cell(
+        self,
+        cell: ConfirmedPrimeAgentCell,
+    ) -> Mapping[str, object]:
+        """Return one complete result record without writing result.json."""
+
+
 class LaunchTransientResumer(Protocol):
     """Wait for a transient condition without changing a confirmed plan."""
 
@@ -323,7 +335,9 @@ class LaunchTransientResumer(Protocol):
         """Return a retry decision after any required model-free wait."""
 
 
-_ConfirmedSubjectRunner = ConfirmedPiRunner | ConfirmedOmpRunner
+_ConfirmedSubjectRunner = (
+    ConfirmedPiRunner | ConfirmedOmpRunner | ConfirmedPrimeAgentRunner
+)
 
 
 @dataclass(frozen=True, slots=True)

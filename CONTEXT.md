@@ -75,7 +75,7 @@ rules live in ADR-0001.
 
 **thinking**:
 The reasoning effort for the model. Choices: `off, minimal, low, medium, high,
-xhigh`. Part of a config leaf's identity alongside the model.
+xhigh, max`. Part of a config leaf's identity alongside the model.
 _Avoid_: reasoning level, effort
 
 **task**:

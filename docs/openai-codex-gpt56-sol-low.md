@@ -3,10 +3,10 @@
 This note validates `openai-codex/gpt-5.6-sol` at Pi thinking `low`, `medium`,
 and `high` for DeepSWE benchmark configs.
 
-Originally validated on 2026-07-23 with Pi `0.81.1` and revalidated for the
-read-long-lines pilot on 2026-08-10 with Pi `0.84.1`. The evidence covers
-official OpenAI documentation, Pi model metadata and request behavior, and the
-existing tiny live calls through Will's Codex subscription OAuth.
+Validated on 2026-07-23 against official OpenAI documentation, Pi model
+metadata and request behavior, and tiny live calls through Will's Codex
+subscription OAuth. The low route was revalidated locally on Pi `0.84.1` for
+the read-long-lines pilot on 2026-08-10.
 
 ## Provider/API path
 
@@ -41,18 +41,36 @@ or an accepted Pi CLI flag alone is not sufficient evidence.
 
 ## Required Pi version
 
-Pi `0.80.2` did not list `gpt-5.6-sol`; Pi `0.81.1` introduced the route used by
-the original validation. The read-long-lines pilot pins Pi `0.84.1` under a new
-`PI_IMAGE_REV`. Its local mock record in
-`analysis/read-long-lines-pilot/provider-evidence/request-probe.jsonl` confirms the model remains
-available and sends explicit `reasoning.effort: "low"` with one tool. The
-original registry artifact remains at
-`analysis/openai-codex-gpt56-sol-model-registry.json`.
+Pi `0.80.2`, previously pinned in `harness/Dockerfile.pi-agent`, does not list
+`gpt-5.6-sol`. Pi `0.81.1` first established this repository's provider,
+thinking, and usage evidence for the model. Those historical artifacts remain
+valid evidence for the earlier results that recorded Pi `0.81.1`.
+
+The pi-fabric PR #10 refresh uses Pi `0.83.0`, matching the candidate package's
+pinned Pi AI and development dependencies. The benchmark image and
+`PI_IMAGE_REV` are pinned to `0.83.0`, so Pi `0.81.1` task images cannot be
+reused. The candidate preflight must capture the live Pi `0.83.0` request shape
+and native session usage before fan-out.
+
+The read-long-lines pilot uses the repository's Pi `0.84.1` image. Its local
+mock record in
+`analysis/read-long-lines-pilot/provider-evidence/request-probe.jsonl` confirms
+that Sol remains available and sends explicit `reasoning.effort: "low"` with
+one tool. The pilot preflight must independently prove that Pi `0.84.1` reaches
+the live Codex subscription route before its fan-out.
+
+Artifacts:
+
+```text
+analysis/openai-codex-gpt56-sol-model-registry.json
+analysis/pi-fabric-pr10-0da479f-package-validation.json
+docs/pi-fabric-pr10-0da479f-validation.md
+```
 
 ## Request-shape probes
 
-The original Pi `0.81.1` captures and the Pi `0.84.1` pilot probe recorded the
-same low request field:
+The historical Pi `0.81.1` `before_provider_request` captures recorded these
+request fields:
 
 ```json
 {"model":"gpt-5.6-sol","reasoning":{"effort":"low","summary":"auto"},"stream":true,"store":false}
@@ -70,7 +88,8 @@ analysis/openai-codex-gpt56-sol-high-request-probe.jsonl
 
 These captures prove Pi maps each setting to the corresponding explicit
 provider effort. In particular, the low condition does not omit reasoning and
-silently take the documented medium default.
+silently take the documented medium default. The Pi `0.84.1` pilot record
+reproduces the same low payload shape.
 
 ## Live subscription probes
 
@@ -99,13 +118,15 @@ not persisted raw `--mode json` streams.
 Each config needs a leaf at `gpt-5.6-sol/<thinking>/` containing:
 
 - `settings.json` with `defaultThinkingLevel` set to that leaf's thinking level;
-- a leaf-local `smoke.json` requiring model, thinking, Pi-version,
-  request-probe, and live-probe evidence;
+- a leaf-local `smoke.json` requiring model, thinking, exact subject version,
+  request-shape, and native session evidence;
 - session evidence containing the exact `"thinkingLevel":"<thinking>"` value;
 - captured provider-request evidence containing the matching explicit effort.
 
 Launches must use `openai-codex/gpt-5.6-sol`, the matching `--thinking` value,
-and `--pass-openai-codex-oauth`.
+and the declared `OPENAI_CODEX_OAUTH` credential route. A Pi `0.83.0` launch
+must not claim compatibility from the older Pi `0.81.1` version alone; its
+preflight supplies the live version-specific request and usage evidence.
 
 ## Stale patterns to avoid
 

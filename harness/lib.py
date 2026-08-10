@@ -16,9 +16,9 @@ REPO = Path(__file__).resolve().parents[1]
 
 # Bump when harness/Dockerfile.pi-agent changes in a way that should invalidate
 # cached per-task pi images. v2 added ripgrep/fd-find; v3 updated Pi to 0.81.1
-# for GPT-5.6-SOL; v4 updated Pi to 0.83.0 for max thinking support;
-# v5 updates Pi to 0.84.1 for the read-long-lines release and GPT-5.6-Terra.
-PI_IMAGE_REV = "v5-pi0841-tools"
+# for GPT-5.6-SOL; v4 updates Pi to 0.84.1 for max thinking and current models.
+PI_IMAGE_REV = "v4-pi0841-tools"
+PRIME_AGENT_IMAGE_REV = "v3-prime-agent070-executor-thinking"
 
 
 # Tasks live in the sibling DeepSWE checkout (~/evals/deep-swe/tasks).
@@ -49,6 +49,12 @@ class Task:
         # one env image per task; tag a pi-augmented layer off it.
         slug = re.sub(r"[^a-zA-Z0-9_.-]", "-", self.env_image.split(":")[-1])
         return f"deep-swe-pi:{PI_IMAGE_REV}-{slug}"
+
+    @property
+    def prime_agent_image(self) -> str:
+        """Return the task-specific Prime Agent 0.7.0 image reference."""
+        slug = re.sub(r"[^a-zA-Z0-9_.-]", "-", self.env_image.split(":")[-1])
+        return f"deep-swe-prime-agent:{PRIME_AGENT_IMAGE_REV}-{slug}"
 
     @property
     def verifier_image(self) -> str:

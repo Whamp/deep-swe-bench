@@ -186,7 +186,9 @@ skill_name = st.from_regex(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,24}", fullmatch=True).f
     lambda name: name not in {".", ".."}
 )
 model_id = st.from_regex(r"[a-z0-9_.-]+/[A-Za-z0-9_.:/-]+", fullmatch=True)
-thinking_level = st.sampled_from(["off", "low", "medium", "high", "xhigh"])
+thinking_level = st.sampled_from(
+    ["off", "low", "medium", "high", "xhigh", "max"]
+)
 
 
 def is_rpc_owned_flag(flag: str) -> bool:

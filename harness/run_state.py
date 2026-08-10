@@ -4,6 +4,7 @@ The batch runner still prints its historical progress lines to stdout.  This
 module adds a side-channel under ``results/_runs/<run_id>/`` so tools can poll a
 small status file instead of tailing stdout or per-cell logs.
 """
+
 from __future__ import annotations
 
 import json
@@ -56,7 +57,9 @@ DETAIL_LEVELS = {"summary", "operational", "diagnostic"}
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
 
 
 def parse_timestamp(value: str | None) -> datetime | None:
@@ -230,7 +233,16 @@ class RunStateWriter:
 
     @staticmethod
     def _initial_cell(cell: dict[str, Any], *, kind: str) -> dict[str, Any]:
-        keys = ("cell_id", "task", "config", "rep", "result_path", "log_path", "contract_path", "reason")
+        keys = (
+            "cell_id",
+            "task",
+            "config",
+            "rep",
+            "result_path",
+            "log_path",
+            "contract_path",
+            "reason",
+        )
         entry = {k: cell[k] for k in keys if k in cell}
         entry.update({"kind": kind, "state": "pending"})
         return entry
@@ -263,9 +275,7 @@ class RunStateWriter:
                         continue
                     if isinstance(event, Mapping):
                         sequence = event.get("seq")
-                        if isinstance(sequence, int) and not isinstance(
-                            sequence, bool
-                        ):
+                        if isinstance(sequence, int) and not isinstance(sequence, bool):
                             self._seq = max(self._seq, sequence)
             if previous_status.get("started_at"):
                 self.status["started_at"] = previous_status["started_at"]
@@ -291,7 +301,9 @@ class RunStateWriter:
             while not self._stop_heartbeat.wait(interval_s):
                 self.heartbeat()
 
-        self._heartbeat_thread = threading.Thread(target=loop, name="run-state-heartbeat", daemon=True)
+        self._heartbeat_thread = threading.Thread(
+            target=loop, name="run-state-heartbeat", daemon=True
+        )
         self._heartbeat_thread.start()
 
     def stop_heartbeat(self) -> None:
@@ -309,7 +321,9 @@ class RunStateWriter:
             self._save_status_locked()
 
     def preflight_skipped(self, cell: dict[str, Any], *, reason: str) -> None:
-        self._finish_cell("preflight", cell, event="preflight_skipped", state="skipped", reason=reason)
+        self._finish_cell(
+            "preflight", cell, event="preflight_skipped", state="skipped", reason=reason
+        )
 
     def preflight_started(self, cell: dict[str, Any]) -> None:
         self._start_cell("preflight", cell, event="preflight_started")
@@ -355,11 +369,7 @@ class RunStateWriter:
             exit_code=exit_code,
             transient_exit=transient_exit,
         )
-        state = (
-            "passed"
-            if outcome in {"ok", "empty"} and not diagnostics
-            else "failed"
-        )
+        state = "passed" if outcome in {"ok", "empty"} and not diagnostics else "failed"
         self._finish_cell(
             "preflight",
             cell,
@@ -376,7 +386,9 @@ class RunStateWriter:
     def cell_started(self, cell: dict[str, Any]) -> None:
         self._start_cell("batch", cell, event="cell_started")
 
-    def cell_skipped(self, cell: dict[str, Any], *, reason: str = "existing_result") -> None:
+    def cell_skipped(
+        self, cell: dict[str, Any], *, reason: str = "existing_result"
+    ) -> None:
         result_path = cell.get("result_path")
         # A skipped cell already has a result on disk. Classify it so the batch
         # counts reflect the existing outcome (a valid prior result counts as
@@ -402,7 +414,9 @@ class RunStateWriter:
         exit_code: int | str | None = None,
         transient_exit: int | None = None,
     ) -> None:
-        outcome, summary = summarize_result_path(result_path, exit_code=exit_code, transient_exit=transient_exit)
+        outcome, summary = summarize_result_path(
+            result_path, exit_code=exit_code, transient_exit=transient_exit
+        )
         self._finish_cell(
             "batch",
             cell,
@@ -487,18 +501,24 @@ class RunStateWriter:
             self.status["stage"] = "failed"
             self.status["failed_at"] = utc_now()
             self._save_status_locked()
-            self._append_event_locked("run_failed", kind="run", reason=reason, exit_code=exit_code)
+            self._append_event_locked(
+                "run_failed", kind="run", reason=reason, exit_code=exit_code
+            )
 
     def _start_cell(self, collection: str, cell: dict[str, Any], *, event: str) -> None:
         cid = cell["cell_id"]
         now = utc_now()
         with self._lock:
-            entry = self._cell_collection(collection).setdefault(cid, self._initial_cell(cell, kind=collection))
+            entry = self._cell_collection(collection).setdefault(
+                cid, self._initial_cell(cell, kind=collection)
+            )
             entry.update({"state": "running", "started_at": now})
             self.status["stage"] = "preflight" if collection == "preflight" else "batch"
             self._refresh_active_locked()
             self._save_status_locked()
-            self._append_event_locked(event, kind=collection, cell_id=cid, **self._event_cell_fields(entry))
+            self._append_event_locked(
+                event, kind=collection, cell_id=cid, **self._event_cell_fields(entry)
+            )
 
     def _finish_cell(
         self,
@@ -520,7 +540,9 @@ class RunStateWriter:
         result_path = str(result_path or cell.get("result_path") or "") or None
         log_path = str(log_path or cell.get("log_path") or "") or None
         with self._lock:
-            entry = self._cell_collection(collection).setdefault(cid, self._initial_cell(cell, kind=collection))
+            entry = self._cell_collection(collection).setdefault(
+                cid, self._initial_cell(cell, kind=collection)
+            )
             entry.update({"state": state, "finished_at": now})
             if outcome is not None:
                 entry["outcome"] = outcome
@@ -551,7 +573,9 @@ class RunStateWriter:
                 "exit_code": exit_code,
                 "diagnostics": diagnostics,
             }
-            self._append_event_locked(event, **{k: v for k, v in payload.items() if v is not None})
+            self._append_event_locked(
+                event, **{k: v for k, v in payload.items() if v is not None}
+            )
 
     def _cell_collection(self, collection: str) -> dict[str, Any]:
         return self.status["preflight" if collection == "preflight" else "cells"]
@@ -562,10 +586,14 @@ class RunStateWriter:
 
     def _refresh_active_locked(self) -> None:
         self.status["active_cell_ids"] = [
-            cid for cid, cell in self.status.get("cells", {}).items() if cell.get("state") == "running"
+            cid
+            for cid, cell in self.status.get("cells", {}).items()
+            if cell.get("state") == "running"
         ]
         self.status["active_preflight_ids"] = [
-            cid for cid, cell in self.status.get("preflight", {}).items() if cell.get("state") == "running"
+            cid
+            for cid, cell in self.status.get("preflight", {}).items()
+            if cell.get("state") == "running"
         ]
 
     def _add_recent_locked(self, entry: dict[str, Any]) -> None:
@@ -600,7 +628,12 @@ class RunStateWriter:
 
     def _append_event_locked(self, event: str, **payload: Any) -> None:
         self._seq += 1
-        record = {"schema_version": SCHEMA_VERSION, "seq": self._seq, "ts": utc_now(), "event": event}
+        record = {
+            "schema_version": SCHEMA_VERSION,
+            "seq": self._seq,
+            "ts": utc_now(),
+            "event": event,
+        }
         record.update({k: v for k, v in payload.items() if v is not None})
         append_ndjson(self.events_path, record)
 
@@ -697,7 +730,9 @@ def base_manifest(
     }
 
 
-def read_events(run_dir: Path, *, after: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
+def read_events(
+    run_dir: Path, *, after: int | None = None, limit: int = 100
+) -> list[dict[str, Any]]:
     path = run_dir / "events.ndjson"
     limit = max(1, min(limit, 1000))
     rows: deque[dict[str, Any]] | list[dict[str, Any]]
@@ -741,7 +776,40 @@ def _estimate_eta_s(status: dict[str, Any]) -> float | None:
     return (total - done) / rate
 
 
+def _to_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _score_snapshot(cells: dict[str, Any]) -> dict[str, Any]:
+    """Compact task-level solve snapshot from finished-cell summaries.
+
+    A task is solved when any rep has reward_binary>=1. This matches the live
+    run-detail hero and baseline delta, so overview cards never mix rep-level
+    and task-level solve rates.
+    """
+    task_solved: dict[str, bool] = {}
+    for cell in cells.values():
+        summary = cell.get("summary") or {}
+        if "reward_binary" not in summary:
+            continue
+        task = str(cell.get("task") or cell.get("cell_id") or "unknown")
+        task_solved[task] = (
+            task_solved.get(task, False) or _to_float(summary.get("reward_binary")) >= 1
+        )
+    finished = len(task_solved)
+    solved = sum(task_solved.values())
+    return {
+        "solved": solved,
+        "finished": finished,
+        "solve_rate": round(solved / finished * 100, 2) if finished else 0.0,
+    }
+
+
 def _failure_buckets(status: dict[str, Any]) -> dict[str, int]:
+    """Bucket non-ok finished cells by outcome for a quick failure read."""
     buckets: dict[str, int] = {}
     for cell in (status.get("cells") or {}).values():
         outcome = cell.get("outcome")
@@ -755,8 +823,15 @@ def _failure_buckets(status: dict[str, Any]) -> dict[str, int]:
 # longer than this without finishing may be hung on a provider request.
 STALE_CELL_THRESHOLD_S = 1800  # 30 minutes
 
+# A "running" run whose heartbeat is older than this was abandoned (its process
+# was killed without writing a terminal state). We reclassify it as "stalled"
+# so the dashboard does not present a dead run as live.
+STALL_RUN_THRESHOLD_S = 900  # 15 minutes
 
-def _enrich_active_cells(active_cells: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], float | None, int]:
+
+def _enrich_active_cells(
+    active_cells: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], float | None, int]:
     """Add cell_age_s to each active cell and return (cells, max_age_s, stale_count)."""
     now = datetime.now(timezone.utc)
     max_age: float | None = None
@@ -828,7 +903,31 @@ def project_structured_run(run_dir: Path, *, detail: str = "summary") -> dict[st
     all_cells = status.get("cells") or {}
     raw_active = [all_cells[cid] for cid in active_ids if cid in all_cells]
     active_cells, max_cell_age_s, stale_cell_count = _enrich_active_cells(raw_active)
+    finished_cells = [
+        cell for cell in all_cells.values() if cell.get("state") in TERMINAL_STATES
+    ]
     preflight = status.get("preflight") or {}
+    # Honest run state: a "running" run whose heartbeat went stale was abandoned
+    # (its process was killed without writing a terminal state). Reclassify it
+    # as "stalled" so the dashboard never presents a dead run as live, while
+    # keeping the declared state for transparency. The threshold scales with
+    # the run's configured heartbeat cadence (progress_interval_s) so a live run
+    # with a long interval is not falsely stalled.
+    declared_state = status.get("state", "unknown")
+    heartbeat_age_s = seconds_since(status.get("heartbeat_at"))
+    heartbeat_interval = manifest.get("progress_interval_s") or 0
+    stall_threshold = max(
+        float(heartbeat_interval) * 3 if heartbeat_interval else 0,
+        STALL_RUN_THRESHOLD_S,
+    )
+    if (
+        declared_state == "running"
+        and heartbeat_age_s is not None
+        and heartbeat_age_s > stall_threshold
+    ):
+        effective_state = "stalled"
+    else:
+        effective_state = declared_state
     # run_key is the unique directory name — always unique even when two runs
     # share the same manifest run_id (e.g. a smoke-failed rerun).  The frontend
     # routes on run_key so every discovered run is individually addressable.
@@ -842,18 +941,17 @@ def project_structured_run(run_dir: Path, *, detail: str = "summary") -> dict[st
         "kind": "structured",
         "run_id": run_id,
         "run_key": run_dir.name,
-        "state": status.get("state", "unknown"),
+        "state": effective_state,
+        "declared_state": declared_state,
         "stage": status.get("stage"),
         "created_at": manifest.get("created_at") or status.get("started_at"),
         "updated_at": status.get("updated_at"),
         "heartbeat_at": status.get("heartbeat_at"),
-        "heartbeat_age_s": seconds_since(status.get("heartbeat_at")),
+        "heartbeat_age_s": heartbeat_age_s,
         "eta_s": _estimate_eta_s(status),
         "model": manifest.get("model"),
         "thinking": manifest.get("thinking"),
-        "configs": manifest.get("config_identities")
-        or manifest.get("configs")
-        or [],
+        "configs": manifest.get("config_identities") or manifest.get("configs") or [],
         "launch_metadata": launch_metadata,
         "launch_plan_identity": launch_plan_identity,
         "preflight_state": project_atomic_preflight_state(status),
@@ -869,6 +967,7 @@ def project_structured_run(run_dir: Path, *, detail: str = "summary") -> dict[st
         else None,
         "stale_cell_count": stale_cell_count,
         "failure_buckets": _failure_buckets(status),
+        "score_snapshot": _score_snapshot(all_cells),
         "paths": {
             "run_dir": str(run_dir),
             "manifest": str(run_dir / "manifest.json"),
@@ -880,6 +979,10 @@ def project_structured_run(run_dir: Path, *, detail: str = "summary") -> dict[st
         projected.update(
             {
                 "active_cells": active_cells,
+                # Keep every terminal rep inspectable. ``recent_finished`` remains
+                # for compatibility with older dashboard clients and is still the
+                # bounded event-oriented view stored by the writer.
+                "finished_cells": finished_cells,
                 "recent_finished": status.get("recent_finished") or [],
                 "preflight": preflight,
             }
@@ -899,7 +1002,9 @@ def _legacy_status_of(record: dict[str, Any]) -> str:
     return classify_result(record)
 
 
-def project_legacy_track(track_path: Path, *, detail: str = "summary") -> dict[str, Any]:
+def project_legacy_track(
+    track_path: Path, *, detail: str = "summary"
+) -> dict[str, Any]:
     run_name = track_path.parent.name
     lines: list[str] = []
     try:
@@ -910,7 +1015,9 @@ def project_legacy_track(track_path: Path, *, detail: str = "summary") -> dict[s
     done = 0
     buckets = {"ok": 0, "empty": 0, "timeout": 0, "transient": 0, "failed": 0}
     recent: list[dict[str, Any]] = []
-    line_re = re.compile(r"^\[(?P<done>\d+)/(?:\?|(?P<total>\d+))\]\s+(?P<task>.*?)\s+/\s+(?P<config>.*?)\s+/\s+rep(?P<rep>\d+)\s+(?P<outcome>\S+)")
+    line_re = re.compile(
+        r"^\[(?P<done>\d+)/(?:\?|(?P<total>\d+))\]\s+(?P<task>.*?)\s+/\s+(?P<config>.*?)\s+/\s+rep(?P<rep>\d+)\s+(?P<outcome>\S+)"
+    )
     done_re = re.compile(r"^done:\s+(?P<done>\d+)/(?:\?|(?P<total>\d+))")
     for line in lines:
         m = line_re.match(line)
@@ -925,7 +1032,9 @@ def project_legacy_track(track_path: Path, *, detail: str = "summary") -> dict[s
                 buckets["failed"] += 1
             recent.append(
                 {
-                    "cell_id": cell_id(m.group("task"), m.group("config"), int(m.group("rep"))),
+                    "cell_id": cell_id(
+                        m.group("task"), m.group("config"), int(m.group("rep"))
+                    ),
                     "task": m.group("task"),
                     "config": m.group("config"),
                     "rep": int(m.group("rep")),
@@ -939,7 +1048,11 @@ def project_legacy_track(track_path: Path, *, detail: str = "summary") -> dict[s
             total = max(total, int(m.group("total")))
     state = "completed" if total and done >= total else "legacy"
     try:
-        updated_at = datetime.fromtimestamp(track_path.stat().st_mtime, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        updated_at = (
+            datetime.fromtimestamp(track_path.stat().st_mtime, timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
     except OSError:
         updated_at = None
     counts = {
@@ -1001,12 +1114,21 @@ def discover_runs(
     rows: list[dict[str, Any]] = []
     if root.exists():
         for child in sorted(root.iterdir()):
-            if child.is_dir() and ((child / "manifest.json").exists() or (child / "status.json").exists()):
+            if child.is_dir() and (
+                (child / "manifest.json").exists() or (child / "status.json").exists()
+            ):
                 rows.append(project_structured_run(child, detail=detail))
     if include_legacy:
-        legacy = Path(legacy_root) if legacy_root is not None else root.parent.parent / "runs"
+        legacy = (
+            Path(legacy_root)
+            if legacy_root is not None
+            else root.parent.parent / "runs"
+        )
         if legacy.exists():
             for track in sorted(legacy.glob("*/track.out")):
                 rows.append(project_legacy_track(track, detail=detail))
-    rows.sort(key=lambda row: row.get("updated_at") or row.get("created_at") or "", reverse=True)
+    rows.sort(
+        key=lambda row: row.get("updated_at") or row.get("created_at") or "",
+        reverse=True,
+    )
     return rows
