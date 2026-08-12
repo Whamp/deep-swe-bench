@@ -26,21 +26,6 @@ EXPECTED_LOCKS = {
     LEFT_CONFIG: "sha256:c6311a9ff6fc7becacbdd1ce59d9f473d62cf30abce9f1b0c355b13cd241660e",
     RIGHT_CONFIG: "sha256:fc27e36bb3e113548a12c958abbc5a7a4b08f1059cb9261d330b8160dc8bcf54",
 }
-FULL_RUN_KEY = (
-    "gpt56-sol-low-baseline-vs-testing-skills-1-1-ful--"
-    "c48f3f717959c476ecc8f2b0daf81d06b96878eda9ce4b44419213938d2c2f10"
-)
-WAZERO_RUN_KEY = (
-    "gpt56-sol-low-baseline-vs-testing-skills-1-1-waz--"
-    "bc18a1a2af72f803a2ff6233e0afbc5c27c4ca0a046017f5ba0c5a2fb37eb147"
-)
-QUARANTINE_ROOTS = {
-    "resource-oom": (
-        RESULTS_ROOT / "_contaminated/resource-oom" / FULL_RUN_KEY,
-        RESULTS_ROOT / "_contaminated/resource-oom" / WAZERO_RUN_KEY,
-    ),
-    "harness-failure": (RESULTS_ROOT / "_contaminated/harness-failure" / FULL_RUN_KEY,),
-}
 ANALYSIS_PATH = Path(__file__).with_name("full113-comparison.json")
 SKILL_NAMES = ("testing", "fuzzing", "property-based-testing")
 SPECIALIST_NAMES = ("fuzzing", "property-based-testing")
@@ -94,27 +79,20 @@ def result_cell_key(path: Path) -> tuple[str, str, int]:
 
 
 def load_result_cells(tasks: set[str]) -> dict[tuple[str, str, int], dict[str, Any]]:
-    """Load every planned canonical or quarantined cell exactly once."""
+    """Load every planned canonical result cell exactly once."""
     cells: dict[tuple[str, str, int], dict[str, Any]] = {}
-    sources = [("canonical", CANONICAL_ROOT)]
-    for category, roots in QUARANTINE_ROOTS.items():
-        sources.extend((category, root) for root in roots)
-    for disposition, root in sources:
-        if not root.exists():
+    for result_path in CANONICAL_ROOT.glob("**/result.json"):
+        if not any(config in result_path.parts for config in CONFIGS):
             continue
-        for result_path in root.glob("**/result.json"):
-            if not any(config in result_path.parts for config in CONFIGS):
-                continue
-            key = result_cell_key(result_path)
-            if key[1] not in tasks or key[2] >= 3:
-                continue
-            if key in cells:
-                raise RuntimeError(f"Duplicate result cell {key}: {result_path}")
-            cells[key] = {
-                "path": result_path.parent,
-                "result": json.loads(result_path.read_text()),
-                "disposition": disposition,
-            }
+        key = result_cell_key(result_path)
+        if key[1] not in tasks or key[2] >= 3:
+            continue
+        if key in cells:
+            raise RuntimeError(f"Duplicate canonical result cell {key}: {result_path}")
+        cells[key] = {
+            "path": result_path.parent,
+            "result": json.loads(result_path.read_text()),
+        }
     expected = {
         (config, task, rep) for config in CONFIGS for task in tasks for rep in range(3)
     }
@@ -128,10 +106,11 @@ def load_result_cells(tasks: set[str]) -> dict[tuple[str, str, int], dict[str, A
 
 
 def verify_result_provenance(cells: dict[tuple[str, str, int], dict[str, Any]]) -> dict:
-    """Assert the model, thinking, locks, exits, and resource dispositions."""
+    """Assert the model, thinking, locks, and successful execution provenance."""
     verifier_statuses = Counter()
     launch_plans = Counter()
-    dispositions = Counter()
+    verifier_recomputations = 0
+    resource_flagged_cells = 0
     for (config, task, rep), cell in cells.items():
         result = cell["result"]
         context = f"{config}/{task}/rep{rep}"
@@ -148,24 +127,22 @@ def verify_result_provenance(cells: dict[tuple[str, str, int], dict[str, Any]]) 
                 raise RuntimeError(
                     f"Provenance mismatch for {context}: {field}={result.get(field)!r}"
                 )
+        verifier_exit = result.get("verifier_exit")
+        if verifier_exit not in (0, "skipped_empty_patch"):
+            raise RuntimeError(f"Canonical verifier outcome is invalid: {context}")
         events = result.get("subject_memory_events") or {}
-        if cell["disposition"] == "canonical" and events.get("oom_kill", 0):
-            raise RuntimeError(f"Canonical OOM contamination leaked into {context}")
-        if cell["disposition"] == "resource-oom" and not events.get("oom_kill", 0):
-            raise RuntimeError(f"OOM quarantine lacks OOM evidence: {context}")
-        if (
-            cell["disposition"] == "harness-failure"
-            and result.get("verifier_exit") != 127
-        ):
-            raise RuntimeError(f"Harness quarantine lacks exit 127: {context}")
+        resource_flagged_cells += bool(
+            result.get("agent_resource_exhausted") or events.get("oom_kill", 0)
+        )
+        verifier_recomputations += "verifier_recomputation" in result
         verifier_statuses[str(result.get("verifier_exit"))] += 1
         launch_plans[str(result.get("launch_plan_identity"))] += 1
-        dispositions[cell["disposition"]] += 1
     return {
         "cells": len(cells),
-        "dispositions": dict(dispositions),
         "verifier_statuses": dict(verifier_statuses),
         "launch_plan_identities": dict(launch_plans),
+        "verifier_recomputations": verifier_recomputations,
+        "resource_flagged_cells": resource_flagged_cells,
     }
 
 
@@ -544,7 +521,7 @@ def paired_bootstrap_interval(deltas: list[int]) -> list[float]:
 
 
 def build_full113_analysis() -> dict[str, Any]:
-    """Build the complete clean, contaminated, delivery, and packet ledgers."""
+    """Build the complete canonical paired, delivery, and packet ledgers."""
     tasks = read_tasks(SUBSET_PATH)
     task_set = set(tasks)
     tasks_36 = set(read_tasks(SUBSET_36_PATH))
@@ -553,36 +530,10 @@ def build_full113_analysis() -> dict[str, Any]:
     provenance = verify_result_provenance(cells)
 
     rows: list[dict[str, Any]] = []
-    excluded_pairs: list[dict[str, Any]] = []
-    raw_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for task in tasks:
         for rep in range(3):
             left_cell = cells[(LEFT_CONFIG, task, rep)]
             right_cell = cells[(RIGHT_CONFIG, task, rep)]
-            raw_rows.append((left_cell["result"], right_cell["result"]))
-            if (
-                left_cell["disposition"] != "canonical"
-                or right_cell["disposition"] != "canonical"
-            ):
-                excluded_pairs.append(
-                    {
-                        "task": task,
-                        "rep": rep,
-                        "left_disposition": left_cell["disposition"],
-                        "right_disposition": right_cell["disposition"],
-                        "left_reward_binary": left_cell["result"].get("reward_binary"),
-                        "right_reward_binary": right_cell["result"].get(
-                            "reward_binary"
-                        ),
-                        "left_oom_kills": (
-                            left_cell["result"].get("subject_memory_events") or {}
-                        ).get("oom_kill", 0),
-                        "right_oom_kills": (
-                            right_cell["result"].get("subject_memory_events") or {}
-                        ).get("oom_kill", 0),
-                    }
-                )
-                continue
             left_path = left_cell["path"]
             right_path = right_cell["path"]
             left_result = result_metrics(left_cell["result"])
@@ -609,6 +560,22 @@ def build_full113_analysis() -> dict[str, Any]:
                     ),
                 }
             )
+
+    resource_observations = []
+    for row in rows:
+        for side, config in (("left", LEFT_CONFIG), ("right", RIGHT_CONFIG)):
+            result = row[f"{side}_raw"]
+            events = result.get("subject_memory_events") or {}
+            if result.get("agent_resource_exhausted") or events.get("oom_kill", 0):
+                resource_observations.append(
+                    {
+                        "task": row["task"],
+                        "rep": row["rep"],
+                        "config": config,
+                        "reward_binary": result.get("reward_binary"),
+                        "oom_kills": events.get("oom_kill", 0),
+                    }
+                )
 
     advertised = Counter()
     treatment_reads = Counter()
@@ -682,7 +649,6 @@ def build_full113_analysis() -> dict[str, Any]:
         summary = split_summary(task_rows)
         summary.update(metadata[task])
         summary["task"] = task
-        summary["excluded_pairs"] = 3 - len(task_rows)
         summary["specialist_read_pairs"] = sum(
             any(row["right_skill_reads"][name] for name in SPECIALIST_NAMES)
             for row in task_rows
@@ -705,12 +671,10 @@ def build_full113_analysis() -> dict[str, Any]:
         packet["packet"] = f"packets/{row['task']}__rep{row['rep']}.json"
         packets.append(packet)
 
-    clean_paths: dict[str, list[Path]] = {
+    canonical_paths: dict[str, list[Path]] = {
         LEFT_CONFIG: [row["left_path"] for row in rows],
         RIGHT_CONFIG: [row["right_path"] for row in rows],
     }
-    raw_left_solves = sum(left["reward_binary"] == 1 for left, _ in raw_rows)
-    raw_right_solves = sum(right["reward_binary"] == 1 for _, right in raw_rows)
     return {
         "scope": {
             "left": LEFT_CONFIG,
@@ -720,11 +684,8 @@ def build_full113_analysis() -> dict[str, Any]:
             "roles": "same-model config control; treatment adds testing, fuzzing, and property-based-testing skills",
             "tasks": len(tasks),
             "reps": 3,
-            "planned_pairs": len(tasks) * 3,
-            "valid_clean_pairs": len(rows),
-            "excluded_pairs": len(excluded_pairs),
-            "full_trajectories": len(cells),
-            "valid_clean_trajectories": len(rows) * 2,
+            "matched_pairs": len(rows),
+            "trajectories": len(cells),
             "difficulty_note": "The task manifest does not assign difficulty labels.",
         },
         "provenance": provenance,
@@ -741,9 +702,6 @@ def build_full113_analysis() -> dict[str, Any]:
             "neither_solved": neither,
             "mean_partial_delta": statistics.mean(partial_deltas),
             "median_partial_delta": statistics.median(partial_deltas),
-            "raw_planned_left_solves": raw_left_solves,
-            "raw_planned_right_solves": raw_right_solves,
-            "raw_planned_note": "Includes OOM-contaminated and invalid-verifier cells; not an efficacy estimate.",
         },
         "splits": {
             "36_v2": split_summary([row for row in rows if row["task"] in tasks_36]),
@@ -759,6 +717,9 @@ def build_full113_analysis() -> dict[str, Any]:
             "specialist_read_cells": len(specialist_rows),
             "fuzz_target_cells": len(fuzz_target_rows),
             "property_test_cells": len(property_test_rows),
+            "fuzz_target_solve_flips": sum(
+                row["left_solved"] != row["right_solved"] for row in fuzz_target_rows
+            ),
             "specialist_association": split_summary(specialist_rows),
             "non_specialist_association": split_summary(
                 [row for row in rows if row not in specialist_rows]
@@ -788,14 +749,14 @@ def build_full113_analysis() -> dict[str, Any]:
             ),
             "aggregates": aggregates,
             "tool_errors": {
-                LEFT_CONFIG: tool_error_audit(clean_paths[LEFT_CONFIG]),
-                RIGHT_CONFIG: tool_error_audit(clean_paths[RIGHT_CONFIG]),
+                LEFT_CONFIG: tool_error_audit(canonical_paths[LEFT_CONFIG]),
+                RIGHT_CONFIG: tool_error_audit(canonical_paths[RIGHT_CONFIG]),
             },
         },
         "task_summaries": task_summaries,
-        "excluded_pairs": excluded_pairs,
+        "resource_observations": resource_observations,
         "packet_rule": (
-            "Select every valid pair with a binary solve flip, a negative-reward "
+            "Select every matched pair with a binary solve flip, a negative-reward "
             "mismatch, or an absolute partial-reward delta of at least 0.05."
         ),
         "packet_count": len(packets),
@@ -821,5 +782,5 @@ def write_full113_analysis() -> dict[str, Any]:
 if __name__ == "__main__":
     result = write_full113_analysis()
     print(f"wrote {ANALYSIS_PATH}")
-    print(f"valid pairs={result['scope']['valid_clean_pairs']}")
+    print(f"matched pairs={result['scope']['matched_pairs']}")
     print(f"packets={result['packet_count']}")
