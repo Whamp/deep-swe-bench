@@ -45,6 +45,14 @@ export interface DefaultComparePair {
   challenger_id: string;
 }
 
+/** Two inspectable cells for the same task and rep. */
+export interface MatchedTaskTrajectoryPair {
+  task: string;
+  rep: number;
+  reference_path: string;
+  challenger_path: string;
+}
+
 export interface DifficultyBucketSummary {
   solved: number;
   total: number;
@@ -170,6 +178,48 @@ export function defaultComparePair(
     group_key: groupKey,
     reference_id: reference.run_id,
     challenger_id: challenger.run_id,
+  };
+}
+
+/** Select a shared rep whose solve outcome best represents the task comparison. */
+export function matchedTaskTrajectoryPair(
+  reference: ComparisonRun,
+  challenger: ComparisonRun,
+  task: string,
+): MatchedTaskTrajectoryPair | null {
+  const referenceCells = reference.cells
+    .filter((cell) => cell.task === task && cell.result_path)
+    .sort((a, b) => a.rep - b.rep);
+  const challengerByRep = new Map(
+    challenger.cells
+      .filter((cell) => cell.task === task && cell.result_path)
+      .map((cell) => [cell.rep, cell]),
+  );
+  const pairs = referenceCells.flatMap((referenceCell) => {
+    const challengerCell = challengerByRep.get(referenceCell.rep);
+    return challengerCell ? [{ referenceCell, challengerCell }] : [];
+  });
+  if (!pairs.length) return null;
+
+  const referenceSolved = referenceCells.some((cell) => Number(cell.reward_binary) >= 1);
+  const challengerSolved = [...challengerByRep.values()].some(
+    (cell) => Number(cell.reward_binary) >= 1,
+  );
+  const taskOutcome = pairOutcome(referenceSolved, challengerSolved);
+  const selected =
+    pairs.find(
+      ({ referenceCell, challengerCell }) =>
+        pairOutcome(
+          Number(referenceCell.reward_binary) >= 1,
+          Number(challengerCell.reward_binary) >= 1,
+        ) === taskOutcome,
+    ) ?? pairs[0];
+
+  return {
+    task,
+    rep: selected.referenceCell.rep,
+    reference_path: selected.referenceCell.result_path,
+    challenger_path: selected.challengerCell.result_path,
   };
 }
 

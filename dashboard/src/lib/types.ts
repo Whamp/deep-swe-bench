@@ -136,6 +136,7 @@ export interface ComparisonCell {
   task: string;
   config: string;
   rep: number;
+  result_path: string;
   reward_binary: number;
   reward_partial: number;
   total_tokens: number;
@@ -222,34 +223,147 @@ export interface RunScore {
   tasks: ScoreTask[];
 }
 
-// Cell session activity (from /api/cell-session — JSONL turn timeline)
-export interface SessionTurn {
-  idx: number;
-  ts: string | null;
-  intent: string | null;
-  tools: string[];
-  targets: string[];
-  token_delta: number;
-  cost_delta: number;
-  cumulative_tokens: number;
-  cumulative_cost: number;
+/** One browsable file stored inside a benchmark cell. */
+export interface CellTrajectoryArtifact {
+  path: string;
+  relative_path: string;
+  kind: "patch" | "tests" | "log" | "result" | "session" | "other";
+  size: number;
 }
 
-export interface CellSession {
-  found: boolean;
-  path?: string;
-  turns?: number;
-  total_tokens?: number;
-  total_cost?: number;
-  tool_calls?: number;
-  tool_call_errors?: number;
-  tool_call_error_rate?: number | null;
-  distinct_tools?: string[];
-  last_intent?: string | null;
+/** Compact verifier counts read from the cell's CTRF report. */
+export interface CellTrajectoryTestSummary {
+  tests: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  pending: number;
+  other: number;
+}
+
+/** Provider usage recorded for one assistant trajectory turn. */
+export interface CellTrajectoryTurnUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+  cost: number;
+}
+
+/** Complete tool output paired to its originating call ID. */
+export interface CellTrajectoryToolResult {
+  timestamp: string | number | null;
+  text: string;
+  is_error: boolean;
+  details: unknown;
+  duration_ms: number;
+}
+
+/** A reasoning or assistant text block in original message order. */
+export interface CellTrajectoryTextBlock {
+  type: "thinking" | "text";
+  text: string;
+}
+
+/** A tool invocation with unmodified arguments and complete paired output. */
+export interface CellTrajectoryToolCallBlock {
+  type: "tool_call";
+  id: string;
+  name: string;
+  arguments: unknown;
+  result: CellTrajectoryToolResult | null;
+}
+
+/** A tool result whose originating call was absent from the session log. */
+export interface CellTrajectoryOrphanResultBlock extends CellTrajectoryToolResult {
+  type: "tool_result";
+  id: string;
+  name: string;
+}
+
+/** An unrecognized provider block retained instead of silently discarded. */
+export interface CellTrajectoryUnknownBlock {
+  type: "unknown";
+  data: Record<string, unknown>;
+}
+
+/** One original-order content block within an assistant turn. */
+export type CellTrajectoryBlock =
+  | CellTrajectoryTextBlock
+  | CellTrajectoryToolCallBlock
+  | CellTrajectoryOrphanResultBlock
+  | CellTrajectoryUnknownBlock;
+
+/** One complete assistant turn and all tool results that followed it. */
+export interface CellTrajectoryTurn {
+  idx: number;
+  id: string | null;
+  timestamp: string | number | null;
+  elapsed_s: number | null;
+  stop_reason: string | null;
+  error: string | null;
+  usage: CellTrajectoryTurnUsage;
+  cumulative_cost: number;
+  observation_chars: number;
+  command_time_ms: number;
+  blocks: CellTrajectoryBlock[];
+}
+
+/** Small all-turn datapoint used for trajectory charts and turn navigation. */
+export interface CellTrajectoryMetric {
+  idx: number;
+  timestamp: string | number | null;
+  intent: string | null;
+  cumulative_cost: number;
+  context_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  observation_chars: number;
+  command_time_ms: number;
+}
+
+/** Allowlisted result metadata shown in a trajectory header. */
+export interface CellTrajectoryCell extends CellSummary {
+  result_path: string;
+  cell_path: string;
+  task?: string;
+  config?: string;
+  rep?: number;
+  model?: string;
+  thinking_level?: string;
+  language?: string;
+  category?: string;
+}
+
+/** Native Pi session identity and live-file state for a trajectory. */
+export interface CellTrajectorySession {
+  id?: string | null;
+  cwd?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  thinking_level?: string | null;
   started_at?: string | null;
-  updated_at?: number | null;
-  is_live?: boolean;
-  truncated?: boolean;
-  turns_list?: SessionTurn[];
+  path: string;
+  updated_at: number;
+  is_live: boolean;
+}
+
+/** Paginated complete trajectory response for one benchmark cell. */
+export interface CellTrajectory {
+  found: boolean;
   error?: string;
+  cell?: CellTrajectoryCell;
+  session?: CellTrajectorySession;
+  prompt?: string;
+  artifacts?: CellTrajectoryArtifact[];
+  test_summary?: CellTrajectoryTestSummary | null;
+  total_turns?: number;
+  offset?: number;
+  limit?: number;
+  has_previous?: boolean;
+  has_next?: boolean;
+  turns?: CellTrajectoryTurn[];
+  metrics?: CellTrajectoryMetric[];
 }

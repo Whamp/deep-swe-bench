@@ -12,6 +12,7 @@ function cell(task: string, rep: number, solved: number): ComparisonCell {
     task,
     config: "config",
     rep,
+    result_path: `/results/config/${task}/rep${rep}/result.json`,
     reward_binary: solved,
     reward_partial: solved,
     total_tokens: 100,

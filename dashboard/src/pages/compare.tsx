@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
 import {
   CartesianGrid,
   Cell as RechartsCell,
@@ -17,6 +18,7 @@ import {
   comparisonGroupKey,
   defaultComparePair,
   difficultySolveSummary,
+  matchedTaskTrajectoryPair,
   type ComparePairOutcome,
   type CompareTaskOutcome,
   type ConfigPairComparison,
@@ -28,6 +30,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { ErrorState } from "@/components/error-state";
 import { cn } from "@/lib/utils";
+import { pairedCellTrajectoryHref } from "@/lib/trajectory-links";
 
 const DEFAULT_SUBSET = "36_v2";
 const REFERENCE_COLOR = "#58a6ff";
@@ -229,7 +232,7 @@ export default function Compare() {
               comparison={comparison}
               reps={reps}
             />
-            <FlipEvidence comparison={comparison} />
+            <FlipEvidence comparison={comparison} reference={reference} challenger={challenger} />
           </div>
           <SideBySideEvidence
             reference={reference}
@@ -384,7 +387,7 @@ function PairSelector({
           <div className="mt-3 grid gap-3 md:!mt-0 md:!grid md:grid-cols-[1fr_auto_1fr] md:items-stretch">
             <ConfigChoice
               slot="A"
-              role="Reference"
+              pairRole="Reference"
               color={REFERENCE_COLOR}
               run={reference}
               rows={rows.filter((row) => row.run_id !== challenger.run_id)}
@@ -400,7 +403,7 @@ function PairSelector({
             </button>
             <ConfigChoice
               slot="B"
-              role="Challenger"
+              pairRole="Challenger"
               color={CHALLENGER_COLOR}
               run={challenger}
               rows={rows.filter((row) => row.run_id !== reference.run_id)}
@@ -416,7 +419,7 @@ function PairSelector({
 
 function ConfigChoice({
   slot,
-  role,
+  pairRole,
   color,
   run,
   rows,
@@ -424,7 +427,7 @@ function ConfigChoice({
   onChange,
 }: {
   slot: "A" | "B";
-  role: string;
+  pairRole: string;
   color: string;
   run: ComparisonRun;
   rows: ComparisonRun[];
@@ -442,7 +445,7 @@ function ConfigChoice({
           >
             {slot}
           </span>
-          {role}
+          {pairRole}
         </span>
         <div className="flex gap-1">
           {run.config === "baseline" && <Badge>Canonical baseline</Badge>}
@@ -453,7 +456,7 @@ function ConfigChoice({
         </div>
       </div>
       <select
-        aria-label={`${role} config`}
+        aria-label={`${pairRole} config`}
         value={run.run_id}
         onChange={(event) => onChange(event.target.value)}
         className="h-9 w-full rounded-md border border-border bg-background px-2 text-sm font-medium text-foreground"
@@ -776,7 +779,15 @@ function OutcomeLegend() {
   );
 }
 
-function FlipEvidence({ comparison }: { comparison: ConfigPairComparison }) {
+function FlipEvidence({
+  comparison,
+  reference,
+  challenger,
+}: {
+  comparison: ConfigPairComparison;
+  reference: ComparisonRun;
+  challenger: ComparisonRun;
+}) {
   const discordant = comparison.tasks.filter(
     (task) => task.outcome === "challenger_only" || task.outcome === "reference_only",
   );
@@ -836,6 +847,11 @@ function FlipEvidence({ comparison }: { comparison: ConfigPairComparison }) {
                     >
                       {task.outcome === "challenger_only" ? "B gained" : "B lost"}
                     </span>
+                    <MatchedTrajectoryLink
+                      reference={reference}
+                      challenger={challenger}
+                      task={task.task}
+                    />
                   </div>
                 ))}
               </div>
@@ -1075,6 +1091,7 @@ function TaskEvidenceDetails({
                     <th className="px-2 py-2 text-right">A partial</th>
                     <th className="px-2 py-2 text-right">B partial</th>
                     <th className="px-2 py-2 text-right">Δ</th>
+                    <th className="px-2 py-2 text-right">Trajectory</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1107,6 +1124,13 @@ function TaskEvidenceDetails({
                       >
                         {formatPointDelta(task.partial_delta * 100)}
                       </td>
+                      <td className="px-2 py-2 text-right">
+                        <MatchedTrajectoryLink
+                          reference={reference}
+                          challenger={challenger}
+                          task={task.task}
+                        />
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -1116,6 +1140,28 @@ function TaskEvidenceDetails({
         </details>
       </CardContent>
     </Card>
+  );
+}
+
+function MatchedTrajectoryLink({
+  reference,
+  challenger,
+  task,
+}: {
+  reference: ComparisonRun;
+  challenger: ComparisonRun;
+  task: string;
+}) {
+  const pair = matchedTaskTrajectoryPair(reference, challenger, task);
+  if (!pair) return <span className="text-muted-foreground">unavailable</span>;
+  return (
+    <Link
+      to={pairedCellTrajectoryHref(pair.reference_path, pair.challenger_path)}
+      aria-label={`Compare trajectories for ${task} rep ${pair.rep}`}
+      className="shrink-0 whitespace-nowrap text-primary hover:underline"
+    >
+      compare rep {pair.rep} →
+    </Link>
   );
 }
 

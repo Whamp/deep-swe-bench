@@ -8,7 +8,7 @@ import { Progress } from "@/components/ui/progress";
 import { StateBadge, OutcomeBadge, Badge } from "@/components/ui/badge";
 import { ErrorState } from "@/components/error-state";
 import { LiveScore } from "@/components/live-score";
-import { CellSessionPanel } from "@/components/cell-session";
+import { cellTrajectoryHref } from "@/lib/trajectory-links";
 import {
   Table,
   TableHeader,
@@ -24,7 +24,6 @@ const DETAIL_OPTIONS: DetailLevel[] = ["summary", "operational", "diagnostic"];
 export default function RunDetail() {
   const { runId } = useParams<{ runId: string }>();
   const [detail, setDetail] = useState<DetailLevel>("operational");
-  const [sessionCell, setSessionCell] = useState<Cell | null>(null);
 
   const {
     data: run,
@@ -80,19 +79,11 @@ export default function RunDetail() {
       <LiveScore run={run} />
       <RunSummary run={run} />
 
-      <ActiveCells cells={run.active_cells || []} onOpenSession={setSessionCell} />
-      <PreflightSmokeResults
-        cells={Object.values(run.preflight || {})}
-        onOpenSession={setSessionCell}
-      />
-      <FinishedRepResults
-        cells={run.finished_cells || run.recent_finished || []}
-        onOpenSession={setSessionCell}
-      />
+      <ActiveCells cells={run.active_cells || []} />
+      <PreflightSmokeResults cells={Object.values(run.preflight || {})} />
+      <FinishedRepResults cells={run.finished_cells || run.recent_finished || []} />
 
       {detail === "diagnostic" && <DiagnosticPanels run={run} />}
-
-      {sessionCell && <CellSessionPanel cell={sessionCell} onClose={() => setSessionCell(null)} />}
     </div>
   );
 }
@@ -157,13 +148,7 @@ function RunSummary({ run }: { run: RunDetailData }) {
 }
 
 /** Active cells, sorted anomaly-first (stale, then oldest). */
-function ActiveCells({
-  cells,
-  onOpenSession,
-}: {
-  cells: Cell[];
-  onOpenSession: (cell: Cell) => void;
-}) {
+function ActiveCells({ cells }: { cells: Cell[] }) {
   const sorted = useMemo(
     () =>
       [...cells].sort((a, b) => {
@@ -210,12 +195,7 @@ function ActiveCells({
                     )}
                   </TableCell>
                   <TableCell>
-                    <button
-                      onClick={() => onOpenSession(cell)}
-                      className="rounded-md border border-border bg-background/60 px-2 py-1 text-xs text-primary hover:bg-accent hover:text-foreground"
-                    >
-                      view session →
-                    </button>
+                    <TrajectoryLink cell={cell} />
                   </TableCell>
                   <TableCell className="text-xs">
                     <CellFiles cell={cell} summary={s} />
@@ -231,13 +211,7 @@ function ActiveCells({
 }
 
 /** Finished reps remain individually inspectable after leaving the active set. */
-function FinishedRepResults({
-  cells,
-  onOpenSession,
-}: {
-  cells: Cell[];
-  onOpenSession: (cell: Cell) => void;
-}) {
+function FinishedRepResults({ cells }: { cells: Cell[] }) {
   const sorted = useMemo(
     () =>
       [...cells].sort((a, b) => {
@@ -307,7 +281,7 @@ function FinishedRepResults({
                     <CellFiles cell={cell} summary={summary} />
                   </TableCell>
                   <TableCell className="text-xs">
-                    <SessionLink cell={cell} onOpen={onOpenSession} />
+                    <TrajectoryLink cell={cell} />
                   </TableCell>
                 </TableRow>
               );
@@ -377,26 +351,20 @@ function CellFiles({
   );
 }
 
-function SessionLink({ cell, onOpen }: { cell: Cell; onOpen: (cell: Cell) => void }) {
+function TrajectoryLink({ cell }: { cell: Cell }) {
   if (!cell.result_path) return <span className="text-muted-foreground">unavailable</span>;
   return (
-    <button
-      onClick={() => onOpen(cell)}
+    <Link
+      to={cellTrajectoryHref(cell.result_path)}
       className="rounded-md border border-border bg-background/60 px-2 py-1 text-xs text-primary hover:bg-accent hover:text-foreground"
     >
-      view session →
-    </button>
+      view trajectory →
+    </Link>
   );
 }
 
 /** Preflight smoke reps expose both agent execution and smoke-contract evidence. */
-function PreflightSmokeResults({
-  cells,
-  onOpenSession,
-}: {
-  cells: Cell[];
-  onOpenSession: (cell: Cell) => void;
-}) {
+function PreflightSmokeResults({ cells }: { cells: Cell[] }) {
   if (cells.length === 0) return null;
   const passed = cells.filter((cell) => cell.state === "passed").length;
   return (
@@ -457,7 +425,7 @@ function PreflightSmokeResults({
                     <PreflightContractDiagnostics diagnostics={cell.diagnostics || []} />
                   </TableCell>
                   <TableCell className="text-xs">
-                    <SessionLink cell={cell} onOpen={onOpenSession} />
+                    <TrajectoryLink cell={cell} />
                   </TableCell>
                 </TableRow>
               );

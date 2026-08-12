@@ -1,6 +1,6 @@
 # deep-swe-bench dashboard
 
-Internal-only dev dashboard for monitoring benchmark runs and comparing results across configs. Built with React + Vite + TypeScript + shadcn/ui + Recharts.
+Internal-only dashboard for monitoring benchmark runs, comparing configs, and inspecting native session trajectories. Built with React, Vite, TypeScript, shadcn/ui, and Recharts.
 
 ## Architecture
 
@@ -73,13 +73,9 @@ The live-monitoring centerpiece. Three things at a glance:
   Reused cells are excluded from the operational error-rate denominator.
   Updates every 5s from the event log plus mtime-cached compact session summaries.
 - **What the agents are doing** — the *Active cells* table is sorted
-  anomaly-first (stale, then oldest). Click **view session** on any cell to
-  open a drill-in that parses the agent's session transcript (server-side) into
-  a **turn timeline**: each turn shows the agent's self-narrated intent (from
-  its `thinking` block), the tools/files it touched, and its token/cost delta.
-  Works for both native-pi (`read`/`edit`/`bash`) and pi-fabric (`fabric_exec`
-  wrapping JS) sessions — fabric's inner tool calls are unwrapped with a
-  tolerant regex. A `LIVE` dot confirms the transcript is still being written.
+  anomaly-first (stale, then oldest). **View trajectory** opens a durable link
+  to the cell's complete native session. The same link remains available for
+  preflight and finished reps. Live session files refresh every four seconds.
 - **Recent results** — failures first as rows; a quiet `N ok` summary when
   nothing needs attention. Three detail levels (summary, operational,
   diagnostic) toggle the raw `status.json` / `manifest.json` / events tail.
@@ -98,8 +94,10 @@ matched evidence:
   shared-task partial reward, and the discordant sample size. These are
   descriptive measurements, not significance claims.
 - **Per-task evidence:** the partial-reward scatter defaults to the observed
-  variation range and retains a full 0–100% toggle. Every discordant task and
-  every shared task remain inspectable.
+  variation range and retains a full 0–100% toggle. Every discordant and shared
+  task links to baseline and challenger trajectories for the same rep. For an
+  aggregated solve flip, the link prefers a shared rep that demonstrates that
+  direction instead of blindly choosing the lowest rep.
 - **Honest secondary metrics:** task success and rep success keep separate
   denominators. `$0` cost is shown as untracked rather than free. Empty
   difficulty buckets show `—`, not 0%.
@@ -107,6 +105,28 @@ matched evidence:
 `/api/compare` rows represent aggregated config paths, not individual launches.
 Subset and rep parameters constrain that aggregation; Compare does not claim
 batch-level isolation or statistical significance.
+
+### Trajectory (`/trajectory`)
+
+A complete, deep-linkable view of one rep's native Pi session:
+
+- `?path=<result.json>` opens one trajectory. `?left=<result.json>&right=<result.json>`
+  opens synchronized A/B panes for a matched task and rep.
+- Each page contains up to 20 complete assistant turns. Reasoning, assistant
+  text, tool arguments, tool output, errors, structured details, timestamps,
+  usage, and cost remain intact. **Focus** collapses long bodies; **Full** opens
+  them. Turn links use `&turn=N`.
+- Five all-turn charts show cumulative cost, context size, output tokens,
+  observation size, and command time even though transcript bodies are paged.
+- **Tests**, **Prompt**, **Patch**, and **Logs** expose the cell's saved evidence.
+  Patches and test reports preview from the head; logs preview from the tail.
+  Previews stop at 2,000 lines or 256 KB. Downloads return the complete file.
+- The parser retains unknown provider blocks rather than dropping them. Native
+  calls pair with results by call ID; Fabric code, returned text, and structured
+  inner-operation traces remain available in the outer call.
+
+Keep trajectory links internal. Prompts, source, commands, and tool output may
+contain repository data that should not be published.
 
 ### Leaderboard (`/leaderboard`)
 A decision surface for choosing a config on one fixed subset:
@@ -136,10 +156,13 @@ A decision surface for choosing a config on one fixed subset:
 | `GET /api/runs/<id>?detail=...` | Detailed projection of a single run |
 | `GET /api/runs/<id>/score` | Live score replay (solve/partial rates, tool-call error rate, cost, throughput, ETA, timeline, per-task results) |
 | `GET /api/runs/<id>/events?limit=N` | Events tail |
-| `GET /api/cell-session?path=&tail=N` | Agent session turn timeline for one cell (intent + tools + token/cost deltas) |
-| `GET /api/compare?subset=&reps=N` | Aggregated cross-run metrics, optionally filtered to a subset |
+| `GET /api/cell-session?path=&tail=N` | Compact session activity summary for live scoring and compatibility |
+| `GET /api/cell-trajectory?path=&offset=N&limit=N` | Complete paginated turns, all-turn metrics, result metadata, prompt, verifier summary, and cell file inventory |
+| `GET /api/compare?subset=&reps=N` | Aggregated cross-run metrics with an inspectable `result_path` on each cell |
 | `GET /api/subsets` | List available task subsets |
-| `GET /api/file?path=&tail=N` | Tail a file (repo-allowlisted) |
+| `GET /api/file?path=&head=N` | Preview the first bounded lines of an allowlisted file |
+| `GET /api/file?path=&tail=N` | Preview the last bounded lines of an allowlisted file |
+| `GET /api/file?path=&download=1` | Download the complete allowlisted file |
 
 ## Development
 
@@ -169,17 +192,20 @@ npm run test:watch
 ```
 dashboard/
   src/
-    components/ui/     shadcn-style primitives (card, badge, table, progress)
+    components/ui/             shadcn-style primitives (card, badge, table, progress)
+    components/trajectory-*    complete turn and cell-artifact renderers
     lib/
-      api.ts           typed fetch client
-      types.ts         API response types
-      metrics.ts       pure utilities (pareto, median, formatting)
-      utils.ts         cn() classname merge
+      api.ts                   typed fetch client
+      types.ts                 API response types
+      metrics.ts               pure utilities (pareto, median, formatting)
+      trajectory-links.ts      single and paired deep-link builders
+      utils.ts                 cn() classname merge
     pages/
-      overview.tsx     run cards grid
-      leaderboard.tsx  per-subset ranked leaderboard + Pareto scatter
-      run-detail.tsx   single run detail
-      compare.tsx      cross-run comparison charts
+      overview.tsx             run cards grid
+      leaderboard.tsx          per-subset ranked leaderboard + Pareto scatter
+      run-detail.tsx           single run detail
+      compare.tsx              paired config evidence and trajectory links
+      trajectory.tsx           single and paired native session viewer
     test/setup.ts      vitest + testing-library setup
   screenshots/         verification screenshots
 ```

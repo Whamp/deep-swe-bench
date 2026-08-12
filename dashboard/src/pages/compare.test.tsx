@@ -50,10 +50,13 @@ function cell(
   rewardPartial: number,
   overrides: Partial<ComparisonCell> = {},
 ): ComparisonCell {
+  const config = overrides.config ?? "baseline";
+  const rep = overrides.rep ?? 0;
   return {
     task,
-    config: "baseline",
-    rep: 0,
+    config,
+    rep,
+    result_path: `/results/${config}/${task}/rep${rep}/result.json`,
     reward_binary: rewardBinary,
     reward_partial: rewardPartial,
     total_tokens: 1_000_000,
@@ -174,6 +177,16 @@ describe("Compare page", () => {
       "true",
     );
     expect(screen.getByText("View all 1 discordant task")).toBeInTheDocument();
+    const trajectoryLinks = screen.getAllByRole("link", {
+      name: "Compare trajectories for task-b rep 0",
+    });
+    expect(trajectoryLinks.length).toBeGreaterThan(0);
+    for (const trajectoryLink of trajectoryLinks) {
+      expect(trajectoryLink).toHaveAttribute(
+        "href",
+        "/trajectory?left=%2Fresults%2Fbaseline%2Ftask-b%2Frep0%2Fresult.json&right=%2Fresults%2Fpi-check%2Ftask-b%2Frep0%2Fresult.json",
+      );
+    }
     expect(screen.getAllByText("Task solve · shared").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Rep solve · scoped").length).toBeGreaterThan(0);
     expect(screen.getAllByText("B-only 1").length).toBeGreaterThan(0);

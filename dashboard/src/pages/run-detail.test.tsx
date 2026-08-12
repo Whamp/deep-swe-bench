@@ -1,7 +1,6 @@
 import { screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
-import { CellSessionPanel } from "@/components/cell-session";
-import type { Cell, RunDetail as RunDetailData } from "@/lib/types";
+import { describe, expect, it } from "vitest";
+import type { RunDetail as RunDetailData } from "@/lib/types";
 import RunDetail from "@/pages/run-detail";
 import { mockDashboardJson, renderDashboardRoute } from "@/test/dashboard-test-harness";
 
@@ -102,21 +101,12 @@ describe("Run detail preflight smoke inspection", () => {
     expect(screen.getByText("usage_evidence · result.total_tokens")).toBeInTheDocument();
     expect(screen.getByText("expected a positive number, got 0")).toBeInTheDocument();
     expect(screen.getAllByRole("link", { name: "contract" })).toHaveLength(2);
-    expect(screen.getAllByRole("button", { name: /view session/i })).toHaveLength(2);
+    expect(screen.getAllByRole("link", { name: /view trajectory/i })).toHaveLength(2);
   });
 });
 
 describe("Run detail completed rep inspection", () => {
-  const finishedCell: Cell = {
-    task: "task-success",
-    config: "cfg@1.0.0",
-    rep: 0,
-    state: "done",
-    result_path: "/repo/results/model/high/cfg/task-success/rep_0/result.json",
-    summary: { reward_binary: 1, reward_partial: 0.875 },
-  };
-
-  it("keeps a successful finished rep visible with outcome, partial score, and session access", async () => {
+  it("keeps a successful finished rep visible with outcome, partial score, and trajectory access", async () => {
     renderRunDetail({
       run_id: "confirmed-run",
       state: "completed",
@@ -160,26 +150,11 @@ describe("Run detail completed rep inspection", () => {
     expect(screen.getByText("5/107 · 4.7%")).toBeInTheDocument();
     expect(screen.getByText("ok")).toBeInTheDocument();
     expect(screen.queryByRole("columnheader", { name: "Config" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /view session/i })).toBeInTheDocument();
+    const trajectory = screen.getByRole("link", { name: /view trajectory/i });
+    expect(trajectory).toHaveAttribute(
+      "href",
+      "/trajectory?path=%2Frepo%2Fresults%2Fmodel%2Fhigh%2Fcfg%2Ftask-success%2Frep_0%2Fresult.json",
+    );
     expect(screen.queryByText(/all ok/i)).not.toBeInTheDocument();
-  });
-
-  it("shows a finished rep's parsed tool-call error count and rate", async () => {
-    mockDashboardJson({
-      session: {
-        found: true,
-        turns: 1,
-        total_tokens: 100,
-        total_cost: 0.01,
-        tool_calls: 4,
-        tool_call_errors: 1,
-        tool_call_error_rate: 0.25,
-        is_live: false,
-        turns_list: [],
-      },
-    });
-    renderDashboardRoute(<CellSessionPanel cell={finishedCell} onClose={vi.fn()} />, "/", "/");
-
-    expect(await screen.findByText("1/4 tool calls · 25.0% error rate")).toBeInTheDocument();
   });
 });

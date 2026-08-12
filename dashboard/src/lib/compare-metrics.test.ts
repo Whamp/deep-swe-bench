@@ -5,6 +5,7 @@ import {
   compareConfigPair,
   defaultComparePair,
   difficultySolveSummary,
+  matchedTaskTrajectoryPair,
   type ComparePairOutcome,
 } from "@/lib/compare-metrics";
 
@@ -18,6 +19,7 @@ function cell(
     task,
     config: "baseline",
     rep: 0,
+    result_path: `/results/baseline/${task}/rep0/result.json`,
     reward_binary: rewardBinary,
     reward_partial: rewardPartial,
     total_tokens: 100,
@@ -141,6 +143,32 @@ describe("compareConfigPair", () => {
         },
       ),
     );
+  });
+});
+
+describe("matchedTaskTrajectoryPair", () => {
+  it("selects the shared rep that demonstrates a directional task flip", () => {
+    const reference = run({
+      cells: [
+        cell("task-a", 0, 0.2, { rep: 0, result_path: "/reference/rep0/result.json" }),
+        cell("task-a", 0, 0.3, { rep: 1, result_path: "/reference/rep1/result.json" }),
+      ],
+    });
+    const challenger = run({
+      run_id: "model/low/challenger",
+      config: "challenger",
+      cells: [
+        cell("task-a", 0, 0.4, { rep: 0, result_path: "/challenger/rep0/result.json" }),
+        cell("task-a", 1, 1, { rep: 1, result_path: "/challenger/rep1/result.json" }),
+      ],
+    });
+
+    expect(matchedTaskTrajectoryPair(reference, challenger, "task-a")).toEqual({
+      task: "task-a",
+      rep: 1,
+      reference_path: "/reference/rep1/result.json",
+      challenger_path: "/challenger/rep1/result.json",
+    });
   });
 });
 

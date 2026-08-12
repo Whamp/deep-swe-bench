@@ -1,6 +1,7 @@
 import json
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -177,6 +178,7 @@ def test_safe_file_links_are_allowlisted_and_tailed(tmp_path):
     )
 
     assert resolved == path.resolve()
+    assert run_dashboard.head_file(resolved, lines=2) == "one\ntwo\n"
     assert run_dashboard.tail_file(resolved, lines=2) == "two\nthree\n"
     with pytest.raises(ValueError):
         run_dashboard.resolve_dashboard_path(
@@ -386,8 +388,10 @@ def test_comparison_subset_filter_excludes_other_tasks(tmp_path):
     assert filt[0]["distinct_tasks"] == 1  # only task-a covered
     assert filt[0]["solved"] == 1
     assert abs(filt[0]["solve_rate"] - 50.0) < 1e-9
-    # the task-z cell is excluded
+    # the task-z cell is excluded, and each retained cell is directly inspectable.
     assert {c["task"] for c in filt[0]["cells"]} == {"task-a"}
+    assert {Path(c["result_path"]).name for c in filt[0]["cells"]} == {"result.json"}
+    assert all(Path(c["result_path"]).is_absolute() for c in filt[0]["cells"])
 
 
 def test_comparison_discovers_symlinked_config_directory(tmp_path):
@@ -889,6 +893,251 @@ def _tool_result(
     }
 
 
+def test_cell_trajectory_returns_complete_paginated_native_turns(tmp_path):
+    result = (
+        tmp_path
+        / "results"
+        / "m"
+        / "high"
+        / "cfg"
+        / "task-a"
+        / "rep0"
+        / "result.json"
+    )
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text(
+        json.dumps(
+            {
+                "task": "task-a",
+                "config": "cfg",
+                "rep": 0,
+                "model": "provider/model-a",
+                "thinking_level": "high",
+                "reward_binary": 1,
+                "reward_partial": 0.75,
+                "agent_wall_s": 12.5,
+            }
+        )
+    )
+    complete_output = "first line\n" + ("x" * 5_000) + "\nlast line"
+    first_assistant = _assistant_turn(
+        [
+            {"type": "thinking", "thinking": "Inspect the implementation in full."},
+            {"type": "text", "text": "I will run the focused test."},
+            {
+                "type": "toolCall",
+                "id": "call-1",
+                "name": "bash",
+                "arguments": {"command": "pytest -q tests/test_feature.py"},
+            },
+            {"type": "provider_meta", "payload": {"retained": "exactly"}},
+        ],
+        ts="2026-01-01T00:00:02.000Z",
+        usage={
+            "input": 200,
+            "output": 40,
+            "cacheRead": 100,
+            "reasoning": 10,
+            "totalTokens": 350,
+            "cost": {"total": 0.02},
+        },
+    )
+    first_assistant["timestamp"] = "2026-01-01T00:00:02.000Z"
+    tool_result = {
+        "type": "message",
+        "timestamp": "2026-01-01T00:00:04.000Z",
+        "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "bash",
+            "content": [{"type": "text", "text": complete_output}],
+            "isError": False,
+            "details": {"exitCode": 0, "trace": {"outcome": "success"}},
+            "timestamp": 1_767_225_604_000,
+        },
+    }
+    orphan_result = {
+        "type": "message",
+        "timestamp": "2026-01-01T00:00:04.500Z",
+        "message": {
+            "role": "toolResult",
+            "toolCallId": "missing-call",
+            "toolName": "provider_tool",
+            "content": [{"type": "text", "text": "orphan output"}],
+            "isError": True,
+            "details": {"providerTrace": "retained"},
+            "timestamp": 1_767_225_604_500,
+        },
+    }
+    second_assistant = _assistant_turn(
+        [{"type": "text", "text": "The focused test passes."}],
+        ts="2026-01-01T00:00:05.000Z",
+        usage={"input": 300, "output": 20, "totalTokens": 320, "cost": {"total": 0.01}},
+    )
+    second_assistant["timestamp"] = "2026-01-01T00:00:05.000Z"
+    _write_session(
+        result.parent / "session" / "s.jsonl",
+        [
+            {
+                "type": "model_change",
+                "provider": "provider",
+                "modelId": "model-a",
+                "timestamp": "2026-01-01T00:00:00.500Z",
+            },
+            {
+                "type": "thinking_level_change",
+                "thinkingLevel": "high",
+                "timestamp": "2026-01-01T00:00:00.600Z",
+            },
+            {
+                "type": "message",
+                "timestamp": "2026-01-01T00:00:01.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Implement the requested behavior."}
+                    ],
+                },
+            },
+            first_assistant,
+            tool_result,
+            orphan_result,
+            second_assistant,
+        ],
+    )
+
+    first_page = run_dashboard.load_cell_trajectory(
+        str(result),
+        offset=0,
+        limit=1,
+        repo_root=tmp_path,
+        state_root=tmp_path / "results" / "_runs",
+    )
+
+    assert first_page["found"] is True
+    assert first_page["total_turns"] == 2
+    assert first_page["offset"] == 0
+    assert first_page["has_previous"] is False
+    assert first_page["has_next"] is True
+    assert first_page["prompt"] == "Implement the requested behavior."
+    assert first_page["cell"]["task"] == "task-a"
+    assert first_page["session"]["model"] == "model-a"
+    assert first_page["session"]["thinking_level"] == "high"
+    assert len(first_page["metrics"]) == 2
+    assert first_page["metrics"][0]["context_tokens"] == 300
+    assert first_page["metrics"][0]["output_tokens"] == 40
+    assert first_page["metrics"][0]["observation_chars"] == len(complete_output) + len(
+        "orphan output"
+    )
+    assert first_page["metrics"][0]["command_time_ms"] == 2_000
+
+    turn = first_page["turns"][0]
+    assert turn["idx"] == 1
+    assert turn["blocks"][0] == {
+        "type": "thinking",
+        "text": "Inspect the implementation in full.",
+    }
+    assert turn["blocks"][1] == {
+        "type": "text",
+        "text": "I will run the focused test.",
+    }
+    call = turn["blocks"][2]
+    assert call["type"] == "tool_call"
+    assert call["name"] == "bash"
+    assert call["arguments"] == {"command": "pytest -q tests/test_feature.py"}
+    assert call["result"]["text"] == complete_output
+    assert call["result"]["is_error"] is False
+    assert call["result"]["details"] == {
+        "exitCode": 0,
+        "trace": {"outcome": "success"},
+    }
+    assert turn["blocks"][3] == {
+        "type": "unknown",
+        "data": {"type": "provider_meta", "payload": {"retained": "exactly"}},
+    }
+    assert turn["blocks"][4]["type"] == "tool_result"
+    assert turn["blocks"][4]["id"] == "missing-call"
+    assert turn["blocks"][4]["text"] == "orphan output"
+    assert turn["blocks"][4]["is_error"] is True
+    assert turn["blocks"][4]["details"] == {"providerTrace": "retained"}
+
+    second_page = run_dashboard.load_cell_trajectory(
+        str(result),
+        offset=1,
+        limit=1,
+        repo_root=tmp_path,
+        state_root=tmp_path / "results" / "_runs",
+    )
+    assert second_page["has_previous"] is True
+    assert second_page["has_next"] is False
+    assert second_page["turns"][0]["idx"] == 2
+    assert second_page["turns"][0]["blocks"][0]["text"] == "The focused test passes."
+
+
+def test_cell_trajectory_inventories_artifacts_and_verifier_summary(tmp_path):
+    result = (
+        tmp_path
+        / "results"
+        / "m"
+        / "high"
+        / "cfg"
+        / "task-a"
+        / "rep0"
+        / "result.json"
+    )
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text(json.dumps({"task": "task-a", "reward_binary": 0}))
+    _write_session(
+        result.parent / "session" / "s.jsonl",
+        [_assistant_turn([{"type": "text", "text": "Done."}])],
+    )
+    patch = result.parent / "artifacts" / "model.patch"
+    patch.parent.mkdir()
+    patch.write_text("diff --git a/a.py b/a.py\n")
+    log = result.parent / "logs" / "verifier.stdout.txt"
+    log.parent.mkdir()
+    log.write_text("verifier output\n")
+    ctrf = result.parent / "verifier" / "ctrf.json"
+    ctrf.parent.mkdir()
+    ctrf.write_text(
+        json.dumps(
+            {
+                "results": {
+                    "summary": {
+                        "tests": 3,
+                        "passed": 2,
+                        "failed": 1,
+                        "skipped": 0,
+                        "pending": 0,
+                        "other": 0,
+                    }
+                }
+            }
+        )
+    )
+
+    trajectory = run_dashboard.load_cell_trajectory(
+        str(result),
+        repo_root=tmp_path,
+        state_root=tmp_path / "results" / "_runs",
+    )
+
+    artifacts = {item["relative_path"]: item for item in trajectory["artifacts"]}
+    assert artifacts["artifacts/model.patch"]["kind"] == "patch"
+    assert artifacts["logs/verifier.stdout.txt"]["kind"] == "log"
+    assert artifacts["verifier/ctrf.json"]["kind"] == "tests"
+    assert artifacts["session/s.jsonl"]["kind"] == "session"
+    assert artifacts["artifacts/model.patch"]["size"] == len(patch.read_bytes())
+    assert trajectory["test_summary"] == {
+        "tests": 3,
+        "passed": 2,
+        "failed": 1,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0,
+    }
+
+
 def test_cell_session_native_pi_extracts_tools_and_intent(tmp_path):
     result = tmp_path / "results" / "m" / "h" / "c" / "task" / "rep0" / "result.json"
     result.parent.mkdir(parents=True, exist_ok=True)
@@ -1033,6 +1282,42 @@ def test_cell_session_not_found(tmp_path):
     assert out["found"] is False
 
 
+def test_cell_session_cache_respects_requested_tail_turns(tmp_path):
+    result = tmp_path / "results" / "m" / "h" / "c" / "task" / "rep0" / "result.json"
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text("{}")
+    _write_session(
+        result.parent / "session" / "s.jsonl",
+        [
+            _assistant_turn([{"type": "thinking", "thinking": "first"}]),
+            _assistant_turn([{"type": "thinking", "thinking": "second"}]),
+            _assistant_turn([{"type": "thinking", "thinking": "third"}]),
+        ],
+    )
+    run_dashboard._SESSION_CACHE.clear()
+
+    compact = run_dashboard.load_cell_session(
+        str(result),
+        tail_turns=1,
+        repo_root=tmp_path,
+        state_root=tmp_path / "results" / "_runs",
+    )
+    expanded = run_dashboard.load_cell_session(
+        str(result),
+        tail_turns=3,
+        repo_root=tmp_path,
+        state_root=tmp_path / "results" / "_runs",
+    )
+
+    assert [turn["intent"] for turn in compact["turns_list"]] == ["third"]
+    assert [turn["intent"] for turn in expanded["turns_list"]] == [
+        "first",
+        "second",
+        "third",
+    ]
+    assert expanded["truncated"] is False
+
+
 def test_cell_session_cache_invalidates_on_mtime(tmp_path):
     import os
     import time as _time
@@ -1098,6 +1383,55 @@ def test_http_api_cell_session_endpoint(tmp_path):
         assert session["found"] is True
         assert session["turns"] == 1
         assert session["last_intent"] == "hello"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_http_api_cell_trajectory_endpoint_paginates(tmp_path):
+    result = tmp_path / "results" / "m" / "h" / "c" / "task" / "rep0" / "result.json"
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text(json.dumps({"task": "task", "config": "c", "rep": 0}))
+    _write_session(
+        result.parent / "session" / "s.jsonl",
+        [
+            _assistant_turn([{"type": "text", "text": "first"}]),
+            _assistant_turn([{"type": "text", "text": "second"}]),
+        ],
+    )
+    server = run_dashboard.make_server(
+        host="127.0.0.1",
+        port=0,
+        state_root=tmp_path / "results" / "_runs",
+        detail="summary",
+        repo_root=tmp_path,
+        legacy_root=tmp_path / "runs",
+        results_root=tmp_path / "results",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        rel = urllib.parse.quote("results/m/h/c/task/rep0/result.json")
+        with urllib.request.urlopen(
+            f"{base}/api/cell-trajectory?path={rel}&offset=1&limit=1",
+            timeout=5,
+        ) as response:
+            trajectory = json.loads(response.read().decode("utf-8"))["trajectory"]
+        assert trajectory["total_turns"] == 2
+        assert trajectory["turns"][0]["idx"] == 2
+        assert trajectory["has_previous"] is True
+        assert trajectory["has_next"] is False
+
+        with urllib.request.urlopen(
+            f"{base}/api/file?path={rel}&download=1",
+            timeout=5,
+        ) as response:
+            downloaded = response.read()
+            disposition = response.headers["Content-Disposition"]
+        assert downloaded == result.read_bytes()
+        assert disposition == "attachment; filename*=UTF-8''result.json"
     finally:
         server.shutdown()
         server.server_close()

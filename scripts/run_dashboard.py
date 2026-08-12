@@ -6,7 +6,8 @@ The frontend is a React+Vite SPA in dashboard/. This server provides:
   GET /api/runs/<id>         — detailed projection of a single run
   GET /api/runs/<id>/events  — events.ndjson tail
   GET /api/compare           — aggregated cross-run benchmark metrics for charts
-  GET /api/subsets            — list available task subsets
+  GET /api/subsets           — list available task subsets
+  GET /api/cell-trajectory   — paginated full trajectory for one result cell
   GET /api/file?path=&tail=  — tail a file from the repo (allowlisted)
 
 Usage:
@@ -30,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from harness.cell_trajectory import build_cell_trajectory_page
 from harness.run_state import (
     DETAIL_LEVELS,
     RunStateWriter,
@@ -61,7 +63,8 @@ def _launch_plan_structured_state_target(
     """Return a wrapper's declared structured state when it is safe and attributable."""
     plan = load_json(wrapper_dir / "launch-plan.json") or {}
     plan_run_id = plan.get("runId")
-    paths = plan.get("paths") if isinstance(plan.get("paths"), dict) else {}
+    raw_paths = plan.get("paths")
+    paths = raw_paths if isinstance(raw_paths, dict) else {}
     raw_state_path = paths.get("statePath")
     if not isinstance(plan_run_id, str) or not plan_run_id:
         return None
@@ -329,6 +332,7 @@ def load_comparison_data(
             if isinstance(data.get("rep"), int)
             else _rep_from_parts(parts)
         )
+        data["_result_path"] = str(result_file.absolute())
         groups.setdefault(data["_group_key"], []).append(data)
 
     runs: list[dict[str, Any]] = []
@@ -368,6 +372,7 @@ def load_comparison_data(
                     "task": task,
                     "config": c.get("config", config),
                     "rep": c.get("_rep", c.get("rep", 0)),
+                    "result_path": c.get("_result_path", ""),
                     "reward_binary": c.get("reward_binary") or 0,
                     "reward_partial": c.get("reward_partial") or 0.0,
                     "total_tokens": c.get("total_tokens") or 0,
@@ -426,6 +431,16 @@ def resolve_dashboard_path(
     raise ValueError("path is outside the dashboard allowlist")
 
 
+def head_file(path: Path, *, lines: int = 200, max_bytes: int = 256_000) -> str:
+    """Return the first bounded lines of an allowlisted text file."""
+    lines = max(1, min(lines, 2000))
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with path.open("rb") as fh:
+        data = fh.read(max_bytes).decode("utf-8", errors="replace")
+    return "\n".join(data.splitlines()[:lines]) + ("\n" if data else "")
+
+
 def tail_file(path: Path, *, lines: int = 200, max_bytes: int = 256_000) -> str:
     lines = max(1, min(lines, 2000))
     if not path.is_file():
@@ -453,7 +468,7 @@ def tail_file(path: Path, *, lines: int = 200, max_bytes: int = 256_000) -> str:
 # Module-level cache for cell-session summaries, keyed by session file path.
 # Invalidated when the file's mtime or size changes (sessions are appended to
 # live during a run). Bounded so a long-lived API process never grows unbounded.
-_SESSION_CACHE: dict[str, tuple[float, int, dict[str, Any]]] = {}
+_SESSION_CACHE: dict[tuple[str, int], tuple[float, int, dict[str, Any]]] = {}
 _SESSION_CACHE_LIMIT = 512
 
 
@@ -787,7 +802,7 @@ def _summarize_session(
         st = path.stat()
     except OSError:
         return {"found": False}
-    cache_key = str(path)
+    cache_key = (str(path), tail_turns)
     cached = _SESSION_CACHE.get(cache_key)
     if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
         result = cached[2]
@@ -931,6 +946,34 @@ def load_cell_session(
     return _summarize_session(session_file, tail_turns=tail_turns, now_ts=now_ts)
 
 
+def load_cell_trajectory(
+    result_path_str: str,
+    *,
+    offset: int = 0,
+    limit: int = 20,
+    repo_root: Path = ROOT,
+    state_root: Path = DEFAULT_STATE_ROOT,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Resolve and return one complete, paginated cell trajectory page."""
+    try:
+        result_path = resolve_dashboard_path(
+            result_path_str, repo_root=repo_root, state_root=state_root
+        )
+    except ValueError:
+        return {"found": False, "error": "path outside dashboard allowlist"}
+    session_path = _newest_session_file(result_path.parent / "session")
+    if session_path is None:
+        return {"found": False}
+    return build_cell_trajectory_page(
+        result_path,
+        session_path,
+        offset=max(0, offset),
+        limit=max(1, min(limit, 50)),
+        now_ts=now_ts,
+    )
+
+
 # ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
@@ -966,7 +1009,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
 class DashboardHandler(BaseHTTPRequestHandler):
     server: DashboardHTTPServer
 
-    def log_message(self, fmt: str, *args: Any) -> None:
+    def log_message(self, format: str, *args: Any) -> None:
         return
 
     def do_GET(self) -> None:
@@ -1070,6 +1113,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         return
                     self._send_json(run)
                     return
+            if parsed.path == "/api/cell-trajectory":
+                qs = urllib.parse.parse_qs(parsed.query)
+                raw = qs.get("path", [""])[0]
+                if not raw:
+                    self._send_error(HTTPStatus.BAD_REQUEST, "missing path")
+                    return
+                try:
+                    offset = int(qs.get("offset", ["0"])[0])
+                    limit = int(qs.get("limit", ["20"])[0])
+                except ValueError:
+                    self._send_error(
+                        HTTPStatus.BAD_REQUEST, "offset and limit must be integers"
+                    )
+                    return
+                trajectory = load_cell_trajectory(
+                    raw,
+                    offset=offset,
+                    limit=limit,
+                    repo_root=self.server.repo_root,
+                    state_root=self.server.state_root,
+                )
+                self._send_json({"trajectory": trajectory})
+                return
             if parsed.path == "/api/cell-session":
                 qs = urllib.parse.parse_qs(parsed.query)
                 raw = qs.get("path", [""])[0]
@@ -1091,13 +1157,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/file":
                 qs = urllib.parse.parse_qs(parsed.query)
                 raw = qs.get("path", [""])[0]
-                tail = int(qs.get("tail", [200])[0])
                 path = resolve_dashboard_path(
                     raw,
                     repo_root=self.server.repo_root,
                     state_root=self.server.state_root,
                 )
-                text = tail_file(path, lines=tail)
+                if qs.get("download", [""])[0] == "1":
+                    self._send_file(path)
+                    return
+                if "head" in qs:
+                    text = head_file(path, lines=int(qs["head"][0]))
+                else:
+                    text = tail_file(path, lines=int(qs.get("tail", [200])[0]))
                 self._send_text(text)
                 return
             self._send_error(HTTPStatus.NOT_FOUND, "not found")
@@ -1105,7 +1176,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_error(HTTPStatus.NOT_FOUND, str(exc))
         except ValueError as exc:
             self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
-        except Exception as exc:  # pragma: no cover - defensive HTTP boundary
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover - HTTP boundary
             self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, repr(exc))
 
     def _send_json(self, payload: dict[str, Any]) -> None:
@@ -1123,6 +1194,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _send_file(self, path: Path) -> None:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(path.stat().st_size))
+        filename = urllib.parse.quote(path.name)
+        self.send_header(
+            "Content-Disposition", f"attachment; filename*=UTF-8''{filename}"
+        )
+        self.end_headers()
+        with path.open("rb") as fh:
+            while chunk := fh.read(64 * 1024):
+                self.wfile.write(chunk)
 
     def _send_error(self, status: HTTPStatus, message: str) -> None:
         data = json.dumps({"error": message}).encode("utf-8")

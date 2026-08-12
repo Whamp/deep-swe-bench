@@ -10,6 +10,7 @@ function makeCells(taskCount: number, reps: number, solvedCells: number): Compar
     task: `task-${Math.floor(index / reps)}`,
     config: "config",
     rep: index % reps,
+    result_path: `/results/config/task-${Math.floor(index / reps)}/rep${index % reps}/result.json`,
     reward_binary: index < solvedCells ? 1 : 0,
     reward_partial: index < solvedCells ? 1 : 0.2,
     total_tokens: 100_000,

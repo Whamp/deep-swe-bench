@@ -8,7 +8,7 @@ import type {
   CompareResponse,
   SubsetsResponse,
   RunScore,
-  CellSession,
+  CellTrajectory,
 } from "./types";
 
 const API_BASE = "/api";
@@ -78,14 +78,30 @@ export async function fetchRunScore(runId: string): Promise<RunScore | null> {
   return data.score ?? null;
 }
 
-export async function fetchCellSession(resultPath: string, tail = 30): Promise<CellSession> {
-  const params = new URLSearchParams({ path: resultPath, tail: String(tail) });
-  const data = await getJSON<{ session: CellSession }>(`${API_BASE}/cell-session?${params}`);
-  return data.session;
+/** Fetch one complete page from a cell's native Pi trajectory. */
+export async function fetchCellTrajectory(
+  resultPath: string,
+  offset = 0,
+  limit = 20,
+): Promise<CellTrajectory> {
+  const params = new URLSearchParams({
+    path: resultPath,
+    offset: String(offset),
+    limit: String(limit),
+  });
+  const data = await getJSON<{ trajectory: CellTrajectory }>(
+    `${API_BASE}/cell-trajectory?${params}`,
+  );
+  return data.trajectory;
 }
 
-export async function fetchFile(path: string, tail = 200): Promise<string> {
-  const params = new URLSearchParams({ path, tail: String(tail) });
+/** Fetch a bounded head or tail preview of an allowlisted dashboard file. */
+export async function fetchFile(
+  path: string,
+  lines = 200,
+  mode: "head" | "tail" = "tail",
+): Promise<string> {
+  const params = new URLSearchParams({ path, [mode]: String(lines) });
   const res = await fetch(`${API_BASE}/file?${params}`);
   if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => res.statusText));
   return res.text();
