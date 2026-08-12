@@ -28,7 +28,6 @@ sys.path.insert(0, str(HERE))
 import parse_usage  # noqa: E402
 import results_tree  # noqa: E402
 from container_resources import (  # noqa: E402
-    VERIFIER_MEMORY_EVENTS_SHELL_COMMAND,
     container_memory_result_fields,
     inspect_docker_container_oom,
     managed_container_start_guard,
@@ -36,6 +35,7 @@ from container_resources import (  # noqa: E402
     record_subject_container_memory_status,
     run_managed_container_and_wait,
     verifier_container_memory_status,
+    verifier_memory_events_shell_args,
 )
 from lib import (  # noqa: E402
     REPO,
@@ -477,8 +477,7 @@ def run_cell(
                 "--network", "none", "--platform", "linux/amd64",
                 "-v", f"{cell}:/logs",
                 task.verifier_image,
-                "bash", "-lc",
-                    VERIFIER_MEMORY_EVENTS_SHELL_COMMAND,
+                *verifier_memory_events_shell_args(),
                 ],
                 container_labels=container_labels,
                 container_name=verifier_cname,

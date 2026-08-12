@@ -22,7 +22,18 @@ from harness.container_resources import (
     parse_cgroup_memory_events,
     run_managed_container_and_wait,
     verifier_container_memory_status,
+    verifier_memory_events_shell_args,
 )
+
+
+def test_verifier_memory_events_shell_preserves_image_environment() -> None:
+    """Verifier startup must not use a login shell that rewrites image PATH."""
+    arguments = verifier_memory_events_shell_args()
+
+    assert arguments[:2] == ["bash", "-c"]
+    assert "-l" not in arguments[1]
+    assert "bash /tests/test.sh" in arguments[2]
+    assert "/sys/fs/cgroup/memory.events" in arguments[2]
 
 
 def test_container_resource_docker_args_enforce_memory_without_extra_swap() -> None:

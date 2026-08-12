@@ -44,6 +44,11 @@ class ContainerStartHaltedError(RuntimeError):
     """Stop Docker creation after the resource supervisor halts a run."""
 
 
+def verifier_memory_events_shell_args() -> list[str]:
+    """Run the verifier without a login shell that rewrites image environment."""
+    return ["bash", "-c", VERIFIER_MEMORY_EVENTS_SHELL_COMMAND]
+
+
 def read_resource_halt_reason(state_path: Path) -> str | None:
     """Read and validate the durable halt reason for one managed run."""
     halt_path = state_path / "resource-halt.json"
