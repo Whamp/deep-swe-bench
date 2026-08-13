@@ -494,6 +494,7 @@ def run_cell(
                 verifier_container_memory_status(
                     verifier_memory_events_path,
                     oom_evidence=inspect_docker_container_oom(verifier_cname),
+                    live_container_name=verifier_cname,
                 )
             )
             sh(["docker", "rm", "-f", verifier_cname])

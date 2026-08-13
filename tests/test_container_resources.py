@@ -187,16 +187,69 @@ def test_verifier_container_oom_overrides_stale_sidecar(tmp_path: Path) -> None:
     assert status["verifier_memory_events"] == {"oom_kill": 1}
 
 
+def test_verifier_container_memory_status_recovers_live_timeout_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out live verifier supplies cgroup evidence without its sidecar."""
+    monkeypatch.setattr(
+        container_resources,
+        "read_container_memory_events",
+        lambda container_name: {
+            "low": 0,
+            "high": 0,
+            "max": 3,
+            "oom": 0,
+            "oom_kill": 0,
+        },
+    )
+    status: dict[str, object] = {"verifier_exit": "timeout"}
+
+    status.update(
+        verifier_container_memory_status(
+            tmp_path / "missing.txt",
+            oom_evidence=DockerContainerOomEvidence(
+                oom_killed=False,
+                diagnostic=None,
+            ),
+            live_container_name="timed-out-verifier",
+        )
+    )
+
+    assert status == {
+        "verifier_exit": "timeout",
+        "verifier_memory_events": {
+            "high": 0,
+            "low": 0,
+            "max": 3,
+            "oom": 0,
+            "oom_kill": 0,
+        },
+    }
+
+
 def test_verifier_container_memory_status_retries_unavailable_evidence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Missing sidecar plus unavailable Docker state cannot become no-OOM."""
+
+    def unavailable_live_events(container_name: str) -> dict[str, int]:
+        raise RuntimeError(f"container unavailable: {container_name}")
+
+    monkeypatch.setattr(
+        container_resources,
+        "read_container_memory_events",
+        unavailable_live_events,
+    )
+
     status = verifier_container_memory_status(
         tmp_path / "missing.txt",
         oom_evidence=DockerContainerOomEvidence(
             oom_killed=None,
             diagnostic="docker inspect timed out after 10s",
         ),
+        live_container_name="unavailable-verifier",
     )
 
     assert status == {
