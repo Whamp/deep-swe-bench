@@ -49,12 +49,16 @@ An operational monitor, not an archive wall:
 - **Ongoing** is the default. Truly running sessions get rich health cards with
   phase, progress, active workers, task-level solve rate, and heartbeat age.
   Preflight is labeled explicitly instead of showing a misleading `0 active`.
-- **Needs attention** shows only recent stalled/failed runs as compact rows;
-  older incidents stay hidden unless requested. A stale declared `running`
-  state is reclassified to **stalled** after 3× its configured heartbeat cadence
-  (with a 15-minute floor), so abandoned processes never look live.
-- **History** keeps completed, paused, old failed/stalled, and legacy runs in a
-  dense row list rather than full cards.
+- **Needs attention** is an operator queue, not a failure archive. It shows only
+  recent runs that stopped heartbeating while still declared `running`. Each row
+  states the missing-heartbeat reason and exposes an explicit **Inspect** action.
+  A stale declared `running` state is reclassified to **stalled** after 3× its
+  configured heartbeat cadence (with a 15-minute floor), so abandoned processes
+  never look live. Stalled runs leave the queue after seven days.
+- **History** keeps terminal failures, completed and paused runs, old stalled
+  runs, and legacy runs in a dense row list with an explicit **View** affordance.
+  The three views are mutually exclusive, so attention items are not duplicated
+  in history.
 - Search filters by run id/key, model, thinking level, or config. When no run is
   active, the page says so plainly and offers direct links to attention/history.
 

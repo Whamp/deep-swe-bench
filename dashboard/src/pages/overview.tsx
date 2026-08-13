@@ -8,18 +8,16 @@ import { StateBadge, Badge } from "@/components/ui/badge";
 import { ErrorState } from "@/components/error-state";
 import { fmtSeconds, rateColor } from "@/lib/metrics";
 
-const STATE_RANK: Record<string, number> = {
-  running: 0,
-  stalled: 1,
-  failed: 2,
-  paused: 3,
-  unknown: 4,
-  completed: 5,
-  legacy: 6,
-};
-
 type View = "ongoing" | "attention" | "history";
-const ATTENTION_THRESHOLD_S = 7 * 24 * 3600; // recent 7 days
+const ATTENTION_WINDOW_S = 7 * 24 * 3600;
+
+function isActionableStalledRun(run: RunSummary): boolean {
+  return (
+    run.state === "stalled" &&
+    run.heartbeat_age_s != null &&
+    run.heartbeat_age_s < ATTENTION_WINDOW_S
+  );
+}
 
 export default function Overview() {
   const {
@@ -33,7 +31,6 @@ export default function Overview() {
   });
   const [query, setQuery] = useState("");
   const [view, setView] = useState<View>("ongoing");
-  const [showOlderProblems, setShowOlderProblems] = useState(false);
 
   const data = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -45,17 +42,13 @@ export default function Overview() {
         .includes(q);
     });
     const sort = (items: RunSummary[]) =>
-      [...items].sort((a, b) => {
-        const stateDiff = (STATE_RANK[a.state] ?? 9) - (STATE_RANK[b.state] ?? 9);
-        return stateDiff || (b.updated_at || "").localeCompare(a.updated_at || "");
-      });
+      [...items].sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
     const ongoing = sort(matching.filter((r) => r.state === "running"));
-    const problems = sort(matching.filter((r) => r.state === "stalled" || r.state === "failed"));
-    const recentProblems = problems.filter(
-      (r) => r.heartbeat_age_s != null && r.heartbeat_age_s < ATTENTION_THRESHOLD_S,
+    const attention = sort(matching.filter(isActionableStalledRun));
+    const history = sort(
+      matching.filter((r) => r.state !== "running" && !isActionableStalledRun(r)),
     );
-    const history = sort(matching.filter((r) => r.state !== "running"));
-    return { matching, ongoing, problems, recentProblems, history };
+    return { ongoing, attention, history };
   }, [runs, query]);
 
   if (isLoading) return <LoadingOverview />;
@@ -64,8 +57,6 @@ export default function Overview() {
     return (
       <p className="text-muted-foreground">No structured state or legacy track files found.</p>
     );
-
-  const attentionRows = showOlderProblems ? data.problems : data.recentProblems;
 
   return (
     <div className="space-y-4">
@@ -97,7 +88,7 @@ export default function Overview() {
           active={view === "attention"}
           onClick={() => setView("attention")}
           label="Needs attention"
-          count={data.recentProblems.length}
+          count={data.attention.length}
         />
         <ViewTab
           active={view === "history"}
@@ -111,7 +102,7 @@ export default function Overview() {
         <>
           {data.ongoing.length === 0 ? (
             <EmptyOngoing
-              attentionCount={data.recentProblems.length}
+              attentionCount={data.attention.length}
               historyCount={data.history.length}
               onAttention={() => setView("attention")}
               onHistory={() => setView("history")}
@@ -127,10 +118,10 @@ export default function Overview() {
             </section>
           )}
 
-          {data.recentProblems.length > 0 && (
+          {data.attention.length > 0 && (
             <section>
               <div className="mb-2 flex items-center justify-between">
-                <SectionHeading title="Needs attention" count={data.recentProblems.length} />
+                <SectionHeading title="Needs attention" count={data.attention.length} />
                 <button
                   onClick={() => setView("attention")}
                   className="text-xs text-primary hover:underline"
@@ -138,7 +129,7 @@ export default function Overview() {
                   View all →
                 </button>
               </div>
-              <RunRows runs={data.recentProblems.slice(0, 5)} />
+              <RunRows runs={data.attention.slice(0, 5)} purpose="attention" />
             </section>
           )}
         </>
@@ -146,27 +137,18 @@ export default function Overview() {
 
       {view === "attention" && (
         <section>
-          <div className="mb-2 flex flex-wrap items-center gap-3">
-            <SectionHeading title="Needs attention" count={attentionRows.length} />
-            <span className="text-xs text-muted-foreground">
-              {showOlderProblems ? "including archived problems" : "updated in the last 7 days"}
-            </span>
-            {data.problems.length > data.recentProblems.length && (
-              <button
-                onClick={() => setShowOlderProblems((v) => !v)}
-                className="ml-auto text-xs text-primary hover:underline"
-              >
-                {showOlderProblems
-                  ? "Hide older problems"
-                  : `Show ${data.problems.length - data.recentProblems.length} older problems`}
-              </button>
-            )}
+          <div className="mb-3">
+            <SectionHeading title="Needs attention" count={data.attention.length} />
+            <p className="text-xs text-muted-foreground">
+              A stalled run stopped reporting while still declared running. Inspect it to decide
+              whether its unfinished work should be resumed.
+            </p>
           </div>
-          {attentionRows.length > 0 ? (
-            <RunRows runs={attentionRows} />
+          {data.attention.length > 0 ? (
+            <RunRows runs={data.attention} purpose="attention" />
           ) : (
             <p className="rounded-lg border border-border bg-card p-6 text-sm text-muted-foreground">
-              No recent stalled or failed runs.
+              No stalled runs need action. Terminal failures are kept in History.
             </p>
           )}
         </section>
@@ -342,36 +324,56 @@ function ActiveRunCard({ run }: { run: RunSummary }) {
   );
 }
 
-function RunRows({ runs }: { runs: RunSummary[] }) {
+function RunRows({
+  runs,
+  purpose = "history",
+}: {
+  runs: RunSummary[];
+  purpose?: "attention" | "history";
+}) {
+  const needsAction = purpose === "attention";
   return (
     <div className="overflow-hidden rounded-lg border border-border bg-card">
-      {runs.map((run, idx) => (
-        <a
-          key={run.run_key || `${run.run_id}-${idx}`}
-          href={runHref(run)}
-          className="grid grid-cols-[auto_minmax(0,2fr)_minmax(8rem,1fr)_auto_auto] items-center gap-3 border-t border-border px-3 py-2.5 first:border-t-0 hover:bg-accent/50"
-        >
-          <StateBadge state={run.state} />
-          <div className="min-w-0">
-            <div className="truncate text-sm font-medium">{run.run_id}</div>
-            <div className="truncate text-xs text-muted-foreground">
-              {(run.configs || []).join(", ") || run.model || run.kind}
+      {runs.map((run, idx) => {
+        const done = run.counts?.batch_done || 0;
+        const total = run.counts?.batch_total || 0;
+        return (
+          <a
+            key={run.run_key || `${run.run_id}-${idx}`}
+            href={runHref(run)}
+            aria-label={
+              needsAction ? `Inspect stalled run ${run.run_id}` : `View run ${run.run_id}`
+            }
+            className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-3 border-t border-border px-3 py-3 first:border-t-0 hover:bg-accent/50"
+          >
+            <StateBadge state={run.state} />
+            <div className="min-w-0">
+              <div className="truncate text-sm font-medium">{run.run_id}</div>
+              <div className="truncate text-xs text-muted-foreground">
+                {(run.configs || []).join(", ") || run.model || run.kind}
+              </div>
+              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+                <span>
+                  {run.model || run.kind} {run.thinking || ""}
+                </span>
+                <span>
+                  {done}/{total} done
+                  {run.score_snapshot &&
+                    run.score_snapshot.finished > 0 &&
+                    ` · ${run.score_snapshot.solve_rate.toFixed(0)}% solve`}
+                </span>
+                <span className={needsAction ? "text-amber-400" : undefined}>
+                  {needsAction ? "No heartbeat for" : "Updated"} {fmtSeconds(run.heartbeat_age_s)}
+                  {!needsAction && " ago"}
+                </span>
+              </div>
             </div>
-          </div>
-          <div className="truncate text-xs text-muted-foreground">
-            {run.model || run.kind} {run.thinking || ""}
-          </div>
-          <div className="text-right text-xs text-muted-foreground">
-            {run.counts?.batch_done || 0}/{run.counts?.batch_total || 0}
-            {run.score_snapshot &&
-              run.score_snapshot.finished > 0 &&
-              ` · ${run.score_snapshot.solve_rate.toFixed(0)}%`}
-          </div>
-          <div className="min-w-[5rem] text-right text-xs text-muted-foreground">
-            hb {fmtSeconds(run.heartbeat_age_s)}
-          </div>
-        </a>
-      ))}
+            <span className="self-center whitespace-nowrap text-xs font-medium text-primary">
+              {needsAction ? "Inspect →" : "View →"}
+            </span>
+          </a>
+        );
+      })}
     </div>
   );
 }

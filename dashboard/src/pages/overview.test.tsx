@@ -116,6 +116,22 @@ describe("Overview views and filtering", () => {
       thinking: "low",
       configs: ["old"],
       heartbeat_age_s: 90000,
+      updated_at: "2026-08-10T00:00:00Z",
+    },
+    {
+      run_id: "failed-run",
+      state: "failed",
+      kind: "structured",
+      counts: { batch_done: 6, batch_total: 10 },
+      active_count: 0,
+      stale_cell_count: 0,
+      launch_metadata: "confirmed_plan",
+      preflight_state: "passed",
+      model: "gpt-5.5",
+      thinking: "low",
+      configs: ["retired-attempt"],
+      heartbeat_age_s: 12000,
+      updated_at: "2026-08-12T00:00:00Z",
     },
     {
       run_id: "finished-run",
@@ -130,35 +146,45 @@ describe("Overview views and filtering", () => {
       thinking: "high",
       configs: ["baseline"],
       heartbeat_age_s: 200000,
+      updated_at: "2026-08-11T00:00:00Z",
       score_snapshot: { solved: 8, finished: 10, solve_rate: 80 },
     },
   ];
 
-  it("defaults to ongoing: live card plus recent compact attention rows, no history", async () => {
+  it("defaults to ongoing: live card plus actionable stalled rows, no terminal history", async () => {
     mockDashboardJson({ runs: mixedRuns });
     renderDashboardRoute(<Overview />, "/", "/");
     expect(await screen.findByText("live-run")).toBeInTheDocument();
     expect(screen.getByText("dead-run")).toBeInTheDocument();
+    expect(screen.queryByText("failed-run")).not.toBeInTheDocument();
     expect(screen.queryByText("finished-run")).not.toBeInTheDocument();
   });
 
-  it("shows only problem rows in Needs attention", async () => {
+  it("reserves Needs attention for stalled runs and states the next action", async () => {
     mockDashboardJson({ runs: mixedRuns });
     renderDashboardRoute(<Overview />, "/", "/");
     await screen.findByText("live-run");
-    await userEvent.click(screen.getByRole("button", { name: /Needs attention/i }));
+    await userEvent.click(screen.getByRole("button", { name: "Needs attention 1" }));
     expect(screen.getByText("dead-run")).toBeInTheDocument();
+    expect(screen.getByText("No heartbeat for 25.0h")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Inspect stalled run dead-run" })).toBeInTheDocument();
+    expect(screen.queryByText("failed-run")).not.toBeInTheDocument();
     expect(screen.queryByText("live-run")).not.toBeInTheDocument();
     expect(screen.queryByText("finished-run")).not.toBeInTheDocument();
   });
 
-  it("shows inactive runs as compact rows in History", async () => {
+  it("keeps terminal failures and completed runs in History without duplicating attention", async () => {
     mockDashboardJson({ runs: mixedRuns });
     renderDashboardRoute(<Overview />, "/", "/");
     await screen.findByText("live-run");
-    await userEvent.click(screen.getByRole("button", { name: /^History/i }));
-    expect(screen.getByText("dead-run")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "History 2" }));
+    expect(screen.getByText("failed-run")).toBeInTheDocument();
     expect(screen.getByText("finished-run")).toBeInTheDocument();
+    expect(screen.getAllByRole("link").map((link) => link.getAttribute("aria-label"))).toEqual([
+      "View run failed-run",
+      "View run finished-run",
+    ]);
+    expect(screen.queryByText("dead-run")).not.toBeInTheDocument();
     expect(screen.queryByText("live-run")).not.toBeInTheDocument();
   });
 
