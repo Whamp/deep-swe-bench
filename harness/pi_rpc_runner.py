@@ -23,6 +23,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
+try:
+    from harness.degeneration_watchdog import (
+        DegenerationWatchdog,
+        DegenerationWatchdogPolicy,
+    )
+except ModuleNotFoundError:  # Direct ``python harness/pi_rpc_runner.py`` use.
+    from degeneration_watchdog import (  # type: ignore[no-redef]
+        DegenerationWatchdog,
+        DegenerationWatchdogPolicy,
+    )
+
 
 @dataclass
 class RpcRunResult:
@@ -35,6 +46,7 @@ class RpcRunResult:
     agent_end_count: int = 0
     event_counts: dict[str, int] = field(default_factory=dict)
     response_errors: list[str] = field(default_factory=list)
+    degeneration_watchdog: dict[str, int | str | None] | None = None
 
 
 class _RpcState:
@@ -49,6 +61,7 @@ class _RpcState:
         self.response_errors: list[str] = []
         self.stdout_eof = False
         self.write_error: str | None = None
+        self.degeneration_watchdog: dict[str, int | str | None] | None = None
 
 
 def _json_line(obj: dict[str, Any]) -> str:
@@ -84,7 +97,7 @@ def _send_command(proc: subprocess.Popen[str], stdin_lock: threading.Lock,
             proc.stdin.write(raw)
             proc.stdin.flush()
         return True
-    except Exception as exc:  # pragma: no cover - defensive for broken pipes/races
+    except (OSError, ValueError) as exc:  # Broken pipe or concurrent close.
         with state.lock:
             state.write_error = str(exc)
         return False
@@ -121,6 +134,7 @@ def run_pi_rpc(
     state_poll_s: float = 0.5,
     shutdown_timeout_s: float = 10.0,
     quiesce_after_agent_end: bool = False,
+    degeneration_watchdog_policy: DegenerationWatchdogPolicy | None = None,
 ) -> RpcRunResult:
     """Run a Pi RPC command until idle plus quiescence or timeout.
 
@@ -147,6 +161,11 @@ def run_pi_rpc(
         )
         state = _RpcState(now=start)
         stdin_lock = threading.Lock()
+        degeneration_watchdog = (
+            DegenerationWatchdog(degeneration_watchdog_policy)
+            if degeneration_watchdog_policy is not None
+            else None
+        )
 
         _write_runner_log(
             runner_log,
@@ -156,12 +175,22 @@ def run_pi_rpc(
             quiescence_s=quiescence_s,
             state_poll_s=state_poll_s,
             timeout_s=timeout_s,
+            degeneration_watchdog_profile=(
+                degeneration_watchdog_policy.profile
+                if degeneration_watchdog_policy is not None
+                else None
+            ),
         )
 
         def handle_obj(obj: dict[str, Any], raw_line: str) -> None:
             typ = str(obj.get("type") or "unknown")
             command = obj.get("command") if typ == "response" else None
             is_state_probe_response = typ == "response" and command == "get_state"
+            violation = (
+                degeneration_watchdog.observe(obj)
+                if degeneration_watchdog is not None
+                else None
+            )
             with state.lock:
                 state.event_counts[typ] += 1
                 if not is_state_probe_response:
@@ -182,6 +211,8 @@ def run_pi_rpc(
                             state.latest_state = data
                     elif obj.get("success") is False:
                         state.response_errors.append(str(obj.get("error") or f"{command} failed"))
+                if violation is not None and state.degeneration_watchdog is None:
+                    state.degeneration_watchdog = violation.to_dict()
 
             advisor_line = _advisor_usage_line(obj, raw_line)
             if advisor_line is not None and advisor_fh is not None:
@@ -242,6 +273,22 @@ def run_pi_rpc(
                     agent_end_count = state.agent_end_count
                     response_errors = list(state.response_errors)
                     write_error = state.write_error
+                    degeneration_evidence = state.degeneration_watchdog
+
+                if degeneration_evidence is not None:
+                    abort_sent = _send_command(
+                        proc,
+                        stdin_lock,
+                        state,
+                        {"id": "degeneration-abort", "type": "abort"},
+                    )
+                    _write_runner_log(
+                        runner_log,
+                        "degeneration_watchdog",
+                        **degeneration_evidence,
+                        abort_sent=abort_sent,
+                    )
+                    break
 
                 if prompt_failed or write_error:
                     _write_runner_log(
@@ -290,8 +337,12 @@ def run_pi_rpc(
                 try:
                     if proc.stdin is not None and not proc.stdin.closed:
                         proc.stdin.close()
-                except Exception:
-                    pass
+                except (OSError, ValueError) as error:
+                    _write_runner_log(
+                        runner_log,
+                        "stdin_close_error",
+                        error_type=type(error).__name__,
+                    )
             try:
                 exit_code = proc.wait(timeout=shutdown_timeout_s)
             except subprocess.TimeoutExpired:
@@ -307,13 +358,18 @@ def run_pi_rpc(
 
         with state.lock:
             result = RpcRunResult(
-                exit_code="timeout" if timed_out else exit_code,
+                exit_code=(
+                    "degeneration"
+                    if state.degeneration_watchdog is not None
+                    else "timeout" if timed_out else exit_code
+                ),
                 timed_out=timed_out,
                 quiescent=quiescent,
                 prompt_accepted=state.prompt_accepted,
                 agent_end_count=state.agent_end_count,
                 event_counts=dict(state.event_counts),
                 response_errors=list(state.response_errors),
+                degeneration_watchdog=state.degeneration_watchdog,
             )
         _write_runner_log(
             runner_log,
@@ -325,6 +381,7 @@ def run_pi_rpc(
             agent_end_count=result.agent_end_count,
             event_counts=result.event_counts,
             response_errors=result.response_errors,
+            degeneration_watchdog=result.degeneration_watchdog,
         )
         return result
 

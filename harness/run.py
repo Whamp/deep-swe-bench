@@ -48,6 +48,9 @@ from container_resources import (  # noqa: E402
     verifier_container_memory_status,
     verifier_memory_events_shell_args,
 )
+from degeneration_watchdog import (
+    degeneration_watchdog_policy_from_mapping,
+)
 from lib import (  # noqa: E402
     REPO,
     load_task,
@@ -449,6 +452,16 @@ def pi_cmd(arm_cfg: dict, model: str, thinking: str, append_text: str,
     return cmd
 
 
+def should_run_verifier(patch_bytes: object, agent_exit: object) -> bool:
+    """Grade only nonempty patches from subjects that did not degenerate."""
+    return (
+        isinstance(patch_bytes, int | float)
+        and not isinstance(patch_bytes, bool)
+        and patch_bytes > 0
+        and agent_exit != "degeneration"
+    )
+
+
 def require_explicit_cell_output(output_cell: Path | None) -> Path:
     """Require a confirmed-plan or explicit draft-probe cell path."""
     if output_cell is None:
@@ -471,6 +484,7 @@ def run_cell(
     pass_openai_codex_oauth: bool,
     rpc_quiescence: float,
     capture_initial_context: bool = True,
+    degeneration_watchdog: Mapping[str, object] | None = None,
     credential_routes: tuple[str, ...] = (),
     resource_policy: Mapping[str, object] | None = None,
     container_labels: Mapping[str, str] | None = None,
@@ -493,6 +507,9 @@ def run_cell(
         load_resolved_config(config_root, config_leaf)
         if config_root is not None and config_leaf is not None
         else load_config(config, model, thinking)
+    )
+    degeneration_watchdog_policy = degeneration_watchdog_policy_from_mapping(
+        degeneration_watchdog
     )
     cell = require_explicit_cell_output(output_cell)
     ensure_env_image(task.env_image)
@@ -611,10 +628,15 @@ def run_cell(
             advisor_usage_path=(cell / "tool-usage.jsonl") if arm_cfg.get("advisor_json") else None,
             timeout_s=agent_timeout,
             quiescence_s=rpc_quiescence,
+            degeneration_watchdog_policy=degeneration_watchdog_policy,
         )
         status["agent_exit"] = rpc_result.exit_code
         if rpc_result.timed_out:
             status["agent_timed_out"] = True
+        if rpc_result.degeneration_watchdog is not None:
+            status["agent_degeneration_watchdog"] = (
+                rpc_result.degeneration_watchdog
+            )
         status["agent_wall_s"] = round(time.time() - started, 1)
         status.update(
             record_subject_container_memory_status(
@@ -635,7 +657,10 @@ def run_cell(
         transient_paths += [p for p in (cell / "session").glob("*.jsonl") if p not in pre_session_paths]
         transient_paths += [p for p in (cell / "pi-agent" / "observational-memory" / "debug").glob("*.ndjson") if p not in pre_om_debug_paths]
         transient = transient_model_error(transient_paths)
-        if transient and status.get("agent_exit") != "timeout":
+        if transient and status.get("agent_exit") not in {
+            "timeout",
+            "degeneration",
+        }:
             status["transient_model_error"] = transient
             (cell / "transient_error.json").write_text(json.dumps(status, indent=2))
             print(f"[pause] transient model error for {task_id}/{config}#{rep}: {transient}", flush=True)
@@ -676,7 +701,7 @@ def run_cell(
     # --- verify in a pristine, air-gapped container ---
     reward = {"reward": -1, "partial": 0.0}
     patch_bytes = status.get("patch_bytes", 0)
-    if isinstance(patch_bytes, int | float) and patch_bytes > 0:
+    if should_run_verifier(patch_bytes, status.get("agent_exit")):
         ensure_verifier_image(task)
         verifier_cname = f"{cname}-verifier"
         verifier_memory_events_path = (
@@ -714,6 +739,8 @@ def run_cell(
                 )
             )
             sh(["docker", "rm", "-f", verifier_cname])
+    elif status.get("agent_exit") == "degeneration":
+        status["verifier_exit"] = "skipped_agent_degeneration"
     else:
         status["verifier_exit"] = "skipped_empty_patch"
 
@@ -756,6 +783,7 @@ def run_cell(
         patch_bytes=status.get("patch_bytes", 0),
         agent_exit=status.get("agent_exit"),
         agent_timed_out=status.get("agent_timed_out", False),
+        agent_degeneration_watchdog=status.get("agent_degeneration_watchdog"),
         verifier_exit=status.get("verifier_exit"),
         agent_wall_s=status.get("agent_wall_s"),
         **container_memory_result_fields(status),

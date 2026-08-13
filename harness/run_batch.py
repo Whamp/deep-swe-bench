@@ -29,6 +29,9 @@ from harness import (
     quota,
     results_tree,
 )
+from harness.degeneration_watchdog import (
+    degeneration_watchdog_policy_for_profile,
+)
 
 try:
     from harness.run_state import (
@@ -100,6 +103,14 @@ def _planned_subject_arguments(
         "task_root": str(task_root),
         "thinking": cell.thinking,
     }
+    if cell.degeneration_watchdog is not None:
+        if cell.subject != "pi":
+            raise ValueError(
+                "Confirmed degeneration watchdog is supported only by Pi"
+            )
+        arguments["degeneration_watchdog"] = asdict(
+            cell.degeneration_watchdog
+        )
     if cell.subject == "omp":
         binary_path = cell.subject_runtime_identity.get("binaryPath")
         if not isinstance(binary_path, str):
@@ -981,6 +992,14 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--agent-timeout", type=float)
     plan_parser.add_argument("--rpc-quiescence", type=float, default=2.0)
     plan_parser.add_argument(
+        "--degeneration-watchdog",
+        choices=["coding-agent-early-gate-v1"],
+        help=(
+            "abort pathological Pi trajectories using the named thresholds "
+            "embedded in the launch plan"
+        ),
+    )
+    plan_parser.add_argument(
         "--no-initial-context-capture",
         action="store_false",
         dest="capture_initial_context",
@@ -1141,6 +1160,9 @@ def _plan_confirmed_launch(
             cell_retries=args.cell_retries,
             agent_timeout_s=args.agent_timeout,
             rpc_quiescence_s=args.rpc_quiescence,
+            degeneration_watchdog=degeneration_watchdog_policy_for_profile(
+                args.degeneration_watchdog
+            ),
             capture_initial_context=args.capture_initial_context,
             auto_resume=args.auto_resume,
             max_quota_wait_s=args.max_quota_wait_s,

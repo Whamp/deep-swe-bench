@@ -30,6 +30,8 @@ BASE_SUMMARY_FIELDS = {
     "agent_wall_s",
     "agent_exit",
     "agent_timed_out",
+    "agent_degeneration_watchdog",
+    "degeneration_watchdog_policy",
     "agent_resource_exhausted",
     "verifier_exit",
     "verifier_resource_exhausted",
