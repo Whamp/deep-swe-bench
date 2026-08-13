@@ -330,8 +330,9 @@ def verifier_container_memory_status(
     memory_events_path: Path,
     *,
     oom_evidence: DockerContainerOomEvidence,
+    live_container_name: str | None = None,
 ) -> dict[str, object]:
-    """Classify verifier memory evidence without accepting unknown state."""
+    """Classify verifier memory evidence, including a still-live timeout."""
     if oom_evidence.oom_killed is True:
         return classify_container_memory_events("verifier", {"oom_kill": 1})
     if memory_events_path.is_file():
@@ -347,9 +348,19 @@ def verifier_container_memory_status(
                 "verifier_resource_evidence_unavailable": True,
             }
         return classify_container_memory_events("verifier", events)
-    diagnostic = oom_evidence.diagnostic or (
-        "verifier memory-events sidecar is missing"
-    )
+    if live_container_name is not None:
+        try:
+            events = read_container_memory_events(live_container_name)
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
+            live_diagnostic = (
+                "live verifier memory events unavailable: "
+                f"{type(error).__name__}: {error}"
+            )
+        else:
+            return classify_container_memory_events("verifier", events)
+    else:
+        live_diagnostic = "verifier memory-events sidecar is missing"
+    diagnostic = oom_evidence.diagnostic or live_diagnostic
     return {
         "verifier_exit": "resource_evidence_unavailable",
         "verifier_resource_diagnostic": diagnostic,

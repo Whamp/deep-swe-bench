@@ -1,0 +1,851 @@
+LAUNCH RECEIPT
+WARNINGS
+- none
+
+SUMMARY
+Plan: sha256:bd70919645618f52ac446a18773ccc60a657d4737c10e49bd059947673503e71
+Subject: pi pi@0.84.1
+Model: openai-codex/gpt-5.6-sol (thinking=low)
+Tasks: 113; configs: 2; reps: 3; concurrency: 12
+Comparison baseline: testing-skills@1.1.0 (selected config)
+Cells: 2 preflight; 678 batch
+Reusable completed batch entries: 670
+Remaining batch attempts: 8
+Preflight-covered batch entries: 2; successful preflight makes no second subject call
+Resources: subject memory=4.0 GiB; verifier memory=4.0 GiB; additional swap=0.0 GiB; host reserve=12.0 GiB; confirmed host memory=60.6 GiB
+Execution: agent timeout=None; RPC quiescence=2.0s; initial context=captured; cell retries=1; auto resume=enabled; max quota wait=21600.0s; quota poll=300.0s; rate-limit backoff=60.0s
+
+TASK SELECTION
+Kind: subset
+- abs-module-cache-flags
+- abs-stepped-slices
+- actionlint-action-pinning-lint
+- adaptix-name-mapping-aliases
+- aiomonitor-task-snapshots-diff
+- anko-default-function-arguments
+- anko-typed-variable-bindings
+- arcane-drift-detection-baselines
+- arktype-json-schema-refs-dependencies
+- awilix-async-container-initialization
+- bandit-incremental-cache-control
+- bandit-interprocedural-taint-checks
+- bandit-structured-nosec-directives
+- boa-hierarchical-evaluation-cancellation
+- cattrs-partial-structuring-recovery
+- clack-async-autocomplete-options
+- claude-code-by-agents-recursive-delegation
+- cliffy-config-file-parsing
+- csstree-shorthand-expansion-compression
+- dasel-html-document-format
+- dateutil-rfc5545-timezone-interop
+- drizzle-orm-window-function-builders
+- dynamodb-toolbox-conditional-attribute-requirements
+- dynamodb-toolbox-lazy-recursive-schemas
+- effect-sse-httpapi-streaming
+- eicrud-keyset-pagination-cursor
+- etree-xml-diff-patch
+- expr-try-catch-errors
+- fastapi-deprecation-response-headers
+- fastapi-implicit-head-options
+- fd-deterministic-multi-key-sorting
+- geo-shapeindex-serialization
+- go-critic-doc-link-checker
+- go-genai-streamed-function-args
+- go-git-worktree-merge-conflicts
+- goreleaser-retry-publish-auditing
+- gql-incremental-graphql-delivery
+- happy-dom-abort-pending-body-reads
+- happy-dom-deterministic-intersectionobserver
+- helm-array-merge-strategies
+- helm-unified-manifest-stream
+- httpx-deterministic-cookie-store
+- httpx-multipart-response-parsing
+- httpx-streaming-json-iteration
+- igel-persist-feature-schema
+- ink-grid-box-layout
+- ipython-session-bundle-replay
+- katex-multicolumn-array-spans
+- kcp-go-multiplexed-kcp-streams
+- kea-atomic-signal-selectors
+- kgateway-consistent-hash-policy
+- kombu-single-active-consumer-priority
+- kombu-virtual-queue-dead-lettering
+- koota-composite-trait-aspects
+- koota-deferred-mutation-buffer
+- koota-entity-snapshot-rollback
+- koota-pair-relation-tracking
+- koota-query-predicates
+- kysely-window-grouping-helpers
+- langchain-request-coalescing
+- mashumaro-flattened-dataclass-fields
+- meriyah-explicit-resource-declarations
+- mnamer-daemon-watch-lifecycle
+- mobly-grouped-test-barriers
+- narwhals-rolling-window-suite
+- numba-stencil-boundary-modes
+- obsidian-linter-auto-table-of-contents
+- obsidian-linter-link-format-conversion
+- obsidian-linter-scoped-ignore-markers
+- ofetch-per-origin-circuit-breaker
+- onedump-dump-encryption-pipeline
+- opa-rego-rule-profiling
+- opa-template-string-reconstruction
+- optique-conditional-option-dependencies
+- oxvg-structural-selector-preservation
+- participle-grammar-conflict-analysis
+- pebble-durability-wait-apis
+- pest-character-class-coalescing
+- prometheus-transactional-reload-status
+- prometheus-typed-label-sorting
+- psd-tools-blend-range-api
+- pwntools-tube-multiplexing
+- python-statemachine-state-data-scoping
+- query-persist-restored-query-state
+- quill-shared-toolbar-focus
+- returns-validated-error-accumulation
+- scc-bounded-memory-spilling
+- scriggo-method-declarations
+- skrub-duration-encoding
+- sql-formatter-bigquery-pipe-formatting
+- sqlfmt-create-table-ddl-formatting
+- sqlite-utils-safe-import-checkpoints
+- superjson-error-stack-serialization
+- task-task-graph-export
+- tengo-callable-instance-isolation
+- tengo-destructuring-bindings
+- termenv-preserve-ansi-resets
+- testem-bail-on-test-failure
+- testem-per-launcher-reports
+- textual-kitty-key-phases
+- textual-richlog-follow-state
+- tomlkit-toml-table-converters
+- true-myth-iterable-collection-combinators
+- ts-pattern-match-each
+- updo-policy-alerting
+- valibot-recursive-schema-composition
+- vitest-duration-sharding
+- vulture-persistent-analysis-cache
+- wasmi-trap-coredumps
+- wazero-multi-module-snapshots
+- yaegi-go-embed-directives
+- yjs-map-conflict-detection
+- ytt-jsonpath-query-api
+
+CONFIG RELEASES
+- testing-skills@1.1.0
+  Lock: sha256:fc27e36bb3e113548a12c958abbc5a7a4b08f1059cb9261d330b8160dc8bcf54
+  Leaf: /home/will/evals/deep-swe-bench/.worktrees/fix-verifier-timeout-evidence/configs/testing-skills@1.1.0/gpt-5.6-sol/low
+  Smoke contract: /home/will/evals/deep-swe-bench/.worktrees/fix-verifier-timeout-evidence/configs/testing-skills@1.1.0/gpt-5.6-sol/low/smoke.json
+  Smoke assertions: {"equalsResultValues":{"arm_settings.defaultThinkingLevel":"low","config":"testing-skills@1.1.0","config_name":"testing-skills","model":"openai-codex/gpt-5.6-sol","subject_version":"pi@0.84.1","thinking_level":"low"},"minResultValues":{"combined_total_tokens":1,"total_tokens":1},"requireFiles":["session/*.jsonl","logs/pi.stderr.txt","logs/pi-rpc-runner.jsonl","initial_context/system_prompt.txt","initial_context/capture_meta.json","initial_context/provider_request_0001.json"],"requireJsonRecords":[{"equals":{"thinkingLevel":"low","type":"thinking_level_change"},"format":"jsonl","globs":["session/*.jsonl"],"minimum":1},{"equals":{"modelId":"gpt-5.6-sol","provider":"openai-codex","type":"model_change"},"format":"jsonl","globs":["session/*.jsonl"],"minimum":1},{"equals":{"event":"prompt_sent"},"format":"jsonl","globs":["logs/pi-rpc-runner.jsonl"],"minimum":1},{"equals":{"event":"quiescent"},"format":"jsonl","globs":["logs/pi-rpc-runner.jsonl"],"minimum":1},{"equals":{"model":"gpt-5.6-sol","reasoning.effort":"low"},"format":"json","globs":["initial_context/provider_request_*.json"],"minimum":1}],"requireRepoFiles":["configs/testing-skills@1.1.0/gpt-5.6-sol/low/settings.json","configs/testing-skills@1.1.0/skills/testing/SKILL.md","configs/testing-skills@1.1.0/skills/fuzzing/SKILL.md","configs/testing-skills@1.1.0/skills/property-based-testing/SKILL.md","docs/openai-codex-gpt56-sol-low.md","analysis/read-long-lines-pilot/provider-evidence/request-probe.jsonl","harness/Dockerfile.pi-agent","tests/test_pi_image.py"]}
+- testing-skills@1.2.0
+  Lock: sha256:18aeac3ac63571b89844aa7f037eb6d4b7f21b983e6173f2fb0bf7b3593150f9
+  Leaf: /home/will/evals/deep-swe-bench/.worktrees/fix-verifier-timeout-evidence/configs/testing-skills@1.2.0/gpt-5.6-sol/low
+  Smoke contract: /home/will/evals/deep-swe-bench/.worktrees/fix-verifier-timeout-evidence/configs/testing-skills@1.2.0/gpt-5.6-sol/low/smoke.json
+  Smoke assertions: {"equalsResultValues":{"arm_settings.defaultThinkingLevel":"low","config":"testing-skills@1.2.0","config_name":"testing-skills","model":"openai-codex/gpt-5.6-sol","subject_version":"pi@0.84.1","thinking_level":"low"},"minResultValues":{"combined_total_tokens":1,"total_tokens":1},"requireFiles":["session/*.jsonl","logs/pi.stderr.txt","logs/pi-rpc-runner.jsonl","initial_context/system_prompt.txt","initial_context/capture_meta.json","initial_context/provider_request_0001.json"],"requireJsonRecords":[{"equals":{"thinkingLevel":"low","type":"thinking_level_change"},"format":"jsonl","globs":["session/*.jsonl"],"minimum":1},{"equals":{"modelId":"gpt-5.6-sol","provider":"openai-codex","type":"model_change"},"format":"jsonl","globs":["session/*.jsonl"],"minimum":1},{"equals":{"event":"prompt_sent"},"format":"jsonl","globs":["logs/pi-rpc-runner.jsonl"],"minimum":1},{"equals":{"event":"quiescent"},"format":"jsonl","globs":["logs/pi-rpc-runner.jsonl"],"minimum":1},{"equals":{"model":"gpt-5.6-sol","reasoning.effort":"low"},"format":"json","globs":["initial_context/provider_request_*.json"],"minimum":1}],"requireRepoFiles":["configs/testing-skills@1.2.0/gpt-5.6-sol/low/settings.json","configs/testing-skills@1.2.0/skills/testing/SKILL.md","configs/testing-skills@1.2.0/skills/fuzzing/SKILL.md","configs/testing-skills@1.2.0/skills/property-based-testing/SKILL.md","docs/openai-codex-gpt56-sol-low.md","analysis/read-long-lines-pilot/provider-evidence/request-probe.jsonl","harness/Dockerfile.pi-agent","tests/test_pi_image.py"]}
+
+MODEL ROLES
+config | role | kind | selection | provider | model | thinking | credential | billing | usage | bounds | activation
+testing-skills@1.1.0 | executor | executor | fixed | openai-codex | openai-codex/gpt-5.6-sol | low | OPENAI_CODEX_OAUTH | subscription quota | session/*.jsonl | 1 executor session/rep; max concurrency 1 | required
+testing-skills@1.2.0 | executor | executor | fixed | openai-codex | openai-codex/gpt-5.6-sol | low | OPENAI_CODEX_OAUTH | subscription quota | session/*.jsonl | 1 executor session/rep; max concurrency 1 | required
+
+SUBJECT COMPATIBILITY
+- testing-skills@1.1.0
+  Tested subject versions: pi@0.84.1
+  Required capabilities: native-session-usage, pi-rpc, pi-skills
+- testing-skills@1.2.0
+  Tested subject versions: pi@0.84.1
+  Required capabilities: native-session-usage, pi-rpc, pi-skills
+
+BEHAVIOR DIFFERENCES FROM testing-skills@1.1.0
+- testing-skills@1.2.0
+  changed skill: skills/testing/SKILL.md (sha256:c3ffaacfd1c959a1227ebaab3ecbba4fca1c488e3930b8938b5e638b586b8a1c -> sha256:980998469b63a114b9bc4e22c860db4de9f0325fc13dcb7eb7c1ebee82c1ea8e)
+
+PREFLIGHT CELLS
+- kgateway-consistent-hash-policy | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kgateway-consistent-hash-policy/rep0/result.json | smoke=/home/will/evals/deep-swe-bench/.worktrees/fix-verifier-timeout-evidence/configs/testing-skills@1.1.0/gpt-5.6-sol/low/smoke.json | reuse=explicit_result_reuse
+- kgateway-consistent-hash-policy | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kgateway-consistent-hash-policy/rep0/result.json | smoke=/home/will/evals/deep-swe-bench/.worktrees/fix-verifier-timeout-evidence/configs/testing-skills@1.2.0/gpt-5.6-sol/low/smoke.json | reuse=explicit_result_reuse
+
+BATCH CELLS
+- abs-module-cache-flags | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/abs-module-cache-flags/rep0/result.json | reuse=explicit_result_reuse
+- abs-module-cache-flags | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/abs-module-cache-flags/rep0/result.json | reuse=explicit_result_reuse
+- abs-module-cache-flags | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/abs-module-cache-flags/rep1/result.json | reuse=explicit_result_reuse
+- abs-module-cache-flags | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/abs-module-cache-flags/rep1/result.json | reuse=explicit_result_reuse
+- abs-module-cache-flags | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/abs-module-cache-flags/rep2/result.json | reuse=explicit_result_reuse
+- abs-module-cache-flags | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/abs-module-cache-flags/rep2/result.json | reuse=explicit_result_reuse
+- abs-stepped-slices | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/abs-stepped-slices/rep0/result.json | reuse=explicit_result_reuse
+- abs-stepped-slices | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/abs-stepped-slices/rep0/result.json | reuse=explicit_result_reuse
+- abs-stepped-slices | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/abs-stepped-slices/rep1/result.json | reuse=explicit_result_reuse
+- abs-stepped-slices | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/abs-stepped-slices/rep1/result.json | reuse=explicit_result_reuse
+- abs-stepped-slices | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/abs-stepped-slices/rep2/result.json | reuse=explicit_result_reuse
+- abs-stepped-slices | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/abs-stepped-slices/rep2/result.json | reuse=explicit_result_reuse
+- actionlint-action-pinning-lint | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/actionlint-action-pinning-lint/rep0/result.json | reuse=explicit_result_reuse
+- actionlint-action-pinning-lint | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/actionlint-action-pinning-lint/rep0/result.json | reuse=explicit_result_reuse
+- actionlint-action-pinning-lint | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/actionlint-action-pinning-lint/rep1/result.json | reuse=explicit_result_reuse
+- actionlint-action-pinning-lint | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/actionlint-action-pinning-lint/rep1/result.json | reuse=explicit_result_reuse
+- actionlint-action-pinning-lint | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/actionlint-action-pinning-lint/rep2/result.json | reuse=explicit_result_reuse
+- actionlint-action-pinning-lint | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/actionlint-action-pinning-lint/rep2/result.json | reuse=explicit_result_reuse
+- adaptix-name-mapping-aliases | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/adaptix-name-mapping-aliases/rep0/result.json | reuse=explicit_result_reuse
+- adaptix-name-mapping-aliases | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/adaptix-name-mapping-aliases/rep0/result.json | reuse=explicit_result_reuse
+- adaptix-name-mapping-aliases | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/adaptix-name-mapping-aliases/rep1/result.json | reuse=explicit_result_reuse
+- adaptix-name-mapping-aliases | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/adaptix-name-mapping-aliases/rep1/result.json | reuse=explicit_result_reuse
+- adaptix-name-mapping-aliases | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/adaptix-name-mapping-aliases/rep2/result.json | reuse=explicit_result_reuse
+- adaptix-name-mapping-aliases | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/adaptix-name-mapping-aliases/rep2/result.json | reuse=explicit_result_reuse
+- aiomonitor-task-snapshots-diff | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/aiomonitor-task-snapshots-diff/rep0/result.json | reuse=explicit_result_reuse
+- aiomonitor-task-snapshots-diff | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/aiomonitor-task-snapshots-diff/rep0/result.json | reuse=explicit_result_reuse
+- aiomonitor-task-snapshots-diff | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/aiomonitor-task-snapshots-diff/rep1/result.json | reuse=explicit_result_reuse
+- aiomonitor-task-snapshots-diff | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/aiomonitor-task-snapshots-diff/rep1/result.json | reuse=explicit_result_reuse
+- aiomonitor-task-snapshots-diff | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/aiomonitor-task-snapshots-diff/rep2/result.json | reuse=explicit_result_reuse
+- aiomonitor-task-snapshots-diff | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/aiomonitor-task-snapshots-diff/rep2/result.json | reuse=explicit_result_reuse
+- anko-default-function-arguments | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/anko-default-function-arguments/rep0/result.json | reuse=explicit_result_reuse
+- anko-default-function-arguments | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/anko-default-function-arguments/rep0/result.json | reuse=explicit_result_reuse
+- anko-default-function-arguments | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/anko-default-function-arguments/rep1/result.json | reuse=explicit_result_reuse
+- anko-default-function-arguments | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/anko-default-function-arguments/rep1/result.json | reuse=explicit_result_reuse
+- anko-default-function-arguments | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/anko-default-function-arguments/rep2/result.json | reuse=explicit_result_reuse
+- anko-default-function-arguments | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/anko-default-function-arguments/rep2/result.json | reuse=explicit_result_reuse
+- anko-typed-variable-bindings | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/anko-typed-variable-bindings/rep0/result.json | reuse=explicit_result_reuse
+- anko-typed-variable-bindings | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/anko-typed-variable-bindings/rep0/result.json | reuse=explicit_result_reuse
+- anko-typed-variable-bindings | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/anko-typed-variable-bindings/rep1/result.json | reuse=explicit_result_reuse
+- anko-typed-variable-bindings | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/anko-typed-variable-bindings/rep1/result.json | reuse=explicit_result_reuse
+- anko-typed-variable-bindings | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/anko-typed-variable-bindings/rep2/result.json | reuse=explicit_result_reuse
+- anko-typed-variable-bindings | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/anko-typed-variable-bindings/rep2/result.json | reuse=explicit_result_reuse
+- arcane-drift-detection-baselines | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/arcane-drift-detection-baselines/rep0/result.json | reuse=explicit_result_reuse
+- arcane-drift-detection-baselines | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/arcane-drift-detection-baselines/rep0/result.json | reuse=explicit_result_reuse
+- arcane-drift-detection-baselines | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/arcane-drift-detection-baselines/rep1/result.json | reuse=explicit_result_reuse
+- arcane-drift-detection-baselines | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/arcane-drift-detection-baselines/rep1/result.json | reuse=explicit_result_reuse
+- arcane-drift-detection-baselines | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/arcane-drift-detection-baselines/rep2/result.json | reuse=explicit_result_reuse
+- arcane-drift-detection-baselines | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/arcane-drift-detection-baselines/rep2/result.json | reuse=explicit_result_reuse
+- arktype-json-schema-refs-dependencies | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/arktype-json-schema-refs-dependencies/rep0/result.json | reuse=explicit_result_reuse
+- arktype-json-schema-refs-dependencies | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/arktype-json-schema-refs-dependencies/rep0/result.json | reuse=explicit_result_reuse
+- arktype-json-schema-refs-dependencies | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/arktype-json-schema-refs-dependencies/rep1/result.json | reuse=explicit_result_reuse
+- arktype-json-schema-refs-dependencies | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/arktype-json-schema-refs-dependencies/rep1/result.json | reuse=explicit_result_reuse
+- arktype-json-schema-refs-dependencies | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/arktype-json-schema-refs-dependencies/rep2/result.json | reuse=explicit_result_reuse
+- arktype-json-schema-refs-dependencies | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/arktype-json-schema-refs-dependencies/rep2/result.json | reuse=explicit_result_reuse
+- awilix-async-container-initialization | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/awilix-async-container-initialization/rep0/result.json | reuse=explicit_result_reuse
+- awilix-async-container-initialization | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/awilix-async-container-initialization/rep0/result.json | reuse=explicit_result_reuse
+- awilix-async-container-initialization | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/awilix-async-container-initialization/rep1/result.json | reuse=explicit_result_reuse
+- awilix-async-container-initialization | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/awilix-async-container-initialization/rep1/result.json | reuse=explicit_result_reuse
+- awilix-async-container-initialization | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/awilix-async-container-initialization/rep2/result.json | reuse=explicit_result_reuse
+- awilix-async-container-initialization | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/awilix-async-container-initialization/rep2/result.json | reuse=explicit_result_reuse
+- bandit-incremental-cache-control | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/bandit-incremental-cache-control/rep0/result.json | reuse=explicit_result_reuse
+- bandit-incremental-cache-control | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/bandit-incremental-cache-control/rep0/result.json | reuse=explicit_result_reuse
+- bandit-incremental-cache-control | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/bandit-incremental-cache-control/rep1/result.json | reuse=explicit_result_reuse
+- bandit-incremental-cache-control | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/bandit-incremental-cache-control/rep1/result.json | reuse=explicit_result_reuse
+- bandit-incremental-cache-control | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/bandit-incremental-cache-control/rep2/result.json | reuse=explicit_result_reuse
+- bandit-incremental-cache-control | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/bandit-incremental-cache-control/rep2/result.json | reuse=explicit_result_reuse
+- bandit-interprocedural-taint-checks | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/bandit-interprocedural-taint-checks/rep0/result.json | reuse=explicit_result_reuse
+- bandit-interprocedural-taint-checks | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/bandit-interprocedural-taint-checks/rep0/result.json | reuse=explicit_result_reuse
+- bandit-interprocedural-taint-checks | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/bandit-interprocedural-taint-checks/rep1/result.json | reuse=explicit_result_reuse
+- bandit-interprocedural-taint-checks | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/bandit-interprocedural-taint-checks/rep1/result.json | reuse=explicit_result_reuse
+- bandit-interprocedural-taint-checks | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/bandit-interprocedural-taint-checks/rep2/result.json | reuse=explicit_result_reuse
+- bandit-interprocedural-taint-checks | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/bandit-interprocedural-taint-checks/rep2/result.json | reuse=explicit_result_reuse
+- bandit-structured-nosec-directives | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/bandit-structured-nosec-directives/rep0/result.json | reuse=explicit_result_reuse
+- bandit-structured-nosec-directives | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/bandit-structured-nosec-directives/rep0/result.json | reuse=explicit_result_reuse
+- bandit-structured-nosec-directives | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/bandit-structured-nosec-directives/rep1/result.json | reuse=explicit_result_reuse
+- bandit-structured-nosec-directives | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/bandit-structured-nosec-directives/rep1/result.json | reuse=explicit_result_reuse
+- bandit-structured-nosec-directives | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/bandit-structured-nosec-directives/rep2/result.json | reuse=explicit_result_reuse
+- bandit-structured-nosec-directives | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/bandit-structured-nosec-directives/rep2/result.json | reuse=explicit_result_reuse
+- boa-hierarchical-evaluation-cancellation | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/boa-hierarchical-evaluation-cancellation/rep0/result.json | reuse=explicit_result_reuse
+- boa-hierarchical-evaluation-cancellation | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/boa-hierarchical-evaluation-cancellation/rep0/result.json | reuse=explicit_result_reuse
+- boa-hierarchical-evaluation-cancellation | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/boa-hierarchical-evaluation-cancellation/rep1/result.json | reuse=explicit_result_reuse
+- boa-hierarchical-evaluation-cancellation | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/boa-hierarchical-evaluation-cancellation/rep1/result.json | reuse=explicit_result_reuse
+- boa-hierarchical-evaluation-cancellation | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/boa-hierarchical-evaluation-cancellation/rep2/result.json | reuse=explicit_result_reuse
+- boa-hierarchical-evaluation-cancellation | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/boa-hierarchical-evaluation-cancellation/rep2/result.json | reuse=explicit_result_reuse
+- cattrs-partial-structuring-recovery | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/cattrs-partial-structuring-recovery/rep0/result.json | reuse=explicit_result_reuse
+- cattrs-partial-structuring-recovery | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/cattrs-partial-structuring-recovery/rep0/result.json | reuse=explicit_result_reuse
+- cattrs-partial-structuring-recovery | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/cattrs-partial-structuring-recovery/rep1/result.json | reuse=explicit_result_reuse
+- cattrs-partial-structuring-recovery | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/cattrs-partial-structuring-recovery/rep1/result.json | reuse=explicit_result_reuse
+- cattrs-partial-structuring-recovery | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/cattrs-partial-structuring-recovery/rep2/result.json | reuse=explicit_result_reuse
+- cattrs-partial-structuring-recovery | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/cattrs-partial-structuring-recovery/rep2/result.json | reuse=explicit_result_reuse
+- clack-async-autocomplete-options | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/clack-async-autocomplete-options/rep0/result.json | reuse=explicit_result_reuse
+- clack-async-autocomplete-options | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/clack-async-autocomplete-options/rep0/result.json | reuse=explicit_result_reuse
+- clack-async-autocomplete-options | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/clack-async-autocomplete-options/rep1/result.json | reuse=explicit_result_reuse
+- clack-async-autocomplete-options | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/clack-async-autocomplete-options/rep1/result.json | reuse=explicit_result_reuse
+- clack-async-autocomplete-options | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/clack-async-autocomplete-options/rep2/result.json | reuse=explicit_result_reuse
+- clack-async-autocomplete-options | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/clack-async-autocomplete-options/rep2/result.json | reuse=explicit_result_reuse
+- claude-code-by-agents-recursive-delegation | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/claude-code-by-agents-recursive-delegation/rep0/result.json | reuse=explicit_result_reuse
+- claude-code-by-agents-recursive-delegation | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/claude-code-by-agents-recursive-delegation/rep0/result.json | reuse=explicit_result_reuse
+- claude-code-by-agents-recursive-delegation | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/claude-code-by-agents-recursive-delegation/rep1/result.json | reuse=explicit_result_reuse
+- claude-code-by-agents-recursive-delegation | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/claude-code-by-agents-recursive-delegation/rep1/result.json | reuse=explicit_result_reuse
+- claude-code-by-agents-recursive-delegation | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/claude-code-by-agents-recursive-delegation/rep2/result.json | reuse=explicit_result_reuse
+- claude-code-by-agents-recursive-delegation | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/claude-code-by-agents-recursive-delegation/rep2/result.json | reuse=explicit_result_reuse
+- cliffy-config-file-parsing | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/cliffy-config-file-parsing/rep0/result.json | reuse=explicit_result_reuse
+- cliffy-config-file-parsing | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/cliffy-config-file-parsing/rep0/result.json | reuse=explicit_result_reuse
+- cliffy-config-file-parsing | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/cliffy-config-file-parsing/rep1/result.json | reuse=explicit_result_reuse
+- cliffy-config-file-parsing | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/cliffy-config-file-parsing/rep1/result.json | reuse=explicit_result_reuse
+- cliffy-config-file-parsing | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/cliffy-config-file-parsing/rep2/result.json | reuse=explicit_result_reuse
+- cliffy-config-file-parsing | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/cliffy-config-file-parsing/rep2/result.json | reuse=explicit_result_reuse
+- csstree-shorthand-expansion-compression | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/csstree-shorthand-expansion-compression/rep0/result.json | reuse=explicit_result_reuse
+- csstree-shorthand-expansion-compression | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/csstree-shorthand-expansion-compression/rep0/result.json | reuse=explicit_result_reuse
+- csstree-shorthand-expansion-compression | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/csstree-shorthand-expansion-compression/rep1/result.json | reuse=explicit_result_reuse
+- csstree-shorthand-expansion-compression | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/csstree-shorthand-expansion-compression/rep1/result.json | reuse=explicit_result_reuse
+- csstree-shorthand-expansion-compression | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/csstree-shorthand-expansion-compression/rep2/result.json | reuse=explicit_result_reuse
+- csstree-shorthand-expansion-compression | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/csstree-shorthand-expansion-compression/rep2/result.json | reuse=explicit_result_reuse
+- dasel-html-document-format | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/dasel-html-document-format/rep0/result.json | reuse=explicit_result_reuse
+- dasel-html-document-format | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/dasel-html-document-format/rep0/result.json | reuse=explicit_result_reuse
+- dasel-html-document-format | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/dasel-html-document-format/rep1/result.json | reuse=explicit_result_reuse
+- dasel-html-document-format | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/dasel-html-document-format/rep1/result.json | reuse=explicit_result_reuse
+- dasel-html-document-format | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/dasel-html-document-format/rep2/result.json | reuse=explicit_result_reuse
+- dasel-html-document-format | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/dasel-html-document-format/rep2/result.json | reuse=explicit_result_reuse
+- dateutil-rfc5545-timezone-interop | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/dateutil-rfc5545-timezone-interop/rep0/result.json | reuse=explicit_result_reuse
+- dateutil-rfc5545-timezone-interop | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/dateutil-rfc5545-timezone-interop/rep0/result.json | reuse=explicit_result_reuse
+- dateutil-rfc5545-timezone-interop | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/dateutil-rfc5545-timezone-interop/rep1/result.json | reuse=explicit_result_reuse
+- dateutil-rfc5545-timezone-interop | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/dateutil-rfc5545-timezone-interop/rep1/result.json | reuse=explicit_result_reuse
+- dateutil-rfc5545-timezone-interop | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/dateutil-rfc5545-timezone-interop/rep2/result.json | reuse=explicit_result_reuse
+- dateutil-rfc5545-timezone-interop | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/dateutil-rfc5545-timezone-interop/rep2/result.json | reuse=explicit_result_reuse
+- drizzle-orm-window-function-builders | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/drizzle-orm-window-function-builders/rep0/result.json | reuse=explicit_result_reuse
+- drizzle-orm-window-function-builders | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/drizzle-orm-window-function-builders/rep0/result.json | reuse=explicit_result_reuse
+- drizzle-orm-window-function-builders | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/drizzle-orm-window-function-builders/rep1/result.json | reuse=explicit_result_reuse
+- drizzle-orm-window-function-builders | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/drizzle-orm-window-function-builders/rep1/result.json | reuse=explicit_result_reuse
+- drizzle-orm-window-function-builders | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/drizzle-orm-window-function-builders/rep2/result.json | reuse=explicit_result_reuse
+- drizzle-orm-window-function-builders | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/drizzle-orm-window-function-builders/rep2/result.json | reuse=explicit_result_reuse
+- dynamodb-toolbox-conditional-attribute-requirements | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/dynamodb-toolbox-conditional-attribute-requirements/rep0/result.json | reuse=explicit_result_reuse
+- dynamodb-toolbox-conditional-attribute-requirements | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/dynamodb-toolbox-conditional-attribute-requirements/rep0/result.json | reuse=explicit_result_reuse
+- dynamodb-toolbox-conditional-attribute-requirements | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/dynamodb-toolbox-conditional-attribute-requirements/rep1/result.json | reuse=explicit_result_reuse
+- dynamodb-toolbox-conditional-attribute-requirements | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/dynamodb-toolbox-conditional-attribute-requirements/rep1/result.json | reuse=explicit_result_reuse
+- dynamodb-toolbox-conditional-attribute-requirements | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/dynamodb-toolbox-conditional-attribute-requirements/rep2/result.json | reuse=explicit_result_reuse
+- dynamodb-toolbox-conditional-attribute-requirements | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/dynamodb-toolbox-conditional-attribute-requirements/rep2/result.json | reuse=explicit_result_reuse
+- dynamodb-toolbox-lazy-recursive-schemas | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/dynamodb-toolbox-lazy-recursive-schemas/rep0/result.json | reuse=explicit_result_reuse
+- dynamodb-toolbox-lazy-recursive-schemas | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/dynamodb-toolbox-lazy-recursive-schemas/rep0/result.json | reuse=explicit_result_reuse
+- dynamodb-toolbox-lazy-recursive-schemas | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/dynamodb-toolbox-lazy-recursive-schemas/rep1/result.json | reuse=explicit_result_reuse
+- dynamodb-toolbox-lazy-recursive-schemas | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/dynamodb-toolbox-lazy-recursive-schemas/rep1/result.json | reuse=explicit_result_reuse
+- dynamodb-toolbox-lazy-recursive-schemas | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/dynamodb-toolbox-lazy-recursive-schemas/rep2/result.json | reuse=explicit_result_reuse
+- dynamodb-toolbox-lazy-recursive-schemas | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/dynamodb-toolbox-lazy-recursive-schemas/rep2/result.json | reuse=explicit_result_reuse
+- effect-sse-httpapi-streaming | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/effect-sse-httpapi-streaming/rep0/result.json | reuse=explicit_result_reuse
+- effect-sse-httpapi-streaming | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/effect-sse-httpapi-streaming/rep0/result.json | reuse=explicit_result_reuse
+- effect-sse-httpapi-streaming | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/effect-sse-httpapi-streaming/rep1/result.json | reuse=explicit_result_reuse
+- effect-sse-httpapi-streaming | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/effect-sse-httpapi-streaming/rep1/result.json | reuse=explicit_result_reuse
+- effect-sse-httpapi-streaming | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/effect-sse-httpapi-streaming/rep2/result.json | reuse=explicit_result_reuse
+- effect-sse-httpapi-streaming | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/effect-sse-httpapi-streaming/rep2/result.json | reuse=explicit_result_reuse
+- eicrud-keyset-pagination-cursor | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/eicrud-keyset-pagination-cursor/rep0/result.json | reuse=explicit_result_reuse
+- eicrud-keyset-pagination-cursor | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/eicrud-keyset-pagination-cursor/rep0/result.json | reuse=explicit_result_reuse
+- eicrud-keyset-pagination-cursor | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/eicrud-keyset-pagination-cursor/rep1/result.json | reuse=explicit_result_reuse
+- eicrud-keyset-pagination-cursor | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/eicrud-keyset-pagination-cursor/rep1/result.json | reuse=explicit_result_reuse
+- eicrud-keyset-pagination-cursor | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/eicrud-keyset-pagination-cursor/rep2/result.json | reuse=explicit_result_reuse
+- eicrud-keyset-pagination-cursor | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/eicrud-keyset-pagination-cursor/rep2/result.json | reuse=explicit_result_reuse
+- etree-xml-diff-patch | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/etree-xml-diff-patch/rep0/result.json | reuse=explicit_result_reuse
+- etree-xml-diff-patch | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/etree-xml-diff-patch/rep0/result.json | reuse=explicit_result_reuse
+- etree-xml-diff-patch | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/etree-xml-diff-patch/rep1/result.json | reuse=explicit_result_reuse
+- etree-xml-diff-patch | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/etree-xml-diff-patch/rep1/result.json | reuse=explicit_result_reuse
+- etree-xml-diff-patch | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/etree-xml-diff-patch/rep2/result.json | reuse=explicit_result_reuse
+- etree-xml-diff-patch | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/etree-xml-diff-patch/rep2/result.json | reuse=explicit_result_reuse
+- expr-try-catch-errors | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/expr-try-catch-errors/rep0/result.json | reuse=explicit_result_reuse
+- expr-try-catch-errors | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/expr-try-catch-errors/rep0/result.json | reuse=explicit_result_reuse
+- expr-try-catch-errors | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/expr-try-catch-errors/rep1/result.json | reuse=explicit_result_reuse
+- expr-try-catch-errors | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/expr-try-catch-errors/rep1/result.json | reuse=explicit_result_reuse
+- expr-try-catch-errors | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/expr-try-catch-errors/rep2/result.json | reuse=explicit_result_reuse
+- expr-try-catch-errors | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/expr-try-catch-errors/rep2/result.json | reuse=explicit_result_reuse
+- fastapi-deprecation-response-headers | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/fastapi-deprecation-response-headers/rep0/result.json | reuse=explicit_result_reuse
+- fastapi-deprecation-response-headers | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/fastapi-deprecation-response-headers/rep0/result.json | reuse=explicit_result_reuse
+- fastapi-deprecation-response-headers | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/fastapi-deprecation-response-headers/rep1/result.json | reuse=explicit_result_reuse
+- fastapi-deprecation-response-headers | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/fastapi-deprecation-response-headers/rep1/result.json | reuse=explicit_result_reuse
+- fastapi-deprecation-response-headers | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/fastapi-deprecation-response-headers/rep2/result.json | reuse=explicit_result_reuse
+- fastapi-deprecation-response-headers | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/fastapi-deprecation-response-headers/rep2/result.json | reuse=explicit_result_reuse
+- fastapi-implicit-head-options | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/fastapi-implicit-head-options/rep0/result.json | reuse=explicit_result_reuse
+- fastapi-implicit-head-options | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/fastapi-implicit-head-options/rep0/result.json | reuse=explicit_result_reuse
+- fastapi-implicit-head-options | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/fastapi-implicit-head-options/rep1/result.json | reuse=explicit_result_reuse
+- fastapi-implicit-head-options | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/fastapi-implicit-head-options/rep1/result.json | reuse=explicit_result_reuse
+- fastapi-implicit-head-options | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/fastapi-implicit-head-options/rep2/result.json | reuse=explicit_result_reuse
+- fastapi-implicit-head-options | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/fastapi-implicit-head-options/rep2/result.json | reuse=explicit_result_reuse
+- fd-deterministic-multi-key-sorting | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/fd-deterministic-multi-key-sorting/rep0/result.json | reuse=explicit_result_reuse
+- fd-deterministic-multi-key-sorting | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/fd-deterministic-multi-key-sorting/rep0/result.json | reuse=explicit_result_reuse
+- fd-deterministic-multi-key-sorting | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/fd-deterministic-multi-key-sorting/rep1/result.json | reuse=explicit_result_reuse
+- fd-deterministic-multi-key-sorting | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/fd-deterministic-multi-key-sorting/rep1/result.json | reuse=explicit_result_reuse
+- fd-deterministic-multi-key-sorting | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/fd-deterministic-multi-key-sorting/rep2/result.json | reuse=explicit_result_reuse
+- fd-deterministic-multi-key-sorting | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/fd-deterministic-multi-key-sorting/rep2/result.json | reuse=explicit_result_reuse
+- geo-shapeindex-serialization | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/geo-shapeindex-serialization/rep0/result.json | reuse=explicit_result_reuse
+- geo-shapeindex-serialization | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/geo-shapeindex-serialization/rep0/result.json | reuse=explicit_result_reuse
+- geo-shapeindex-serialization | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/geo-shapeindex-serialization/rep1/result.json | reuse=explicit_result_reuse
+- geo-shapeindex-serialization | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/geo-shapeindex-serialization/rep1/result.json | reuse=explicit_result_reuse
+- geo-shapeindex-serialization | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/geo-shapeindex-serialization/rep2/result.json | reuse=explicit_result_reuse
+- geo-shapeindex-serialization | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/geo-shapeindex-serialization/rep2/result.json | reuse=explicit_result_reuse
+- go-critic-doc-link-checker | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/go-critic-doc-link-checker/rep0/result.json | reuse=explicit_result_reuse
+- go-critic-doc-link-checker | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/go-critic-doc-link-checker/rep0/result.json | reuse=explicit_result_reuse
+- go-critic-doc-link-checker | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/go-critic-doc-link-checker/rep1/result.json | reuse=explicit_result_reuse
+- go-critic-doc-link-checker | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/go-critic-doc-link-checker/rep1/result.json | reuse=explicit_result_reuse
+- go-critic-doc-link-checker | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/go-critic-doc-link-checker/rep2/result.json | reuse=explicit_result_reuse
+- go-critic-doc-link-checker | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/go-critic-doc-link-checker/rep2/result.json | reuse=explicit_result_reuse
+- go-genai-streamed-function-args | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/go-genai-streamed-function-args/rep0/result.json | reuse=explicit_result_reuse
+- go-genai-streamed-function-args | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/go-genai-streamed-function-args/rep0/result.json | reuse=explicit_result_reuse
+- go-genai-streamed-function-args | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/go-genai-streamed-function-args/rep1/result.json | reuse=explicit_result_reuse
+- go-genai-streamed-function-args | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/go-genai-streamed-function-args/rep1/result.json | reuse=explicit_result_reuse
+- go-genai-streamed-function-args | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/go-genai-streamed-function-args/rep2/result.json | reuse=explicit_result_reuse
+- go-genai-streamed-function-args | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/go-genai-streamed-function-args/rep2/result.json | reuse=explicit_result_reuse
+- go-git-worktree-merge-conflicts | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/go-git-worktree-merge-conflicts/rep0/result.json | reuse=explicit_result_reuse
+- go-git-worktree-merge-conflicts | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/go-git-worktree-merge-conflicts/rep0/result.json | reuse=explicit_result_reuse
+- go-git-worktree-merge-conflicts | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/go-git-worktree-merge-conflicts/rep1/result.json | reuse=explicit_result_reuse
+- go-git-worktree-merge-conflicts | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/go-git-worktree-merge-conflicts/rep1/result.json | reuse=explicit_result_reuse
+- go-git-worktree-merge-conflicts | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/go-git-worktree-merge-conflicts/rep2/result.json | reuse=explicit_result_reuse
+- go-git-worktree-merge-conflicts | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/go-git-worktree-merge-conflicts/rep2/result.json | reuse=explicit_result_reuse
+- goreleaser-retry-publish-auditing | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/goreleaser-retry-publish-auditing/rep0/result.json | reuse=explicit_result_reuse
+- goreleaser-retry-publish-auditing | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/goreleaser-retry-publish-auditing/rep0/result.json | reuse=explicit_result_reuse
+- goreleaser-retry-publish-auditing | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/goreleaser-retry-publish-auditing/rep1/result.json | reuse=explicit_result_reuse
+- goreleaser-retry-publish-auditing | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/goreleaser-retry-publish-auditing/rep1/result.json | reuse=explicit_result_reuse
+- goreleaser-retry-publish-auditing | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/goreleaser-retry-publish-auditing/rep2/result.json | reuse=explicit_result_reuse
+- goreleaser-retry-publish-auditing | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/goreleaser-retry-publish-auditing/rep2/result.json | reuse=explicit_result_reuse
+- gql-incremental-graphql-delivery | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/gql-incremental-graphql-delivery/rep0/result.json | reuse=explicit_result_reuse
+- gql-incremental-graphql-delivery | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/gql-incremental-graphql-delivery/rep0/result.json | reuse=explicit_result_reuse
+- gql-incremental-graphql-delivery | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/gql-incremental-graphql-delivery/rep1/result.json | reuse=explicit_result_reuse
+- gql-incremental-graphql-delivery | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/gql-incremental-graphql-delivery/rep1/result.json | reuse=explicit_result_reuse
+- gql-incremental-graphql-delivery | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/gql-incremental-graphql-delivery/rep2/result.json | reuse=explicit_result_reuse
+- gql-incremental-graphql-delivery | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/gql-incremental-graphql-delivery/rep2/result.json | reuse=explicit_result_reuse
+- happy-dom-abort-pending-body-reads | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/happy-dom-abort-pending-body-reads/rep0/result.json | reuse=explicit_result_reuse
+- happy-dom-abort-pending-body-reads | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/happy-dom-abort-pending-body-reads/rep0/result.json | reuse=explicit_result_reuse
+- happy-dom-abort-pending-body-reads | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/happy-dom-abort-pending-body-reads/rep1/result.json | reuse=explicit_result_reuse
+- happy-dom-abort-pending-body-reads | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/happy-dom-abort-pending-body-reads/rep1/result.json | reuse=explicit_result_reuse
+- happy-dom-abort-pending-body-reads | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/happy-dom-abort-pending-body-reads/rep2/result.json | reuse=explicit_result_reuse
+- happy-dom-abort-pending-body-reads | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/happy-dom-abort-pending-body-reads/rep2/result.json | reuse=explicit_result_reuse
+- happy-dom-deterministic-intersectionobserver | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/happy-dom-deterministic-intersectionobserver/rep0/result.json | reuse=explicit_result_reuse
+- happy-dom-deterministic-intersectionobserver | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/happy-dom-deterministic-intersectionobserver/rep0/result.json | reuse=explicit_result_reuse
+- happy-dom-deterministic-intersectionobserver | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/happy-dom-deterministic-intersectionobserver/rep1/result.json | reuse=explicit_result_reuse
+- happy-dom-deterministic-intersectionobserver | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/happy-dom-deterministic-intersectionobserver/rep1/result.json | reuse=explicit_result_reuse
+- happy-dom-deterministic-intersectionobserver | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/happy-dom-deterministic-intersectionobserver/rep2/result.json | reuse=explicit_result_reuse
+- happy-dom-deterministic-intersectionobserver | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/happy-dom-deterministic-intersectionobserver/rep2/result.json | reuse=explicit_result_reuse
+- helm-array-merge-strategies | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/helm-array-merge-strategies/rep0/result.json | reuse=explicit_result_reuse
+- helm-array-merge-strategies | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/helm-array-merge-strategies/rep0/result.json | reuse=explicit_result_reuse
+- helm-array-merge-strategies | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/helm-array-merge-strategies/rep1/result.json | reuse=explicit_result_reuse
+- helm-array-merge-strategies | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/helm-array-merge-strategies/rep1/result.json | reuse=explicit_result_reuse
+- helm-array-merge-strategies | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/helm-array-merge-strategies/rep2/result.json | reuse=explicit_result_reuse
+- helm-array-merge-strategies | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/helm-array-merge-strategies/rep2/result.json | reuse=explicit_result_reuse
+- helm-unified-manifest-stream | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/helm-unified-manifest-stream/rep0/result.json | reuse=explicit_result_reuse
+- helm-unified-manifest-stream | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/helm-unified-manifest-stream/rep0/result.json | reuse=explicit_result_reuse
+- helm-unified-manifest-stream | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/helm-unified-manifest-stream/rep1/result.json | reuse=explicit_result_reuse
+- helm-unified-manifest-stream | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/helm-unified-manifest-stream/rep1/result.json | reuse=explicit_result_reuse
+- helm-unified-manifest-stream | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/helm-unified-manifest-stream/rep2/result.json | reuse=explicit_result_reuse
+- helm-unified-manifest-stream | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/helm-unified-manifest-stream/rep2/result.json | reuse=explicit_result_reuse
+- httpx-deterministic-cookie-store | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/httpx-deterministic-cookie-store/rep0/result.json | reuse=explicit_result_reuse
+- httpx-deterministic-cookie-store | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/httpx-deterministic-cookie-store/rep0/result.json | reuse=explicit_result_reuse
+- httpx-deterministic-cookie-store | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/httpx-deterministic-cookie-store/rep1/result.json | reuse=explicit_result_reuse
+- httpx-deterministic-cookie-store | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/httpx-deterministic-cookie-store/rep1/result.json | reuse=explicit_result_reuse
+- httpx-deterministic-cookie-store | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/httpx-deterministic-cookie-store/rep2/result.json | reuse=explicit_result_reuse
+- httpx-deterministic-cookie-store | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/httpx-deterministic-cookie-store/rep2/result.json | reuse=explicit_result_reuse
+- httpx-multipart-response-parsing | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/httpx-multipart-response-parsing/rep0/result.json | reuse=explicit_result_reuse
+- httpx-multipart-response-parsing | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/httpx-multipart-response-parsing/rep0/result.json | reuse=explicit_result_reuse
+- httpx-multipart-response-parsing | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/httpx-multipart-response-parsing/rep1/result.json | reuse=explicit_result_reuse
+- httpx-multipart-response-parsing | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/httpx-multipart-response-parsing/rep1/result.json | reuse=explicit_result_reuse
+- httpx-multipart-response-parsing | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/httpx-multipart-response-parsing/rep2/result.json | reuse=explicit_result_reuse
+- httpx-multipart-response-parsing | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/httpx-multipart-response-parsing/rep2/result.json | reuse=explicit_result_reuse
+- httpx-streaming-json-iteration | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/httpx-streaming-json-iteration/rep0/result.json | reuse=explicit_result_reuse
+- httpx-streaming-json-iteration | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/httpx-streaming-json-iteration/rep0/result.json | reuse=explicit_result_reuse
+- httpx-streaming-json-iteration | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/httpx-streaming-json-iteration/rep1/result.json | reuse=explicit_result_reuse
+- httpx-streaming-json-iteration | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/httpx-streaming-json-iteration/rep1/result.json | reuse=explicit_result_reuse
+- httpx-streaming-json-iteration | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/httpx-streaming-json-iteration/rep2/result.json | reuse=explicit_result_reuse
+- httpx-streaming-json-iteration | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/httpx-streaming-json-iteration/rep2/result.json | reuse=explicit_result_reuse
+- igel-persist-feature-schema | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/igel-persist-feature-schema/rep0/result.json | reuse=explicit_result_reuse
+- igel-persist-feature-schema | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/igel-persist-feature-schema/rep0/result.json | reuse=explicit_result_reuse
+- igel-persist-feature-schema | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/igel-persist-feature-schema/rep1/result.json | reuse=explicit_result_reuse
+- igel-persist-feature-schema | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/igel-persist-feature-schema/rep1/result.json | reuse=explicit_result_reuse
+- igel-persist-feature-schema | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/igel-persist-feature-schema/rep2/result.json | reuse=explicit_result_reuse
+- igel-persist-feature-schema | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/igel-persist-feature-schema/rep2/result.json | reuse=explicit_result_reuse
+- ink-grid-box-layout | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ink-grid-box-layout/rep0/result.json | reuse=explicit_result_reuse
+- ink-grid-box-layout | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ink-grid-box-layout/rep0/result.json | reuse=explicit_result_reuse
+- ink-grid-box-layout | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ink-grid-box-layout/rep1/result.json | reuse=explicit_result_reuse
+- ink-grid-box-layout | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ink-grid-box-layout/rep1/result.json | reuse=explicit_result_reuse
+- ink-grid-box-layout | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ink-grid-box-layout/rep2/result.json | reuse=explicit_result_reuse
+- ink-grid-box-layout | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ink-grid-box-layout/rep2/result.json | reuse=explicit_result_reuse
+- ipython-session-bundle-replay | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ipython-session-bundle-replay/rep0/result.json | reuse=explicit_result_reuse
+- ipython-session-bundle-replay | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ipython-session-bundle-replay/rep0/result.json | reuse=explicit_result_reuse
+- ipython-session-bundle-replay | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ipython-session-bundle-replay/rep1/result.json | reuse=explicit_result_reuse
+- ipython-session-bundle-replay | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ipython-session-bundle-replay/rep1/result.json | reuse=explicit_result_reuse
+- ipython-session-bundle-replay | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ipython-session-bundle-replay/rep2/result.json | reuse=explicit_result_reuse
+- ipython-session-bundle-replay | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ipython-session-bundle-replay/rep2/result.json | reuse=explicit_result_reuse
+- katex-multicolumn-array-spans | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/katex-multicolumn-array-spans/rep0/result.json | reuse=explicit_result_reuse
+- katex-multicolumn-array-spans | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/katex-multicolumn-array-spans/rep0/result.json | reuse=explicit_result_reuse
+- katex-multicolumn-array-spans | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/katex-multicolumn-array-spans/rep1/result.json | reuse=explicit_result_reuse
+- katex-multicolumn-array-spans | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/katex-multicolumn-array-spans/rep1/result.json | reuse=explicit_result_reuse
+- katex-multicolumn-array-spans | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/katex-multicolumn-array-spans/rep2/result.json | reuse=explicit_result_reuse
+- katex-multicolumn-array-spans | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/katex-multicolumn-array-spans/rep2/result.json | reuse=explicit_result_reuse
+- kcp-go-multiplexed-kcp-streams | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kcp-go-multiplexed-kcp-streams/rep0/result.json | reuse=explicit_result_reuse
+- kcp-go-multiplexed-kcp-streams | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kcp-go-multiplexed-kcp-streams/rep0/result.json | reuse=explicit_result_reuse
+- kcp-go-multiplexed-kcp-streams | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kcp-go-multiplexed-kcp-streams/rep1/result.json | reuse=explicit_result_reuse
+- kcp-go-multiplexed-kcp-streams | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kcp-go-multiplexed-kcp-streams/rep1/result.json | reuse=explicit_result_reuse
+- kcp-go-multiplexed-kcp-streams | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kcp-go-multiplexed-kcp-streams/rep2/result.json | reuse=explicit_result_reuse
+- kcp-go-multiplexed-kcp-streams | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kcp-go-multiplexed-kcp-streams/rep2/result.json | reuse=explicit_result_reuse
+- kea-atomic-signal-selectors | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kea-atomic-signal-selectors/rep0/result.json | reuse=explicit_result_reuse
+- kea-atomic-signal-selectors | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kea-atomic-signal-selectors/rep0/result.json | reuse=explicit_result_reuse
+- kea-atomic-signal-selectors | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kea-atomic-signal-selectors/rep1/result.json | reuse=explicit_result_reuse
+- kea-atomic-signal-selectors | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kea-atomic-signal-selectors/rep1/result.json | reuse=explicit_result_reuse
+- kea-atomic-signal-selectors | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kea-atomic-signal-selectors/rep2/result.json | reuse=explicit_result_reuse
+- kea-atomic-signal-selectors | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kea-atomic-signal-selectors/rep2/result.json | reuse=explicit_result_reuse
+- kgateway-consistent-hash-policy | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kgateway-consistent-hash-policy/rep0/result.json | reuse=explicit_result_reuse
+- kgateway-consistent-hash-policy | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kgateway-consistent-hash-policy/rep0/result.json | reuse=explicit_result_reuse
+- kgateway-consistent-hash-policy | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kgateway-consistent-hash-policy/rep1/result.json | reuse=explicit_result_reuse
+- kgateway-consistent-hash-policy | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kgateway-consistent-hash-policy/rep1/result.json | reuse=explicit_result_reuse
+- kgateway-consistent-hash-policy | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kgateway-consistent-hash-policy/rep2/result.json | reuse=explicit_result_reuse
+- kgateway-consistent-hash-policy | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kgateway-consistent-hash-policy/rep2/result.json | reuse=explicit_result_reuse
+- kombu-single-active-consumer-priority | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kombu-single-active-consumer-priority/rep0/result.json | reuse=explicit_result_reuse
+- kombu-single-active-consumer-priority | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kombu-single-active-consumer-priority/rep0/result.json | reuse=explicit_result_reuse
+- kombu-single-active-consumer-priority | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kombu-single-active-consumer-priority/rep1/result.json | reuse=explicit_result_reuse
+- kombu-single-active-consumer-priority | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kombu-single-active-consumer-priority/rep1/result.json | reuse=explicit_result_reuse
+- kombu-single-active-consumer-priority | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kombu-single-active-consumer-priority/rep2/result.json | reuse=explicit_result_reuse
+- kombu-single-active-consumer-priority | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kombu-single-active-consumer-priority/rep2/result.json | reuse=explicit_result_reuse
+- kombu-virtual-queue-dead-lettering | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kombu-virtual-queue-dead-lettering/rep0/result.json | reuse=explicit_result_reuse
+- kombu-virtual-queue-dead-lettering | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kombu-virtual-queue-dead-lettering/rep0/result.json | reuse=explicit_result_reuse
+- kombu-virtual-queue-dead-lettering | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kombu-virtual-queue-dead-lettering/rep1/result.json | reuse=explicit_result_reuse
+- kombu-virtual-queue-dead-lettering | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kombu-virtual-queue-dead-lettering/rep1/result.json | reuse=explicit_result_reuse
+- kombu-virtual-queue-dead-lettering | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kombu-virtual-queue-dead-lettering/rep2/result.json | reuse=explicit_result_reuse
+- kombu-virtual-queue-dead-lettering | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kombu-virtual-queue-dead-lettering/rep2/result.json
+- koota-composite-trait-aspects | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-composite-trait-aspects/rep0/result.json | reuse=explicit_result_reuse
+- koota-composite-trait-aspects | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-composite-trait-aspects/rep0/result.json | reuse=explicit_result_reuse
+- koota-composite-trait-aspects | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-composite-trait-aspects/rep1/result.json | reuse=explicit_result_reuse
+- koota-composite-trait-aspects | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-composite-trait-aspects/rep1/result.json | reuse=explicit_result_reuse
+- koota-composite-trait-aspects | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-composite-trait-aspects/rep2/result.json | reuse=explicit_result_reuse
+- koota-composite-trait-aspects | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-composite-trait-aspects/rep2/result.json | reuse=explicit_result_reuse
+- koota-deferred-mutation-buffer | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-deferred-mutation-buffer/rep0/result.json | reuse=explicit_result_reuse
+- koota-deferred-mutation-buffer | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-deferred-mutation-buffer/rep0/result.json | reuse=explicit_result_reuse
+- koota-deferred-mutation-buffer | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-deferred-mutation-buffer/rep1/result.json | reuse=explicit_result_reuse
+- koota-deferred-mutation-buffer | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-deferred-mutation-buffer/rep1/result.json | reuse=explicit_result_reuse
+- koota-deferred-mutation-buffer | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-deferred-mutation-buffer/rep2/result.json | reuse=explicit_result_reuse
+- koota-deferred-mutation-buffer | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-deferred-mutation-buffer/rep2/result.json | reuse=explicit_result_reuse
+- koota-entity-snapshot-rollback | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-entity-snapshot-rollback/rep0/result.json | reuse=explicit_result_reuse
+- koota-entity-snapshot-rollback | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-entity-snapshot-rollback/rep0/result.json | reuse=explicit_result_reuse
+- koota-entity-snapshot-rollback | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-entity-snapshot-rollback/rep1/result.json | reuse=explicit_result_reuse
+- koota-entity-snapshot-rollback | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-entity-snapshot-rollback/rep1/result.json | reuse=explicit_result_reuse
+- koota-entity-snapshot-rollback | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-entity-snapshot-rollback/rep2/result.json | reuse=explicit_result_reuse
+- koota-entity-snapshot-rollback | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-entity-snapshot-rollback/rep2/result.json | reuse=explicit_result_reuse
+- koota-pair-relation-tracking | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-pair-relation-tracking/rep0/result.json | reuse=explicit_result_reuse
+- koota-pair-relation-tracking | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-pair-relation-tracking/rep0/result.json | reuse=explicit_result_reuse
+- koota-pair-relation-tracking | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-pair-relation-tracking/rep1/result.json | reuse=explicit_result_reuse
+- koota-pair-relation-tracking | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-pair-relation-tracking/rep1/result.json | reuse=explicit_result_reuse
+- koota-pair-relation-tracking | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-pair-relation-tracking/rep2/result.json | reuse=explicit_result_reuse
+- koota-pair-relation-tracking | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-pair-relation-tracking/rep2/result.json | reuse=explicit_result_reuse
+- koota-query-predicates | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-query-predicates/rep0/result.json | reuse=explicit_result_reuse
+- koota-query-predicates | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-query-predicates/rep0/result.json | reuse=explicit_result_reuse
+- koota-query-predicates | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-query-predicates/rep1/result.json | reuse=explicit_result_reuse
+- koota-query-predicates | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-query-predicates/rep1/result.json | reuse=explicit_result_reuse
+- koota-query-predicates | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/koota-query-predicates/rep2/result.json | reuse=explicit_result_reuse
+- koota-query-predicates | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/koota-query-predicates/rep2/result.json | reuse=explicit_result_reuse
+- kysely-window-grouping-helpers | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kysely-window-grouping-helpers/rep0/result.json | reuse=explicit_result_reuse
+- kysely-window-grouping-helpers | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kysely-window-grouping-helpers/rep0/result.json | reuse=explicit_result_reuse
+- kysely-window-grouping-helpers | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kysely-window-grouping-helpers/rep1/result.json | reuse=explicit_result_reuse
+- kysely-window-grouping-helpers | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kysely-window-grouping-helpers/rep1/result.json | reuse=explicit_result_reuse
+- kysely-window-grouping-helpers | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/kysely-window-grouping-helpers/rep2/result.json | reuse=explicit_result_reuse
+- kysely-window-grouping-helpers | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/kysely-window-grouping-helpers/rep2/result.json | reuse=explicit_result_reuse
+- langchain-request-coalescing | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/langchain-request-coalescing/rep0/result.json | reuse=explicit_result_reuse
+- langchain-request-coalescing | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/langchain-request-coalescing/rep0/result.json | reuse=explicit_result_reuse
+- langchain-request-coalescing | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/langchain-request-coalescing/rep1/result.json | reuse=explicit_result_reuse
+- langchain-request-coalescing | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/langchain-request-coalescing/rep1/result.json | reuse=explicit_result_reuse
+- langchain-request-coalescing | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/langchain-request-coalescing/rep2/result.json | reuse=explicit_result_reuse
+- langchain-request-coalescing | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/langchain-request-coalescing/rep2/result.json | reuse=explicit_result_reuse
+- mashumaro-flattened-dataclass-fields | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/mashumaro-flattened-dataclass-fields/rep0/result.json | reuse=explicit_result_reuse
+- mashumaro-flattened-dataclass-fields | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/mashumaro-flattened-dataclass-fields/rep0/result.json | reuse=explicit_result_reuse
+- mashumaro-flattened-dataclass-fields | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/mashumaro-flattened-dataclass-fields/rep1/result.json | reuse=explicit_result_reuse
+- mashumaro-flattened-dataclass-fields | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/mashumaro-flattened-dataclass-fields/rep1/result.json | reuse=explicit_result_reuse
+- mashumaro-flattened-dataclass-fields | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/mashumaro-flattened-dataclass-fields/rep2/result.json | reuse=explicit_result_reuse
+- mashumaro-flattened-dataclass-fields | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/mashumaro-flattened-dataclass-fields/rep2/result.json | reuse=explicit_result_reuse
+- meriyah-explicit-resource-declarations | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/meriyah-explicit-resource-declarations/rep0/result.json | reuse=explicit_result_reuse
+- meriyah-explicit-resource-declarations | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/meriyah-explicit-resource-declarations/rep0/result.json | reuse=explicit_result_reuse
+- meriyah-explicit-resource-declarations | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/meriyah-explicit-resource-declarations/rep1/result.json | reuse=explicit_result_reuse
+- meriyah-explicit-resource-declarations | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/meriyah-explicit-resource-declarations/rep1/result.json | reuse=explicit_result_reuse
+- meriyah-explicit-resource-declarations | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/meriyah-explicit-resource-declarations/rep2/result.json | reuse=explicit_result_reuse
+- meriyah-explicit-resource-declarations | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/meriyah-explicit-resource-declarations/rep2/result.json | reuse=explicit_result_reuse
+- mnamer-daemon-watch-lifecycle | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/mnamer-daemon-watch-lifecycle/rep0/result.json | reuse=explicit_result_reuse
+- mnamer-daemon-watch-lifecycle | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/mnamer-daemon-watch-lifecycle/rep0/result.json | reuse=explicit_result_reuse
+- mnamer-daemon-watch-lifecycle | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/mnamer-daemon-watch-lifecycle/rep1/result.json | reuse=explicit_result_reuse
+- mnamer-daemon-watch-lifecycle | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/mnamer-daemon-watch-lifecycle/rep1/result.json | reuse=explicit_result_reuse
+- mnamer-daemon-watch-lifecycle | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/mnamer-daemon-watch-lifecycle/rep2/result.json | reuse=explicit_result_reuse
+- mnamer-daemon-watch-lifecycle | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/mnamer-daemon-watch-lifecycle/rep2/result.json | reuse=explicit_result_reuse
+- mobly-grouped-test-barriers | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/mobly-grouped-test-barriers/rep0/result.json | reuse=explicit_result_reuse
+- mobly-grouped-test-barriers | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/mobly-grouped-test-barriers/rep0/result.json | reuse=explicit_result_reuse
+- mobly-grouped-test-barriers | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/mobly-grouped-test-barriers/rep1/result.json | reuse=explicit_result_reuse
+- mobly-grouped-test-barriers | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/mobly-grouped-test-barriers/rep1/result.json | reuse=explicit_result_reuse
+- mobly-grouped-test-barriers | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/mobly-grouped-test-barriers/rep2/result.json | reuse=explicit_result_reuse
+- mobly-grouped-test-barriers | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/mobly-grouped-test-barriers/rep2/result.json | reuse=explicit_result_reuse
+- narwhals-rolling-window-suite | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/narwhals-rolling-window-suite/rep0/result.json | reuse=explicit_result_reuse
+- narwhals-rolling-window-suite | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/narwhals-rolling-window-suite/rep0/result.json | reuse=explicit_result_reuse
+- narwhals-rolling-window-suite | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/narwhals-rolling-window-suite/rep1/result.json | reuse=explicit_result_reuse
+- narwhals-rolling-window-suite | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/narwhals-rolling-window-suite/rep1/result.json | reuse=explicit_result_reuse
+- narwhals-rolling-window-suite | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/narwhals-rolling-window-suite/rep2/result.json | reuse=explicit_result_reuse
+- narwhals-rolling-window-suite | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/narwhals-rolling-window-suite/rep2/result.json | reuse=explicit_result_reuse
+- numba-stencil-boundary-modes | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/numba-stencil-boundary-modes/rep0/result.json | reuse=explicit_result_reuse
+- numba-stencil-boundary-modes | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/numba-stencil-boundary-modes/rep0/result.json | reuse=explicit_result_reuse
+- numba-stencil-boundary-modes | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/numba-stencil-boundary-modes/rep1/result.json | reuse=explicit_result_reuse
+- numba-stencil-boundary-modes | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/numba-stencil-boundary-modes/rep1/result.json | reuse=explicit_result_reuse
+- numba-stencil-boundary-modes | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/numba-stencil-boundary-modes/rep2/result.json | reuse=explicit_result_reuse
+- numba-stencil-boundary-modes | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/numba-stencil-boundary-modes/rep2/result.json | reuse=explicit_result_reuse
+- obsidian-linter-auto-table-of-contents | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/obsidian-linter-auto-table-of-contents/rep0/result.json | reuse=explicit_result_reuse
+- obsidian-linter-auto-table-of-contents | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/obsidian-linter-auto-table-of-contents/rep0/result.json | reuse=explicit_result_reuse
+- obsidian-linter-auto-table-of-contents | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/obsidian-linter-auto-table-of-contents/rep1/result.json | reuse=explicit_result_reuse
+- obsidian-linter-auto-table-of-contents | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/obsidian-linter-auto-table-of-contents/rep1/result.json | reuse=explicit_result_reuse
+- obsidian-linter-auto-table-of-contents | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/obsidian-linter-auto-table-of-contents/rep2/result.json | reuse=explicit_result_reuse
+- obsidian-linter-auto-table-of-contents | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/obsidian-linter-auto-table-of-contents/rep2/result.json | reuse=explicit_result_reuse
+- obsidian-linter-link-format-conversion | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/obsidian-linter-link-format-conversion/rep0/result.json | reuse=explicit_result_reuse
+- obsidian-linter-link-format-conversion | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/obsidian-linter-link-format-conversion/rep0/result.json | reuse=explicit_result_reuse
+- obsidian-linter-link-format-conversion | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/obsidian-linter-link-format-conversion/rep1/result.json | reuse=explicit_result_reuse
+- obsidian-linter-link-format-conversion | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/obsidian-linter-link-format-conversion/rep1/result.json | reuse=explicit_result_reuse
+- obsidian-linter-link-format-conversion | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/obsidian-linter-link-format-conversion/rep2/result.json | reuse=explicit_result_reuse
+- obsidian-linter-link-format-conversion | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/obsidian-linter-link-format-conversion/rep2/result.json | reuse=explicit_result_reuse
+- obsidian-linter-scoped-ignore-markers | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/obsidian-linter-scoped-ignore-markers/rep0/result.json | reuse=explicit_result_reuse
+- obsidian-linter-scoped-ignore-markers | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/obsidian-linter-scoped-ignore-markers/rep0/result.json | reuse=explicit_result_reuse
+- obsidian-linter-scoped-ignore-markers | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/obsidian-linter-scoped-ignore-markers/rep1/result.json | reuse=explicit_result_reuse
+- obsidian-linter-scoped-ignore-markers | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/obsidian-linter-scoped-ignore-markers/rep1/result.json | reuse=explicit_result_reuse
+- obsidian-linter-scoped-ignore-markers | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/obsidian-linter-scoped-ignore-markers/rep2/result.json | reuse=explicit_result_reuse
+- obsidian-linter-scoped-ignore-markers | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/obsidian-linter-scoped-ignore-markers/rep2/result.json | reuse=explicit_result_reuse
+- ofetch-per-origin-circuit-breaker | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ofetch-per-origin-circuit-breaker/rep0/result.json | reuse=explicit_result_reuse
+- ofetch-per-origin-circuit-breaker | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ofetch-per-origin-circuit-breaker/rep0/result.json | reuse=explicit_result_reuse
+- ofetch-per-origin-circuit-breaker | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ofetch-per-origin-circuit-breaker/rep1/result.json | reuse=explicit_result_reuse
+- ofetch-per-origin-circuit-breaker | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ofetch-per-origin-circuit-breaker/rep1/result.json | reuse=explicit_result_reuse
+- ofetch-per-origin-circuit-breaker | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ofetch-per-origin-circuit-breaker/rep2/result.json | reuse=explicit_result_reuse
+- ofetch-per-origin-circuit-breaker | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ofetch-per-origin-circuit-breaker/rep2/result.json | reuse=explicit_result_reuse
+- onedump-dump-encryption-pipeline | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/onedump-dump-encryption-pipeline/rep0/result.json | reuse=explicit_result_reuse
+- onedump-dump-encryption-pipeline | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/onedump-dump-encryption-pipeline/rep0/result.json | reuse=explicit_result_reuse
+- onedump-dump-encryption-pipeline | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/onedump-dump-encryption-pipeline/rep1/result.json | reuse=explicit_result_reuse
+- onedump-dump-encryption-pipeline | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/onedump-dump-encryption-pipeline/rep1/result.json | reuse=explicit_result_reuse
+- onedump-dump-encryption-pipeline | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/onedump-dump-encryption-pipeline/rep2/result.json | reuse=explicit_result_reuse
+- onedump-dump-encryption-pipeline | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/onedump-dump-encryption-pipeline/rep2/result.json | reuse=explicit_result_reuse
+- opa-rego-rule-profiling | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/opa-rego-rule-profiling/rep0/result.json | reuse=explicit_result_reuse
+- opa-rego-rule-profiling | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/opa-rego-rule-profiling/rep0/result.json | reuse=explicit_result_reuse
+- opa-rego-rule-profiling | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/opa-rego-rule-profiling/rep1/result.json | reuse=explicit_result_reuse
+- opa-rego-rule-profiling | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/opa-rego-rule-profiling/rep1/result.json | reuse=explicit_result_reuse
+- opa-rego-rule-profiling | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/opa-rego-rule-profiling/rep2/result.json | reuse=explicit_result_reuse
+- opa-rego-rule-profiling | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/opa-rego-rule-profiling/rep2/result.json | reuse=explicit_result_reuse
+- opa-template-string-reconstruction | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/opa-template-string-reconstruction/rep0/result.json | reuse=explicit_result_reuse
+- opa-template-string-reconstruction | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/opa-template-string-reconstruction/rep0/result.json | reuse=explicit_result_reuse
+- opa-template-string-reconstruction | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/opa-template-string-reconstruction/rep1/result.json | reuse=explicit_result_reuse
+- opa-template-string-reconstruction | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/opa-template-string-reconstruction/rep1/result.json | reuse=explicit_result_reuse
+- opa-template-string-reconstruction | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/opa-template-string-reconstruction/rep2/result.json | reuse=explicit_result_reuse
+- opa-template-string-reconstruction | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/opa-template-string-reconstruction/rep2/result.json | reuse=explicit_result_reuse
+- optique-conditional-option-dependencies | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/optique-conditional-option-dependencies/rep0/result.json | reuse=explicit_result_reuse
+- optique-conditional-option-dependencies | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/optique-conditional-option-dependencies/rep0/result.json | reuse=explicit_result_reuse
+- optique-conditional-option-dependencies | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/optique-conditional-option-dependencies/rep1/result.json | reuse=explicit_result_reuse
+- optique-conditional-option-dependencies | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/optique-conditional-option-dependencies/rep1/result.json | reuse=explicit_result_reuse
+- optique-conditional-option-dependencies | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/optique-conditional-option-dependencies/rep2/result.json | reuse=explicit_result_reuse
+- optique-conditional-option-dependencies | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/optique-conditional-option-dependencies/rep2/result.json | reuse=explicit_result_reuse
+- oxvg-structural-selector-preservation | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/oxvg-structural-selector-preservation/rep0/result.json | reuse=explicit_result_reuse
+- oxvg-structural-selector-preservation | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/oxvg-structural-selector-preservation/rep0/result.json | reuse=explicit_result_reuse
+- oxvg-structural-selector-preservation | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/oxvg-structural-selector-preservation/rep1/result.json | reuse=explicit_result_reuse
+- oxvg-structural-selector-preservation | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/oxvg-structural-selector-preservation/rep1/result.json | reuse=explicit_result_reuse
+- oxvg-structural-selector-preservation | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/oxvg-structural-selector-preservation/rep2/result.json | reuse=explicit_result_reuse
+- oxvg-structural-selector-preservation | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/oxvg-structural-selector-preservation/rep2/result.json | reuse=explicit_result_reuse
+- participle-grammar-conflict-analysis | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/participle-grammar-conflict-analysis/rep0/result.json | reuse=explicit_result_reuse
+- participle-grammar-conflict-analysis | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/participle-grammar-conflict-analysis/rep0/result.json | reuse=explicit_result_reuse
+- participle-grammar-conflict-analysis | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/participle-grammar-conflict-analysis/rep1/result.json | reuse=explicit_result_reuse
+- participle-grammar-conflict-analysis | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/participle-grammar-conflict-analysis/rep1/result.json | reuse=explicit_result_reuse
+- participle-grammar-conflict-analysis | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/participle-grammar-conflict-analysis/rep2/result.json | reuse=explicit_result_reuse
+- participle-grammar-conflict-analysis | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/participle-grammar-conflict-analysis/rep2/result.json | reuse=explicit_result_reuse
+- pebble-durability-wait-apis | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/pebble-durability-wait-apis/rep0/result.json | reuse=explicit_result_reuse
+- pebble-durability-wait-apis | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/pebble-durability-wait-apis/rep0/result.json | reuse=explicit_result_reuse
+- pebble-durability-wait-apis | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/pebble-durability-wait-apis/rep1/result.json | reuse=explicit_result_reuse
+- pebble-durability-wait-apis | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/pebble-durability-wait-apis/rep1/result.json | reuse=explicit_result_reuse
+- pebble-durability-wait-apis | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/pebble-durability-wait-apis/rep2/result.json | reuse=explicit_result_reuse
+- pebble-durability-wait-apis | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/pebble-durability-wait-apis/rep2/result.json | reuse=explicit_result_reuse
+- pest-character-class-coalescing | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/pest-character-class-coalescing/rep0/result.json | reuse=explicit_result_reuse
+- pest-character-class-coalescing | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/pest-character-class-coalescing/rep0/result.json | reuse=explicit_result_reuse
+- pest-character-class-coalescing | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/pest-character-class-coalescing/rep1/result.json | reuse=explicit_result_reuse
+- pest-character-class-coalescing | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/pest-character-class-coalescing/rep1/result.json | reuse=explicit_result_reuse
+- pest-character-class-coalescing | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/pest-character-class-coalescing/rep2/result.json | reuse=explicit_result_reuse
+- pest-character-class-coalescing | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/pest-character-class-coalescing/rep2/result.json | reuse=explicit_result_reuse
+- prometheus-transactional-reload-status | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/prometheus-transactional-reload-status/rep0/result.json | reuse=explicit_result_reuse
+- prometheus-transactional-reload-status | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/prometheus-transactional-reload-status/rep0/result.json | reuse=explicit_result_reuse
+- prometheus-transactional-reload-status | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/prometheus-transactional-reload-status/rep1/result.json | reuse=explicit_result_reuse
+- prometheus-transactional-reload-status | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/prometheus-transactional-reload-status/rep1/result.json | reuse=explicit_result_reuse
+- prometheus-transactional-reload-status | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/prometheus-transactional-reload-status/rep2/result.json | reuse=explicit_result_reuse
+- prometheus-transactional-reload-status | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/prometheus-transactional-reload-status/rep2/result.json | reuse=explicit_result_reuse
+- prometheus-typed-label-sorting | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/prometheus-typed-label-sorting/rep0/result.json | reuse=explicit_result_reuse
+- prometheus-typed-label-sorting | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/prometheus-typed-label-sorting/rep0/result.json | reuse=explicit_result_reuse
+- prometheus-typed-label-sorting | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/prometheus-typed-label-sorting/rep1/result.json | reuse=explicit_result_reuse
+- prometheus-typed-label-sorting | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/prometheus-typed-label-sorting/rep1/result.json | reuse=explicit_result_reuse
+- prometheus-typed-label-sorting | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/prometheus-typed-label-sorting/rep2/result.json | reuse=explicit_result_reuse
+- prometheus-typed-label-sorting | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/prometheus-typed-label-sorting/rep2/result.json | reuse=explicit_result_reuse
+- psd-tools-blend-range-api | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/psd-tools-blend-range-api/rep0/result.json | reuse=explicit_result_reuse
+- psd-tools-blend-range-api | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/psd-tools-blend-range-api/rep0/result.json | reuse=explicit_result_reuse
+- psd-tools-blend-range-api | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/psd-tools-blend-range-api/rep1/result.json | reuse=explicit_result_reuse
+- psd-tools-blend-range-api | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/psd-tools-blend-range-api/rep1/result.json | reuse=explicit_result_reuse
+- psd-tools-blend-range-api | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/psd-tools-blend-range-api/rep2/result.json | reuse=explicit_result_reuse
+- psd-tools-blend-range-api | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/psd-tools-blend-range-api/rep2/result.json | reuse=explicit_result_reuse
+- pwntools-tube-multiplexing | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/pwntools-tube-multiplexing/rep0/result.json | reuse=explicit_result_reuse
+- pwntools-tube-multiplexing | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/pwntools-tube-multiplexing/rep0/result.json | reuse=explicit_result_reuse
+- pwntools-tube-multiplexing | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/pwntools-tube-multiplexing/rep1/result.json | reuse=explicit_result_reuse
+- pwntools-tube-multiplexing | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/pwntools-tube-multiplexing/rep1/result.json | reuse=explicit_result_reuse
+- pwntools-tube-multiplexing | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/pwntools-tube-multiplexing/rep2/result.json | reuse=explicit_result_reuse
+- pwntools-tube-multiplexing | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/pwntools-tube-multiplexing/rep2/result.json | reuse=explicit_result_reuse
+- python-statemachine-state-data-scoping | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/python-statemachine-state-data-scoping/rep0/result.json | reuse=explicit_result_reuse
+- python-statemachine-state-data-scoping | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/python-statemachine-state-data-scoping/rep0/result.json | reuse=explicit_result_reuse
+- python-statemachine-state-data-scoping | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/python-statemachine-state-data-scoping/rep1/result.json | reuse=explicit_result_reuse
+- python-statemachine-state-data-scoping | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/python-statemachine-state-data-scoping/rep1/result.json | reuse=explicit_result_reuse
+- python-statemachine-state-data-scoping | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/python-statemachine-state-data-scoping/rep2/result.json | reuse=explicit_result_reuse
+- python-statemachine-state-data-scoping | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/python-statemachine-state-data-scoping/rep2/result.json | reuse=explicit_result_reuse
+- query-persist-restored-query-state | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/query-persist-restored-query-state/rep0/result.json | reuse=explicit_result_reuse
+- query-persist-restored-query-state | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/query-persist-restored-query-state/rep0/result.json | reuse=explicit_result_reuse
+- query-persist-restored-query-state | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/query-persist-restored-query-state/rep1/result.json | reuse=explicit_result_reuse
+- query-persist-restored-query-state | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/query-persist-restored-query-state/rep1/result.json | reuse=explicit_result_reuse
+- query-persist-restored-query-state | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/query-persist-restored-query-state/rep2/result.json | reuse=explicit_result_reuse
+- query-persist-restored-query-state | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/query-persist-restored-query-state/rep2/result.json | reuse=explicit_result_reuse
+- quill-shared-toolbar-focus | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/quill-shared-toolbar-focus/rep0/result.json | reuse=explicit_result_reuse
+- quill-shared-toolbar-focus | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/quill-shared-toolbar-focus/rep0/result.json | reuse=explicit_result_reuse
+- quill-shared-toolbar-focus | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/quill-shared-toolbar-focus/rep1/result.json | reuse=explicit_result_reuse
+- quill-shared-toolbar-focus | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/quill-shared-toolbar-focus/rep1/result.json | reuse=explicit_result_reuse
+- quill-shared-toolbar-focus | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/quill-shared-toolbar-focus/rep2/result.json | reuse=explicit_result_reuse
+- quill-shared-toolbar-focus | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/quill-shared-toolbar-focus/rep2/result.json | reuse=explicit_result_reuse
+- returns-validated-error-accumulation | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/returns-validated-error-accumulation/rep0/result.json | reuse=explicit_result_reuse
+- returns-validated-error-accumulation | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/returns-validated-error-accumulation/rep0/result.json | reuse=explicit_result_reuse
+- returns-validated-error-accumulation | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/returns-validated-error-accumulation/rep1/result.json | reuse=explicit_result_reuse
+- returns-validated-error-accumulation | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/returns-validated-error-accumulation/rep1/result.json | reuse=explicit_result_reuse
+- returns-validated-error-accumulation | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/returns-validated-error-accumulation/rep2/result.json | reuse=explicit_result_reuse
+- returns-validated-error-accumulation | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/returns-validated-error-accumulation/rep2/result.json | reuse=explicit_result_reuse
+- scc-bounded-memory-spilling | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/scc-bounded-memory-spilling/rep0/result.json | reuse=explicit_result_reuse
+- scc-bounded-memory-spilling | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/scc-bounded-memory-spilling/rep0/result.json | reuse=explicit_result_reuse
+- scc-bounded-memory-spilling | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/scc-bounded-memory-spilling/rep1/result.json | reuse=explicit_result_reuse
+- scc-bounded-memory-spilling | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/scc-bounded-memory-spilling/rep1/result.json | reuse=explicit_result_reuse
+- scc-bounded-memory-spilling | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/scc-bounded-memory-spilling/rep2/result.json | reuse=explicit_result_reuse
+- scc-bounded-memory-spilling | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/scc-bounded-memory-spilling/rep2/result.json | reuse=explicit_result_reuse
+- scriggo-method-declarations | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/scriggo-method-declarations/rep0/result.json | reuse=explicit_result_reuse
+- scriggo-method-declarations | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/scriggo-method-declarations/rep0/result.json | reuse=explicit_result_reuse
+- scriggo-method-declarations | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/scriggo-method-declarations/rep1/result.json | reuse=explicit_result_reuse
+- scriggo-method-declarations | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/scriggo-method-declarations/rep1/result.json | reuse=explicit_result_reuse
+- scriggo-method-declarations | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/scriggo-method-declarations/rep2/result.json | reuse=explicit_result_reuse
+- scriggo-method-declarations | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/scriggo-method-declarations/rep2/result.json | reuse=explicit_result_reuse
+- skrub-duration-encoding | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/skrub-duration-encoding/rep0/result.json | reuse=explicit_result_reuse
+- skrub-duration-encoding | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/skrub-duration-encoding/rep0/result.json | reuse=explicit_result_reuse
+- skrub-duration-encoding | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/skrub-duration-encoding/rep1/result.json | reuse=explicit_result_reuse
+- skrub-duration-encoding | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/skrub-duration-encoding/rep1/result.json | reuse=explicit_result_reuse
+- skrub-duration-encoding | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/skrub-duration-encoding/rep2/result.json | reuse=explicit_result_reuse
+- skrub-duration-encoding | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/skrub-duration-encoding/rep2/result.json | reuse=explicit_result_reuse
+- sql-formatter-bigquery-pipe-formatting | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/sql-formatter-bigquery-pipe-formatting/rep0/result.json | reuse=explicit_result_reuse
+- sql-formatter-bigquery-pipe-formatting | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/sql-formatter-bigquery-pipe-formatting/rep0/result.json | reuse=explicit_result_reuse
+- sql-formatter-bigquery-pipe-formatting | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/sql-formatter-bigquery-pipe-formatting/rep1/result.json | reuse=explicit_result_reuse
+- sql-formatter-bigquery-pipe-formatting | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/sql-formatter-bigquery-pipe-formatting/rep1/result.json | reuse=explicit_result_reuse
+- sql-formatter-bigquery-pipe-formatting | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/sql-formatter-bigquery-pipe-formatting/rep2/result.json | reuse=explicit_result_reuse
+- sql-formatter-bigquery-pipe-formatting | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/sql-formatter-bigquery-pipe-formatting/rep2/result.json | reuse=explicit_result_reuse
+- sqlfmt-create-table-ddl-formatting | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/sqlfmt-create-table-ddl-formatting/rep0/result.json | reuse=explicit_result_reuse
+- sqlfmt-create-table-ddl-formatting | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/sqlfmt-create-table-ddl-formatting/rep0/result.json | reuse=explicit_result_reuse
+- sqlfmt-create-table-ddl-formatting | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/sqlfmt-create-table-ddl-formatting/rep1/result.json | reuse=explicit_result_reuse
+- sqlfmt-create-table-ddl-formatting | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/sqlfmt-create-table-ddl-formatting/rep1/result.json | reuse=explicit_result_reuse
+- sqlfmt-create-table-ddl-formatting | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/sqlfmt-create-table-ddl-formatting/rep2/result.json | reuse=explicit_result_reuse
+- sqlfmt-create-table-ddl-formatting | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/sqlfmt-create-table-ddl-formatting/rep2/result.json | reuse=explicit_result_reuse
+- sqlite-utils-safe-import-checkpoints | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/sqlite-utils-safe-import-checkpoints/rep0/result.json | reuse=explicit_result_reuse
+- sqlite-utils-safe-import-checkpoints | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/sqlite-utils-safe-import-checkpoints/rep0/result.json | reuse=explicit_result_reuse
+- sqlite-utils-safe-import-checkpoints | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/sqlite-utils-safe-import-checkpoints/rep1/result.json | reuse=explicit_result_reuse
+- sqlite-utils-safe-import-checkpoints | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/sqlite-utils-safe-import-checkpoints/rep1/result.json | reuse=explicit_result_reuse
+- sqlite-utils-safe-import-checkpoints | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/sqlite-utils-safe-import-checkpoints/rep2/result.json | reuse=explicit_result_reuse
+- sqlite-utils-safe-import-checkpoints | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/sqlite-utils-safe-import-checkpoints/rep2/result.json | reuse=explicit_result_reuse
+- superjson-error-stack-serialization | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/superjson-error-stack-serialization/rep0/result.json | reuse=explicit_result_reuse
+- superjson-error-stack-serialization | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/superjson-error-stack-serialization/rep0/result.json | reuse=explicit_result_reuse
+- superjson-error-stack-serialization | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/superjson-error-stack-serialization/rep1/result.json | reuse=explicit_result_reuse
+- superjson-error-stack-serialization | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/superjson-error-stack-serialization/rep1/result.json | reuse=explicit_result_reuse
+- superjson-error-stack-serialization | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/superjson-error-stack-serialization/rep2/result.json | reuse=explicit_result_reuse
+- superjson-error-stack-serialization | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/superjson-error-stack-serialization/rep2/result.json | reuse=explicit_result_reuse
+- task-task-graph-export | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/task-task-graph-export/rep0/result.json | reuse=explicit_result_reuse
+- task-task-graph-export | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/task-task-graph-export/rep0/result.json | reuse=explicit_result_reuse
+- task-task-graph-export | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/task-task-graph-export/rep1/result.json | reuse=explicit_result_reuse
+- task-task-graph-export | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/task-task-graph-export/rep1/result.json | reuse=explicit_result_reuse
+- task-task-graph-export | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/task-task-graph-export/rep2/result.json | reuse=explicit_result_reuse
+- task-task-graph-export | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/task-task-graph-export/rep2/result.json | reuse=explicit_result_reuse
+- tengo-callable-instance-isolation | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/tengo-callable-instance-isolation/rep0/result.json | reuse=explicit_result_reuse
+- tengo-callable-instance-isolation | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/tengo-callable-instance-isolation/rep0/result.json | reuse=explicit_result_reuse
+- tengo-callable-instance-isolation | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/tengo-callable-instance-isolation/rep1/result.json | reuse=explicit_result_reuse
+- tengo-callable-instance-isolation | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/tengo-callable-instance-isolation/rep1/result.json | reuse=explicit_result_reuse
+- tengo-callable-instance-isolation | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/tengo-callable-instance-isolation/rep2/result.json | reuse=explicit_result_reuse
+- tengo-callable-instance-isolation | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/tengo-callable-instance-isolation/rep2/result.json | reuse=explicit_result_reuse
+- tengo-destructuring-bindings | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/tengo-destructuring-bindings/rep0/result.json | reuse=explicit_result_reuse
+- tengo-destructuring-bindings | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/tengo-destructuring-bindings/rep0/result.json | reuse=explicit_result_reuse
+- tengo-destructuring-bindings | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/tengo-destructuring-bindings/rep1/result.json | reuse=explicit_result_reuse
+- tengo-destructuring-bindings | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/tengo-destructuring-bindings/rep1/result.json | reuse=explicit_result_reuse
+- tengo-destructuring-bindings | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/tengo-destructuring-bindings/rep2/result.json | reuse=explicit_result_reuse
+- tengo-destructuring-bindings | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/tengo-destructuring-bindings/rep2/result.json | reuse=explicit_result_reuse
+- termenv-preserve-ansi-resets | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/termenv-preserve-ansi-resets/rep0/result.json | reuse=explicit_result_reuse
+- termenv-preserve-ansi-resets | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/termenv-preserve-ansi-resets/rep0/result.json | reuse=explicit_result_reuse
+- termenv-preserve-ansi-resets | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/termenv-preserve-ansi-resets/rep1/result.json | reuse=explicit_result_reuse
+- termenv-preserve-ansi-resets | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/termenv-preserve-ansi-resets/rep1/result.json | reuse=explicit_result_reuse
+- termenv-preserve-ansi-resets | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/termenv-preserve-ansi-resets/rep2/result.json | reuse=explicit_result_reuse
+- termenv-preserve-ansi-resets | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/termenv-preserve-ansi-resets/rep2/result.json | reuse=explicit_result_reuse
+- testem-bail-on-test-failure | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/testem-bail-on-test-failure/rep0/result.json | reuse=explicit_result_reuse
+- testem-bail-on-test-failure | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/testem-bail-on-test-failure/rep0/result.json | reuse=explicit_result_reuse
+- testem-bail-on-test-failure | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/testem-bail-on-test-failure/rep1/result.json | reuse=explicit_result_reuse
+- testem-bail-on-test-failure | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/testem-bail-on-test-failure/rep1/result.json | reuse=explicit_result_reuse
+- testem-bail-on-test-failure | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/testem-bail-on-test-failure/rep2/result.json | reuse=explicit_result_reuse
+- testem-bail-on-test-failure | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/testem-bail-on-test-failure/rep2/result.json | reuse=explicit_result_reuse
+- testem-per-launcher-reports | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/testem-per-launcher-reports/rep0/result.json | reuse=explicit_result_reuse
+- testem-per-launcher-reports | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/testem-per-launcher-reports/rep0/result.json | reuse=explicit_result_reuse
+- testem-per-launcher-reports | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/testem-per-launcher-reports/rep1/result.json | reuse=explicit_result_reuse
+- testem-per-launcher-reports | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/testem-per-launcher-reports/rep1/result.json | reuse=explicit_result_reuse
+- testem-per-launcher-reports | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/testem-per-launcher-reports/rep2/result.json | reuse=explicit_result_reuse
+- testem-per-launcher-reports | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/testem-per-launcher-reports/rep2/result.json | reuse=explicit_result_reuse
+- textual-kitty-key-phases | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/textual-kitty-key-phases/rep0/result.json | reuse=explicit_result_reuse
+- textual-kitty-key-phases | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/textual-kitty-key-phases/rep0/result.json | reuse=explicit_result_reuse
+- textual-kitty-key-phases | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/textual-kitty-key-phases/rep1/result.json | reuse=explicit_result_reuse
+- textual-kitty-key-phases | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/textual-kitty-key-phases/rep1/result.json | reuse=explicit_result_reuse
+- textual-kitty-key-phases | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/textual-kitty-key-phases/rep2/result.json | reuse=explicit_result_reuse
+- textual-kitty-key-phases | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/textual-kitty-key-phases/rep2/result.json | reuse=explicit_result_reuse
+- textual-richlog-follow-state | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/textual-richlog-follow-state/rep0/result.json | reuse=explicit_result_reuse
+- textual-richlog-follow-state | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/textual-richlog-follow-state/rep0/result.json | reuse=explicit_result_reuse
+- textual-richlog-follow-state | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/textual-richlog-follow-state/rep1/result.json | reuse=explicit_result_reuse
+- textual-richlog-follow-state | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/textual-richlog-follow-state/rep1/result.json | reuse=explicit_result_reuse
+- textual-richlog-follow-state | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/textual-richlog-follow-state/rep2/result.json | reuse=explicit_result_reuse
+- textual-richlog-follow-state | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/textual-richlog-follow-state/rep2/result.json | reuse=explicit_result_reuse
+- tomlkit-toml-table-converters | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/tomlkit-toml-table-converters/rep0/result.json | reuse=explicit_result_reuse
+- tomlkit-toml-table-converters | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/tomlkit-toml-table-converters/rep0/result.json | reuse=explicit_result_reuse
+- tomlkit-toml-table-converters | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/tomlkit-toml-table-converters/rep1/result.json | reuse=explicit_result_reuse
+- tomlkit-toml-table-converters | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/tomlkit-toml-table-converters/rep1/result.json | reuse=explicit_result_reuse
+- tomlkit-toml-table-converters | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/tomlkit-toml-table-converters/rep2/result.json | reuse=explicit_result_reuse
+- tomlkit-toml-table-converters | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/tomlkit-toml-table-converters/rep2/result.json | reuse=explicit_result_reuse
+- true-myth-iterable-collection-combinators | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/true-myth-iterable-collection-combinators/rep0/result.json | reuse=explicit_result_reuse
+- true-myth-iterable-collection-combinators | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/true-myth-iterable-collection-combinators/rep0/result.json | reuse=explicit_result_reuse
+- true-myth-iterable-collection-combinators | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/true-myth-iterable-collection-combinators/rep1/result.json | reuse=explicit_result_reuse
+- true-myth-iterable-collection-combinators | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/true-myth-iterable-collection-combinators/rep1/result.json | reuse=explicit_result_reuse
+- true-myth-iterable-collection-combinators | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/true-myth-iterable-collection-combinators/rep2/result.json | reuse=explicit_result_reuse
+- true-myth-iterable-collection-combinators | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/true-myth-iterable-collection-combinators/rep2/result.json | reuse=explicit_result_reuse
+- ts-pattern-match-each | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ts-pattern-match-each/rep0/result.json | reuse=explicit_result_reuse
+- ts-pattern-match-each | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ts-pattern-match-each/rep0/result.json | reuse=explicit_result_reuse
+- ts-pattern-match-each | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ts-pattern-match-each/rep1/result.json | reuse=explicit_result_reuse
+- ts-pattern-match-each | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ts-pattern-match-each/rep1/result.json | reuse=explicit_result_reuse
+- ts-pattern-match-each | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ts-pattern-match-each/rep2/result.json | reuse=explicit_result_reuse
+- ts-pattern-match-each | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ts-pattern-match-each/rep2/result.json | reuse=explicit_result_reuse
+- updo-policy-alerting | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/updo-policy-alerting/rep0/result.json | reuse=explicit_result_reuse
+- updo-policy-alerting | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/updo-policy-alerting/rep0/result.json | reuse=explicit_result_reuse
+- updo-policy-alerting | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/updo-policy-alerting/rep1/result.json | reuse=explicit_result_reuse
+- updo-policy-alerting | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/updo-policy-alerting/rep1/result.json | reuse=explicit_result_reuse
+- updo-policy-alerting | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/updo-policy-alerting/rep2/result.json | reuse=explicit_result_reuse
+- updo-policy-alerting | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/updo-policy-alerting/rep2/result.json | reuse=explicit_result_reuse
+- valibot-recursive-schema-composition | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/valibot-recursive-schema-composition/rep0/result.json | reuse=explicit_result_reuse
+- valibot-recursive-schema-composition | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/valibot-recursive-schema-composition/rep0/result.json | reuse=explicit_result_reuse
+- valibot-recursive-schema-composition | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/valibot-recursive-schema-composition/rep1/result.json | reuse=explicit_result_reuse
+- valibot-recursive-schema-composition | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/valibot-recursive-schema-composition/rep1/result.json | reuse=explicit_result_reuse
+- valibot-recursive-schema-composition | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/valibot-recursive-schema-composition/rep2/result.json | reuse=explicit_result_reuse
+- valibot-recursive-schema-composition | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/valibot-recursive-schema-composition/rep2/result.json | reuse=explicit_result_reuse
+- vitest-duration-sharding | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/vitest-duration-sharding/rep0/result.json | reuse=explicit_result_reuse
+- vitest-duration-sharding | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/vitest-duration-sharding/rep0/result.json | reuse=explicit_result_reuse
+- vitest-duration-sharding | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/vitest-duration-sharding/rep1/result.json | reuse=explicit_result_reuse
+- vitest-duration-sharding | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/vitest-duration-sharding/rep1/result.json | reuse=explicit_result_reuse
+- vitest-duration-sharding | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/vitest-duration-sharding/rep2/result.json | reuse=explicit_result_reuse
+- vitest-duration-sharding | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/vitest-duration-sharding/rep2/result.json | reuse=explicit_result_reuse
+- vulture-persistent-analysis-cache | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/vulture-persistent-analysis-cache/rep0/result.json | reuse=explicit_result_reuse
+- vulture-persistent-analysis-cache | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/vulture-persistent-analysis-cache/rep0/result.json | reuse=explicit_result_reuse
+- vulture-persistent-analysis-cache | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/vulture-persistent-analysis-cache/rep1/result.json | reuse=explicit_result_reuse
+- vulture-persistent-analysis-cache | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/vulture-persistent-analysis-cache/rep1/result.json | reuse=explicit_result_reuse
+- vulture-persistent-analysis-cache | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/vulture-persistent-analysis-cache/rep2/result.json | reuse=explicit_result_reuse
+- vulture-persistent-analysis-cache | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/vulture-persistent-analysis-cache/rep2/result.json | reuse=explicit_result_reuse
+- wasmi-trap-coredumps | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/wasmi-trap-coredumps/rep0/result.json | reuse=explicit_result_reuse
+- wasmi-trap-coredumps | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/wasmi-trap-coredumps/rep0/result.json | reuse=explicit_result_reuse
+- wasmi-trap-coredumps | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/wasmi-trap-coredumps/rep1/result.json | reuse=explicit_result_reuse
+- wasmi-trap-coredumps | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/wasmi-trap-coredumps/rep1/result.json | reuse=explicit_result_reuse
+- wasmi-trap-coredumps | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/wasmi-trap-coredumps/rep2/result.json | reuse=explicit_result_reuse
+- wasmi-trap-coredumps | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/wasmi-trap-coredumps/rep2/result.json | reuse=explicit_result_reuse
+- wazero-multi-module-snapshots | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/wazero-multi-module-snapshots/rep0/result.json | reuse=explicit_result_reuse
+- wazero-multi-module-snapshots | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/wazero-multi-module-snapshots/rep0/result.json | reuse=explicit_result_reuse
+- wazero-multi-module-snapshots | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/wazero-multi-module-snapshots/rep1/result.json | reuse=explicit_result_reuse
+- wazero-multi-module-snapshots | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/wazero-multi-module-snapshots/rep1/result.json | reuse=explicit_result_reuse
+- wazero-multi-module-snapshots | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/wazero-multi-module-snapshots/rep2/result.json | reuse=explicit_result_reuse
+- wazero-multi-module-snapshots | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/wazero-multi-module-snapshots/rep2/result.json | reuse=explicit_result_reuse
+- yaegi-go-embed-directives | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/yaegi-go-embed-directives/rep0/result.json | reuse=explicit_result_reuse
+- yaegi-go-embed-directives | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/yaegi-go-embed-directives/rep0/result.json | reuse=explicit_result_reuse
+- yaegi-go-embed-directives | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/yaegi-go-embed-directives/rep1/result.json | reuse=explicit_result_reuse
+- yaegi-go-embed-directives | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/yaegi-go-embed-directives/rep1/result.json | reuse=explicit_result_reuse
+- yaegi-go-embed-directives | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/yaegi-go-embed-directives/rep2/result.json | reuse=explicit_result_reuse
+- yaegi-go-embed-directives | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/yaegi-go-embed-directives/rep2/result.json
+- yjs-map-conflict-detection | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/yjs-map-conflict-detection/rep0/result.json | reuse=explicit_result_reuse
+- yjs-map-conflict-detection | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/yjs-map-conflict-detection/rep0/result.json
+- yjs-map-conflict-detection | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/yjs-map-conflict-detection/rep1/result.json | reuse=explicit_result_reuse
+- yjs-map-conflict-detection | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/yjs-map-conflict-detection/rep1/result.json
+- yjs-map-conflict-detection | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/yjs-map-conflict-detection/rep2/result.json | reuse=explicit_result_reuse
+- yjs-map-conflict-detection | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/yjs-map-conflict-detection/rep2/result.json
+- ytt-jsonpath-query-api | testing-skills@1.1.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ytt-jsonpath-query-api/rep0/result.json | reuse=explicit_result_reuse
+- ytt-jsonpath-query-api | testing-skills@1.2.0 | rep0 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ytt-jsonpath-query-api/rep0/result.json
+- ytt-jsonpath-query-api | testing-skills@1.1.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ytt-jsonpath-query-api/rep1/result.json | reuse=explicit_result_reuse
+- ytt-jsonpath-query-api | testing-skills@1.2.0 | rep1 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ytt-jsonpath-query-api/rep1/result.json
+- ytt-jsonpath-query-api | testing-skills@1.1.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.1.0/ytt-jsonpath-query-api/rep2/result.json | reuse=explicit_result_reuse
+- ytt-jsonpath-query-api | testing-skills@1.2.0 | rep2 | result=/home/will/evals/deep-swe-bench/results/gpt-5.6-sol/low/testing-skills@1.2.0/ytt-jsonpath-query-api/rep2/result.json
+
+PATHS
+Workspace: /home/will/evals/deep-swe-bench/.worktrees/fix-verifier-timeout-evidence
+Tasks root: /home/will/evals/deep-swe/tasks
+Results root: /home/will/evals/deep-swe-bench/results
+Structured state: /home/will/evals/deep-swe-bench/results/_runs/gpt56-sol-low-testing-skills-1-2-full113-timeout--21c929c7b7ddf55aeffdfd2a9570d12e4428aa96eeaf67ab5ac5dd23294f7063
