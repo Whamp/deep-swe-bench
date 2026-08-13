@@ -168,3 +168,16 @@ enforced by construction: the 12-task per-cell allocations are drawn as subsets
 of the 36-task per-cell allocations. Change `--seed` to get a different
 stratified draw with the same statistical properties; this is how you build a
 fresh neutral subsample that does not overlap an existing one.
+
+## Mechanism-diagnostic subset: `testing_skills_24_v0`
+
+`testing_skills_24_v0` is an outcome-informed diagnostic subset for cumulative
+changes to the `testing`, `property-based-testing`, and `fuzzing` skills. It
+contains contract-observation sentinels, final-evidence and stopping cases,
+property-testing opportunities, fuzzing opportunities, and negative controls.
+It intentionally uses prior `testing-skills@1.1.0` trajectories to maximize
+mechanism signal.
+
+Use this subset to decide which wording mechanism merits a neutral or full-set
+confirmation. Do not present its solve-rate delta as an unbiased estimate of
+full-corpus efficacy.
