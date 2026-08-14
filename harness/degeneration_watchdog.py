@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 _CODING_AGENT_EARLY_GATE_PROFILE = "coding-agent-early-gate-v1"
+_CODING_AGENT_RESPONSE_GATE_PROFILE = "coding-agent-response-gate-v1"
 _POLICY_FIELDS = frozenset(
     {
         "profile",
@@ -32,7 +33,7 @@ class DegenerationWatchdogPolicy:
     max_assistant_output_tokens_per_turn: int
     max_tool_calls_per_turn: int
     max_identical_tool_calls_per_turn: int
-    max_tool_calls_without_progress: int
+    max_tool_calls_without_progress: int | None
     progress_tool_names: tuple[str, ...]
 
 
@@ -72,22 +73,40 @@ def coding_agent_early_gate_watchdog() -> DegenerationWatchdogPolicy:
     )
 
 
+def coding_agent_response_gate_watchdog() -> DegenerationWatchdogPolicy:
+    """Bound pathological single responses without guessing cross-turn progress."""
+    return DegenerationWatchdogPolicy(
+        profile=_CODING_AGENT_RESPONSE_GATE_PROFILE,
+        max_assistant_chars_per_turn=180_000,
+        max_assistant_output_tokens_per_turn=50_000,
+        max_tool_calls_per_turn=24,
+        max_identical_tool_calls_per_turn=4,
+        max_tool_calls_without_progress=None,
+        progress_tool_names=(),
+    )
+
+
 def degeneration_watchdog_policy_for_profile(
     profile: str | None,
 ) -> DegenerationWatchdogPolicy | None:
     """Resolve a named CLI profile without accepting hidden custom thresholds."""
     if profile is None:
         return None
-    if profile != _CODING_AGENT_EARLY_GATE_PROFILE:
-        raise ValueError(f"Unknown degeneration watchdog profile: {profile!r}")
-    return coding_agent_early_gate_watchdog()
+    if profile == _CODING_AGENT_EARLY_GATE_PROFILE:
+        return coding_agent_early_gate_watchdog()
+    if profile == _CODING_AGENT_RESPONSE_GATE_PROFILE:
+        return coding_agent_response_gate_watchdog()
+    raise ValueError(f"Unknown degeneration watchdog profile: {profile!r}")
 
 
 def validate_degeneration_watchdog_policy(
     policy: DegenerationWatchdogPolicy,
 ) -> None:
     """Reject malformed or drifted watchdog policies before plan compilation."""
-    if policy.profile != _CODING_AGENT_EARLY_GATE_PROFILE:
+    if policy.profile not in {
+        _CODING_AGENT_EARLY_GATE_PROFILE,
+        _CODING_AGENT_RESPONSE_GATE_PROFILE,
+    }:
         raise ValueError(
             "Degeneration watchdog policy invalid: unsupported profile "
             f"{policy.profile!r}"
@@ -99,7 +118,6 @@ def validate_degeneration_watchdog_policy(
         ),
         "max tool calls per turn": policy.max_tool_calls_per_turn,
         "max identical tool calls per turn": (policy.max_identical_tool_calls_per_turn),
-        "max tool calls without progress": policy.max_tool_calls_without_progress,
     }
     for name, value in limits.items():
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -107,28 +125,57 @@ def validate_degeneration_watchdog_policy(
                 "Degeneration watchdog policy invalid: expected a positive "
                 f"integer for {name}; got {value!r}"
             )
+    no_progress_limit = policy.max_tool_calls_without_progress
     names = policy.progress_tool_names
-    if (
-        not names
-        or len(set(names)) != len(names)
-        or any(not isinstance(name, str) or not name for name in names)
-    ):
+    if no_progress_limit is None:
+        if names:
+            raise ValueError(
+                "Degeneration watchdog policy invalid: progress tool names require "
+                "a no-progress limit"
+            )
+    else:
+        if (
+            isinstance(no_progress_limit, bool)
+            or not isinstance(no_progress_limit, int)
+            or no_progress_limit <= 0
+        ):
+            raise ValueError(
+                "Degeneration watchdog policy invalid: expected a positive integer "
+                "or null for max tool calls without progress"
+            )
+        if (
+            not names
+            or len(set(names)) != len(names)
+            or any(not isinstance(name, str) or not name for name in names)
+        ):
+            raise ValueError(
+                "Degeneration watchdog policy invalid: progress tool names must be "
+                "unique nonempty strings"
+            )
+
+
+def validate_named_degeneration_watchdog_policy(
+    policy: DegenerationWatchdogPolicy,
+) -> None:
+    """Require a named launch profile to retain its reviewed thresholds."""
+    validate_degeneration_watchdog_policy(policy)
+    expected = degeneration_watchdog_policy_for_profile(policy.profile)
+    if expected is None or policy != expected:
         raise ValueError(
-            "Degeneration watchdog policy invalid: progress tool names must be "
-            "unique nonempty strings"
+            f"Degeneration watchdog policy invalid: {policy.profile} thresholds drifted"
         )
 
 
 def validate_coding_agent_early_gate_watchdog(
     policy: DegenerationWatchdogPolicy,
 ) -> None:
-    """Require the named launch profile to retain its reviewed thresholds."""
-    validate_degeneration_watchdog_policy(policy)
-    if policy != coding_agent_early_gate_watchdog():
+    """Preserve validation for historical early-gate launch plans."""
+    if policy.profile != _CODING_AGENT_EARLY_GATE_PROFILE:
         raise ValueError(
-            "Degeneration watchdog policy invalid: coding-agent-early-gate-v1 "
-            "thresholds drifted"
+            "Degeneration watchdog policy invalid: expected "
+            f"{_CODING_AGENT_EARLY_GATE_PROFILE!r}; got {policy.profile!r}"
         )
+    validate_named_degeneration_watchdog_policy(policy)
 
 
 def degeneration_watchdog_policy_from_mapping(
@@ -168,13 +215,19 @@ def degeneration_watchdog_policy_from_mapping(
         max_identical_tool_calls_per_turn=_integer_policy_value(
             value.get("max_identical_tool_calls_per_turn")
         ),
-        max_tool_calls_without_progress=_integer_policy_value(
+        max_tool_calls_without_progress=_optional_integer_policy_value(
             value.get("max_tool_calls_without_progress")
         ),
         progress_tool_names=tuple(progress_tool_names),
     )
-    validate_coding_agent_early_gate_watchdog(policy)
+    validate_named_degeneration_watchdog_policy(policy)
     return policy
+
+
+def _optional_integer_policy_value(value: object) -> int | None:
+    if value is None:
+        return None
+    return _integer_policy_value(value)
 
 
 def _integer_policy_value(value: object) -> int:
@@ -286,16 +339,17 @@ class DegenerationWatchdog:
                 tool_signature_sha256=signature,
             )
 
-        if tool_name not in self.policy.progress_tool_names:
+        no_progress_limit = self.policy.max_tool_calls_without_progress
+        if (
+            no_progress_limit is not None
+            and tool_name not in self.policy.progress_tool_names
+        ):
             self.tool_calls_without_progress += 1
-            if (
-                self.tool_calls_without_progress
-                > self.policy.max_tool_calls_without_progress
-            ):
+            if self.tool_calls_without_progress > no_progress_limit:
                 return self._record_violation(
                     "tool_calls_without_progress",
                     self.tool_calls_without_progress,
-                    self.policy.max_tool_calls_without_progress,
+                    no_progress_limit,
                     tool_name=tool_name,
                 )
         return None

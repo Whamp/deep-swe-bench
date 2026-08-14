@@ -993,7 +993,10 @@ def _confirmed_launch_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--rpc-quiescence", type=float, default=2.0)
     plan_parser.add_argument(
         "--degeneration-watchdog",
-        choices=["coding-agent-early-gate-v1"],
+        choices=[
+            "coding-agent-early-gate-v1",
+            "coding-agent-response-gate-v1",
+        ],
         help=(
             "abort pathological Pi trajectories using the named thresholds "
             "embedded in the launch plan"

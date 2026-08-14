@@ -345,9 +345,14 @@ def _write_omp_launch_fixture(
 
 
 @pytest.mark.parametrize("thinking", ["low", "max"])
+@pytest.mark.parametrize(
+    "watchdog_profile",
+    ["coding-agent-early-gate-v1", "coding-agent-response-gate-v1"],
+)
 def test_plan_command_writes_review_artifacts_without_execution(
     tmp_path: Path,
     thinking: str,
+    watchdog_profile: str,
 ) -> None:
     """Preparing a launch writes only its immutable plan and receipt."""
     repository_root, tasks_root, results_root, state_root = (
@@ -399,7 +404,7 @@ def test_plan_command_writes_review_artifacts_without_execution(
             "--rpc-quiescence",
             "4.5",
             "--degeneration-watchdog",
-            "coding-agent-early-gate-v1",
+            watchdog_profile,
             "--no-initial-context-capture",
             "--repository",
             str(repository_root),
@@ -431,14 +436,15 @@ def test_plan_command_writes_review_artifacts_without_execution(
     }
     assert policies["agent_timeout_s"] == 321.0
     assert policies["rpc_quiescence_s"] == 4.5
+    response_scoped = watchdog_profile == "coding-agent-response-gate-v1"
     assert policies["degeneration_watchdog"] == {
         "max_assistant_chars_per_turn": 180_000,
         "max_assistant_output_tokens_per_turn": 50_000,
         "max_identical_tool_calls_per_turn": 4,
         "max_tool_calls_per_turn": 24,
-        "max_tool_calls_without_progress": 48,
-        "profile": "coding-agent-early-gate-v1",
-        "progress_tool_names": ["edit", "write"],
+        "max_tool_calls_without_progress": None if response_scoped else 48,
+        "profile": watchdog_profile,
+        "progress_tool_names": [] if response_scoped else ["edit", "write"],
     }
     assert policies["capture_initial_context"] is False
     assert policies["auto_resume"] is True
@@ -453,12 +459,16 @@ def test_plan_command_writes_review_artifacts_without_execution(
     assert "additional swap=0.0 GiB" in receipt
     assert "host reserve=13.0 GiB" in receipt
     assert "RPC quiescence=4.5s" in receipt
-    assert "Degeneration watchdog: coding-agent-early-gate-v1" in receipt
+    assert f"Degeneration watchdog: {watchdog_profile}" in receipt
     assert "max assistant output=50000 tokens/turn" in receipt
     assert "max tool calls=24/turn" in receipt
     assert "max identical tool calls=4/turn" in receipt
-    assert "max tool calls without progress=48" in receipt
-    assert "progress tools=edit, write" in receipt
+    if response_scoped:
+        assert "cross-turn no-progress heuristic=disabled" in receipt
+        assert "max tool calls without progress" not in receipt
+    else:
+        assert "max tool calls without progress=48" in receipt
+        assert "progress tools=edit, write" in receipt
     assert "initial context=not captured" in receipt
     assert "auto resume=enabled" in receipt
     assert "max quota wait=21600.0s" in receipt

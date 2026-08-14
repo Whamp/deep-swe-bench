@@ -8,6 +8,7 @@ import pytest
 from harness.degeneration_watchdog import (
     DegenerationWatchdog,
     coding_agent_early_gate_watchdog,
+    coding_agent_response_gate_watchdog,
     degeneration_watchdog_policy_from_mapping,
 )
 
@@ -22,6 +23,73 @@ def test_coding_agent_early_gate_profile_is_explicit() -> None:
     assert policy.max_identical_tool_calls_per_turn == 4
     assert policy.max_tool_calls_without_progress == 48
     assert policy.progress_tool_names == ("edit", "write")
+
+
+def test_coding_agent_response_gate_profile_has_no_cross_turn_heuristic() -> None:
+    policy = coding_agent_response_gate_watchdog()
+
+    assert policy.profile == "coding-agent-response-gate-v1"
+    assert policy.max_assistant_chars_per_turn == 180_000
+    assert policy.max_assistant_output_tokens_per_turn == 50_000
+    assert policy.max_tool_calls_per_turn == 24
+    assert policy.max_identical_tool_calls_per_turn == 4
+    assert policy.max_tool_calls_without_progress is None
+    assert policy.progress_tool_names == ()
+    assert degeneration_watchdog_policy_from_mapping(asdict(policy)) == policy
+
+
+def test_response_gate_allows_many_unique_single_bash_turns() -> None:
+    watchdog = DegenerationWatchdog(coding_agent_response_gate_watchdog())
+
+    for index in range(100):
+        assert watchdog.observe({"type": "turn_start"}) is None
+        assert (
+            watchdog.observe(
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "bash",
+                    "args": {"command": f"sed -n '{index + 1}p' src/module.py"},
+                }
+            )
+            is None
+        )
+        assert (
+            watchdog.observe(
+                {
+                    "type": "tool_execution_end",
+                    "toolName": "bash",
+                    "isError": False,
+                }
+            )
+            is None
+        )
+
+
+def test_response_gate_still_rejects_large_tool_batch() -> None:
+    watchdog = DegenerationWatchdog(coding_agent_response_gate_watchdog())
+    assert watchdog.observe({"type": "turn_start"}) is None
+
+    for index in range(24):
+        assert (
+            watchdog.observe(
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "read",
+                    "args": {"path": f"/app/file-{index}"},
+                }
+            )
+            is None
+        )
+    violation = watchdog.observe(
+        {
+            "type": "tool_execution_start",
+            "toolName": "read",
+            "args": {"path": "/app/file-24"},
+        }
+    )
+
+    assert violation is not None
+    assert violation.reason == "tool_calls_per_turn"
 
 
 def test_confirmed_profile_rejects_threshold_drift() -> None:

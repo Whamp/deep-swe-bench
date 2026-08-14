@@ -19,7 +19,7 @@ from harness import (
     versioned_smoke_contract,
 )
 from harness.degeneration_watchdog import (
-    validate_coding_agent_early_gate_watchdog,
+    validate_named_degeneration_watchdog_policy,
 )
 from harness.launch_contract import (
     CompiledLaunch,
@@ -263,7 +263,7 @@ def _validate_launch_policies(request: LaunchRequest) -> None:
                 "Launch degeneration-watchdog policy invalid: only Pi RPC "
                 "subjects are supported"
             )
-        validate_coding_agent_early_gate_watchdog(degeneration_watchdog)
+        validate_named_degeneration_watchdog_policy(degeneration_watchdog)
     if not isinstance(request.policies.capture_initial_context, bool):
         raise TypeError(
             "Launch initial-context policy invalid: expected true or false; "
@@ -1958,6 +1958,15 @@ def _render_degeneration_watchdog_policy(policy: object) -> str:
             "Launch degeneration-watchdog policy invalid: progress tools must "
             "be strings"
         )
+    no_progress_limit = policy.get("max_tool_calls_without_progress")
+    no_progress_summary = (
+        "cross-turn no-progress heuristic=disabled"
+        if no_progress_limit is None
+        else (
+            f"max tool calls without progress={no_progress_limit}; "
+            f"progress tools={', '.join(progress_tool_names)}"
+        )
+    )
     return (
         f"Degeneration watchdog: {policy.get('profile')}; "
         "max assistant chars="
@@ -1967,9 +1976,7 @@ def _render_degeneration_watchdog_policy(policy: object) -> str:
         f"max tool calls={policy.get('max_tool_calls_per_turn')}/turn; "
         "max identical tool calls="
         f"{policy.get('max_identical_tool_calls_per_turn')}/turn; "
-        "max tool calls without progress="
-        f"{policy.get('max_tool_calls_without_progress')}; progress tools="
-        + ", ".join(progress_tool_names)
+        f"{no_progress_summary}"
     )
 
 
