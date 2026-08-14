@@ -30,11 +30,14 @@ export default function Trajectory() {
   const [density, setDensity] = useState<TrajectoryDensity>("focus");
   const paths = trajectoryPaths(searchParams);
   const requestedTurn = parseRequestedTurn(searchParams.get("turn"));
-  const offset = Math.floor((requestedTurn - 1) / TRAJECTORY_PAGE_SIZE) * TRAJECTORY_PAGE_SIZE;
+  const requestedOffset =
+    requestedTurn === null
+      ? "latest"
+      : Math.floor((requestedTurn - 1) / TRAJECTORY_PAGE_SIZE) * TRAJECTORY_PAGE_SIZE;
   const queries = useQueries({
     queries: paths.map((path) => ({
-      queryKey: ["cell-trajectory", path, offset, TRAJECTORY_PAGE_SIZE],
-      queryFn: () => fetchCellTrajectory(path, offset, TRAJECTORY_PAGE_SIZE),
+      queryKey: ["cell-trajectory", path, requestedOffset, TRAJECTORY_PAGE_SIZE],
+      queryFn: () => fetchCellTrajectory(path, requestedOffset, TRAJECTORY_PAGE_SIZE),
       refetchInterval: (query: { state: { data?: CellTrajectory } }) =>
         query.state.data?.session?.is_live ? 4_000 : false,
     })),
@@ -44,18 +47,22 @@ export default function Trajectory() {
   const isLoading = queries.some((query) => query.isLoading);
   const error = queries.find((query) => query.error)?.error;
   const maxTurns = Math.max(0, ...trajectories.map((trajectory) => trajectory.total_turns ?? 0));
-  const hasPrevious = offset > 0;
+  const offset =
+    requestedOffset === "latest"
+      ? Math.max(0, ...trajectories.map((trajectory) => trajectory.offset ?? 0))
+      : requestedOffset;
+  const hasPrevious = trajectories.some((trajectory) => trajectory.has_previous);
   const hasNext = trajectories.some((trajectory) => trajectory.has_next);
 
   const chooseTurn = (turn: number) => {
     const next = new URLSearchParams(searchParams);
-    if (turn <= 1) next.delete("turn");
+    if (maxTurns > 0 && turn >= maxTurns) next.delete("turn");
     else next.set("turn", String(turn));
     setSearchParams(next);
   };
 
   useEffect(() => {
-    if (maxTurns <= 0 || requestedTurn <= maxTurns) return;
+    if (requestedTurn === null || maxTurns <= 0 || requestedTurn <= maxTurns) return;
     const next = new URLSearchParams(searchParams);
     next.set("turn", String(maxTurns));
     setSearchParams(next, { replace: true });
@@ -109,7 +116,7 @@ export default function Trajectory() {
               <select
                 aria-label="Jump to turn"
                 name="trajectory-turn"
-                value={Math.min(requestedTurn, maxTurns)}
+                value={Math.min(requestedTurn ?? maxTurns, maxTurns)}
                 onChange={(event) => chooseTurn(Number(event.target.value))}
                 className="rounded-md border border-border bg-card px-2 py-1.5 text-foreground"
               >
@@ -172,7 +179,7 @@ function CellTrajectoryPane({
         <>
           <TrajectoryMetricCharts metrics={trajectory.metrics ?? []} paired={Boolean(sideLabel)} />
           <div className="space-y-3">
-            {(trajectory.turns ?? []).map((turn) => (
+            {[...(trajectory.turns ?? [])].reverse().map((turn) => (
               <CellTrajectoryTurnCard key={turn.idx} turn={turn} density={density} />
             ))}
             {(trajectory.turns ?? []).length === 0 && (
@@ -505,8 +512,9 @@ function trajectoryPaths(searchParams: URLSearchParams): string[] {
   return path ? [path] : [];
 }
 
-function parseRequestedTurn(raw: string | null): number {
-  const turn = Number(raw ?? 1);
+function parseRequestedTurn(raw: string | null): number | null {
+  if (raw === null) return null;
+  const turn = Number(raw);
   return Number.isInteger(turn) && turn > 0 ? turn : 1;
 }
 

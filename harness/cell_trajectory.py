@@ -48,21 +48,26 @@ def build_cell_trajectory_page(
     result_path: Path,
     session_path: Path,
     *,
-    offset: int = 0,
+    offset: int | None = 0,
     limit: int = 20,
     now_ts: float | None = None,
 ) -> dict[str, Any]:
-    """Return one complete turn page plus compact metrics for every turn."""
+    """Return one turn page; a None offset selects the final page boundary."""
     parsed = _parse_session_trajectory(session_path)
     result = _load_json_object(result_path)
     cell = {field: result[field] for field in _CELL_RESULT_FIELDS if field in result}
     cell.update({"result_path": str(result_path), "cell_path": str(result_path.parent)})
 
     turns = parsed["turns"]
-    bounded_offset = max(0, offset)
     bounded_limit = max(1, limit)
-    page = turns[bounded_offset : bounded_offset + bounded_limit]
     total_turns = len(turns)
+    if offset is None:
+        bounded_offset = (
+            ((total_turns - 1) // bounded_limit) * bounded_limit if total_turns else 0
+        )
+    else:
+        bounded_offset = max(0, offset)
+    page = turns[bounded_offset : bounded_offset + bounded_limit]
     stat = session_path.stat()
     session = {
         **parsed["session"],

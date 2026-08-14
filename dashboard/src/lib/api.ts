@@ -78,10 +78,10 @@ export async function fetchRunScore(runId: string): Promise<RunScore | null> {
   return data.score ?? null;
 }
 
-/** Fetch one complete page from a cell's native Pi trajectory. */
+/** Fetch one complete page, or the latest page, from a cell's native Pi trajectory. */
 export async function fetchCellTrajectory(
   resultPath: string,
-  offset = 0,
+  offset: number | "latest" = 0,
   limit = 20,
 ): Promise<CellTrajectory> {
   const params = new URLSearchParams({

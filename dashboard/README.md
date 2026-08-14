@@ -116,10 +116,12 @@ A complete, deep-linkable view of one rep's native Pi session:
 
 - `?path=<result.json>` opens one trajectory. `?left=<result.json>&right=<result.json>`
   opens synchronized A/B panes for a matched task and rep.
-- Each page contains up to 20 complete assistant turns. Reasoning, assistant
+- The default view opens the final page and lists its newest turn first, so the
+  agent's latest action is immediately visible. Each page contains up to 20
+  complete assistant turns in reverse chronological order. Reasoning, assistant
   text, tool arguments, tool output, errors, structured details, timestamps,
   usage, and cost remain intact. **Focus** collapses long bodies; **Full** opens
-  them. Turn links use `&turn=N`.
+  them. Explicit `&turn=N` links still open the page containing that turn.
 - Five all-turn charts show cumulative cost, context size, output tokens,
   observation size, and command time even though transcript bodies are paged.
 - **Tests**, **Prompt**, **Patch**, and **Logs** expose the cell's saved evidence.
@@ -161,7 +163,7 @@ A decision surface for choosing a config on one fixed subset:
 | `GET /api/runs/<id>/score` | Live score replay (solve/partial rates, tool-call error rate, cost, throughput, ETA, timeline, per-task results) |
 | `GET /api/runs/<id>/events?limit=N` | Events tail |
 | `GET /api/cell-session?path=&tail=N` | Compact session activity summary for live scoring and compatibility |
-| `GET /api/cell-trajectory?path=&offset=N&limit=N` | Complete paginated turns, all-turn metrics, result metadata, prompt, verifier summary, and cell file inventory |
+| `GET /api/cell-trajectory?path=&offset=N\|latest&limit=N` | Complete paginated turns (including one-request final-page selection), all-turn metrics, result metadata, prompt, verifier summary, and cell file inventory |
 | `GET /api/compare?subset=&reps=N` | Aggregated cross-run metrics with an inspectable `result_path` on each cell |
 | `GET /api/subsets` | List available task subsets |
 | `GET /api/file?path=&head=N` | Preview the first bounded lines of an allowlisted file |

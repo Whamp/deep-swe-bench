@@ -1425,6 +1425,16 @@ def test_http_api_cell_trajectory_endpoint_paginates(tmp_path):
         assert trajectory["has_next"] is False
 
         with urllib.request.urlopen(
+            f"{base}/api/cell-trajectory?path={rel}&offset=latest&limit=1",
+            timeout=5,
+        ) as response:
+            latest = json.loads(response.read().decode("utf-8"))["trajectory"]
+        assert latest["offset"] == 1
+        assert latest["turns"][0]["idx"] == 2
+        assert latest["has_previous"] is True
+        assert latest["has_next"] is False
+
+        with urllib.request.urlopen(
             f"{base}/api/file?path={rel}&download=1",
             timeout=5,
         ) as response:

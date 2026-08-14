@@ -949,13 +949,13 @@ def load_cell_session(
 def load_cell_trajectory(
     result_path_str: str,
     *,
-    offset: int = 0,
+    offset: int | None = 0,
     limit: int = 20,
     repo_root: Path = ROOT,
     state_root: Path = DEFAULT_STATE_ROOT,
     now_ts: float | None = None,
 ) -> dict[str, Any]:
-    """Resolve and return one complete, paginated cell trajectory page."""
+    """Resolve one trajectory page; a None offset selects the latest page."""
     try:
         result_path = resolve_dashboard_path(
             result_path_str, repo_root=repo_root, state_root=state_root
@@ -968,7 +968,7 @@ def load_cell_trajectory(
     return build_cell_trajectory_page(
         result_path,
         session_path,
-        offset=max(0, offset),
+        offset=None if offset is None else max(0, offset),
         limit=max(1, min(limit, 50)),
         now_ts=now_ts,
     )
@@ -1120,11 +1120,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._send_error(HTTPStatus.BAD_REQUEST, "missing path")
                     return
                 try:
-                    offset = int(qs.get("offset", ["0"])[0])
+                    raw_offset = qs.get("offset", ["0"])[0]
+                    offset = None if raw_offset == "latest" else int(raw_offset)
                     limit = int(qs.get("limit", ["20"])[0])
                 except ValueError:
                     self._send_error(
-                        HTTPStatus.BAD_REQUEST, "offset and limit must be integers"
+                        HTTPStatus.BAD_REQUEST,
+                        "offset must be an integer or latest; limit must be an integer",
                     )
                     return
                 trajectory = load_cell_trajectory(

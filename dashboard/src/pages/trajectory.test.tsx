@@ -5,8 +5,11 @@ import { renderDashboardRoute } from "@/test/dashboard-test-harness";
 
 const RESULT_PATH = "/repo/results/model/high/cfg/task-a/rep0/result.json";
 
-function trajectoryResponse(offset: number, resultPath = RESULT_PATH) {
-  const turn = offset === 20 ? makeTurn(21, "Final verification") : makeTurn(1, "Inspect code");
+function trajectoryResponse(offset: number | "latest", resultPath = RESULT_PATH) {
+  const isFinalPage = offset === 20 || offset === "latest";
+  const turns = isFinalPage
+    ? [makeTurn(21, "Final verification"), makeTurn(22, "Most recent verification")]
+    : [makeTurn(1, "Inspect code")];
   const config = resultPath.includes("challenger") ? "challenger@1.0.0" : "cfg@1.0.0";
   return {
     trajectory: {
@@ -69,13 +72,13 @@ function trajectoryResponse(offset: number, resultPath = RESULT_PATH) {
         pending: 0,
         other: 0,
       },
-      total_turns: 21,
-      offset,
+      total_turns: 22,
+      offset: isFinalPage ? 20 : offset,
       limit: 20,
-      has_previous: offset > 0,
+      has_previous: isFinalPage || Number(offset) > 0,
       has_next: offset === 0,
-      turns: [turn],
-      metrics: Array.from({ length: 21 }, (_, index) => ({
+      turns,
+      metrics: Array.from({ length: 22 }, (_, index) => ({
         idx: index + 1,
         timestamp: `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
         intent: `Turn ${index + 1}`,
@@ -147,7 +150,9 @@ function mockTrajectoryApi() {
     if (url.pathname === "/api/cell-trajectory") {
       return jsonResponse(
         trajectoryResponse(
-          Number(url.searchParams.get("offset") ?? 0),
+          url.searchParams.get("offset") === "latest"
+            ? "latest"
+            : Number(url.searchParams.get("offset") ?? 0),
           url.searchParams.get("path") ?? RESULT_PATH,
         ),
       );
@@ -179,12 +184,33 @@ afterEach(() => {
 });
 
 describe("Trajectory page", () => {
-  it("renders a complete deep-linked turn page with charts and evidence tabs", async () => {
+  it("opens the latest page and lists the most recent turn first by default", async () => {
     const fetchMock = mockTrajectoryApi();
     renderDashboardRoute(
       <Trajectory />,
       "/trajectory",
       `/trajectory?path=${encodeURIComponent(RESULT_PATH)}`,
+    );
+
+    expect(await screen.findByText("Most recent verification")).toBeInTheDocument();
+    expect(screen.getAllByText(/^Turn (21|22)$/).map((turn) => turn.textContent)).toEqual([
+      "Turn 22",
+      "Turn 21",
+    ]);
+    expect(screen.getByRole("combobox", { name: "Jump to turn" })).toHaveValue("22");
+    expect(screen.getByRole("button", { name: "Next turns" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Previous turns" })).toBeEnabled();
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("offset=latest"))).toBe(
+      true,
+    );
+  });
+
+  it("renders a complete deep-linked turn page with charts and evidence tabs", async () => {
+    const fetchMock = mockTrajectoryApi();
+    renderDashboardRoute(
+      <Trajectory />,
+      "/trajectory",
+      `/trajectory?path=${encodeURIComponent(RESULT_PATH)}&turn=1`,
     );
 
     expect(await screen.findByRole("heading", { name: "task-a" })).toBeInTheDocument();

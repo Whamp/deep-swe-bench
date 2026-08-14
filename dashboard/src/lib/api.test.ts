@@ -104,6 +104,25 @@ describe("api client error handling", () => {
     global.fetch = original;
   });
 
+  it("fetchCellTrajectory requests the latest page explicitly", async () => {
+    const original = global.fetch;
+    let calledUrl = "";
+    global.fetch = vi.fn().mockImplementation((url: string) => {
+      calledUrl = url;
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ trajectory: { found: true, turns: [] } }),
+      });
+    });
+
+    await fetchCellTrajectory("/repo/results/cfg/task/rep0/result.json", "latest", 20);
+
+    const parsed = new URL(calledUrl, "http://dashboard.test");
+    expect(parsed.searchParams.get("offset")).toBe("latest");
+    global.fetch = original;
+  });
+
   it("fetchFile requests a head preview when selected", async () => {
     const original = global.fetch;
     let calledUrl = "";
