@@ -23,16 +23,22 @@ from .baseline_analysis import (
     OPENING_PREDICTOR_NAMES,
     PREDICTOR_SPECIFICATIONS,
     PROCESS_FEATURE_NAMES,
+    SEQUENCE_PREDICTOR_NAMES,
     TEST_FLOW_PREDICTOR_NAMES,
     _binary_metrics,
     _bootstrap_task_log_loss_delta,
     build_task_folds,
 )
+from .extractor import SEQUENCE_FEATURE_NAMES
 
+ALL_MEASURED_PREDICTOR_NAMES = tuple(
+    dict.fromkeys(LENGTH_FEATURE_NAMES + PROCESS_FEATURE_NAMES + SEQUENCE_FEATURE_NAMES)
+)
 RANDOM_FOREST_SPECIFICATIONS: dict[str, tuple[str, ...]] = {
     "length": PREDICTOR_SPECIFICATIONS["length"],
     "test_flow": PREDICTOR_SPECIFICATIONS["test_flow"],
     "all_process": PREDICTOR_SPECIFICATIONS["all_process"],
+    "all_measured": ALL_MEASURED_PREDICTOR_NAMES,
 }
 RANDOM_FOREST_PERMUTATION_FAMILIES: dict[str, tuple[str, ...]] = {
     "length": LENGTH_FEATURE_NAMES,
@@ -40,6 +46,9 @@ RANDOM_FOREST_PERMUTATION_FAMILIES: dict[str, tuple[str, ...]] = {
     "opening": OPENING_PREDICTOR_NAMES,
     "mutation_style": MUTATION_STYLE_PREDICTOR_NAMES,
     "test_flow": TEST_FLOW_PREDICTOR_NAMES,
+    "additional_sequence": tuple(
+        name for name in SEQUENCE_FEATURE_NAMES if name not in SEQUENCE_PREDICTOR_NAMES
+    ),
 }
 DEFAULT_RANDOM_FOREST_SEEDS = (1401, 2903, 4409)
 
@@ -212,6 +221,13 @@ def evaluate_random_forest_held_out_tasks(
     predictions = {
         name: np.full(len(rows), np.nan, dtype=float) for name in specifications
     }
+    permutation_reference = (
+        "all_measured"
+        if "all_measured" in specifications
+        else "all_process"
+        if "all_process" in specifications
+        else None
+    )
     permutation_predictions = {
         name: np.full(len(rows), np.nan, dtype=float)
         for name in RANDOM_FOREST_PERMUTATION_FAMILIES
@@ -286,7 +302,7 @@ def evaluate_random_forest_held_out_tasks(
                 oob_predictions,
                 [str(row["task"]) for row in train_rows],
             )
-            if name == "all_process":
+            if name == permutation_reference:
                 for family_index, (family, family_names) in enumerate(
                     RANDOM_FOREST_PERMUTATION_FAMILIES.items()
                 ):
@@ -328,14 +344,14 @@ def evaluate_random_forest_held_out_tasks(
         if name != "length"
     }
     permutation_importance: dict[str, Any] = {}
-    if "all_process" in predictions:
+    if permutation_reference is not None:
         for family, values in permutation_predictions.items():
             permuted_metrics = _binary_metrics(outcomes, values, tasks)
             permutation_importance[family] = {
                 "permuted_metrics": permuted_metrics,
                 "permuted_minus_unpermuted": _prediction_delta(
                     outcomes,
-                    predictions["all_process"],
+                    predictions[permutation_reference],
                     values,
                     tasks,
                 ),
@@ -358,6 +374,7 @@ def evaluate_random_forest_held_out_tasks(
                 name: list(feature_names)
                 for name, feature_names in specifications.items()
             },
+            "permutation_reference": permutation_reference,
             "parameter_grid": [asdict(parameters) for parameters in parameter_grid],
             "tuning_trees": tuning_trees,
             "final_trees_per_seed": final_trees,
@@ -372,7 +389,7 @@ def evaluate_random_forest_held_out_tasks(
         "binary_metrics": binary_metrics,
         "specification_minus_length": specification_deltas,
         "oob_diagnostics": _summarize_oob_diagnostics(fold_reports, specifications),
-        "all_process_family_permutation_importance": permutation_importance,
+        "permutation_family_importance": permutation_importance,
     }
 
 
