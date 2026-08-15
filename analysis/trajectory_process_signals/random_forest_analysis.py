@@ -556,21 +556,32 @@ def _summarize_oob_diagnostics(
     }
 
 
-def _linear_comparison(
+def compare_random_forest_to_linear_metrics(
     forest_evaluation: dict[str, Any], linear_evaluation: dict[str, Any]
 ) -> dict[str, Any]:
+    """Compare shared specifications and mark forests without a linear equivalent."""
     comparison: dict[str, Any] = {}
+    linear_metrics_by_name = linear_evaluation["binary_metrics"]
     for name, forest_metrics in forest_evaluation["binary_metrics"].items():
-        linear_metrics = linear_evaluation["binary_metrics"][name]
+        if name not in linear_metrics_by_name:
+            comparison[name] = {
+                "status": "no_linear_equivalent",
+                "reason": "the linear analysis did not fit this predictor specification",
+            }
+            continue
+        linear_metrics = linear_metrics_by_name[name]
         comparison[name] = {
-            metric: float(forest_metrics[metric] - linear_metrics[metric])
-            for metric in (
-                "log_loss",
-                "macro_task_log_loss",
-                "brier",
-                "auroc",
-                "average_precision",
-            )
+            "status": "compared",
+            "deltas": {
+                metric: float(forest_metrics[metric] - linear_metrics[metric])
+                for metric in (
+                    "log_loss",
+                    "macro_task_log_loss",
+                    "brier",
+                    "auroc",
+                    "average_precision",
+                )
+            },
         }
     return comparison
 
@@ -623,7 +634,7 @@ def run_random_forest_analysis(
         permutation_repeats=permutation_repeats,
     )
     linear_evaluation = json.loads(linear_evaluation_path.read_text())
-    evaluation["forest_minus_linear"] = _linear_comparison(
+    evaluation["forest_minus_linear"] = compare_random_forest_to_linear_metrics(
         evaluation, linear_evaluation
     )
     certain_boundary_rows = select_certain_source_mutation_rows(rows)
@@ -638,8 +649,10 @@ def run_random_forest_analysis(
     certain_boundary_linear = linear_evaluation["cohort_sensitivities"][
         "certain_first_source_mutation"
     ]["evaluation"]
-    certain_boundary_evaluation["forest_minus_linear"] = _linear_comparison(
-        certain_boundary_evaluation, certain_boundary_linear
+    certain_boundary_evaluation["forest_minus_linear"] = (
+        compare_random_forest_to_linear_metrics(
+            certain_boundary_evaluation, certain_boundary_linear
+        )
     )
     evaluation["cohort_sensitivities"] = {
         "certain_first_source_mutation": {

@@ -32,6 +32,7 @@ from analysis.trajectory_process_signals.extractor import (
 from analysis.trajectory_process_signals.random_forest_analysis import (
     RANDOM_FOREST_SPECIFICATIONS,
     RandomForestParameters,
+    compare_random_forest_to_linear_metrics,
     encode_random_forest_design,
     evaluate_random_forest_held_out_tasks,
     select_certain_source_mutation_rows,
@@ -510,6 +511,32 @@ def test_predictor_allowlist_excludes_outcomes_and_verifier_artifacts() -> None:
         if name.startswith(("reward", "verifier", "f2p", "p2p"))
         or name in {"patch_bytes", "artifacts", "result_path"}
     }
+
+
+def test_random_forest_linear_comparison_marks_unmatched_specification() -> None:
+    metric = {
+        "log_loss": 0.6,
+        "macro_task_log_loss": 0.6,
+        "brier": 0.2,
+        "auroc": 0.7,
+        "average_precision": 0.6,
+    }
+    comparison = compare_random_forest_to_linear_metrics(
+        {"binary_metrics": {"length": metric, "all_measured": metric}},
+        {"binary_metrics": {"length": metric}},
+    )
+
+    assert comparison["length"] == {
+        "status": "compared",
+        "deltas": {
+            "log_loss": 0.0,
+            "macro_task_log_loss": 0.0,
+            "brier": 0.0,
+            "auroc": 0.0,
+            "average_precision": 0.0,
+        },
+    }
+    assert comparison["all_measured"]["status"] == "no_linear_equivalent"
 
 
 def test_random_forest_clean_boundary_requires_observed_certain_source_change() -> None:
