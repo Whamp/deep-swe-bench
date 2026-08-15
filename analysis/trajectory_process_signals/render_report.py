@@ -29,17 +29,62 @@ def render_trajectory_process_report() -> str:
     sessions = _load("session_schema_audit.json")
     features = _load("feature_summary.json")
     evaluation = _load("held_out_task_evaluation.json")
+    forest = _load("random_forest_evaluation.json")
     task_effects = _load("task_controlled_feature_effects.json")
     manifest = _load("baseline_manifest.json")
 
     dataset = manifest["dataset"]
     metrics = evaluation["binary_metrics"]
     deltas = evaluation["specification_minus_length"]
-    test_delta = deltas["test_flow"]
-    test_interval = test_delta["task_bootstrap_log_loss_delta_95pct"]
-    clean = evaluation["cohort_sensitivities"]["certain_first_source_mutation"]
-    clean_test_delta = clean["evaluation"]["specification_minus_length"]["test_flow"]
     support = sessions["semantic_feature_support"]
+    forest_metrics = forest["binary_metrics"]
+    forest_deltas = forest["specification_minus_length"]
+    forest_test_interval = forest_deltas["test_flow"][
+        "task_bootstrap_log_loss_delta_95pct"
+    ]
+    forest_clean = forest["cohort_sensitivities"]["certain_first_source_mutation"]
+    forest_clean_metrics = forest_clean["evaluation"]["binary_metrics"]
+    forest_clean_delta = forest_clean["evaluation"]["specification_minus_length"][
+        "test_flow"
+    ]
+    forest_rows = "".join(
+        _metric_row(forest_metrics, key, label)
+        for key, label in (
+            ("length", "Forest: length + controls"),
+            ("test_flow", "Forest: test and phase flow"),
+            ("all_process", "Forest: compact process features"),
+            ("all_measured", "Forest: all 91 measured features"),
+        )
+    )
+    forest_delta_rows = "".join(
+        _delta_row(forest_deltas, key, label)
+        for key, label in (
+            ("test_flow", "Test and phase flow"),
+            ("all_process", "Compact process features"),
+            ("all_measured", "All 91 measured features"),
+        )
+    )
+    oob_rows = "".join(
+        f"<tr><td>{_escape(label)}</td><td>{forest['oob_diagnostics']['mean_across_outer_training_partitions'][key]['log_loss']:.3f}</td>"
+        f"<td>{forest_metrics[key]['log_loss']:.3f}</td></tr>"
+        for key, label in (
+            ("length", "Length + controls"),
+            ("test_flow", "Test and phase flow"),
+            ("all_process", "Compact process features"),
+            ("all_measured", "All 91 measured features"),
+        )
+    )
+    permutation_rows = "".join(
+        _permutation_row(forest["permutation_family_importance"], key, label)
+        for key, label in (
+            ("length", "Length"),
+            ("aggregate_process", "Aggregate process"),
+            ("opening", "Opening behavior"),
+            ("mutation_style", "Edit/write style"),
+            ("test_flow", "Test and phase flow"),
+            ("additional_sequence", "Additional sequence measures"),
+        )
+    )
 
     metric_rows = "".join(
         _metric_row(metrics, key, label)
@@ -135,11 +180,16 @@ def render_trajectory_process_report() -> str:
 <style>
 :root{{--bg:#07111f;--surface:#0f1d31;--ink:#eef5ff;--blue:#60a5fa;--green:#34d399;--red:#fb7185;--amber:#fbbf24;--muted:#9fb0c9;--line:#263850}} *{{box-sizing:border-box}} body{{margin:0;background:radial-gradient(circle at top left,#183e65,var(--bg) 42%,#050913);color:var(--ink);font:15px/1.55 ui-sans-serif,system-ui}} main{{max-width:1240px;margin:auto;padding:36px 22px 70px}} h1{{font-size:clamp(38px,6vw,72px);line-height:.94;letter-spacing:-.055em;margin:12px 0 18px}} h2{{margin:36px 0 12px;font-size:28px}} h3{{margin:18px 0 8px}} p,li{{color:#dbe7fb}} code{{color:#bfdbfe}} a{{color:#93c5fd}} .hero,.card,.callout{{background:rgba(15,29,49,.9);border:1px solid var(--line);border-radius:24px;padding:24px}} .hero{{padding:34px;background:linear-gradient(135deg,rgba(96,165,250,.18),rgba(15,29,49,.95) 48%,rgba(251,191,36,.09))}} .kicker{{color:var(--blue);text-transform:uppercase;letter-spacing:.14em;font-size:12px;font-weight:800}} .pills{{display:flex;gap:9px;flex-wrap:wrap;margin:18px 0}} .pill,.tag{{display:inline-flex;border-radius:999px;padding:5px 10px;font-size:12px;font-weight:800;border:1px solid var(--line);background:#0b1728}} .good{{color:#b9f8da;border-color:rgba(52,211,153,.5);background:rgba(52,211,153,.12)}} .bad{{color:#fecdd3;border-color:rgba(251,113,133,.5);background:rgba(251,113,133,.12)}} .caution{{color:#fde68a;border-color:rgba(251,191,36,.55);background:rgba(251,191,36,.12)}} .neutral{{color:#bfdbfe;border-color:rgba(96,165,250,.45);background:rgba(96,165,250,.12)}} .stats{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:20px 0}} .stat{{background:rgba(15,29,49,.88);border:1px solid var(--line);border-radius:20px;padding:18px}} .stat b{{display:block;font-size:30px;line-height:1.05;letter-spacing:-.04em}} .stat span,.muted,.src{{color:var(--muted);font-size:12px}} .grid{{display:grid;grid-template-columns:1fr 1fr;gap:18px}} .callout{{margin:18px 0}} .callout.bad{{border-left:5px solid var(--red)}} .callout.caution{{border-left:5px solid var(--amber)}} .callout.good{{border-left:5px solid var(--green)}} .scroll{{overflow:auto}} table{{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--line);border-radius:18px;overflow:hidden;background:rgba(9,18,32,.68)}} th,td{{text-align:left;vertical-align:top;padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap}} th{{color:#bfdbfe;background:#0d1a2d}} tr:last-child td{{border-bottom:0}} @media(max-width:760px){{.stats,.grid{{grid-template-columns:1fr}}}}
 </style></head><body><main>
-<section class="hero"><div class="kicker">DeepSWE retrospective · stock Pi only · sequence-aware follow-up</div><h1>Ordering explains behavior better.<br>It still does not improve prediction.</h1><p>This follow-up measures what happened before the first source change, distinguishes <code>edit</code> from <code>write</code>, and tracks implementation/test cycles. Test flow comes closest to helping, but it remains tied with the length-only model.</p><div class="pills"><span class="pill good">{dataset["modeling_reps"]} direct Pi sessions</span><span class="pill neutral">{dataset["task_count"]} held-out tasks</span><span class="pill caution">test-flow log loss Δ {test_delta["log_loss"]:+.3f}</span><span class="pill neutral">clean-boundary Δ {clean_test_delta["log_loss"]:+.3f}</span></div><div class="src">Research basis: <a href="trajectory_analysis_research.md">trajectory-analysis methods</a> · Full methods: <a href="report.md">report.md</a></div></section>
+<section class="hero"><div class="kicker">DeepSWE retrospective · stock Pi only · nonlinear follow-up</div><h1>Forests improve the baseline.<br>Process signal still does not transfer.</h1><p>A random forest captures modest nonlinear structure in trajectory length and basic controls. Adding test flow, compact process features, or all 91 measured features makes predictions worse on wholly unseen tasks. On the clean-boundary cohort, test flow is tied with length.</p><div class="pills"><span class="pill good">forest length loss {forest_metrics["length"]["log_loss"]:.3f}</span><span class="pill bad">all-measured Δ {forest_deltas["all_measured"]["log_loss"]:+.3f}</span><span class="pill caution">test-flow Δ {forest_deltas["test_flow"]["log_loss"]:+.3f}</span><span class="pill neutral">clean test-flow Δ {forest_clean_delta["log_loss"]:+.3f}</span></div><div class="src">{dataset["modeling_reps"]} direct Pi sessions · {dataset["task_count"]} held-out tasks · <a href="report.md">full methods and results</a></div></section>
 <div class="stats"><div class="stat"><b>{support["reps_with_source_mutations"]}</b><span>attempts with an observed source change</span></div><div class="stat"><b>{support["reps_with_write_as_first_source_mutation"]}</b><span>used write for the first source change</span></div><div class="stat"><b>{support["reps_with_uncertain_first_source_mutation"]}</b><span>possible earlier shell mutation</span></div><div class="stat"><b>{support["reps_with_observable_tests"]}</b><span>attempts with an observed test</span></div></div>
-<section class="callout caution"><h2>Main result</h2><p>The test/phase-flow model changes log loss from <b>{metrics["length"]["log_loss"]:.3f}</b> to <b>{metrics["test_flow"]["log_loss"]:.3f}</b>. Its task-bootstrap interval for the difference is <b>{test_interval["low"]:+.3f} to {test_interval["high"]:+.3f}</b>, which includes no difference. Opening behavior, edit/write style, and the combined sequence models all perform worse.</p></section>
-<h2>Held-out-task comparison</h2><div class="scroll"><table><thead><tr><th>Predictors</th><th>Log loss ↓</th><th>Macro-task loss ↓</th><th>Brier ↓</th><th>AUROC ↑</th><th>Average precision ↑</th></tr></thead><tbody>{metric_rows}</tbody></table></div>
-<h2>Difference from length-only</h2><div class="scroll"><table><thead><tr><th>Added feature family</th><th>Log-loss difference</th><th>95% task-bootstrap interval</th><th>AUROC difference</th><th>Average-precision difference</th></tr></thead><tbody>{delta_rows}</tbody></table></div>
+<section class="callout bad"><h2>Main result</h2><p>The forest length baseline reaches <b>{forest_metrics["length"]["log_loss"]:.3f}</b> log loss. Test flow worsens it by <b>{forest_deltas["test_flow"]["log_loss"]:+.3f}</b> with a task-bootstrap interval of <b>{forest_test_interval["low"]:+.3f} to {forest_test_interval["high"]:+.3f}</b>. All 91 measured features worsen it by <b>{forest_deltas["all_measured"]["log_loss"]:+.3f}</b>. The nonlinear model does not recover transferable process signal.</p></section>
+<h2>Random-forest held-out-task comparison</h2><div class="scroll"><table><thead><tr><th>Predictors</th><th>Log loss ↓</th><th>Macro-task loss ↓</th><th>Brier ↓</th><th>AUROC ↑</th><th>Average precision ↑</th></tr></thead><tbody>{forest_rows}</tbody></table></div>
+<h2>Forest difference from length-only</h2><div class="scroll"><table><thead><tr><th>Added feature family</th><th>Log-loss difference</th><th>95% task-bootstrap interval</th><th>AUROC difference</th><th>Average-precision difference</th></tr></thead><tbody>{forest_delta_rows}</tbody></table></div>
+<section class="callout caution"><h2>OOB looks positive—and is wrong for this question</h2><p>Out-of-bag validation leaves individual attempts out, not whole tasks. It makes both process forests look better than length. When entire tasks are unseen, the ordering reverses.</p><div class="scroll"><table><thead><tr><th>Predictors</th><th>Mean OOB log loss</th><th>Task-held-out log loss</th></tr></thead><tbody>{oob_rows}</tbody></table></div></section>
+<h2>Clean-boundary forest sensitivity</h2><p>After removing uncertain shell boundaries and no-source-change attempts, {forest_clean["reps"]} attempts remain. Test flow is tied with length: {forest_clean_metrics["length"]["log_loss"]:.3f} versus {forest_clean_metrics["test_flow"]["log_loss"]:.3f}, with log-loss difference {forest_clean_delta["log_loss"]:+.3f}. The all-measured forest reaches {forest_clean_metrics["all_measured"]["log_loss"]:.3f}.</p>
+<h2>Held-out family permutation</h2><p class="muted">Positive means prediction worsens when the family is shuffled and therefore suggests useful held-out dependence. Negative means shuffling helps.</p><div class="scroll"><table><thead><tr><th>Family</th><th>Log-loss change after shuffle</th><th>95% task-bootstrap interval</th></tr></thead><tbody>{permutation_rows}</tbody></table></div>
+<h2>Linear held-out-task comparison</h2><div class="scroll"><table><thead><tr><th>Predictors</th><th>Log loss ↓</th><th>Macro-task loss ↓</th><th>Brier ↓</th><th>AUROC ↑</th><th>Average precision ↑</th></tr></thead><tbody>{metric_rows}</tbody></table></div>
+<h2>Linear difference from length-only</h2><div class="scroll"><table><thead><tr><th>Added feature family</th><th>Log-loss difference</th><th>95% task-bootstrap interval</th><th>AUROC difference</th><th>Average-precision difference</th></tr></thead><tbody>{delta_rows}</tbody></table></div>
 <section class="callout good"><h2>What the ordering data does show</h2><p>Within the same task, successful attempts reach their first source change earlier as a share of the total trajectory. They are also more likely to finish with a passing test after the final source change and to make more implementation→validation and validation→implementation cycles. In other words, backtracking between code and tests is often productive iteration, not failure.</p></section>
 <h2>Within-task descriptive effects</h2><p class="muted">Positive means higher in successful attempts. Standardized differences compare success and failure inside each contested task; intervals bootstrap whole tasks.</p><div class="scroll"><table><thead><tr><th>Measure</th><th>Mean raw difference</th><th>Mean standardized difference</th><th>95% task-bootstrap interval</th><th>Tasks higher in success</th></tr></thead><tbody>{task_effect_rows}</tbody></table></div>
 <h2><code>edit</code> versus <code>write</code></h2><div class="grid"><section class="card"><h3>First source change: edit</h3><p><b>{first_edit_successes} successes / {first_edit_successes + first_edit_failures} attempts</b> ({_percent(first_edit_successes, first_edit_successes + first_edit_failures)}).</p><p>Across all runs, structured source edits were used 8,728 times.</p></section><section class="card"><h3>First source change: write</h3><p><b>{first_write_successes} successes / {first_write_successes + first_write_failures} attempts</b> ({_percent(first_write_successes, first_write_successes + first_write_failures)}).</p><p>Across all runs, whole-file source writes were used 1,094 times.</p></section></div><p>The raw first-action gap is only 1.9 percentage points, and the within-task interval includes zero. The data does not support calling either tool intrinsically better. Target and sequence matter more: 574 attempts wrote and later edited the same path.</p>
@@ -147,8 +197,8 @@ def render_trajectory_process_report() -> str:
 <h2>Model coverage</h2><div class="scroll"><table><thead><tr><th>Model</th><th>Attempts</th><th>Tasks</th><th>Successes</th><th>Failures</th></tr></thead><tbody>{model_rows}</tbody></table></div>
 <section class="callout caution"><h2>Important limits</h2><ul><li>Only 30 attempts ran a test before the first source change, so that specific behavior is too rare to judge.</li><li>Sixty-two attempts contain a possible shell mutation before the structured boundary. Excluding all uncertain/no-source cases leaves 925 attempts and does not create a clear test-flow improvement.</li><li>A successful test command is not proof that the relevant hidden or feature test passed.</li><li>The combined sequence models have many correlated measurements and overfit badly; the grouped comparisons are the reliable view.</li><li>These associations do not prove that forcing an agent to read more or test more would improve it.</li></ul></section>
 <h2>All {features["tasks"]} tasks</h2><div class="scroll"><table><thead><tr><th>Task</th><th>Attempts</th><th>Successes</th><th>Success rate</th></tr></thead><tbody>{task_rows}</tbody></table></div>
-<section class="callout good"><h2>Conclusion</h2><p>The simple “too much exploration before acting” hypothesis is not supported. Successful runs often read more in absolute terms, but they commit earlier relative to their total trajectory and then perform more code/test cycles. Test discipline looks behaviorally meaningful, yet the current deterministic features still do not predict held-out-task success better than length and basic controls.</p></section>
-<p class="src">Evidence: <a href="artifacts/baseline_features.csv">features</a> · <a href="artifacts/task_controlled_feature_effects.json">within-task effects</a> · <a href="artifacts/held_out_task_evaluation.json">evaluation</a> · <a href="artifacts/baseline_manifest.json">manifest</a></p>
+<section class="callout good"><h2>Conclusion</h2><p>The forest confirms that there is modest nonlinear signal in length and basic controls, but not in the current process counters. Successful runs still show meaningful behavioral differences—earlier proportional commitment and more validation cycles—but those patterns do not generalize into better unseen-task predictions. Manual trajectory labels are the next useful source of information.</p></section>
+<p class="src">Evidence: <a href="artifacts/random_forest_evaluation.json">random forest</a> · <a href="artifacts/baseline_features.csv">features</a> · <a href="artifacts/task_controlled_feature_effects.json">within-task effects</a> · <a href="artifacts/held_out_task_evaluation.json">linear evaluation</a> · <a href="trajectory_analysis_research.md">research basis</a> · <a href="artifacts/baseline_manifest.json">manifest</a></p>
 </main></body></html>"""
 
 
@@ -172,6 +222,15 @@ def _delta_row(deltas: dict[str, Any], key: str, label: str) -> str:
         f"<tr><td>{_escape(label)}</td><td>{row['log_loss']:+.3f}</td>"
         f"<td>{interval['low']:+.3f} to {interval['high']:+.3f}</td>"
         f"<td>{row['auroc']:+.3f}</td><td>{row['average_precision']:+.3f}</td></tr>"
+    )
+
+
+def _permutation_row(importance: dict[str, Any], key: str, label: str) -> str:
+    delta = importance[key]["permuted_minus_unpermuted"]
+    interval = delta["task_bootstrap_log_loss_delta_95pct"]
+    return (
+        f"<tr><td>{_escape(label)}</td><td>{delta['log_loss']:+.3f}</td>"
+        f"<td>{interval['low']:+.3f} to {interval['high']:+.3f}</td></tr>"
     )
 
 

@@ -1,6 +1,6 @@
 # Sequence-aware trajectory analysis of stock-Pi baseline runs
 
-**Status:** second retrospective milestone; ordered-feature follow-up
+**Status:** third retrospective milestone; ordered features plus nonlinear random-forest follow-up
 
 **Snapshot analyzed:** local `results/` tree on 2026-08-14
 
@@ -10,7 +10,9 @@
 
 **Base:** `origin/master@0ad5f5345f64e6525e8dfb64a57717bbaafa09f8`
 
-**Analysis source:** `5380d2149e3281f81d0623ae6fc4777d9c8e2465`
+**Sequence-feature source:** `5380d2149e3281f81d0623ae6fc4777d9c8e2465`
+
+**Random-forest source:** `f86ecad`
 
 ## Short answer
 
@@ -30,6 +32,7 @@ The result is mixed but clear:
 1. **The ordered features explain behavior better than the old totals.** Successful runs are more likely to end with a passing test and perform more code/test cycles.
 2. **They still do not improve held-out-task prediction beyond trajectory length.** The test/phase-flow model is the closest, but is statistically tied with the length-only model.
 3. **The simple “too much exploration before acting causes failure” story is not supported.** Successful runs often do more reading in absolute terms, yet reach their first source change earlier as a share of their total trajectory.
+4. **A random forest does not uncover hidden nonlinear process signal.** It improves the length-only baseline, but adding test flow or all process features makes unseen-task predictions worse. On the clean 925-attempt cohort, test flow is effectively tied with length.
 
 ## Research basis
 
@@ -136,7 +139,7 @@ A tool result with `isError=false` means the command exited successfully. It doe
 
 Four deterministic folds hold out whole tasks. Each attempt appears in one test fold, and no task appears in both training and test data for that fold.
 
-Every fitted model includes the same model, thinking-level, config, token, turn, wall-time, and within-task length controls. Fixed L2 regularization is used without test-fold tuning.
+Every fitted linear model includes the same model, thinking-level, config, token, turn, wall-time, and within-task length controls. Fixed L2 regularization is used without test-fold tuning.
 
 The compared specifications are:
 
@@ -209,6 +212,73 @@ For Sol, test flow improves AUROC by 0.017 and average precision by 0.015 while 
 
 No added feature group improves partial-reward RMSE. Test flow changes RMSE by +0.00114 and MAE by +0.00146. The other compact groups also move slightly in the wrong direction.
 
+## Random-forest follow-up
+
+The nonlinear follow-up compares four forests on the same 990 attempts and the same four outer task folds:
+
+1. length and controls;
+2. length plus test/phase flow;
+3. length plus aggregate and compact ordered features;
+4. length plus every measured aggregate and ordered feature (91 numeric predictors before categorical encoding).
+
+Inside each outer training partition, three additional task-disjoint folds select among four conservative tree settings. Selection minimizes mean per-task log loss. Final predictions average three independent 400-tree forests. The small grid varies depth, minimum leaf size, and sampled features; it is deliberately not an open-ended hyperparameter search.
+
+Out-of-bag predictions are retained only as training diagnostics. They leave attempts out, not whole tasks, and therefore do not test transfer to a genuinely unseen task.
+
+### Primary random-forest results
+
+| Predictors | Log loss ↓ | Brier ↓ | AUROC ↑ | Average precision ↑ |
+|---|---:|---:|---:|---:|
+| Linear length baseline | 0.658 | 0.232 | 0.648 | 0.589 |
+| **Forest length baseline** | **0.649** | **0.229** | **0.651** | **0.604** |
+| Forest test/phase flow | 0.665 | 0.235 | 0.637 | 0.598 |
+| Forest aggregate + compact ordered features | 0.670 | 0.238 | 0.620 | 0.584 |
+| Forest all 91 measured features | 0.669 | 0.238 | 0.617 | 0.588 |
+
+The forest itself helps modestly: the forest length baseline improves log loss by 0.009 and average precision by 0.015 over logistic regression. That suggests some nonlinear structure in trajectory length and the basic controls.
+
+The process features do not add signal beyond that stronger baseline:
+
+| Added forest features | Log-loss difference from forest length | Task-bootstrap 95% interval | AUROC difference | Average-precision difference |
+|---|---:|---:|---:|---:|
+| Test/phase flow | +0.016 | **+0.003 to +0.029** | −0.014 | −0.005 |
+| Aggregate + compact ordered features | +0.020 | **+0.006 to +0.033** | −0.031 | −0.020 |
+| All 91 measured features | +0.020 | **+0.003 to +0.035** | −0.034 | −0.015 |
+
+All three process forests are reliably worse on wholly unseen tasks. The compact all-process forest is much better than its linear equivalent, but it still loses to the simpler forest that sees only length and controls. Giving the forest every measured feature does not recover additional signal.
+
+### Why out-of-bag validation is insufficient here
+
+| Forest | Mean OOB log loss | True task-held-out log loss |
+|---|---:|---:|
+| Length | 0.635 | **0.649** |
+| Test/phase flow | **0.627** | 0.665 |
+| Aggregate + compact ordered features | **0.627** | 0.670 |
+| All 91 measured features | **0.627** | 0.669 |
+
+OOB diagnostics suggest that process features help. Holding out whole tasks reverses the result. Attempts from the same task share task-specific structure, so attempt-level OOB estimates are optimistic for the question we care about.
+
+### Clean-boundary forest sensitivity
+
+Removing the 62 shell-uncertain attempts and five attempts without an observed source change leaves 925 attempts.
+
+| Predictors | Log loss ↓ | AUROC ↑ | Average precision ↑ |
+|---|---:|---:|---:|
+| Forest length | **0.660** | **0.641** | 0.599 |
+| Forest test/phase flow | 0.661 | 0.640 | **0.603** |
+| Forest aggregate + compact ordered features | 0.668 | 0.615 | 0.595 |
+| Forest all 91 measured features | 0.671 | 0.610 | 0.597 |
+
+Test flow is tied with length: log-loss difference +0.001, task-bootstrap interval −0.013 to +0.014, nearly identical AUROC, and +0.003 average precision. The compact and all-measured forests are inconclusive on log loss but rank worse.
+
+### Held-out family permutation
+
+As a diagnostic, each feature family is jointly shuffled within every held-out task. Positive log-loss change means the model depended usefully on that family; negative means shuffling improved prediction.
+
+In the primary all-measured forest, shuffling test-flow features improves log loss by 0.004 and shuffling mutation-style features improves it by 0.001; both task-bootstrap intervals remain below zero. Shuffling the 39 additional sequence measurements worsens log loss by 0.006, but its interval spans zero. This is consistent with weak, unstable process dependence rather than a transferable feature family.
+
+The clean cohort weakens these effects toward zero. No process family shows stable positive held-out importance.
+
 ## Within-task descriptive results
 
 Only 61 of 110 tasks contain both successful and failed attempts. For each feature, the analysis computes success minus failure inside those contested tasks and bootstraps whole tasks. Positive values mean the feature is higher in successful attempts.
@@ -276,7 +346,7 @@ The sequence-aware result narrows the hypothesis:
 
 - **Not supported:** failures spend more time exploring before acting; `write` is worse than `edit`; more code/test cycling indicates failure.
 - **Supported descriptively:** successful runs commit earlier relative to their own length, validate more after changing code, and cycle between implementation and validation more often.
-- **Not yet predictive:** these deterministic measurements do not improve held-out-task probability estimates over length and controls.
+- **Not predictive with either model family:** these deterministic measurements do not improve held-out-task probability estimates over length and controls in linear or random-forest models.
 
 This differs from some published cross-agent results that associate delayed first edits with higher agent-level resolution. The likely reasons include dataset and design differences: this analysis holds the scaffold to stock Pi, uses newer model families, compares individual attempts rather than agent-level averages, and holds out entire tasks. The disagreement is itself useful evidence that opening strategy is model/scaffold dependent rather than universal.
 
@@ -289,8 +359,10 @@ This differs from some published cross-agent results that associate delayed firs
 5. **No intermediate workspace snapshots exist.** Structured edit/write arguments preserve substantial history, but arbitrary shell changes prevent complete patch reconstruction.
 6. **Feature families remain correlated.** Combined models overfit; group-level comparisons are safer.
 7. **The compact specifications are partly adaptive.** The research note preceded extraction, but the final compact subsets were tightened after an initial broad-feature pass overfit. Treat this as exploratory model development, not a pristine preregistered confirmation.
-8. **Only 61 tasks are contested.** Within-task effect intervals are wide for sparse behaviors.
-9. **Observational data is not an intervention.** Forcing more reading or testing could have different effects.
+8. **The forest search is intentionally narrow.** Four conservative settings cannot rule out every possible nonlinear learner, but a wider search on 990 attempts would raise overfitting risk.
+9. **OOB is not task-held-out evidence.** It is included to show exactly how attempt-level validation can look encouraging while unseen-task performance worsens.
+10. **Only 61 tasks are contested.** Within-task effect intervals are wide for sparse behaviors.
+11. **Observational data is not an intervention.** Forcing more reading or testing could have different effects.
 
 ## Recommended next step
 
@@ -313,7 +385,15 @@ uv run python -m analysis.trajectory_process_signals.baseline_analysis \
   --folds 4 \
   --max-session-bytes 536870912
 
-uv run python -m analysis.trajectory_process_signals.render_report
+uv run --extra analysis python -m \
+  analysis.trajectory_process_signals.random_forest_analysis \
+  --outer-folds 4 \
+  --inner-folds 3 \
+  --tuning-trees 150 \
+  --final-trees 400 \
+  --permutation-repeats 8
+
+uv run --extra analysis python -m analysis.trajectory_process_signals.render_report
 ```
 
 Generated evidence:
@@ -325,15 +405,16 @@ Generated evidence:
 - `artifacts/session_schema_audit.json` — parsed session coverage and boundary support;
 - `artifacts/feature_summary.json` — outcome, task, model, config, and feature summaries;
 - `artifacts/baseline_manifest.json` — exact config allowlist, task list, byte cap, and source revision;
+- `artifacts/random_forest_evaluation.json` — nested task-held-out forests, OOB diagnostics, clean-boundary sensitivity, and held-out permutation results;
 - `trajectory_analysis_research.md` — research basis and predeclared feature plan;
 - `index.html` — self-contained rendered report.
 
 ## Validation record
 
-- Full repository tests: **500 passed**.
-- Focused sequence-feature contracts: **14 passed**.
+- Full repository tests: **504 passed**.
+- Focused sequence/forest contracts: **18 passed**.
 - Ruff formatting/lint: passed.
 - Ty type checking: passed.
 - CodeGraph cycles and boundaries: passed; its declaration check reports the intentional replacement of internal renderer helpers.
-- `aislop scan --changes --base origin/master`: 94/100, zero slop/security/lint/formatting errors; ten size/complexity advisories.
+- `aislop scan --changes --base origin/master`: 91/100, zero slop/security/lint/formatting errors; thirteen size/complexity advisories across the cumulative analysis branch.
 - Dataset assertions and HTML-link validation are recorded with the final artifact commit.
