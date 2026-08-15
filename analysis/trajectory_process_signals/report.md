@@ -1,6 +1,6 @@
-# Trajectory process signals: first retrospective milestone
+# Trajectory process signals in stock-Pi baseline runs
 
-**Status:** feasibility pilot, not a final hypothesis test
+**Status:** corrected first retrospective analysis
 
 **Snapshot analyzed:** local `results/` tree on 2026-08-14
 
@@ -9,231 +9,246 @@
 **Branch:** `analysis/trajectory-process-signals`
 
 **Base:** `origin/master@0ad5f5345f64e6525e8dfb64a57717bbaafa09f8`
-**Fallback:** `origin/main` and local `main` did not exist; `origin/master` is the remote default.
 
-## Verdict
+## Short answer
 
-The corpus can support a leakage-resistant trajectory analysis, but the current feature definitions are not ready for a full-corpus claim. The bounded 12-task pilot parsed 985 valid reps and held out whole tasks. Under the predeclared fixed model, adding process features made prediction worse than the same controls plus length alone: log loss increased by **0.156**, AUROC fell by **0.030**, and partial-reward RMSE increased by **0.010**. A task bootstrap put the process-minus-length log-loss delta at **+0.038 to +0.278**.
+This analysis asks whether behavior visible inside a Pi coding session predicts final failure better than trajectory length alone.
 
-That result is measured, but it is not a general rejection of the hypothesis. The pilot pooled 17 models and 86 configs, 19% of reps had incomplete or opaque semantic tool coverage, true patch-state history was unavailable, and the strict unchanged-test-failure signal never fired. The right next step is to repair observability and run a direct-tool, config-balanced sensitivity analysis before expanding beyond the pilot.
+On the corrected stock-Pi dataset, the answer is **no for the features tested here**. Adding repeated actions, rereads, test transitions, mutation activity, edit reversions, and strategy-reset language made held-out-task predictions worse overall:
 
-## Question and scope
+- length-model log loss: **0.658**;
+- process-model log loss: **0.717**;
+- process minus length: **+0.059** (lower is better);
+- task-bootstrap 95% interval: **+0.025 to +0.102**.
 
-The source hypothesis asks whether event-semantic process signals predict final verifier failure beyond tokens, turns, task, model, thinking level, and config. This milestone does four things:
+The correction matters. The earlier pilot pooled many configs, including Pi Fabric. Those results are superseded. The dataset now contains only the three repository-defined stock-Pi baseline releases, and every modeled session exposes only direct `read`, `bash`, `edit`, and `write` calls.
 
-1. audits the schemas and missingness in the current result tree;
-2. defines censoring and exclusion rules before modeling;
-3. implements a read-only native-session extractor for a minimal feature set;
-4. checks the pipeline on a deterministic, resource-bounded task pilot.
+## Dataset definition
 
-It does **not** parse all native sessions, estimate causal effects, rank models or configs, or modify the hypothesis note. The analysis read raw results from `/home/will/evals/deep-swe-bench/results`; it wrote only derived files under this worktree.
+The exact config allowlist is:
 
-## Current corpus audit
+1. `baseline`
+2. `baseline@1.0.0`
+3. `baseline@1.1.0`
 
-The hypothesis note's corpus counts are stale relative to this snapshot. The current tree contains **12,089** native `session/*.jsonl` files and **11,488** `result.json` files, not 13,311 and roughly 13,039. Result quarantine and archival explain part of the difference; this analysis does not infer where every removed file went.
+Their config READMEs define them as stock Pi with no config-authored extension, skill, system preamble, orchestration prompt, or appended prompt. The versioned releases preserve that behavior while pinning later Pi/model leaves.
 
-### Result and session locations
+The inventory code rejects every other config before schema counting, cohort classification, or session parsing. This excludes all Fabric, workflow, advisor, memory, testing-skill, prompt, and other wrapper configs.
 
-| Location/disposition | `result.json` | Native sessions |
-|---|---:|---:|
-| Canonical result tree | 9,254 | 9,621 attached |
-| Quarantined under `_contaminated` | 2,119 | 2,339 |
-| Archived | 108 | 108 |
-| Throughput diagnostics | 6 | 14 |
-| Other diagnostics | 1 | 0 |
-| Canonical root without a matching canonical result | — | 7 |
-| **Total** | **11,488** | **12,089** |
+### Cohort construction
 
-Only exact paths of the form `results/<model-leaf>/<thinking>/<config>/<task>/repN/result.json` enter the canonical audit. Quarantined, archived, diagnostic, throughput, and structured run-state trees never enter the modeling cohort.
+| Stage | Attempts |
+|---|---:|
+| Stock-Pi baseline results found | 1,005 |
+| Verifier-complete binary outcomes | 990 |
+| Empty-patch outcomes with reward `-1` | 15 |
+| Terminally truncated sessions | 0 |
+| Malformed sessions | 0 |
+| **Modeled attempts** | **990** |
 
-### Canonical artifact availability
+All 1,005 baseline result cells had exactly one native session. The 990 modeled sessions cover:
 
-| Artifact/schema | Present | Missing | Measured shape |
+- **110 tasks**;
+- **5 model identities**;
+- **4 thinking levels**;
+- **3 baseline releases**;
+- **463 successes and 527 failures**;
+- **322,820,030 bytes (307.9 MiB)** of native session JSONL.
+
+Every eligible task was included. There was no reward-based task selection and no task subset after applying the baseline allowlist.
+
+### Model support
+
+| Model | Attempts | Tasks | Successes | Failures | Thinking levels |
+|---|---:|---:|---:|---:|---|
+| GPT-5.6 Sol | 648 | 110 | 335 | 313 | low, medium, high |
+| GPT-5.5 | 216 | 36 | 78 | 138 | low, medium |
+| GPT-5.6 Luna | 114 | 14 | 45 | 69 | low, high, max |
+| GPT-5.6 Terra | 6 | 2 | 2 | 4 | low |
+| GLM-5.2 | 6 | 2 | 3 | 3 | max |
+
+Terra and GLM provide diversity but not enough observations for reliable model-specific estimates. The aggregate model controls for their labels; separate model checks are reported only for Sol, GPT-5.5, and Luna.
+
+## Artifact and schema audit
+
+The full results tree contained 11,488 `result.json` files. Exactly 1,005 belonged to the stock-Pi allowlist; 8,249 other canonical results were excluded before analysis. Quarantined, archived, throughput, diagnostic, and run-state trees were also excluded.
+
+| Baseline artifact | Present | Missing | Observation |
 |---|---:|---:|---|
-| `result.json` | 9,254 | 0 | All loaded as JSON objects. Core identity, outcome, token, turn, wall-time, and exit fields were present in every row. |
-| Exactly one native session | 8,969 | 285 | 267 cells had 2–10 sessions; 18 had none. |
-| `artifacts/model.patch` | 9,243 | 11 | 9,048 non-empty unified diffs; 195 empty files. Every present file size matched `result.patch_bytes`. |
-| Verifier reward JSON | 9,003 | 251 | All 9,003 carried `reward`, `partial`, f2p/p2p ratios, and passed/total counts. |
-| Verifier CTRF | 9,003 | 251 | 9,002 at `verifier/ctrf.json`, one at `verifier/reports/new-ctrf.json`; all summaries carried tests/passed/failed/skipped/pending/other integer counts. |
-| Verifier run log | 9,050 | 204 | Presence only; logs are never predictors. |
+| `result.json` | 1,005 | 0 | Required identity, outcome, length, and exit fields were present. |
+| Exactly one `session/*.jsonl` | 1,005 | 0 | No result-producing-session ambiguity. |
+| `artifacts/model.patch` | 1,005 | 0 | All sizes matched `result.patch_bytes`; 990 nonempty, 15 empty. |
+| Verifier reward JSON | 990 | 15 | Missing only for the 15 skipped empty patches. |
+| Verifier CTRF | 990 | 15 | Missing only for the 15 skipped empty patches. |
+| Verifier run log | 990 | 15 | Missing only for the 15 skipped empty patches. |
 
-`reward_binary` was `1` for 2,946 canonical rows, `0` for 6,054, and `-1` for 254. f2p/p2p fields were numeric for the 9,000 verifier-complete rows and null for 254 rows. Declared `resource_policy` existed for only 1,652/9,254 rows (17.9%), so historical budget control is incomplete.
+Declared `resource_policy` was present for 357/1,005 baseline results. Wall time is complete, but historical declared budgets remain incomplete.
 
-## Cohort and censoring taxonomy
+### Native session evidence
 
-The taxonomy is mutually exclusive and ordered. It distinguishes valid agent failures from incomplete or invalid outcomes.
+The extractor parsed the 990 modeled JSONL files directly:
 
-| Primary disposition | N | Analytical treatment |
-|---|---:|---|
-| **Eligible verifier-complete rep** | **8,694** | Primary cohort before task sampling: 2,839 successes and 5,855 agent failures. |
-| Agent timeout | 63 | Censored; never relabeled as agent failure. |
-| Agent infrastructure error | 11 | Excluded; nonzero/non-timeout agent exit. |
-| Ambiguous multiple sessions | 267 | Excluded until the result-producing session can be identified without guessing. |
-| Missing session | 18 | Excluded; outcome exists but process predictors do not. |
-| Verifier timeout after a normal agent exit | 21 | Censored as verifier failure, not agent failure. |
-| Verifier skipped an empty patch | 180 | Recorded as an agent no-patch failure, but excluded from the primary binary model because final verifier reward is `-1`, not binary. |
+- 88,301 message records;
+- 39,309 assistant turns;
+- 48,035 top-level tool calls;
+- 48,002 matched tool results;
+- 33 terminal or otherwise unresolved tool calls;
+- zero orphan tool results;
+- zero malformed records;
+- zero mismatches against result-level turn or tool-call totals.
 
-The pilot adds two content-level rules after session parsing:
+The observed tool calls were:
 
-- an explicit terminal `length`, `max_tokens`, `max_output_tokens`, or `output_limit` stop is **terminal output truncation** and is censored;
-- malformed JSONL records are excluded rather than silently skipped for modeling.
+| Tool | Calls |
+|---|---:|
+| `bash` | 21,935 |
+| `read` | 13,441 |
+| `edit` | 11,009 |
+| `write` | 1,650 |
 
-The pilot found two terminal output truncations and no malformed records. A `stopReason: error` inside a session is not automatically called truncation or infrastructure failure because agents can continue after such a turn.
+All 990 modeled sessions had complete supported tool surfaces. None contained Fabric or another opaque wrapper call. Of those sessions, 830 ran at least one observable test command and 987 made at least one direct mutation.
 
-## Feature semantics
+## Measurement boundaries
 
-All predictors come from agent-time native session events or non-outcome result controls. Verifier logs, CTRF, reward details, f2p/p2p, and final patch contents never enter a predictor matrix.
+These limits apply before interpreting the result.
 
-| Signal | Operational definition | Boundary |
+| Signal | What is measured | What is not claimed |
 |---|---|---|
-| Repeated normalized tool actions | Top-level tool name plus canonical JSON arguments; `/app/` and `./` paths align; command whitespace aligns. | Nested operations inside `fabric_exec`, workflow, advisor, or similar calls remain opaque. |
-| Repeated reads | Repeated normalized path for top-level `read`. | Different windows of the same file count as a repeated target, while exact action repeats are tracked separately. |
-| Repeated searches | Repeated exact top-level grep/find/search action or normalized bash command invoking `rg`, `grep`, `git grep`, `find`, or `fd`. | It does not infer semantically equivalent but textually different queries. |
-| Repeated tests without observed edits | Same normalized top-level bash test command repeated in the same successful direct-mutation epoch. | “No edit” means no observed successful `edit`, `write`, or `apply_patch`; bash and nested mutations are not visible. |
-| Unchanged repeated failures | Same normalized test command, `isError=true`, and exact normalized output fingerprint within one mutation epoch. | Strict by design; it fired zero times in this pilot. |
-| Failure→pass / pass→failure | Adjacent observable outcomes for the same normalized test command, using tool-result `isError`. | No verifier results and no text-only test inference. |
-| Edit churn | Successful direct mutation count, repeated mutation targets, failed mutations, and exact inverse `oldText`/`newText` edits. | True intermediate patch size, line churn, and semantic reversion are unsupported because no patch snapshots exist. |
-| Strategy reset | Assistant-only phrase matches such as “start over,” “rethink this approach,” “different approach,” “backtrack,” or “abandon this strategy.” | Linguistic and conservative; it is not a state transition oracle. |
-| Within-task length outliers | Robust z-scores of log tokens and log turns within each selected task. | These belong to the length baseline, not the process increment. |
+| Repeated actions | Exact normalized tool name and arguments. | Semantically equivalent but textually different actions. |
+| Repeated reads | Repeated normalized target paths, with exact windows tracked separately. | Whether rereading was useful or unnecessary. |
+| Repeated searches | Repeated normalized `rg`, `grep`, `find`, `fd`, or `git grep` commands. | Semantically equivalent queries with different text. |
+| Repeated tests | The same normalized top-level test command, with direct edits dividing mutation epochs. | Test activity inferred from prose. |
+| Test transitions | Failure→pass and pass→failure from the tool result's `isError` field. | Final verifier outcomes or hidden tests. |
+| Unchanged failures | Exact normalized command and exact output fingerprint. | Functional equivalence when incidental output changes. |
+| Edit churn | Direct mutation counts, target revisits, failed mutations, and exact inverse edits. | True intermediate patch size or partial semantic reversion. |
+| Strategy reset | Conservative assistant phrase matches such as “rethink this approach.” | A reliable internal-state label. |
+| Length | Tokens, turns, wall time, and within-task robust length outliers. | A declared budget where `resource_policy` is absent. |
 
-## Deterministic pilot
+The JSONL files preserve direct edit arguments, but the result tree does not preserve a patch snapshot after each action. Therefore true patch-size churn remains unsupported rather than replaced with a made-up proxy.
 
-Tasks were ordered by `blake2b-64(task)` without consulting reward values. The first 12 tasks contributed every initially eligible rep. The preflight estimated **370,898,888 bytes** of session input, below the explicit **536,870,912-byte** cap. It selected 987 reps; two terminal truncations left **985** modeling reps.
+The strict unchanged-test-failure feature fired zero times. It is too brittle for substantive interpretation in this dataset.
 
-The cohort spans 12 tasks, 17 models, 6 thinking levels, 86 configs, and four languages. It contains 301 successes and 684 failures.
+## Evaluation method
 
-| Task | Reps | Successes |
-|---|---:|---:|
-| `wasmi-trap-coredumps` | 34 | 0 |
-| `abs-module-cache-flags` | 42 | 17 |
-| `httpx-streaming-json-iteration` | 47 | 25 |
-| `koota-deferred-mutation-buffer` | 25 | 2 |
-| `kcp-go-multiplexed-kcp-streams` | 14 | 8 |
-| `go-genai-streamed-function-args` | 15 | 9 |
-| `superjson-error-stack-serialization` | 253 | 48 |
-| `kombu-virtual-queue-dead-lettering` | 13 | 2 |
-| `meriyah-explicit-resource-declarations` | 164 | 33 |
-| `dynamodb-toolbox-conditional-attribute-requirements` | 177 | 29 |
-| `happy-dom-deterministic-intersectionobserver` | 166 | 107 |
-| `prometheus-typed-label-sorting` | 35 | 21 |
+The primary outcome is final binary verifier reward: success (`1`) or failure (`0`). Partial reward is secondary.
 
-### Session schema and signal support
+Four deterministic folds hold out whole tasks. Each attempt appears in one test fold, and no task appears in both training and test data for a fold. Fold test sizes were 247–248 attempts across 26–29 tasks.
 
-The parser saw 51,995 assistant turns and 56,530 top-level tool calls. Result-level turn and tool-call totals matched parsed totals for every retained rep. Forty-nine calls lacked a matching result; no orphan results appeared.
+The models are:
 
-- 798/985 reps (81.0%) had fully supported top-level tool surfaces.
-- 117/985 (11.9%) had mixed supported and opaque tools.
-- 70/985 (7.1%) had only opaque semantic tool calls.
-- 793/985 (80.5%) had at least one observable top-level test command.
-- 912/985 (92.6%) had at least one successful direct mutation.
+1. **Training-fold success rate:** no trajectory features.
+2. **Length + controls:** log tokens, log turns, log wall time, within-task token/turn outliers, model, thinking level, and config.
+3. **Length + process + controls:** the same predictors plus the process features above.
 
-## Blockers to a substantive corpus claim
+Both fitted models use the same fixed L2 regularization. There is no tuning on held-out tasks. Verifier logs, verifier details, final patch contents, f2p/p2p measures, reward fields, and post-outcome artifacts are excluded from every predictor matrix.
 
-These blockers apply before interpreting model deltas.
+## Results
 
-1. **Nested tool semantics are config-dependent.** `fabric_exec`, workflow, AST, goal, and other wrappers hide reads, searches, tests, or mutations behind a top-level call. Config controls do not restore missing within-trajectory events.
-2. **No intermediate patch state exists.** The extractor can measure direct mutation attempts and exact inverse edits, but not true patch churn, partial reversion, or workspace state after bash mutations.
-3. **The unchanged-failure oracle is too strict for this corpus.** It produced zero events. Test output often changes timing, ordering, or incidental text even when the failure is functionally unchanged.
-4. **Historical budgets are mostly absent.** `resource_policy` exists in only 17.9% of canonical results. Wall time is complete, but it is exposure, not a declared budget.
-5. **Task fixed effects and held-out-task prediction are not simultaneously estimable.** The predictive analysis controls task by holding out whole tasks and by unsupervised within-task length normalization. It intentionally does not one-hot task identity because a new task has no learned fixed effect.
-6. **The pilot is heterogeneous and unbalanced.** It pools 17 models and 86 configs; one task contributes 253 reps while another contributes 13. Categorical controls help, but they do not prove stable effects across model/config families.
-7. **Partial reward is viable but preservation-heavy.** All 985 pilot reps have partial reward, yet high partial scores can coexist with failure on feature tests. It remains secondary.
-
-## Measured pilot observations
-
-### Raw, unadjusted feature differences
-
-Failures were longer on average: 2.57M versus 2.01M tokens and 56.8 versus 43.1 turns. They also had more repeated exact actions (2.96 versus 1.95), repeated read targets (5.36 versus 3.25), direct mutations (14.28 versus 10.52), and failed direct mutations (1.07 versus 0.44).
-
-Strategy-reset language appeared in 109/684 failures (15.9%) and 5/301 successes (1.7%). Repeated searches appeared in 24 failures and no successes. These are unadjusted associations, not independent effects.
-
-The transition pattern did not match the simple prediction. Failures averaged 0.338 observable failure→pass transitions versus 0.213 for successes; pass→failure transitions were also higher in failures (0.069 versus 0.043). Longer failed trajectories have more opportunities for both transitions, and productive recovery can occur before a different hidden test still fails.
-
-### Held-out-task evaluation
-
-Four deterministic folds held out whole tasks. Both fitted models used the same model, thinking-level, and config controls. The length model used log tokens, log turns, log wall time, and within-task token/turn outliers. The process model added the event features above. Both used fixed L2 regularization with no test-fold tuning.
+### Held-out-task binary prediction
 
 | Model | Log loss ↓ | Macro-task log loss ↓ | Brier ↓ | AUROC ↑ | Average precision ↑ |
 |---|---:|---:|---:|---:|---:|
-| Fold-train prevalence | 0.644 | 0.657 | 0.224 | 0.354 | 0.254 |
-| Length + controls | 0.671 | 0.666 | 0.222 | 0.643 | 0.415 |
-| Length + process + controls | 0.826 | 0.741 | 0.249 | 0.613 | 0.384 |
-| **Process minus length** | **+0.156** | **+0.074** | **+0.027** | **−0.030** | **−0.031** |
+| Training-fold success rate | 0.696 | 0.689 | 0.251 | 0.440 | 0.435 |
+| Length + controls | **0.658** | **0.670** | **0.232** | **0.648** | **0.589** |
+| Length + process + controls | 0.717 | 0.730 | 0.247 | 0.624 | 0.570 |
+| **Process minus length** | **+0.059** | **+0.060** | **+0.015** | **−0.024** | **−0.019** |
 
-The 2,000-sample task bootstrap estimated the process-minus-length log-loss delta at **+0.038 to +0.278**. Lower is better, so the complete interval favors the length-only specification within this pilot.
+The 2,000-sample task bootstrap places the process-minus-length log-loss difference between **+0.025 and +0.102**. Because lower log loss is better, the entire interval favors the length-only model in this dataset.
 
-For partial reward, the length model reached RMSE 0.119 and MAE 0.063. Adding process features worsened RMSE by 0.010 and MAE by 0.012. The fold-train prevalence baseline had RMSE 0.118.
+### Checks within supported models
+
+| Model | Length log loss | Process log loss | Difference | Task-bootstrap 95% interval |
+|---|---:|---:|---:|---:|
+| GPT-5.5 | 0.619 | 0.687 | +0.068 | +0.012 to +0.132 |
+| GPT-5.6 Luna | 0.528 | 0.688 | +0.160 | +0.064 to +0.255 |
+| GPT-5.6 Sol | 0.658 | 0.685 | +0.027 | −0.009 to +0.067 |
+
+GPT-5.5 and Luna clearly favor the length-only model. Sol's interval includes no difference: its process model slightly improves AUROC (+0.002) and average precision (+0.006), but worsens log loss (+0.027) and Brier score (+0.004). There is no consistent model family in which the process feature set clearly improves the primary probability prediction.
+
+Terra and GLM were not separately fitted because each has only six attempts across two tasks.
+
+### Partial reward
+
+The process model also failed to improve partial-reward prediction:
+
+- length RMSE: **0.10145**;
+- process RMSE: **0.10183**;
+- difference: **+0.00038**;
+- MAE difference: **+0.00052**.
+
+The difference is small, but it does not support an improvement.
+
+## Direct observations
+
+In this corrected dataset, successful attempts were longer, not shorter:
+
+- mean tokens: 2.18M for successes versus 1.28M for failures;
+- mean turns: 42.5 versus 37.2;
+- mean wall time: 512.7 seconds versus 389.8 seconds.
+
+Several process counts were also higher in successes before adjustment:
+
+- repeated normalized actions: 1.33 versus 1.05;
+- repeated read targets: 4.86 versus 3.68;
+- direct mutations: 12.80 versus 11.36;
+- failure→pass transitions: 0.225 versus 0.146;
+- exact inverse edits: 0.086 versus 0.065.
+
+Failed direct mutations were slightly higher in failures: 0.751 versus 0.698. Strategy-reset language was rare—seven successes and seven failures contained it—and repeated searches were nearly absent.
+
+These are descriptive differences, not independent effects. They show why a simple “more activity means overthinking means failure” interpretation does not fit this stock-Pi cohort.
 
 ## Interpretation
 
-This pilot gives no support to the current process-feature model. It instead satisfies a pilot-level falsification direction: the added features did not improve held-out-task prediction beyond length and controls.
+The corrected result is stronger than the mixed-config pilot in one respect: wrapper opacity is no longer a plausible explanation. Every modeled session uses supported direct Pi tools.
 
-The result does not show that trajectory process carries no information. The raw differences show signal, but the current representation is sparse, length-correlated, and unevenly observable across configs. The fixed pooled model may be learning tool-surface identity and task-specific opportunity counts rather than portable failure dynamics. The zero unchanged-failure count is an operationalization failure, not evidence that repeated unchanged failures never occur.
+The result still does **not** prove that useful trajectory warning signs do not exist. It says that this particular aggregate feature set does not improve held-out-task prediction beyond length and basic controls. Plausible remaining explanations include:
 
-The strongest conclusion is methodological: **do not run or interpret the full corpus yet**. Fix semantic coverage and test-transition normalization first.
+1. useful and unproductive retries produce similar counts;
+2. exact command/output matching is too brittle for repeated failure detection;
+3. counts discard the order and local context that distinguish recovery from thrashing;
+4. model and task coverage remain uneven;
+5. a stronger sequence model or manually validated event labels may be required.
 
-## Recommended next step
+## Conclusion and next step
 
-Run one narrower sensitivity milestone before expanding task count:
+For 990 stock-Pi baseline attempts across 110 tasks, adding the current process features makes prediction worse overall. The result repeats within GPT-5.5 and Luna and is inconclusive for Sol.
 
-1. restrict the primary sensitivity cohort to direct-tool reps with `semantic_event_coverage == 1.0`;
-2. stratify or interact by major model/config family, with minimum cell counts declared before fitting;
-3. manually label a deterministic sample of repeated test outputs, then replace exact output hashes with a validated failure-signature normalizer;
-4. add nested operation extraction only where the native tool result exposes a structured trace; otherwise keep the signal unsupported;
-5. rerun the same 12 held-out tasks and require stable improvement in both micro and macro-task log loss before moving to a 36-task pilot.
+The next useful step is not to add more wrapper configs. It is to manually label a small, task-balanced set of baseline trajectories for genuine repeated failures, abandoned approaches, and patch reversions, then test whether sequence-aware features recover those labels. Without that validation, adding more automated counters is unlikely to clarify the hypothesis.
 
-A 36-task pilot would read roughly three times this milestone's 371 MB if task density is similar. The full canonical session set is about 3.6 GB, but its cost is not justified until the feature observability blockers are closed.
+## Validation record
+
+- `uv run --extra test python -m pytest -q` — **497 passed**.
+- Ruff formatting and lint — all checks passed.
+- Ty type checking — all checks passed.
+- CodeGraph — cycle and ownership-boundary checks passed. Its declaration-signature check marks the intentional public rename from the superseded `pilot.py` driver to `baseline_analysis.py`.
+- `aislop scan --changes --base origin/master` — 95/100 with zero AI-slop, security, lint, or formatting errors; eight advisory function/file-size warnings.
+- Dataset assertions — exactly 1,005 cohort rows and 990 feature rows, all restricted to the three allowed configs.
+- HTML validation — parsed successfully and all six local evidence links resolve.
 
 ## Reproduction
 
-From the worktree:
+From the isolated worktree:
 
 ```bash
-uv run pytest -q tests/test_trajectory_process_signals.py
-uv run python -m analysis.trajectory_process_signals.pilot \
+uv run python -m analysis.trajectory_process_signals.baseline_analysis \
   --results /home/will/evals/deep-swe-bench/results \
   --output analysis/trajectory_process_signals/artifacts \
-  --pilot-tasks 12 \
   --folds 4 \
   --max-session-bytes 536870912
+
+uv run python -m analysis.trajectory_process_signals.render_report
 ```
 
-### Validation record
+The extractor reads the results tree without writing to it.
 
-- `uv run --extra test python -m pytest -q` — **495 passed**.
-- `ruff format --check analysis/trajectory_process_signals tests/test_trajectory_process_signals.py` — all files formatted.
-- `ruff check analysis/trajectory_process_signals tests/test_trajectory_process_signals.py` — all checks passed.
-- `uvx ty check analysis/trajectory_process_signals tests/test_trajectory_process_signals.py` — all checks passed.
-- `codegraph check --staged --cycles --signatures` — cycles, signatures, and boundaries passed.
-- `aislop scan --changes` — 96/100, zero AI-slop, security, lint, or formatting errors; seven advisory function/file-size warnings.
-- Deterministic pilot rerun — 987 pre-parse reps, 985 modeling reps, 370,898,888 session bytes.
-- Tailnet report check — `http://100.112.72.93:8790/` returned HTTP 200 with the expected 9,664-byte page.
+Generated evidence:
 
-Derived artifacts:
-
-- `artifacts/pilot_manifest.json` — worktree, branch, base, task selection, byte cap, and outputs
-- `artifacts/schema_audit.json` — full result/session/verifier/patch audit
-- `artifacts/cohort_audit.csv` — one row per canonical result and its disposition
-- `artifacts/session_schema_audit.json` — pilot JSONL/tool schema and observability
-- `artifacts/pilot_features.csv` — compact per-rep outcomes, controls, and extracted features
-- `artifacts/feature_summary.json` — measured feature distributions and support boundaries
-- `artifacts/held_out_task_evaluation.json` — folds, model specification, and metrics
-
-## Evidence ledgers
-
-### CodeGraph evidence
-
-- Rebuilt the structural index and narrowed the seam to `harness/cell_trajectory.py`.
-- `brief` identified `_parse_session_trajectory`, `_content_text`, usage parsing, and test-summary loading as the stable native-session semantics.
-- `deps` showed no static imports for the parser; this analysis therefore uses a standalone parser rather than coupling to dashboard page construction.
-
-### Source-read interpretation
-
-- `harness/cell_trajectory.py` joins assistant tool calls to `toolResult` messages by call ID and reads usage from final native-session messages.
-- ADR-0002 establishes native sessions as the executor usage source and warns that secondary model usage is separate.
-- ADR-0001 and ADR-0005 define the canonical cell path and rep/cell distinction.
-- `docs/result-quarantine.md` requires `_contaminated` results to stay out of normal efficacy analysis.
-
-### Proof commands
-
-The final validation record appears in the branch commit and closing summary. CodeGraph structural checks are scouting evidence only; pytest, Ruff, Ty, the deterministic pilot rerun, and artifact consistency checks provide behavioral evidence.
+- `artifacts/baseline_cohort.csv` — all 1,005 stock-Pi baseline results and dispositions;
+- `artifacts/baseline_features.csv` — 990 pre-verifier feature rows used for modeling;
+- `artifacts/schema_audit.json` — scoped result, session, patch, and verifier availability;
+- `artifacts/session_schema_audit.json` — parsed JSONL records and semantic coverage;
+- `artifacts/feature_summary.json` — task, model, config, outcome, and feature summaries;
+- `artifacts/held_out_task_evaluation.json` — folds, aggregate metrics, bootstrap results, and model checks;
+- `artifacts/baseline_manifest.json` — exact allowlist, tasks, byte cap, and provenance;
+- `index.html` — self-contained review page generated from those artifacts.
