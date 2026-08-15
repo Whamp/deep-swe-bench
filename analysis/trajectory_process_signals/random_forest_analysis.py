@@ -376,6 +376,18 @@ def evaluate_random_forest_held_out_tasks(
     }
 
 
+def select_certain_source_mutation_rows(
+    rows: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep attempts with an observed source mutation and no prior shell uncertainty."""
+    return [
+        row
+        for row in rows
+        if float(row["has_successful_source_mutation"]) == 1.0
+        and float(row["first_source_mutation_boundary_uncertain"]) == 0.0
+    ]
+
+
 def load_random_forest_feature_rows(path: Path) -> list[dict[str, Any]]:
     """Load only the pre-verifier columns required by the forest experiment."""
     numeric_names = set().union(*RANDOM_FOREST_SPECIFICATIONS.values())
@@ -597,6 +609,28 @@ def run_random_forest_analysis(
     evaluation["forest_minus_linear"] = _linear_comparison(
         evaluation, linear_evaluation
     )
+    certain_boundary_rows = select_certain_source_mutation_rows(rows)
+    certain_boundary_evaluation = evaluate_random_forest_held_out_tasks(
+        certain_boundary_rows,
+        outer_fold_count=outer_fold_count,
+        inner_fold_count=inner_fold_count,
+        tuning_trees=tuning_trees,
+        final_trees=final_trees,
+        permutation_repeats=permutation_repeats,
+    )
+    certain_boundary_linear = linear_evaluation["cohort_sensitivities"][
+        "certain_first_source_mutation"
+    ]["evaluation"]
+    certain_boundary_evaluation["forest_minus_linear"] = _linear_comparison(
+        certain_boundary_evaluation, certain_boundary_linear
+    )
+    evaluation["cohort_sensitivities"] = {
+        "certain_first_source_mutation": {
+            "reps": len(certain_boundary_rows),
+            "excluded_reps": len(rows) - len(certain_boundary_rows),
+            "evaluation": certain_boundary_evaluation,
+        }
+    }
     evaluation["provenance"] = {
         "analysis": "stock-pi-random-forest-trajectory-signals",
         "git": _git_metadata(Path(__file__).resolve().parents[2]),

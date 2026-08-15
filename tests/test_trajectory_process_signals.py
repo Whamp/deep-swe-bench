@@ -34,6 +34,7 @@ from analysis.trajectory_process_signals.random_forest_analysis import (
     RandomForestParameters,
     encode_random_forest_design,
     evaluate_random_forest_held_out_tasks,
+    select_certain_source_mutation_rows,
 )
 
 
@@ -509,6 +510,30 @@ def test_predictor_allowlist_excludes_outcomes_and_verifier_artifacts() -> None:
         if name.startswith(("reward", "verifier", "f2p", "p2p"))
         or name in {"patch_bytes", "artifacts", "result_path"}
     }
+
+
+def test_random_forest_clean_boundary_requires_observed_certain_source_change() -> None:
+    rows = [
+        {
+            "cell_id": "clean",
+            "has_successful_source_mutation": 1.0,
+            "first_source_mutation_boundary_uncertain": 0.0,
+        },
+        {
+            "cell_id": "shell-uncertain",
+            "has_successful_source_mutation": 1.0,
+            "first_source_mutation_boundary_uncertain": 1.0,
+        },
+        {
+            "cell_id": "no-source-change",
+            "has_successful_source_mutation": 0.0,
+            "first_source_mutation_boundary_uncertain": 0.0,
+        },
+    ]
+
+    assert [row["cell_id"] for row in select_certain_source_mutation_rows(rows)] == [
+        "clean"
+    ]
 
 
 def test_random_forest_encoder_uses_training_categories_without_outcome_fields() -> (
