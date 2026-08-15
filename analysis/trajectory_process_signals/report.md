@@ -1,6 +1,6 @@
-# Trajectory process signals in stock-Pi baseline runs
+# Sequence-aware trajectory analysis of stock-Pi baseline runs
 
-**Status:** corrected first retrospective analysis
+**Status:** second retrospective milestone; ordered-feature follow-up
 
 **Snapshot analyzed:** local `results/` tree on 2026-08-14
 
@@ -10,225 +10,301 @@
 
 **Base:** `origin/master@0ad5f5345f64e6525e8dfb64a57717bbaafa09f8`
 
+**Analysis source:** `5380d2149e3281f81d0623ae6fc4777d9c8e2465`
+
 ## Short answer
 
-This analysis asks whether behavior visible inside a Pi coding session predicts final failure better than trajectory length alone.
+This follow-up tests a different idea from the first analysis: not just how much an agent reads, edits, or tests, but **when** it does those things.
 
-On the corrected stock-Pi dataset, the answer is **no for the features tested here**. Adding repeated actions, rereads, test transitions, mutation activity, edit reversions, and strategy-reset language made held-out-task predictions worse overall:
+The new measurements include:
 
-- length-model log loss: **0.658**;
-- process-model log loss: **0.717**;
-- process minus length: **+0.059** (lower is better);
-- task-bootstrap 95% interval: **+0.025 to +0.102**.
+- reads and tests before the first source-code change;
+- the point in the trajectory where the first source change occurs;
+- `edit` versus whole-file `write` behavior;
+- code changes before and after tests;
+- implementation→validation cycles and backward transitions;
+- testing after the final source change.
 
-The correction matters. The earlier pilot pooled many configs, including Pi Fabric. Those results are superseded. The dataset now contains only the three repository-defined stock-Pi baseline releases, and every modeled session exposes only direct `read`, `bash`, `edit`, and `write` calls.
+The result is mixed but clear:
 
-## Dataset definition
+1. **The ordered features explain behavior better than the old totals.** Successful runs are more likely to end with a passing test and perform more code/test cycles.
+2. **They still do not improve held-out-task prediction beyond trajectory length.** The test/phase-flow model is the closest, but is statistically tied with the length-only model.
+3. **The simple “too much exploration before acting causes failure” story is not supported.** Successful runs often do more reading in absolute terms, yet reach their first source change earlier as a share of their total trajectory.
 
-The exact config allowlist is:
+## Research basis
+
+The feature design follows a review of primary trajectory-analysis work recorded in [`trajectory_analysis_research.md`](./trajectory_analysis_research.md).
+
+The most directly relevant study, *Beyond Resolution Rates*, analyzes opening context gathering, patching in the first ten steps, and validation effort. Other applicable methods come from TraceProbe milestones, TrajEval's search/read/edit decomposition and intermediate-edit corruption, AgentLens phase coherence and temporal profiles, Graphectory phase flows and loops, and *Failure as a Process* recovery windows.
+
+The literature shaped four decisions here:
+
+- preserve action order rather than only totals;
+- distinguish diagnosis before source changes from validation after them;
+- treat `edit` and `write` separately;
+- compare within tasks and hold out whole tasks, because task difficulty confounds trajectory length.
+
+The cited studies use other agents, benchmarks, and feature definitions. Their findings are motivation, not evidence about this Pi dataset.
+
+## Dataset
+
+The exact config allowlist remains:
 
 1. `baseline`
 2. `baseline@1.0.0`
 3. `baseline@1.1.0`
 
-Their config READMEs define them as stock Pi with no config-authored extension, skill, system preamble, orchestration prompt, or appended prompt. The versioned releases preserve that behavior while pinning later Pi/model leaves.
-
-The inventory code rejects every other config before schema counting, cohort classification, or session parsing. This excludes all Fabric, workflow, advisor, memory, testing-skill, prompt, and other wrapper configs.
-
-### Cohort construction
+Every other config—including all Fabric, workflow, advisor, memory, skill, and prompt variants—is rejected before session parsing.
 
 | Stage | Attempts |
 |---|---:|
-| Stock-Pi baseline results found | 1,005 |
-| Verifier-complete binary outcomes | 990 |
-| Empty-patch outcomes with reward `-1` | 15 |
-| Terminally truncated sessions | 0 |
-| Malformed sessions | 0 |
+| Stock-Pi results | 1,005 |
+| Empty-patch outcomes excluded from binary modeling | 15 |
 | **Modeled attempts** | **990** |
+| Successes | 463 |
+| Failures | 527 |
+| Tasks | 110 |
+| Models | 5 |
+| Thinking levels | 4 |
+| Native-session input | 322,820,030 bytes |
 
-All 1,005 baseline result cells had exactly one native session. The 990 modeled sessions cover:
+All 990 modeled sessions contain only supported direct Pi tools: `read`, `bash`, `edit`, and `write`.
 
-- **110 tasks**;
-- **5 model identities**;
-- **4 thinking levels**;
-- **3 baseline releases**;
-- **463 successes and 527 failures**;
-- **322,820,030 bytes (307.9 MiB)** of native session JSONL.
+## Event definitions
 
-Every eligible task was included. There was no reward-based task selection and no task subset after applying the baseline allowlist.
+### First mutation boundaries
 
-### Model support
+The analysis uses two boundaries:
 
-| Model | Attempts | Tasks | Successes | Failures | Thinking levels |
-|---|---:|---:|---:|---:|---|
-| GPT-5.6 Sol | 648 | 110 | 335 | 313 | low, medium, high |
-| GPT-5.5 | 216 | 36 | 78 | 138 | low, medium |
-| GPT-5.6 Luna | 114 | 14 | 45 | 69 | low, high, max |
-| GPT-5.6 Terra | 6 | 2 | 2 | 4 | low |
-| GLM-5.2 | 6 | 2 | 3 | 3 | max |
+- **first workspace mutation:** first successful structured `edit` or `write`;
+- **first source mutation:** first successful structured mutation to a supported source-file extension, excluding paths conservatively identified as tests or reproduction scripts.
 
-Terra and GLM provide diversity but not enough observations for reliable model-specific estimates. The aggregate model controls for their labels; separate model checks are reported only for Sol, GPT-5.5, and Luna.
+The source boundary is the main proxy for committing to a fix. A `write` that creates `repro_bug.py` is diagnosis, not source implementation.
 
-## Artifact and schema audit
+Five attempts have no observed source mutation. Sixty-two contain a shell command that may have mutated files before the first structured source change. Those 62 are marked uncertain. A separate sensitivity analysis excludes both uncertain boundaries and no-source-mutation attempts, leaving 925 attempts.
 
-The full results tree contained 11,488 `result.json` files. Exactly 1,005 belonged to the stock-Pi allowlist; 8,249 other canonical results were excluded before analysis. Quarantined, archived, throughput, diagnostic, and run-state trees were also excluded.
+### Opening behavior
 
-| Baseline artifact | Present | Missing | Observation |
-|---|---:|---:|---|
-| `result.json` | 1,005 | 0 | Required identity, outcome, length, and exit fields were present. |
-| Exactly one `session/*.jsonl` | 1,005 | 0 | No result-producing-session ambiguity. |
-| `artifacts/model.patch` | 1,005 | 0 | All sizes matched `result.patch_bytes`; 990 nonempty, 15 empty. |
-| Verifier reward JSON | 990 | 15 | Missing only for the 15 skipped empty patches. |
-| Verifier CTRF | 990 | 15 | Missing only for the 15 skipped empty patches. |
-| Verifier run log | 990 | 15 | Missing only for the 15 skipped empty patches. |
+The compact opening feature group contains ten measures drawn from the research plan:
 
-Declared `resource_policy` was present for 357/1,005 baseline results. Wall time is complete, but historical declared budgets remain incomplete.
+- whether a source mutation occurs;
+- tool calls, reads, unique read paths, and tests before it;
+- failed tests before it;
+- first-source-mutation position divided by total tool calls;
+- read and source-mutation shares among the first ten tool calls;
+- shell-boundary uncertainty.
 
-### Native session evidence
+Tokens before first mutation and other opening measurements remain in the dataset for description but were kept out of the compact predictive group to reduce collinearity.
 
-The extractor parsed the 990 modeled JSONL files directly:
+### `edit` versus `write`
 
-- 88,301 message records;
-- 39,309 assistant turns;
-- 48,035 top-level tool calls;
-- 48,002 matched tool results;
-- 33 terminal or otherwise unresolved tool calls;
-- zero orphan tool results;
-- zero malformed records;
-- zero mismatches against result-level turn or tool-call totals.
+The mutation-style group contains:
 
-The observed tool calls were:
+- source `edit` calls;
+- source `write` calls;
+- failed edit/write calls;
+- whether the first source mutation is a write;
+- mutation-tool switches;
+- write→edit on the same target;
+- repeated writes to the same target.
 
-| Tool | Calls |
-|---|---:|
-| `bash` | 21,935 |
-| `read` | 13,441 |
-| `edit` | 11,009 |
-| `write` | 1,650 |
+The extractor also records content sizes and mutations to test/reproduction targets, but these are descriptive rather than primary predictors.
 
-All 990 modeled sessions had complete supported tool surfaces. None contained Fabric or another opaque wrapper call. Of those sessions, 830 ran at least one observable test command and 987 made at least one direct mutation.
+### Test and phase flow
 
-## Measurement boundaries
+Events receive deterministic phase labels where supported:
 
-These limits apply before interpreting the result.
+- **exploration:** reads and searches;
+- **diagnosis:** tests or test/reproduction writes before source mutation;
+- **implementation:** source mutations;
+- **validation:** tests after source mutation and reads of already-mutated source targets.
 
-| Signal | What is measured | What is not claimed |
-|---|---|---|
-| Repeated actions | Exact normalized tool name and arguments. | Semantically equivalent but textually different actions. |
-| Repeated reads | Repeated normalized target paths, with exact windows tracked separately. | Whether rereading was useful or unnecessary. |
-| Repeated searches | Repeated normalized `rg`, `grep`, `find`, `fd`, or `git grep` commands. | Semantically equivalent queries with different text. |
-| Repeated tests | The same normalized top-level test command, with direct edits dividing mutation epochs. | Test activity inferred from prose. |
-| Test transitions | Failure→pass and pass→failure from the tool result's `isError` field. | Final verifier outcomes or hidden tests. |
-| Unchanged failures | Exact normalized command and exact output fingerprint. | Functional equivalence when incidental output changes. |
-| Edit churn | Direct mutation counts, target revisits, failed mutations, and exact inverse edits. | True intermediate patch size or partial semantic reversion. |
-| Strategy reset | Conservative assistant phrase matches such as “rethink this approach.” | A reliable internal-state label. |
-| Length | Tokens, turns, wall time, and within-task robust length outliers. | A declared budget where `resource_policy` is absent. |
+The compact test-flow group measures:
 
-The JSONL files preserve direct edit arguments, but the result tree does not preserve a patch snapshot after each action. Therefore true patch-size churn remains unsupported rather than replaced with a made-up proxy.
+- tests after first mutation;
+- distance and mutation count to the first post-mutation test;
+- longest mutation streak without testing;
+- tests and passing tests after the final mutation;
+- changes after a passing test;
+- pass→mutation→fail patterns;
+- implementation→validation transitions;
+- validation→implementation transitions.
 
-The strict unchanged-test-failure feature fired zero times. It is too brittle for substantive interpretation in this dataset.
+A tool result with `isError=false` means the command exited successfully. It does not prove that the relevant hidden or feature tests passed.
 
-## Evaluation method
+## Evaluation
 
-The primary outcome is final binary verifier reward: success (`1`) or failure (`0`). Partial reward is secondary.
+Four deterministic folds hold out whole tasks. Each attempt appears in one test fold, and no task appears in both training and test data for that fold.
 
-Four deterministic folds hold out whole tasks. Each attempt appears in one test fold, and no task appears in both training and test data for a fold. Fold test sizes were 247–248 attempts across 26–29 tasks.
+Every fitted model includes the same model, thinking-level, config, token, turn, wall-time, and within-task length controls. Fixed L2 regularization is used without test-fold tuning.
 
-The models are:
+The compared specifications are:
 
-1. **Training-fold success rate:** no trajectory features.
-2. **Length + controls:** log tokens, log turns, log wall time, within-task token/turn outliers, model, thinking level, and config.
-3. **Length + process + controls:** the same predictors plus the process features above.
+1. length and controls;
+2. length plus the original aggregate counts;
+3. length plus opening behavior;
+4. length plus mutation style;
+5. length plus test/phase flow;
+6. length plus all compact ordered features;
+7. length plus aggregate and ordered features.
 
-Both fitted models use the same fixed L2 regularization. There is no tuning on held-out tasks. Verifier logs, verifier details, final patch contents, f2p/p2p measures, reward fields, and post-outcome artifacts are excluded from every predictor matrix.
+Verifier outputs, final patch contents, reward details, and post-outcome artifacts never enter the predictors.
 
-## Results
+## Predictive results
 
 ### Held-out-task binary prediction
 
-| Model | Log loss ↓ | Macro-task log loss ↓ | Brier ↓ | AUROC ↑ | Average precision ↑ |
+| Predictors | Log loss ↓ | Macro-task loss ↓ | Brier ↓ | AUROC ↑ | Average precision ↑ |
 |---|---:|---:|---:|---:|---:|
-| Training-fold success rate | 0.696 | 0.689 | 0.251 | 0.440 | 0.435 |
-| Length + controls | **0.658** | **0.670** | **0.232** | **0.648** | **0.589** |
-| Length + process + controls | 0.717 | 0.730 | 0.247 | 0.624 | 0.570 |
-| **Process minus length** | **+0.059** | **+0.060** | **+0.015** | **−0.024** | **−0.019** |
+| Length + controls | **0.658** | **0.670** | **0.232** | **0.648** | 0.589 |
+| Original aggregate counts | 0.717 | 0.730 | 0.247 | 0.624 | 0.570 |
+| Opening behavior | 0.686 | 0.681 | 0.242 | 0.626 | 0.573 |
+| Edit/write style | 0.694 | 0.678 | 0.241 | 0.626 | 0.578 |
+| Test and phase flow | 0.674 | 0.672 | 0.234 | 0.647 | **0.599** |
+| All compact ordered features | 0.746 | 0.706 | 0.253 | 0.613 | 0.567 |
+| Aggregate + ordered features | 0.806 | 0.777 | 0.270 | 0.588 | 0.551 |
 
-The 2,000-sample task bootstrap places the process-minus-length log-loss difference between **+0.025 and +0.102**. Because lower log loss is better, the entire interval favors the length-only model in this dataset.
+### Difference from length-only
 
-### Checks within supported models
-
-| Model | Length log loss | Process log loss | Difference | Task-bootstrap 95% interval |
+| Added feature group | Log-loss difference | Task-bootstrap 95% interval | AUROC difference | Average-precision difference |
 |---|---:|---:|---:|---:|
-| GPT-5.5 | 0.619 | 0.687 | +0.068 | +0.012 to +0.132 |
-| GPT-5.6 Luna | 0.528 | 0.688 | +0.160 | +0.064 to +0.255 |
-| GPT-5.6 Sol | 0.658 | 0.685 | +0.027 | −0.009 to +0.067 |
+| Original aggregate counts | +0.059 | +0.025 to +0.102 | −0.024 | −0.019 |
+| Opening behavior | +0.028 | +0.006 to +0.061 | −0.022 | −0.016 |
+| Edit/write style | +0.036 | +0.008 to +0.068 | −0.022 | −0.011 |
+| Test and phase flow | **+0.016** | **−0.005 to +0.036** | −0.002 | **+0.010** |
+| All compact ordered features | +0.088 | +0.039 to +0.140 | −0.035 | −0.022 |
+| Aggregate + ordered features | +0.148 | +0.086 to +0.214 | −0.060 | −0.037 |
 
-GPT-5.5 and Luna clearly favor the length-only model. Sol's interval includes no difference: its process model slightly improves AUROC (+0.002) and average precision (+0.006), but worsens log loss (+0.027) and Brier score (+0.004). There is no consistent model family in which the process feature set clearly improves the primary probability prediction.
+Lower log loss is better. Opening and mutation-style features clearly worsen probability prediction. Test/phase flow is effectively tied with length: its interval includes no difference, AUROC is unchanged, and average precision improves by 0.010.
 
-Terra and GLM were not separately fitted because each has only six attempts across two tasks.
+The large combined models overfit badly despite regularization. They should not be interpreted as evidence that every sequence feature is harmful; they show that adding many correlated counters is not useful with this sample size.
+
+### Clean-boundary sensitivity
+
+Excluding 62 shell-uncertain attempts and five no-source-mutation attempts leaves 925 attempts.
+
+| Added feature group | Log-loss difference | Task-bootstrap 95% interval | AUROC difference |
+|---|---:|---:|---:|
+| Opening behavior | +0.010 | −0.002 to +0.026 | −0.007 |
+| Edit/write style | +0.020 | +0.002 to +0.040 | −0.017 |
+| Test and phase flow | **+0.005** | **−0.018 to +0.025** | **+0.007** |
+| All compact ordered features | +0.031 | +0.004 to +0.059 | −0.010 |
+| Aggregate + ordered features | +0.084 | +0.036 to +0.141 | −0.031 |
+
+The clean-boundary cohort reaches the same conclusion. Test flow remains tied with length and gains a small amount of AUROC, while opening and mutation style do not improve log loss.
+
+### Supported models
+
+For the test/phase-flow group:
+
+| Model | Attempts | Length log loss | Test-flow log loss | Difference | Task-bootstrap 95% interval |
+|---|---:|---:|---:|---:|---:|
+| GPT-5.5 | 216 | 0.619 | 0.667 | +0.048 | +0.003 to +0.094 |
+| GPT-5.6 Luna | 114 | 0.528 | 0.866 | +0.338 | +0.101 to +0.616 |
+| GPT-5.6 Sol | 648 | 0.658 | 0.659 | +0.001 | −0.037 to +0.037 |
+
+For Sol, test flow improves AUROC by 0.017 and average precision by 0.015 while leaving log loss unchanged. It clearly hurts Luna and modestly hurts GPT-5.5. Terra and GLM have only six attempts each and are not fitted separately.
 
 ### Partial reward
 
-The process model also failed to improve partial-reward prediction:
+No added feature group improves partial-reward RMSE. Test flow changes RMSE by +0.00114 and MAE by +0.00146. The other compact groups also move slightly in the wrong direction.
 
-- length RMSE: **0.10145**;
-- process RMSE: **0.10183**;
-- difference: **+0.00038**;
-- MAE difference: **+0.00052**.
+## Within-task descriptive results
 
-The difference is small, but it does not support an improvement.
+Only 61 of 110 tasks contain both successful and failed attempts. For each feature, the analysis computes success minus failure inside those contested tasks and bootstraps whole tasks. Positive values mean the feature is higher in successful attempts.
 
-## Direct observations
+| Measure | Mean raw difference | Mean standardized difference | Task-bootstrap 95% interval |
+|---|---:|---:|---:|
+| Calls before first source mutation | +2.592 | +0.088 | −0.208 to +0.364 |
+| Reads before first source mutation | +2.077 | +0.247 | −0.045 to +0.509 |
+| Unique paths read before first source mutation | +1.827 | +0.247 | −0.060 to +0.542 |
+| Share of trajectory before first source mutation | −0.025 | **−0.304** | **−0.583 to −0.034** |
+| First source mutation is `write` | −0.003 | −0.048 | −0.316 to +0.209 |
+| Source `edit` calls | +1.576 | +0.243 | −0.035 to +0.530 |
+| Source `write` calls | +0.081 | +0.131 | −0.113 to +0.385 |
+| Tests after first source mutation | +0.671 | +0.275 | −0.064 to +0.586 |
+| Passing test after final source mutation | +0.088 | **+0.299** | **+0.013 to +0.580** |
+| Implementation→validation transitions | +0.561 | **+0.443** | **+0.173 to +0.714** |
+| Validation→implementation transitions | +0.483 | **+0.443** | **+0.169 to +0.721** |
 
-In this corrected dataset, successful attempts were longer, not shorter:
+The key distinction is absolute versus relative exploration:
 
-- mean tokens: 2.18M for successes versus 1.28M for failures;
-- mean turns: 42.5 versus 37.2;
-- mean wall time: 512.7 seconds versus 389.8 seconds.
+- successful attempts make more pre-mutation calls and reads on average, although those intervals include zero;
+- successful attempts reach the first source mutation earlier as a fraction of their total trajectory;
+- successful attempts perform more implementation/validation cycles and are more likely to end with a passing test.
 
-Several process counts were also higher in successes before adjustment:
+This does not look like successful agents simply “read less.” It looks more like they sustain a longer productive trajectory after committing to a change.
 
-- repeated normalized actions: 1.33 versus 1.05;
-- repeated read targets: 4.86 versus 3.68;
-- direct mutations: 12.80 versus 11.36;
-- failure→pass transitions: 0.225 versus 0.146;
-- exact inverse edits: 0.086 versus 0.065.
+## `edit` versus `write`
 
-Failed direct mutations were slightly higher in failures: 0.751 versus 0.698. Strategy-reset language was rare—seven successes and seven failures contained it—and repeated searches were nearly absent.
+The stock-Pi sessions contain:
 
-These are descriptive differences, not independent effects. They show why a simple “more activity means overthinking means failure” interpretation does not fit this stock-Pi cohort.
+- 8,728 structured source `edit` calls;
+- 1,094 whole-file source `write` calls;
+- 2,044 write→edit events on the same target across 574 attempts.
+
+First source mutation:
+
+| Tool | Attempts | Successes | Raw success rate |
+|---|---:|---:|---:|
+| `edit` | 507 | 242 | 47.7% |
+| `write` | 478 | 219 | 45.8% |
+| No observed source mutation | 5 | 2 | 40.0% |
+
+The 1.9-point raw difference between first-`edit` and first-`write` runs is small. The within-task standardized interval for “first source mutation is write” spans −0.316 to +0.209. The predictive mutation-style model also worsens log loss.
+
+There is therefore no evidence that `edit` is intrinsically better than `write`, or vice versa. Their meaning depends on target and sequence: `write` may create a complete source file or a reproduction test; `edit` may make a focused repair or repeatedly thrash the same file.
+
+## Test behavior
+
+Only 30/990 attempts run any recognized test before the first source mutation, for 38 total pre-mutation tests. This behavior is too rare to estimate reliably in this cohort.
+
+After source mutation:
+
+- 830 attempts run at least one recognized test somewhere in the trajectory;
+- 670 run a test after the final source mutation;
+- 534 obtain a successful test command after the final source mutation;
+- 165 contain at least one pass→mutation→fail pattern.
+
+Raw success rates are 51.9% when a passing test follows the final source mutation and 40.8% otherwise. The within-task effect remains positive after task control. This is the clearest descriptive signal in the new feature family, although it does not improve the full predictive model enough to beat length.
+
+Validation→implementation transitions are also higher in successful runs. A failed test followed by another change is often a healthy feedback loop, not “backtracking” in the pejorative sense.
 
 ## Interpretation
 
-The corrected result is stronger than the mixed-config pilot in one respect: wrapper opacity is no longer a plausible explanation. Every modeled session uses supported direct Pi tools.
+The sequence-aware result narrows the hypothesis:
 
-The result still does **not** prove that useful trajectory warning signs do not exist. It says that this particular aggregate feature set does not improve held-out-task prediction beyond length and basic controls. Plausible remaining explanations include:
+- **Not supported:** failures spend more time exploring before acting; `write` is worse than `edit`; more code/test cycling indicates failure.
+- **Supported descriptively:** successful runs commit earlier relative to their own length, validate more after changing code, and cycle between implementation and validation more often.
+- **Not yet predictive:** these deterministic measurements do not improve held-out-task probability estimates over length and controls.
 
-1. useful and unproductive retries produce similar counts;
-2. exact command/output matching is too brittle for repeated failure detection;
-3. counts discard the order and local context that distinguish recovery from thrashing;
-4. model and task coverage remain uneven;
-5. a stronger sequence model or manually validated event labels may be required.
+This differs from some published cross-agent results that associate delayed first edits with higher agent-level resolution. The likely reasons include dataset and design differences: this analysis holds the scaffold to stock Pi, uses newer model families, compares individual attempts rather than agent-level averages, and holds out entire tasks. The disagreement is itself useful evidence that opening strategy is model/scaffold dependent rather than universal.
 
-## Conclusion and next step
+## Remaining limits
 
-For 990 stock-Pi baseline attempts across 110 tasks, adding the current process features makes prediction worse overall. The result repeats within GPT-5.5 and Luna and is inconclusive for Sol.
+1. **First source mutation is a proxy for commitment.** It is not an observed internal plan decision.
+2. **Shell mutation detection is conservative.** Sixty-two boundaries are flagged uncertain; other shell-writing patterns may be missed.
+3. **Path purpose is heuristic.** Test and reproduction files are recognized by path patterns; unusual names may be misclassified.
+4. **Test success is coarse.** `isError=false` means command success, not necessarily feature correctness.
+5. **No intermediate workspace snapshots exist.** Structured edit/write arguments preserve substantial history, but arbitrary shell changes prevent complete patch reconstruction.
+6. **Feature families remain correlated.** Combined models overfit; group-level comparisons are safer.
+7. **The compact specifications are partly adaptive.** The research note preceded extraction, but the final compact subsets were tightened after an initial broad-feature pass overfit. Treat this as exploratory model development, not a pristine preregistered confirmation.
+8. **Only 61 tasks are contested.** Within-task effect intervals are wide for sparse behaviors.
+9. **Observational data is not an intervention.** Forcing more reading or testing could have different effects.
 
-The next useful step is not to add more wrapper configs. It is to manually label a small, task-balanced set of baseline trajectories for genuine repeated failures, abandoned approaches, and patch reversions, then test whether sequence-aware features recover those labels. Without that validation, adding more automated counters is unlikely to clarify the hypothesis.
+## Recommended next step
 
-## Validation record
+The most useful next milestone is manual labeling, not more counters. Select a task-balanced set of stock-Pi trajectories and label:
 
-- `uv run --extra test python -m pytest -q` — **497 passed**.
-- Ruff formatting and lint — all checks passed.
-- Ty type checking — all checks passed.
-- CodeGraph — cycle and ownership-boundary checks passed. Its declaration-signature check marks the intentional public rename from the superseded `pilot.py` driver to `baseline_analysis.py`.
-- `aislop scan --changes --base origin/master` — 95/100 with zero AI-slop, security, lint, or formatting errors; eight advisory function/file-size warnings.
-- Dataset assertions — exactly 1,005 cohort rows and 990 feature rows, all restricted to the three allowed configs.
-- HTML validation — parsed successfully and all six local evidence links resolve.
+- whether pre-mutation exploration was focused or aimless;
+- whether a `write` created a reproduction/test artifact or implemented the fix;
+- whether a failed test caused a useful change;
+- whether a passing intermediate state was later corrupted;
+- whether the final validation actually exercised the requested behavior.
+
+Use those labels to validate a small sequence-aware detector set. The automated result says where to look—final validation and code/test cycling—but does not yet distinguish productive iteration from accidental motion.
 
 ## Reproduction
-
-From the isolated worktree:
 
 ```bash
 uv run python -m analysis.trajectory_process_signals.baseline_analysis \
@@ -240,15 +316,24 @@ uv run python -m analysis.trajectory_process_signals.baseline_analysis \
 uv run python -m analysis.trajectory_process_signals.render_report
 ```
 
-The extractor reads the results tree without writing to it.
-
 Generated evidence:
 
-- `artifacts/baseline_cohort.csv` — all 1,005 stock-Pi baseline results and dispositions;
-- `artifacts/baseline_features.csv` — 990 pre-verifier feature rows used for modeling;
-- `artifacts/schema_audit.json` — scoped result, session, patch, and verifier availability;
-- `artifacts/session_schema_audit.json` — parsed JSONL records and semantic coverage;
-- `artifacts/feature_summary.json` — task, model, config, outcome, and feature summaries;
-- `artifacts/held_out_task_evaluation.json` — folds, aggregate metrics, bootstrap results, and model checks;
-- `artifacts/baseline_manifest.json` — exact allowlist, tasks, byte cap, and provenance;
-- `index.html` — self-contained review page generated from those artifacts.
+- `artifacts/baseline_cohort.csv` — scoped result cohort and dispositions;
+- `artifacts/baseline_features.csv` — aggregate and ordered features for 990 attempts;
+- `artifacts/task_controlled_feature_effects.json` — within-task descriptive effects and task bootstraps;
+- `artifacts/held_out_task_evaluation.json` — grouped models, model checks, and clean-boundary sensitivity;
+- `artifacts/session_schema_audit.json` — parsed session coverage and boundary support;
+- `artifacts/feature_summary.json` — outcome, task, model, config, and feature summaries;
+- `artifacts/baseline_manifest.json` — exact config allowlist, task list, byte cap, and source revision;
+- `trajectory_analysis_research.md` — research basis and predeclared feature plan;
+- `index.html` — self-contained rendered report.
+
+## Validation record
+
+- Full repository tests: **500 passed**.
+- Focused sequence-feature contracts: **14 passed**.
+- Ruff formatting/lint: passed.
+- Ty type checking: passed.
+- CodeGraph cycles and boundaries: passed; its declaration check reports the intentional replacement of internal renderer helpers.
+- `aislop scan --changes --base origin/master`: 94/100, zero slop/security/lint/formatting errors; ten size/complexity advisories.
+- Dataset assertions and HTML-link validation are recorded with the final artifact commit.
