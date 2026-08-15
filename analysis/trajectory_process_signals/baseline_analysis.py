@@ -19,6 +19,7 @@ from scipy.stats import rankdata
 
 from .extractor import (
     PROCESS_FEATURE_NAMES,
+    SEQUENCE_FEATURE_NAMES,
     NativeSessionParse,
     extract_session_process_features,
     parse_native_session,
@@ -33,6 +34,54 @@ LENGTH_FEATURE_NAMES = (
     "within_task_turn_robust_z",
 )
 CATEGORICAL_CONTROL_NAMES = ("model", "thinking_level", "config")
+OPENING_PREDICTOR_NAMES = (
+    "has_successful_source_mutation",
+    "tool_calls_before_first_source_mutation",
+    "reads_before_first_source_mutation",
+    "unique_paths_read_before_first_source_mutation",
+    "tests_before_first_source_mutation",
+    "failed_tests_before_first_source_mutation",
+    "first_source_mutation_call_fraction",
+    "opening_ten_read_fraction",
+    "opening_ten_source_mutation_fraction",
+    "first_source_mutation_boundary_uncertain",
+)
+MUTATION_STYLE_PREDICTOR_NAMES = (
+    "source_edit_calls",
+    "source_write_calls",
+    "failed_edit_calls",
+    "failed_write_calls",
+    "first_source_mutation_is_write",
+    "mutation_tool_switches",
+    "write_then_edit_same_target",
+    "repeated_write_targets",
+)
+TEST_FLOW_PREDICTOR_NAMES = (
+    "tests_after_first_source_mutation",
+    "tool_calls_to_first_post_mutation_test",
+    "source_mutations_before_first_post_mutation_test",
+    "longest_source_mutation_streak_without_test",
+    "tests_after_final_source_mutation",
+    "has_passing_test_after_final_source_mutation",
+    "source_mutations_after_passing_test",
+    "pass_mutation_fail_patterns",
+    "implementation_to_validation_transitions",
+    "validation_to_implementation_backtracks",
+)
+SEQUENCE_PREDICTOR_NAMES = (
+    OPENING_PREDICTOR_NAMES + MUTATION_STYLE_PREDICTOR_NAMES + TEST_FLOW_PREDICTOR_NAMES
+)
+PREDICTOR_SPECIFICATIONS = {
+    "length": LENGTH_FEATURE_NAMES,
+    "process": LENGTH_FEATURE_NAMES + PROCESS_FEATURE_NAMES,
+    "opening": LENGTH_FEATURE_NAMES + OPENING_PREDICTOR_NAMES,
+    "mutation_style": LENGTH_FEATURE_NAMES + MUTATION_STYLE_PREDICTOR_NAMES,
+    "test_flow": LENGTH_FEATURE_NAMES + TEST_FLOW_PREDICTOR_NAMES,
+    "sequence": LENGTH_FEATURE_NAMES + SEQUENCE_PREDICTOR_NAMES,
+    "all_process": LENGTH_FEATURE_NAMES
+    + PROCESS_FEATURE_NAMES
+    + SEQUENCE_PREDICTOR_NAMES,
+}
 STOCK_PI_BASELINE_CONFIGS = (
     "baseline",
     "baseline@1.0.0",
@@ -511,6 +560,15 @@ def extract_analysis_rows(
                 "reps_with_direct_mutations": sum(
                     row["direct_mutation_calls"] > 0 for row in rows
                 ),
+                "reps_with_source_mutations": sum(
+                    row["has_successful_source_mutation"] > 0 for row in rows
+                ),
+                "reps_with_uncertain_first_source_mutation": sum(
+                    row["first_source_mutation_boundary_uncertain"] > 0 for row in rows
+                ),
+                "reps_with_write_as_first_source_mutation": sum(
+                    row["first_source_mutation_is_write"] > 0 for row in rows
+                ),
                 "patch_state_history": "unsupported",
                 "nested_tool_operations": "unsupported",
                 "test_outcome_oracle": "top-level test-command tool result isError only",
@@ -523,13 +581,12 @@ def extract_analysis_rows(
 def evaluate_held_out_tasks(
     rows: Sequence[dict[str, Any]], fold_count: int
 ) -> dict[str, Any]:
-    """Compare prevalence, length-only, and process models on held-out tasks."""
+    """Compare grouped trajectory feature specifications on held-out tasks."""
     folds = build_task_folds(rows, fold_count)
-    binary_predictions = {
-        name: np.full(len(rows), np.nan) for name in ("prevalence", "length", "process")
-    }
+    prediction_names = ("prevalence", *PREDICTOR_SPECIFICATIONS)
+    binary_predictions = {name: np.full(len(rows), np.nan) for name in prediction_names}
     partial_predictions = {
-        name: np.full(len(rows), np.nan) for name in ("prevalence", "length", "process")
+        name: np.full(len(rows), np.nan) for name in prediction_names
     }
     fold_reports: list[dict[str, Any]] = []
 
@@ -556,10 +613,7 @@ def evaluate_held_out_tasks(
         partial_predictions["prevalence"][test_indices] = np.clip(
             y_partial_train.mean(), 0.0, 1.0
         )
-        for model_name, numeric_names in (
-            ("length", LENGTH_FEATURE_NAMES),
-            ("process", LENGTH_FEATURE_NAMES + PROCESS_FEATURE_NAMES),
-        ):
+        for model_name, numeric_names in PREDICTOR_SPECIFICATIONS.items():
             train_matrix, test_matrix = _encode_design(
                 train_rows,
                 test_rows,
@@ -598,12 +652,29 @@ def evaluate_held_out_tasks(
         name: _partial_metrics(y_partial, predictions, tasks)
         for name, predictions in partial_predictions.items()
     }
-    bootstrap = _bootstrap_task_log_loss_delta(
-        y,
-        binary_predictions["length"],
-        binary_predictions["process"],
-        tasks,
-    )
+    specification_deltas: dict[str, Any] = {}
+    partial_specification_deltas: dict[str, Any] = {}
+    for name in PREDICTOR_SPECIFICATIONS:
+        if name == "length":
+            continue
+        specification_deltas[name] = {
+            "log_loss": binary_metrics[name]["log_loss"]
+            - binary_metrics["length"]["log_loss"],
+            "brier": binary_metrics[name]["brier"] - binary_metrics["length"]["brier"],
+            "auroc": binary_metrics[name]["auroc"] - binary_metrics["length"]["auroc"],
+            "average_precision": binary_metrics[name]["average_precision"]
+            - binary_metrics["length"]["average_precision"],
+            "task_bootstrap_log_loss_delta_95pct": _bootstrap_task_log_loss_delta(
+                y,
+                binary_predictions["length"],
+                binary_predictions[name],
+                tasks,
+            ),
+        }
+        partial_specification_deltas[name] = {
+            "rmse": partial_metrics[name]["rmse"] - partial_metrics["length"]["rmse"],
+            "mae": partial_metrics[name]["mae"] - partial_metrics["length"]["mae"],
+        }
     return {
         "design": {
             "outcome": "reward_binary (1=success, 0=failure)",
@@ -614,8 +685,10 @@ def evaluate_held_out_tasks(
                 "held-out tasks have no estimable fixed effect"
             ),
             "categorical_controls": list(CATEGORICAL_CONTROL_NAMES),
-            "length_features": list(LENGTH_FEATURE_NAMES),
-            "process_features": list(PROCESS_FEATURE_NAMES),
+            "predictor_specifications": {
+                name: list(features)
+                for name, features in PREDICTOR_SPECIFICATIONS.items()
+            },
             "censoring_controls": (
                 "timeouts, truncations, nonzero agent exits, verifier errors, invalid rewards, "
                 "and ambiguous sessions are excluded before modeling rather than used as predictors"
@@ -626,22 +699,10 @@ def evaluate_held_out_tasks(
         "folds": fold_reports,
         "binary_metrics": binary_metrics,
         "partial_metrics": partial_metrics,
-        "process_minus_length": {
-            "log_loss": binary_metrics["process"]["log_loss"]
-            - binary_metrics["length"]["log_loss"],
-            "brier": binary_metrics["process"]["brier"]
-            - binary_metrics["length"]["brier"],
-            "auroc": binary_metrics["process"]["auroc"]
-            - binary_metrics["length"]["auroc"],
-            "average_precision": binary_metrics["process"]["average_precision"]
-            - binary_metrics["length"]["average_precision"],
-            "task_bootstrap_log_loss_delta_95pct": bootstrap,
-        },
-        "partial_process_minus_length": {
-            "rmse": partial_metrics["process"]["rmse"]
-            - partial_metrics["length"]["rmse"],
-            "mae": partial_metrics["process"]["mae"] - partial_metrics["length"]["mae"],
-        },
+        "specification_minus_length": specification_deltas,
+        "partial_specification_minus_length": partial_specification_deltas,
+        "process_minus_length": specification_deltas["process"],
+        "partial_process_minus_length": partial_specification_deltas["process"],
     }
 
 
@@ -689,6 +750,7 @@ def summarize_analysis_features(rows: Sequence[dict[str, Any]]) -> dict[str, Any
         "turns",
         "agent_wall_s",
         *PROCESS_FEATURE_NAMES,
+        *SEQUENCE_FEATURE_NAMES,
     )
     by_outcome = {
         outcome: {name: _numeric_distribution(group, name) for name in numeric_names}
@@ -758,10 +820,78 @@ def summarize_analysis_features(rows: Sequence[dict[str, Any]]) -> dict[str, Any
             "direct_exact_edit_reversion": "supported only for successful edit calls exposing path/oldText/newText",
             "bash_or_nested_mutations": "not observable as edits",
             "nested_tool_read_search_test_semantics": "unsupported and counted as opaque",
-            "test_transitions": "supported only for repeated normalized top-level bash test commands with tool-result isError",
+            "test_transitions": "supported only for normalized top-level bash test commands with tool-result isError",
+            "first_source_mutation": "first successful edit/write to a supported source-file extension; possible earlier shell mutations are flagged",
+            "edit_vs_write": "supported for structured top-level edit/write calls; target purpose is conservatively path-classified",
+            "phase_flow": "deterministic exploration/diagnosis/implementation/validation labels over supported events",
             "verifier_or_final_test_artifacts": "excluded from every predictor",
         },
     }
+
+
+def summarize_task_controlled_feature_effects(
+    rows: Sequence[dict[str, Any]], feature_names: Sequence[str]
+) -> dict[str, Any]:
+    """Summarize success/failure feature differences within contested tasks."""
+    result: dict[str, Any] = {}
+    tasks = sorted({str(row["task"]) for row in rows})
+    for feature_name in feature_names:
+        raw_deltas: list[float] = []
+        standardized_deltas: list[float] = []
+        for task in tasks:
+            task_rows = [row for row in rows if row["task"] == task]
+            success_values = [
+                float(row[feature_name])
+                for row in task_rows
+                if row["reward_binary"] == 1
+            ]
+            failure_values = [
+                float(row[feature_name])
+                for row in task_rows
+                if row["reward_binary"] == 0
+            ]
+            if not success_values or not failure_values:
+                continue
+            delta = float(np.mean(success_values) - np.mean(failure_values))
+            raw_deltas.append(delta)
+            task_standard_deviation = float(
+                np.std(success_values + failure_values, ddof=0)
+            )
+            if task_standard_deviation > 0:
+                standardized_deltas.append(delta / task_standard_deviation)
+        if standardized_deltas:
+            rng = np.random.default_rng(int(_stable_hash(feature_name), 16))
+            values = np.array(standardized_deltas, dtype=float)
+            bootstrap_means = np.mean(
+                rng.choice(values, size=(2000, len(values)), replace=True), axis=1
+            )
+            interval = {
+                "low": float(np.quantile(bootstrap_means, 0.025)),
+                "high": float(np.quantile(bootstrap_means, 0.975)),
+                "samples": 2000,
+            }
+        else:
+            interval = {"low": None, "high": None, "samples": 0}
+        result[feature_name] = {
+            "contested_tasks": len(raw_deltas),
+            "tasks_with_nonconstant_feature": len(standardized_deltas),
+            "mean_success_minus_failure": float(np.mean(raw_deltas))
+            if raw_deltas
+            else None,
+            "median_success_minus_failure": float(np.median(raw_deltas))
+            if raw_deltas
+            else None,
+            "fraction_tasks_higher_in_success": (
+                sum(delta > 0 for delta in raw_deltas) / len(raw_deltas)
+                if raw_deltas
+                else 0.0
+            ),
+            "mean_within_task_standardized_delta": float(np.mean(standardized_deltas))
+            if standardized_deltas
+            else None,
+            "task_bootstrap_standardized_mean_95pct": interval,
+        }
+    return result
 
 
 def run_baseline_analysis(
@@ -784,7 +914,23 @@ def run_baseline_analysis(
     evaluation["model_sensitivities"] = evaluate_model_sensitivities(
         analysis_rows, fold_count
     )
+    certain_boundary_rows = [
+        row
+        for row in analysis_rows
+        if row["has_successful_source_mutation"] == 1
+        and row["first_source_mutation_boundary_uncertain"] == 0
+    ]
+    evaluation["cohort_sensitivities"] = {
+        "certain_first_source_mutation": {
+            "reps": len(certain_boundary_rows),
+            "excluded_reps": len(analysis_rows) - len(certain_boundary_rows),
+            "evaluation": evaluate_held_out_tasks(certain_boundary_rows, fold_count),
+        }
+    }
     feature_summary = summarize_analysis_features(analysis_rows)
+    task_controlled_effects = summarize_task_controlled_feature_effects(
+        analysis_rows, PROCESS_FEATURE_NAMES + SEQUENCE_FEATURE_NAMES
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(output_dir / "baseline_cohort.csv", inventory_rows)
@@ -800,6 +946,9 @@ def run_baseline_analysis(
     )
     (output_dir / "feature_summary.json").write_text(
         json.dumps(feature_summary, indent=2, sort_keys=True) + "\n"
+    )
+    (output_dir / "task_controlled_feature_effects.json").write_text(
+        json.dumps(task_controlled_effects, indent=2, sort_keys=True) + "\n"
     )
     selection_method = (
         "all eligible tasks in the stock-Pi baseline configs"
@@ -829,6 +978,7 @@ def run_baseline_analysis(
             "session_schema_audit.json",
             "held_out_task_evaluation.json",
             "feature_summary.json",
+            "task_controlled_feature_effects.json",
             "baseline_manifest.json",
         ],
     }

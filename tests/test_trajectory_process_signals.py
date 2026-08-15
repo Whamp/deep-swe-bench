@@ -18,9 +18,13 @@ from analysis.trajectory_process_signals.baseline_analysis import (
     discover_result_inventory,
     is_canonical_result_path,
     select_analysis_tasks,
+    summarize_task_controlled_feature_effects,
 )
 from analysis.trajectory_process_signals.extractor import (
+    MUTATION_STYLE_FEATURE_NAMES,
+    OPENING_FEATURE_NAMES,
     PROCESS_FEATURE_NAMES,
+    TEST_FLOW_FEATURE_NAMES,
     extract_session_process_features,
     normalize_tool_action,
     parse_native_session,
@@ -135,6 +139,103 @@ def test_extract_transition_features_only_uses_pre_verifier_session_events(
     assert features["exact_inverse_edit_pairs"] == 1
     assert features["strategy_reset_turns"] == 1
     assert features["opaque_top_level_tool_calls"] == 0
+
+
+def test_sequence_features_separate_diagnosis_implementation_and_validation(
+    tmp_path: Path,
+) -> None:
+    session_path = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session", "id": "s1", "cwd": "/app"},
+        _assistant_tool("r1", "read", {"path": "/app/src/example.py"}),
+        _tool_result("r1", "read", "source", is_error=False),
+        _assistant_tool("t0", "bash", {"command": "pytest -q"}),
+        _tool_result("t0", "bash", "1 failed", is_error=True),
+        _assistant_tool(
+            "w0", "write", {"path": "repro_bug.py", "content": "assert False\n"}
+        ),
+        _tool_result("w0", "write", "created", is_error=False),
+        _assistant_tool(
+            "e1",
+            "edit",
+            {"path": "src/example.py", "oldText": "before", "newText": "after"},
+        ),
+        _tool_result("e1", "edit", "updated", is_error=False),
+        _assistant_tool("t1", "bash", {"command": "pytest -q"}),
+        _tool_result("t1", "bash", "still failing", is_error=True),
+        _assistant_tool(
+            "w1", "write", {"path": "src/example.py", "content": "replacement\n"}
+        ),
+        _tool_result("w1", "write", "updated", is_error=False),
+        _assistant_tool("t2", "bash", {"command": "pytest -q"}),
+        _tool_result("t2", "bash", "passed", is_error=False),
+        _assistant_tool(
+            "e2",
+            "edit",
+            {"path": "src/example.py", "oldText": "replacement", "newText": "extra"},
+        ),
+        _tool_result("e2", "edit", "updated", is_error=False),
+        _assistant_tool("t3", "bash", {"command": "pytest -q"}),
+        _tool_result("t3", "bash", "failed again", is_error=True),
+    ]
+    _write_session(session_path, records)
+
+    features = extract_session_process_features(parse_native_session(session_path))
+
+    assert features["has_successful_source_mutation"] == 1
+    assert features["first_workspace_mutation_is_write"] == 1
+    assert features["first_source_mutation_is_write"] == 0
+    assert features["tool_calls_before_first_source_mutation"] == 3
+    assert features["turns_before_first_source_mutation"] == 3
+    assert features["tokens_before_first_source_mutation"] == 36
+    assert features["reads_before_first_source_mutation"] == 1
+    assert features["unique_paths_read_before_first_source_mutation"] == 1
+    assert features["tests_before_first_source_mutation"] == 1
+    assert features["failed_tests_before_first_source_mutation"] == 1
+    assert features["successful_edit_calls"] == 2
+    assert features["successful_write_calls"] == 2
+    assert features["source_mutation_calls"] == 3
+    assert features["source_edit_calls"] == 2
+    assert features["source_write_calls"] == 1
+    assert features["reproduction_mutation_calls"] == 1
+    assert features["mutation_tool_switches"] == 3
+    assert features["write_then_edit_same_target"] == 1
+    assert features["tests_after_first_source_mutation"] == 3
+    assert features["source_mutations_before_first_post_mutation_test"] == 1
+    assert features["implementation_to_validation_transitions"] == 3
+    assert features["validation_to_implementation_backtracks"] == 2
+    assert features["source_mutations_after_passing_test"] == 1
+    assert features["pass_mutation_fail_patterns"] == 1
+    assert features["tests_after_final_source_mutation"] == 1
+    assert features["has_passing_test_after_final_source_mutation"] == 0
+    assert set(OPENING_FEATURE_NAMES) <= features.keys()
+    assert set(MUTATION_STYLE_FEATURE_NAMES) <= features.keys()
+    assert set(TEST_FLOW_FEATURE_NAMES) <= features.keys()
+
+
+def test_possible_shell_mutation_before_source_edit_is_marked_uncertain(
+    tmp_path: Path,
+) -> None:
+    session_path = tmp_path / "session.jsonl"
+    _write_session(
+        session_path,
+        [
+            {"type": "session", "id": "s1", "cwd": "/app"},
+            _assistant_tool("b1", "bash", {"command": "sed -i 's/a/b/' src/a.py"}),
+            _tool_result("b1", "bash", "", is_error=False),
+            _assistant_tool(
+                "e1",
+                "edit",
+                {"path": "src/a.py", "oldText": "b", "newText": "c"},
+            ),
+            _tool_result("e1", "edit", "updated", is_error=False),
+        ],
+    )
+
+    features = extract_session_process_features(parse_native_session(session_path))
+
+    assert features["possible_shell_mutations_before_first_source_mutation"] == 1
+    assert features["first_source_mutation_boundary_uncertain"] == 1
 
 
 def test_opaque_nested_tool_surface_is_marked_unsupported(tmp_path: Path) -> None:
@@ -361,6 +462,22 @@ def test_task_folds_are_deterministic_and_task_disjoint() -> None:
     assert seen_test_tasks == {row["task"] for row in rows}
 
 
+def test_task_controlled_effects_compare_outcomes_within_each_task() -> None:
+    rows = [
+        {"task": "a", "reward_binary": 0, "reads": 1.0},
+        {"task": "a", "reward_binary": 1, "reads": 3.0},
+        {"task": "b", "reward_binary": 0, "reads": 10.0},
+        {"task": "b", "reward_binary": 1, "reads": 12.0},
+        {"task": "success-only", "reward_binary": 1, "reads": 100.0},
+    ]
+
+    summary = summarize_task_controlled_feature_effects(rows, ("reads",))
+
+    assert summary["reads"]["contested_tasks"] == 2
+    assert summary["reads"]["mean_success_minus_failure"] == 2.0
+    assert summary["reads"]["fraction_tasks_higher_in_success"] == 1.0
+
+
 def test_average_precision_handles_prediction_ties_without_row_order_bias() -> None:
     outcomes = np.array([0.0, 1.0, 0.0, 1.0])
     tied_predictions = np.full(4, 0.5)
@@ -373,6 +490,9 @@ def test_predictor_allowlist_excludes_outcomes_and_verifier_artifacts() -> None:
     predictor_names = {
         *LENGTH_FEATURE_NAMES,
         *PROCESS_FEATURE_NAMES,
+        *OPENING_FEATURE_NAMES,
+        *MUTATION_STYLE_FEATURE_NAMES,
+        *TEST_FLOW_FEATURE_NAMES,
         *CATEGORICAL_CONTROL_NAMES,
     }
 
