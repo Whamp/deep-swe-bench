@@ -8,20 +8,22 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from analysis.trajectory_process_signals.extractor import (
-    PROCESS_FEATURE_NAMES,
-    extract_session_process_features,
-    normalize_tool_action,
-    parse_native_session,
-)
-from analysis.trajectory_process_signals.pilot import (
+from analysis.trajectory_process_signals.baseline_analysis import (
     CATEGORICAL_CONTROL_NAMES,
     LENGTH_FEATURE_NAMES,
+    STOCK_PI_BASELINE_CONFIGS,
     _average_precision,
     build_task_folds,
     classify_primary_model_disposition,
     discover_result_inventory,
     is_canonical_result_path,
+    select_analysis_tasks,
+)
+from analysis.trajectory_process_signals.extractor import (
+    PROCESS_FEATURE_NAMES,
+    extract_session_process_features,
+    normalize_tool_action,
+    parse_native_session,
 )
 
 
@@ -274,12 +276,69 @@ def test_schema_inventory_counts_native_verifier_and_patch_shapes(
 
     assert rows[0]["primary_disposition"] == "eligible"
     assert audit["candidate_native_session_files"] == 1
-    assert audit["native_session_dispositions"] == {"attached_to_canonical_result": 1}
+    assert audit["native_session_dispositions"] == {
+        "attached_to_selected_canonical_result": 1
+    }
     assert audit["model_patch_schema"]["size_matches_result_patch_bytes"] == 1
     assert audit["model_patch_schema"]["unified_diff_header"] == 1
     assert audit["verifier_reward_schema"]["reward"]["present"] == 1
     assert audit["verifier_reward_schema"]["reward"]["missing_from_reward_files"] == 0
     assert audit["verifier_ctrf_schema"]["summary_fields"]["failed"]["present"] == 1
+
+
+def test_inventory_filters_to_stock_pi_baseline_configs(tmp_path: Path) -> None:
+    results = tmp_path / "results"
+    result_template = {
+        "task": "task",
+        "rep": 0,
+        "model": "provider/model",
+        "thinking_level": "low",
+        "reward_binary": 0,
+        "reward_partial": 0.5,
+        "total_tokens": 100,
+        "turns": 1,
+        "tool_calls": 0,
+        "agent_wall_s": 1.0,
+        "agent_exit": 0,
+        "agent_timed_out": False,
+        "verifier_exit": 0,
+        "patch_bytes": 0,
+    }
+    for config in ("baseline", "pi-fabric"):
+        cell = results / "model" / "low" / config / "task" / "rep0"
+        (cell / "session").mkdir(parents=True)
+        (cell / "session" / "session.jsonl").write_text("{}\n")
+        (cell / "result.json").write_text(
+            json.dumps({**result_template, "config": config})
+        )
+
+    rows, audit = discover_result_inventory(
+        results, allowed_configs=STOCK_PI_BASELINE_CONFIGS
+    )
+
+    assert [row["config"] for row in rows] == ["baseline"]
+    assert audit["analysis_scope"]["allowed_configs"] == [
+        "baseline",
+        "baseline@1.0.0",
+        "baseline@1.1.0",
+    ]
+    assert audit["analysis_scope"]["excluded_canonical_results"] == 1
+    assert audit["analysis_scope"]["excluded_config_counts"] == {"pi-fabric": 1}
+    assert audit["native_session_dispositions"] == {
+        "attached_to_excluded_canonical_result": 1,
+        "attached_to_selected_canonical_result": 1,
+    }
+
+
+def test_default_analysis_task_selection_includes_every_eligible_task() -> None:
+    rows = [
+        {"task": "alpha", "primary_disposition": "eligible"},
+        {"task": "beta", "primary_disposition": "eligible"},
+        {"task": "excluded", "primary_disposition": "agent_timeout"},
+    ]
+
+    assert set(select_analysis_tasks(rows, task_limit=None)) == {"alpha", "beta"}
+    assert len(select_analysis_tasks(rows, task_limit=1)) == 1
 
 
 def test_task_folds_are_deterministic_and_task_disjoint() -> None:

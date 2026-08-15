@@ -1,4 +1,4 @@
-"""Run a bounded, leakage-resistant pilot over canonical DeepSWE result cells."""
+"""Build and evaluate the stock-Pi baseline trajectory dataset."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import json
 import math
 import subprocess
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,11 @@ LENGTH_FEATURE_NAMES = (
     "within_task_turn_robust_z",
 )
 CATEGORICAL_CONTROL_NAMES = ("model", "thinking_level", "config")
+STOCK_PI_BASELINE_CONFIGS = (
+    "baseline",
+    "baseline@1.0.0",
+    "baseline@1.1.0",
+)
 _REQUIRED_RESULT_FIELDS = (
     "task",
     "config",
@@ -150,9 +155,14 @@ def build_task_folds(
 
 def discover_result_inventory(
     results_root: Path,
+    *,
+    allowed_configs: Collection[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Audit result schema and cell artifacts without mutating the result tree."""
+    """Audit selected result schemas and artifacts without mutating the result tree."""
+    allowed_config_set = set(allowed_configs) if allowed_configs is not None else None
     path_dispositions: Counter[str] = Counter()
+    excluded_config_counts: Counter[str] = Counter()
+    selected_result_paths: set[Path] = set()
     result_field_presence: Counter[str] = Counter()
     result_field_types: dict[str, Counter[str]] = defaultdict(Counter)
     verifier_reward_field_presence: Counter[str] = Counter()
@@ -172,7 +182,13 @@ def discover_result_inventory(
         if not is_canonical_result_path(result_path, results_root):
             path_dispositions[_RESERVED_ROOT_DISPOSITIONS.get(top, "noncanonical")] += 1
             continue
+        path_config = relative.parts[2]
+        if allowed_config_set is not None and path_config not in allowed_config_set:
+            path_dispositions["canonical_excluded_config"] += 1
+            excluded_config_counts[path_config] += 1
+            continue
         path_dispositions["canonical"] += 1
+        selected_result_paths.add(result_path)
         try:
             result = json.loads(result_path.read_text())
         except (OSError, json.JSONDecodeError):
@@ -278,11 +294,13 @@ def discover_result_inventory(
     for session_path in native_session_candidates:
         top = session_path.relative_to(results_root).parts[0]
         result_path = session_path.parent.parent / "result.json"
-        if (
+        if result_path in selected_result_paths:
+            native_session_dispositions["attached_to_selected_canonical_result"] += 1
+        elif (
             is_canonical_result_path(result_path, results_root)
             and result_path.is_file()
         ):
-            native_session_dispositions["attached_to_canonical_result"] += 1
+            native_session_dispositions["attached_to_excluded_canonical_result"] += 1
         elif top.startswith("_"):
             native_session_dispositions[
                 _RESERVED_ROOT_DISPOSITIONS.get(top, "reserved_noncanonical")
@@ -295,6 +313,13 @@ def discover_result_inventory(
     ctrf_summary_count = max(ctrf_summary_field_presence.values(), default=0)
     audit = {
         "results_root": str(results_root),
+        "analysis_scope": {
+            "allowed_configs": (
+                sorted(allowed_config_set) if allowed_config_set is not None else None
+            ),
+            "excluded_canonical_results": sum(excluded_config_counts.values()),
+            "excluded_config_counts": dict(sorted(excluded_config_counts.items())),
+        },
         "candidate_result_files": len(candidates),
         "path_dispositions": dict(sorted(path_dispositions.items())),
         "canonical_results_loaded": len(canonical_rows),
@@ -355,32 +380,33 @@ def discover_result_inventory(
     return canonical_rows, audit
 
 
-def select_pilot_tasks(
-    inventory_rows: Sequence[dict[str, Any]], task_count: int
+def select_analysis_tasks(
+    inventory_rows: Sequence[dict[str, Any]], task_limit: int | None
 ) -> list[str]:
-    """Select tasks by stable hash before parsing trajectory content or outcomes."""
+    """Select all eligible tasks, or a stable outcome-independent bounded subset."""
     eligible_tasks = {
         str(row["task"])
         for row in inventory_rows
         if row["primary_disposition"] == "eligible"
     }
-    if task_count > len(eligible_tasks):
+    ordered_tasks = sorted(eligible_tasks, key=lambda task: (_stable_hash(task), task))
+    if task_limit is None:
+        return ordered_tasks
+    if task_limit < 1 or task_limit > len(ordered_tasks):
         raise ValueError(
-            f"requested {task_count} pilot tasks but only {len(eligible_tasks)} are eligible"
+            f"task_limit must be between 1 and {len(ordered_tasks)}, got {task_limit}"
         )
-    return sorted(eligible_tasks, key=lambda task: (_stable_hash(task), task))[
-        :task_count
-    ]
+    return ordered_tasks[:task_limit]
 
 
-def extract_pilot_rows(
+def extract_analysis_rows(
     inventory_rows: list[dict[str, Any]],
-    pilot_tasks: Sequence[str],
+    analysis_tasks: Sequence[str],
     *,
     max_session_bytes: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Parse all initially eligible reps for selected tasks under an explicit byte cap."""
-    selected_tasks = set(pilot_tasks)
+    selected_tasks = set(analysis_tasks)
     selected_inventory = [
         row
         for row in inventory_rows
@@ -619,7 +645,40 @@ def evaluate_held_out_tasks(
     }
 
 
-def summarize_pilot_features(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+def evaluate_model_sensitivities(
+    rows: Sequence[dict[str, Any]],
+    fold_count: int,
+    *,
+    min_reps: int = 100,
+    min_tasks: int = 12,
+) -> dict[str, Any]:
+    """Repeat held-out-task evaluation for models with adequate support."""
+    results: dict[str, Any] = {}
+    for model in sorted({str(row["model"]) for row in rows}):
+        model_rows = [row for row in rows if row["model"] == model]
+        task_count = len({row["task"] for row in model_rows})
+        support = {
+            "reps": len(model_rows),
+            "tasks": task_count,
+            "successes": sum(row["reward_binary"] for row in model_rows),
+        }
+        if len(model_rows) < min_reps or task_count < min_tasks:
+            results[model] = {
+                "status": "insufficient_support",
+                "minimum_reps": min_reps,
+                "minimum_tasks": min_tasks,
+                **support,
+            }
+            continue
+        results[model] = {
+            "status": "evaluated",
+            **support,
+            "evaluation": evaluate_held_out_tasks(model_rows, fold_count),
+        }
+    return results
+
+
+def summarize_analysis_features(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Summarize feature availability and distributions without fitting a model."""
     outcome_groups = {
         "failure": [row for row in rows if row["reward_binary"] == 0],
@@ -653,11 +712,31 @@ def summarize_pilot_features(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             {
                 "config": config,
                 "reps": len(group),
+                "tasks": len({row["task"] for row in group}),
+                "models": sorted({str(row["model"]) for row in group}),
+                "successes": sum(row["reward_binary"] for row in group),
                 "mean_semantic_event_coverage": float(
                     np.mean([row["semantic_event_coverage"] for row in group])
                 ),
                 "reps_with_observable_tests": sum(
                     row["observable_test_runs"] > 0 for row in group
+                ),
+            }
+        )
+    model_support = []
+    for model in sorted({str(row["model"]) for row in rows}):
+        group = [row for row in rows if row["model"] == model]
+        successes = sum(row["reward_binary"] for row in group)
+        model_support.append(
+            {
+                "model": model,
+                "reps": len(group),
+                "tasks": len({row["task"] for row in group}),
+                "successes": successes,
+                "failures": len(group) - successes,
+                "configs": sorted({str(row["config"]) for row in group}),
+                "thinking_levels": sorted(
+                    {str(row["thinking_level"]) for row in group}
                 ),
             }
         )
@@ -673,6 +752,7 @@ def summarize_pilot_features(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "by_outcome": by_outcome,
         "by_task": task_rows,
         "config_semantic_support": config_support,
+        "model_support": model_support,
         "measured_signal_boundaries": {
             "true_patch_state_churn": "unsupported; no intermediate patch snapshots",
             "direct_exact_edit_reversion": "supported only for successful edit calls exposing path/oldText/newText",
@@ -684,26 +764,31 @@ def summarize_pilot_features(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def run_pilot(
+def run_baseline_analysis(
     results_root: Path,
     output_dir: Path,
     *,
-    pilot_task_count: int,
+    task_limit: int | None,
     fold_count: int,
     max_session_bytes: int,
 ) -> dict[str, Any]:
-    """Run inventory, bounded extraction, and held-out-task evaluation."""
-    inventory_rows, schema_audit = discover_result_inventory(results_root)
-    pilot_tasks = select_pilot_tasks(inventory_rows, pilot_task_count)
-    pilot_rows, session_schema = extract_pilot_rows(
-        inventory_rows, pilot_tasks, max_session_bytes=max_session_bytes
+    """Build and evaluate the bounded stock-Pi baseline trajectory dataset."""
+    inventory_rows, schema_audit = discover_result_inventory(
+        results_root, allowed_configs=STOCK_PI_BASELINE_CONFIGS
     )
-    evaluation = evaluate_held_out_tasks(pilot_rows, fold_count)
-    feature_summary = summarize_pilot_features(pilot_rows)
+    analysis_tasks = select_analysis_tasks(inventory_rows, task_limit)
+    analysis_rows, session_schema = extract_analysis_rows(
+        inventory_rows, analysis_tasks, max_session_bytes=max_session_bytes
+    )
+    evaluation = evaluate_held_out_tasks(analysis_rows, fold_count)
+    evaluation["model_sensitivities"] = evaluate_model_sensitivities(
+        analysis_rows, fold_count
+    )
+    feature_summary = summarize_analysis_features(analysis_rows)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    _write_csv(output_dir / "cohort_audit.csv", inventory_rows)
-    _write_csv(output_dir / "pilot_features.csv", pilot_rows)
+    _write_csv(output_dir / "baseline_cohort.csv", inventory_rows)
+    _write_csv(output_dir / "baseline_features.csv", analysis_rows)
     (output_dir / "schema_audit.json").write_text(
         json.dumps(schema_audit, indent=2, sort_keys=True) + "\n"
     )
@@ -716,31 +801,38 @@ def run_pilot(
     (output_dir / "feature_summary.json").write_text(
         json.dumps(feature_summary, indent=2, sort_keys=True) + "\n"
     )
+    selection_method = (
+        "all eligible tasks in the stock-Pi baseline configs"
+        if task_limit is None
+        else "first task ids by blake2b-64(task), independent of outcomes"
+    )
     manifest = {
-        "analysis": "trajectory-process-signals-first-milestone",
+        "analysis": "stock-pi-baseline-trajectory-process-signals",
         "git": _git_metadata(Path(__file__).resolve().parents[2]),
         "results_root": str(results_root.resolve()),
         "output_dir": str(output_dir.resolve()),
-        "pilot_selection": {
-            "method": "first task ids by blake2b-64(task), independent of outcomes",
-            "task_count": pilot_task_count,
-            "tasks": pilot_tasks,
+        "dataset": {
+            "allowed_configs": list(STOCK_PI_BASELINE_CONFIGS),
+            "method": selection_method,
+            "task_limit": task_limit,
+            "task_count": len(analysis_tasks),
+            "tasks": analysis_tasks,
             "pre_parse_reps": session_schema["selected_pre_parse_reps"],
             "modeling_reps": session_schema["modeling_reps"],
             "session_bytes": session_schema["selected_session_bytes"],
             "max_session_bytes": max_session_bytes,
         },
         "outputs": [
-            "cohort_audit.csv",
-            "pilot_features.csv",
+            "baseline_cohort.csv",
+            "baseline_features.csv",
             "schema_audit.json",
             "session_schema_audit.json",
             "held_out_task_evaluation.json",
             "feature_summary.json",
-            "pilot_manifest.json",
+            "baseline_manifest.json",
         ],
     }
-    (output_dir / "pilot_manifest.json").write_text(
+    (output_dir / "baseline_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
     return {"manifest": manifest, "evaluation": evaluation}
@@ -1038,7 +1130,7 @@ def _stable_hash(value: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run the bounded trajectory process-signal feasibility pilot."
+        description="Build and evaluate the stock-Pi baseline trajectory dataset."
     )
     parser.add_argument("--results", type=Path, default=Path("results"))
     parser.add_argument(
@@ -1046,14 +1138,18 @@ def main() -> None:
         type=Path,
         default=Path("analysis/trajectory_process_signals/artifacts"),
     )
-    parser.add_argument("--pilot-tasks", type=int, default=12)
+    parser.add_argument(
+        "--task-limit",
+        type=int,
+        help="Optional stable task subset; omit to analyze every eligible baseline task.",
+    )
     parser.add_argument("--folds", type=int, default=4)
     parser.add_argument("--max-session-bytes", type=int, default=536_870_912)
     args = parser.parse_args()
-    result = run_pilot(
+    result = run_baseline_analysis(
         args.results,
         args.output,
-        pilot_task_count=args.pilot_tasks,
+        task_limit=args.task_limit,
         fold_count=args.folds,
         max_session_bytes=args.max_session_bytes,
     )
