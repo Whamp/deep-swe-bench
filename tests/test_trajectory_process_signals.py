@@ -29,6 +29,12 @@ from analysis.trajectory_process_signals.extractor import (
     normalize_tool_action,
     parse_native_session,
 )
+from analysis.trajectory_process_signals.random_forest_analysis import (
+    RANDOM_FOREST_SPECIFICATIONS,
+    RandomForestParameters,
+    encode_random_forest_design,
+    evaluate_random_forest_held_out_tasks,
+)
 
 
 def _message(role: str, content: list[dict], **fields: object) -> dict:
@@ -494,6 +500,7 @@ def test_predictor_allowlist_excludes_outcomes_and_verifier_artifacts() -> None:
         *MUTATION_STYLE_FEATURE_NAMES,
         *TEST_FLOW_FEATURE_NAMES,
         *CATEGORICAL_CONTROL_NAMES,
+        *(name for names in RANDOM_FOREST_SPECIFICATIONS.values() for name in names),
     }
 
     assert not {
@@ -502,3 +509,99 @@ def test_predictor_allowlist_excludes_outcomes_and_verifier_artifacts() -> None:
         if name.startswith(("reward", "verifier", "f2p", "p2p"))
         or name in {"patch_bytes", "artifacts", "result_path"}
     }
+
+
+def test_random_forest_encoder_uses_training_categories_without_outcome_fields() -> (
+    None
+):
+    train_rows = [
+        {"signal": 1.0, "model": "a", "reward_binary": 0},
+        {"signal": 2.0, "model": "b", "reward_binary": 1},
+    ]
+    test_rows = [{"signal": 3.0, "model": "unseen", "reward_binary": 1}]
+
+    train, test, names = encode_random_forest_design(
+        train_rows,
+        test_rows,
+        numeric_names=("signal",),
+        categorical_names=("model",),
+    )
+
+    assert names == ("signal", "model=a", "model=b")
+    assert train.tolist() == [[1.0, 1.0, 0.0], [2.0, 0.0, 1.0]]
+    assert test.tolist() == [[3.0, 0.0, 0.0]]
+    assert all("reward" not in name for name in names)
+
+
+def test_random_forest_finds_nonlinear_signal_on_whole_held_out_tasks() -> None:
+    feature_names = set(RANDOM_FOREST_SPECIFICATIONS["test_flow"])
+    rows: list[dict[str, object]] = []
+    for task_index in range(18):
+        for rep in range(8):
+            left = float((rep // 2) % 2)
+            right = float(rep % 2)
+            row: dict[str, object] = {name: 0.0 for name in feature_names}
+            row.update(
+                {
+                    "task": f"task-{task_index:02d}",
+                    "cell_id": f"task-{task_index:02d}-rep{rep}",
+                    "model": "model",
+                    "thinking_level": "high",
+                    "config": "baseline",
+                    "reward_binary": int(bool(left) != bool(right)),
+                    "tests_after_first_source_mutation": left,
+                    "implementation_to_validation_transitions": right,
+                }
+            )
+            rows.append(row)
+    specifications = {
+        name: RANDOM_FOREST_SPECIFICATIONS[name] for name in ("length", "test_flow")
+    }
+    parameters = (
+        RandomForestParameters(max_depth=6, min_samples_leaf=2, max_features=1.0),
+    )
+
+    first = evaluate_random_forest_held_out_tasks(
+        rows,
+        outer_fold_count=3,
+        inner_fold_count=2,
+        specifications=specifications,
+        parameter_grid=parameters,
+        tuning_trees=40,
+        final_trees=80,
+        final_seeds=(11, 29),
+    )
+    second = evaluate_random_forest_held_out_tasks(
+        rows,
+        outer_fold_count=3,
+        inner_fold_count=2,
+        specifications=specifications,
+        parameter_grid=parameters,
+        tuning_trees=40,
+        final_trees=80,
+        final_seeds=(11, 29),
+    )
+
+    assert first["design"] == second["design"]
+    assert [fold["test_tasks"] for fold in first["folds"]] == [
+        fold["test_tasks"] for fold in second["folds"]
+    ]
+    assert [fold["selected_parameters"] for fold in first["folds"]] == [
+        fold["selected_parameters"] for fold in second["folds"]
+    ]
+    for name in specifications:
+        np.testing.assert_allclose(
+            list(first["binary_metrics"][name].values()),
+            list(second["binary_metrics"][name].values()),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+    assert first["binary_metrics"]["test_flow"]["auroc"] > 0.95
+    assert (
+        first["binary_metrics"]["test_flow"]["log_loss"]
+        < first["binary_metrics"]["length"]["log_loss"] - 0.2
+    )
+    assert len(first["folds"]) == 3
+    for fold in first["folds"]:
+        assert set(fold["train_tasks"]).isdisjoint(fold["test_tasks"])
+        assert set(fold["oob_diagnostics"]) == {"length", "test_flow"}
