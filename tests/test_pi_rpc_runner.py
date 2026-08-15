@@ -195,6 +195,119 @@ class PiRpcRunnerTests(unittest.TestCase):
             self.assertIn('"event":"degeneration_watchdog"', runner_log)
             self.assertNotIn("/app/src/index.ts", runner_log)
 
+    def test_degeneration_watchdog_writes_bounded_unfinished_response(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = self.write_fake_rpc(
+                root,
+                """
+                import json, sys, time
+
+                def emit(obj):
+                    print(json.dumps(obj), flush=True)
+
+                for raw in sys.stdin:
+                    cmd = json.loads(raw)
+                    if cmd.get("type") == "prompt":
+                        emit({"id": cmd.get("id"), "type": "response", "command": "prompt", "success": True})
+                        emit({"type": "turn_start"})
+                        emit({"type": "message_start", "message": {"role": "assistant", "content": []}})
+                        emit({"type": "message_update", "usage": {"input": 180235, "output": 4000}, "assistantMessageEvent": {"type": "thinking_start", "contentIndex": 0}})
+                        emit({"type": "message_update", "usage": {"input": 180235, "output": 8000}, "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": "BEGIN-" + "a" * 12000}})
+                        emit({"type": "message_update", "usage": {"input": 180235, "output": 12000}, "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": "b" * 7996 + "-TAIL"}})
+                    elif cmd.get("type") == "abort":
+                        emit({"type": "response", "command": "abort", "success": True})
+                        break
+                    elif cmd.get("type") == "get_state":
+                        emit({"id": cmd.get("id"), "type": "response", "command": "get_state", "success": True, "data": {"isStreaming": True, "pendingMessageCount": 0}})
+                    time.sleep(0.01)
+                """,
+            )
+            policy = replace(
+                coding_agent_early_gate_watchdog(),
+                max_assistant_chars_per_turn=20_000,
+            )
+            diagnostic_path = root / "agent-degeneration-diagnostic.json"
+
+            result = run_pi_rpc(
+                [sys.executable, str(fake)],
+                prompt_text="sensitive prompt must not be captured",
+                stderr_path=root / "pi.stderr.txt",
+                runner_log_path=root / "pi-rpc-runner.jsonl",
+                timeout_s=5,
+                quiescence_s=0.1,
+                state_poll_s=0.05,
+                degeneration_watchdog_policy=policy,
+                degeneration_diagnostic_path=diagnostic_path,
+            )
+
+            self.assertEqual(result.exit_code, "degeneration")
+            diagnostic = json.loads(diagnostic_path.read_text())
+            self.assertEqual(diagnostic["schema_version"], 1)
+            self.assertEqual(
+                diagnostic["violation"]["reason"],
+                "assistant_chars_per_turn",
+            )
+            response = diagnostic["unfinished_response"]
+            self.assertEqual(response["total_chars"], 20_007)
+            self.assertEqual(response["delta_event_counts"], {"thinking_delta": 2})
+            self.assertEqual(
+                response["latest_usage"], {"input": 180235, "output": 12000}
+            )
+            self.assertEqual(
+                response["open_blocks"],
+                [{"content_index": 0, "type": "thinking"}],
+            )
+            self.assertTrue(response["first_chars"].startswith("BEGIN-"))
+            self.assertTrue(response["last_chars"].endswith("-TAIL"))
+            self.assertLessEqual(len(response["first_chars"]), 16_384)
+            self.assertLessEqual(len(response["last_chars"]), 16_384)
+            self.assertEqual(diagnostic_path.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn("sensitive prompt", diagnostic_path.read_text())
+            runner_log = (root / "pi-rpc-runner.jsonl").read_text()
+            self.assertIn('"diagnostic_bytes":', runner_log)
+            self.assertIn('"diagnostic_sha256":', runner_log)
+            self.assertNotIn("BEGIN-", runner_log)
+            self.assertNotIn("-TAIL", runner_log)
+
+    def test_watchdog_writes_no_diagnostic_for_normal_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = self.write_fake_rpc(
+                root,
+                """
+                import json, sys
+                state = {"isStreaming": False, "pendingMessageCount": 0}
+                for raw in sys.stdin:
+                    cmd = json.loads(raw)
+                    if cmd.get("type") == "prompt":
+                        print(json.dumps({"id": cmd.get("id"), "type": "response", "command": "prompt", "success": True}), flush=True)
+                        print(json.dumps({"type": "turn_start"}), flush=True)
+                        print(json.dumps({"type": "message_update", "usage": {"output": 2}, "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "done"}}), flush=True)
+                        print(json.dumps({"type": "message_end", "message": {"role": "assistant", "usage": {"output": 2}}}), flush=True)
+                        print(json.dumps({"type": "agent_end"}), flush=True)
+                    elif cmd.get("type") == "get_state":
+                        print(json.dumps({"id": cmd.get("id"), "type": "response", "command": "get_state", "success": True, "data": state}), flush=True)
+                """,
+            )
+            diagnostic_path = root / "agent-degeneration-diagnostic.json"
+
+            result = run_pi_rpc(
+                [sys.executable, str(fake)],
+                prompt_text="normal completion",
+                stderr_path=root / "pi.stderr.txt",
+                runner_log_path=root / "pi-rpc-runner.jsonl",
+                timeout_s=5,
+                quiescence_s=0.05,
+                state_poll_s=0.02,
+                degeneration_watchdog_policy=coding_agent_early_gate_watchdog(),
+                degeneration_diagnostic_path=diagnostic_path,
+            )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertTrue(result.quiescent)
+            self.assertFalse(diagnostic_path.exists())
+
     def test_timeout_kills_process_and_reports_timeout(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

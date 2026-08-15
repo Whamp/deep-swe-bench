@@ -511,6 +511,23 @@ class DegenerationVerifierAdmissionTests(unittest.TestCase):
 
 
 class RunPiCommandTests(unittest.TestCase):
+    def test_watchdog_can_enable_latest_provider_request_capture(self):
+        with patch.dict(run.os.environ, {}, clear=True):
+            env = run.initial_context_capture_env(
+                True,
+                capture_latest_provider_request=True,
+            )
+
+        self.assertEqual(
+            env,
+            [
+                "-e",
+                f"PI_INITIAL_CONTEXT_DIR={run.INITIAL_CONTEXT_CAPTURE_OUT}",
+                "-e",
+                "PI_INITIAL_CONTEXT_CAPTURE_LATEST_PROVIDER_REQUEST=1",
+            ],
+        )
+
     def test_pi_cmd_uses_rpc_without_print_mode_and_preserves_session_dir(self):
         cmd = run.pi_cmd(
             {"pi_flags": ["-e", "/arm/extensions/example.ts"], "skill_dirs": []},

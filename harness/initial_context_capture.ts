@@ -1,4 +1,5 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 
 const SCHEMA_VERSION = 1;
@@ -12,6 +13,10 @@ function envInt(name: string, fallback: number): number {
   if (!raw) return fallback;
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function envEnabled(name: string): boolean {
+  return ["1", "true", "yes"].includes((process.env[name] || "").toLowerCase());
 }
 
 function captureDir(ctx: { cwd?: string }): string {
@@ -40,6 +45,39 @@ function writeText(ctx: { cwd?: string }, name: string, content: string): void {
 
 function writeJson(ctx: { cwd?: string }, name: string, value: unknown): void {
   writeText(ctx, name, `${JSON.stringify(value, redactingReplacer(), 2)}\n`);
+}
+
+function writeAtomicText(
+  ctx: { cwd?: string },
+  name: string,
+  content: string,
+): void {
+  const dir = captureDir(ctx);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, name);
+  const temporaryPath = join(dir, `.${name}.tmp`);
+  writeFileSync(temporaryPath, content, { encoding: "utf8", mode: 0o600 });
+  renameSync(temporaryPath, path);
+}
+
+function writeLatestProviderRequest(
+  ctx: { cwd?: string },
+  requestCount: number,
+  payload: unknown,
+): void {
+  const encoded = `${JSON.stringify(payload, redactingReplacer(), 2)}\n`;
+  writeAtomicText(ctx, "provider_request_latest.json", encoded);
+  const metadata = {
+    schemaVersion: SCHEMA_VERSION,
+    providerRequestCount: requestCount,
+    payloadBytes: Buffer.byteLength(encoded),
+    payloadSha256: createHash("sha256").update(encoded).digest("hex"),
+  };
+  writeAtomicText(
+    ctx,
+    "provider_request_latest_meta.json",
+    `${JSON.stringify(metadata, null, 2)}\n`,
+  );
 }
 
 function maybeGetSystemPrompt(event: any, ctx: any): string {
@@ -73,6 +111,9 @@ function requestStop(ctx: any, phase: StopAfter): void {
 export default function initialContextCapture(pi: any): void {
   const maxContexts = envInt("PI_INITIAL_CONTEXT_MAX_CONTEXTS", DEFAULT_MAX_CONTEXTS);
   const maxProviderRequests = envInt("PI_INITIAL_CONTEXT_MAX_PROVIDER_REQUESTS", DEFAULT_MAX_PROVIDER_REQUESTS);
+  const captureLatestProviderRequest = envEnabled(
+    "PI_INITIAL_CONTEXT_CAPTURE_LATEST_PROVIDER_REQUEST",
+  );
   const stop = stopAfter();
   let contextCount = 0;
   let providerRequestCount = 0;
@@ -82,6 +123,7 @@ export default function initialContextCapture(pi: any): void {
       schemaVersion: SCHEMA_VERSION,
       maxContexts,
       maxProviderRequests,
+      captureLatestProviderRequest,
       stopAfter: stop || null,
       cwd: ctx?.cwd,
       capturedAt: new Date().toISOString(),
@@ -105,6 +147,9 @@ export default function initialContextCapture(pi: any): void {
 
   pi.on("before_provider_request", (event: any, ctx: any) => {
     providerRequestCount += 1;
+    if (captureLatestProviderRequest) {
+      writeLatestProviderRequest(ctx, providerRequestCount, event?.payload ?? null);
+    }
     if (providerRequestCount > maxProviderRequests) return;
     writeJson(ctx, `provider_request_${String(providerRequestCount).padStart(4, "0")}.json`, event?.payload ?? null);
     if (providerRequestCount === 1 && stop === "before_provider_request") requestStop(ctx, stop);
