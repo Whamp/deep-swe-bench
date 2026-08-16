@@ -56,6 +56,7 @@ type SortKey =
   | "baseline_delta"
   | "median_cost"
   | "cost_per_successful_rep"
+  | "solves_per_million_adjusted_tokens"
   | "mean_partial"
   | "median_tokens"
   | "median_wall_s"
@@ -171,8 +172,8 @@ export default function Leaderboard() {
           </p>
           <h1 className="mt-1 text-2xl font-semibold tracking-tight">Leaderboard</h1>
           <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
-            Choose a config using measured solve quality, same-group baseline lift, and cost
-            efficiency. Rep and task success are shown separately.
+            Choose a config using measured solve quality, same-group baseline lift, cost, and
+            cache-adjusted token efficiency. Rep and task success are shown separately.
           </p>
         </div>
         <div className="text-right">
@@ -926,6 +927,10 @@ function LeaderboardTable({
   showMoreMetrics: boolean;
   onShowMoreMetricsChange: (value: boolean) => void;
 }) {
+  const tokenPolicyRow = rows.find(
+    (row) =>
+      row.token_policy && row.cache_read_weight != null && Number.isFinite(row.cache_read_weight),
+  );
   return (
     <Card id="ranked-evidence" className="scroll-mt-16">
       <CardContent className="p-0">
@@ -935,6 +940,13 @@ function LeaderboardTable({
             <p className="text-xs text-muted-foreground">
               Default rank is observed rep solve rate. Click a header to rerank.
             </p>
+            {tokenPolicyRow && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Solves / 1M adjusted tokens · cache reads ×{" "}
+                {formatCacheReadWeight(tokenPolicyRow.cache_read_weight)} ·{" "}
+                {tokenPolicyRow.token_policy}
+              </p>
+            )}
           </div>
           <button
             type="button"
@@ -961,7 +973,7 @@ function LeaderboardTable({
         </div>
 
         <div className="hidden overflow-x-auto md:block">
-          <Table className="min-w-[980px]">
+          <Table className="min-w-[1160px]">
             <TableHeader className="sticky top-12 z-20 bg-card">
               <TableRow>
                 <TableHead className="sticky left-0 z-30 min-w-[300px] bg-card">Config</TableHead>
@@ -978,6 +990,15 @@ function LeaderboardTable({
                   <SortButton
                     label="Δ baseline"
                     sortKey="baseline_delta"
+                    activeKey={sortKey}
+                    direction={sortDir}
+                    onSort={onSort}
+                  />
+                </TableHead>
+                <TableHead className="min-w-[150px] text-right">
+                  <SortButton
+                    label="Solves / 1M adjusted tokens"
+                    sortKey="solves_per_million_adjusted_tokens"
                     activeKey={sortKey}
                     direction={sortDir}
                     onSort={onSort}
@@ -1083,6 +1104,14 @@ function LeaderboardTable({
                     >
                       {formatDelta(row.baseline_delta)}
                     </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      <div className="font-mono font-medium">
+                        {formatAdjustedTokenEfficiency(row.solves_per_million_adjusted_tokens)}
+                      </div>
+                      <div className="text-[11px] text-muted-foreground">
+                        {formatCacheReadShare(row.cache_read_share)}
+                      </div>
+                    </TableCell>
                     <TableCell className="text-right font-mono">
                       {row.cost_tracked ? fmtCost(row.median_cost) : "untracked"}
                     </TableCell>
@@ -1182,12 +1211,16 @@ function MobileLeaderboardCard({
       )}
     >
       <ConfigIdentity row={row} rank={rank} pareto={pareto} color={color} />
-      <div className="mt-3 grid grid-cols-3 gap-2 border-t border-border pt-3 text-right">
+      <div className="mt-3 grid grid-cols-2 gap-2 border-t border-border pt-3 text-right">
         <MobileMetric label="Rep solve" value={`${row.solve_rate.toFixed(1)}%`} />
         <MobileMetric
           label="Δ baseline"
           value={formatDelta(row.baseline_delta)}
           className={deltaColor(row.baseline_delta)}
+        />
+        <MobileMetric
+          label="Solves / 1M adjusted tokens"
+          value={formatAdjustedTokenEfficiency(row.solves_per_million_adjusted_tokens)}
         />
         <MobileMetric label="Cost / successful rep" value={fmtCost(row.cost_per_successful_rep)} />
       </div>
@@ -1294,6 +1327,21 @@ function sortableMetric(row: LeaderboardRow, key: SortKey): number | null {
 function compactConfigName(config: string): string {
   const withoutVersion = config.replace(/@\d+(?:\.\d+)*$/, "");
   return withoutVersion.length > 24 ? `${withoutVersion.slice(0, 22)}…` : withoutVersion;
+}
+
+function formatAdjustedTokenEfficiency(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return value.toFixed(3);
+}
+
+function formatCacheReadShare(value: number | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "cache-read share unavailable";
+  return `${(value * 100).toFixed(1)}% cache-read share`;
+}
+
+function formatCacheReadWeight(value: number | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "unavailable";
+  return value.toFixed(2);
 }
 
 function formatDelta(delta: number | null): string {

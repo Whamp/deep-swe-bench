@@ -22,10 +22,11 @@ import math
 import statistics
 import sys
 import urllib.parse
+from collections.abc import Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -49,6 +50,39 @@ DEFAULT_LEGACY_ROOT = ROOT / "runs"
 DEFAULT_RESULTS_ROOT = ROOT / "results"
 DEFAULT_SUBSETS_ROOT = ROOT / "subsets"
 DIFFICULTY_TSV = ROOT / "data" / "deepswe-v1.1-task-difficulty.tsv"
+
+LEADERBOARD_TOKEN_POLICY_VERSION = "cache-read-10pct-v1"
+LEADERBOARD_CACHE_READ_WEIGHT = 0.1
+LEADERBOARD_CACHE_READ_FIELDS = (
+    "cache_read_tokens",
+    "advisor_cache_read_tokens",
+    "om_worker_cache_read_tokens",
+    "recursive_child_cache_read_tokens",
+    "workflow_cache_read_tokens",
+)
+
+
+class CacheAdjustedTokenSummary(TypedDict):
+    """Versioned cache-adjusted token accounting for one benchmark cell."""
+
+    reported_total_tokens: int
+    cache_read_tokens: int
+    adjusted_tokens: float
+    cache_read_share: float
+    token_policy: str
+    cache_read_weight: float
+
+
+class CacheAdjustedRunSummary(TypedDict):
+    """Aggregate cache-adjusted token efficiency for one comparison row."""
+
+    total_reported_tokens: int
+    total_cache_read_tokens: int
+    total_adjusted_tokens: float
+    cache_read_share: float
+    solves_per_million_adjusted_tokens: float | None
+    token_policy: str
+    cache_read_weight: float
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +323,88 @@ def _rep_from_parts(parts: tuple[str, ...]) -> int:
         return 0
 
 
+def _nonnegative_token_count(value: object) -> int:
+    """Normalize one result token counter without accepting booleans or negatives."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return max(int(value), 0)
+
+
+def cache_adjusted_token_summary(
+    result: Mapping[str, object],
+) -> CacheAdjustedTokenSummary:
+    """Apply the versioned leaderboard cache discount to one result's model tokens.
+
+    Args:
+        result: Native benchmark result fields for one cell.
+
+    Returns:
+        Combined model tokens, known cache reads, and the adjusted denominator.
+        Tokens without a role breakdown remain in the denominator at full weight.
+    """
+    combined_total = _nonnegative_token_count(result.get("combined_total_tokens"))
+    main_total = _nonnegative_token_count(result.get("total_tokens"))
+    reported_total = max(combined_total, main_total)
+    known_cache_reads = sum(
+        _nonnegative_token_count(result.get(field))
+        for field in LEADERBOARD_CACHE_READ_FIELDS
+    )
+    cache_reads = min(known_cache_reads, reported_total)
+    adjusted_tokens = round(
+        reported_total - ((1.0 - LEADERBOARD_CACHE_READ_WEIGHT) * cache_reads),
+        6,
+    )
+    return {
+        "reported_total_tokens": reported_total,
+        "cache_read_tokens": cache_reads,
+        "adjusted_tokens": adjusted_tokens,
+        "cache_read_share": cache_reads / reported_total if reported_total > 0 else 0.0,
+        "token_policy": LEADERBOARD_TOKEN_POLICY_VERSION,
+        "cache_read_weight": LEADERBOARD_CACHE_READ_WEIGHT,
+    }
+
+
+def cache_adjusted_run_summary(
+    cell_summaries: list[CacheAdjustedTokenSummary], solved: int
+) -> CacheAdjustedRunSummary:
+    """Aggregate adjusted token efficiency across every selected comparison cell.
+
+    Args:
+        cell_summaries: Versioned token summaries for the selected cells.
+        solved: Number of selected cells with binary reward one.
+
+    Returns:
+        Run totals and solves per million adjusted tokens under the same policy.
+    """
+    total_reported_tokens = sum(
+        summary["reported_total_tokens"] for summary in cell_summaries
+    )
+    total_cache_read_tokens = sum(
+        summary["cache_read_tokens"] for summary in cell_summaries
+    )
+    total_adjusted_tokens = round(
+        sum(summary["adjusted_tokens"] for summary in cell_summaries),
+        6,
+    )
+    return {
+        "total_reported_tokens": total_reported_tokens,
+        "total_cache_read_tokens": total_cache_read_tokens,
+        "total_adjusted_tokens": total_adjusted_tokens,
+        "cache_read_share": (
+            total_cache_read_tokens / total_reported_tokens
+            if total_reported_tokens > 0
+            else 0.0
+        ),
+        "solves_per_million_adjusted_tokens": (
+            solved * 1_000_000 / total_adjusted_tokens
+            if total_adjusted_tokens > 0
+            else None
+        ),
+        "token_policy": LEADERBOARD_TOKEN_POLICY_VERSION,
+        "cache_read_weight": LEADERBOARD_CACHE_READ_WEIGHT,
+    }
+
+
 def load_comparison_data(
     results_root: str | Path = DEFAULT_RESULTS_ROOT,
     *,
@@ -369,10 +485,13 @@ def load_comparison_data(
         total = len(binaries)
 
         cells_out = []
+        token_summaries = []
         for c in cells_raw:
             task = c.get("_task") or c.get("task", "")
             diff_info = difficulty.get(task, {})
             diff_bucket = _difficulty_bucket(diff_info.get("pass_rate", ""))
+            token_summary = cache_adjusted_token_summary(c)
+            token_summaries.append(token_summary)
             cells_out.append(
                 {
                     "task": task,
@@ -382,6 +501,9 @@ def load_comparison_data(
                     "reward_binary": _binary(c.get("reward_binary")),
                     "reward_partial": c.get("reward_partial") or 0.0,
                     "total_tokens": c.get("total_tokens") or 0,
+                    "reported_total_tokens": token_summary["reported_total_tokens"],
+                    "cache_read_tokens": token_summary["cache_read_tokens"],
+                    "adjusted_tokens": token_summary["adjusted_tokens"],
                     "cost_usd": c.get("cost_usd") or 0.0,
                     "agent_wall_s": c.get("agent_wall_s") or 0.0,
                     "patch_bytes": c.get("patch_bytes") or 0,
@@ -390,6 +512,7 @@ def load_comparison_data(
                 }
             )
 
+        run_token_summary = cache_adjusted_run_summary(token_summaries, solved)
         runs.append(
             {
                 "run_id": group_key,
@@ -406,6 +529,7 @@ def load_comparison_data(
                 "median_tokens": int(_median(tokens)),
                 "median_wall_s": _median(walls),
                 "total_cost": sum(c for c in costs if isinstance(c, (int, float))),
+                **run_token_summary,
                 "cells": cells_out,
             }
         )

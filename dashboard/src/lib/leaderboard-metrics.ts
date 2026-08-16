@@ -1,7 +1,7 @@
 import type { ComparisonRun } from "@/lib/types";
 import { paretoFrontier } from "@/lib/metrics";
 
-/** Decision-ready comparison row with explicit rep/task and cost semantics. */
+/** Decision-ready comparison row with explicit rep/task, cost, and token semantics. */
 export interface LeaderboardRow extends ComparisonRun {
   group_key: string;
   task_solved: number;

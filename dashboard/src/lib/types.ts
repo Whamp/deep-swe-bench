@@ -140,6 +140,9 @@ export interface ComparisonCell {
   reward_binary: number;
   reward_partial: number;
   total_tokens: number;
+  reported_total_tokens?: number;
+  cache_read_tokens?: number;
+  adjusted_tokens?: number;
   cost_usd: number;
   agent_wall_s: number;
   patch_bytes: number;
@@ -162,6 +165,13 @@ export interface ComparisonRun {
   median_tokens: number;
   median_wall_s: number;
   total_cost: number;
+  total_reported_tokens?: number;
+  total_cache_read_tokens?: number;
+  total_adjusted_tokens?: number;
+  cache_read_share?: number;
+  solves_per_million_adjusted_tokens?: number | null;
+  token_policy?: string;
+  cache_read_weight?: number;
   cells: ComparisonCell[];
 }
 

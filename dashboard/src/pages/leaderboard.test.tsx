@@ -14,6 +14,9 @@ function makeCells(taskCount: number, reps: number, solvedCells: number): Compar
     reward_binary: index < solvedCells ? 1 : 0,
     reward_partial: index < solvedCells ? 1 : 0.2,
     total_tokens: 100_000,
+    reported_total_tokens: 100_000,
+    cache_read_tokens: 90_000,
+    adjusted_tokens: 19_000,
     cost_usd: 1,
     agent_wall_s: 100,
     patch_bytes: 100,
@@ -43,6 +46,13 @@ function makeRun(overrides: Partial<ComparisonRun> = {}): ComparisonRun {
     median_tokens: 610_000,
     median_wall_s: 206,
     total_cost: 100,
+    total_reported_tokens: totalCells * 100_000,
+    total_cache_read_tokens: totalCells * 90_000,
+    total_adjusted_tokens: totalCells * 19_000,
+    cache_read_share: 0.9,
+    solves_per_million_adjusted_tokens: solved / ((totalCells * 19_000) / 1_000_000),
+    token_policy: "cache-read-10pct-v1",
+    cache_read_weight: 0.1,
     cells: overrides.cells ?? makeCells(distinctTasks, reps, solved),
     ...overrides,
   };
@@ -146,6 +156,10 @@ describe("Leaderboard page", () => {
     expect(screen.getByText("Dataset, reps, model + thinking")).toBeInTheDocument();
     expect(screen.getAllByText(/Equal-weight 0–1 normalization/).length).toBeGreaterThan(0);
     expect(screen.getAllByText("Cost / successful rep").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Solves / 1M adjusted tokens").length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/cache reads × 0.10 · cache-read-10pct-v1/).length).toBeGreaterThan(
+      0,
+    );
     expect(screen.getByText("colored ring = Pareto")).toBeInTheDocument();
     expect(screen.getByText("white ring = selected")).toBeInTheDocument();
     expect(screen.getAllByText("+18.5pp").length).toBeGreaterThan(0);
@@ -233,6 +247,17 @@ describe("Leaderboard page", () => {
     expect(firstDesktopRow?.textContent).toContain("gpt-5.5 · low");
   });
 
+  it("sorts adjusted token efficiency higher first", async () => {
+    mockFetch({ compare: { runs: COMPLETE_RUNS, subset: "36_v2" } });
+    const { container } = renderLeaderboard();
+    await screen.findByText("Ranked evidence");
+
+    fireEvent.click(screen.getByRole("button", { name: /^Solves \/ 1M adjusted tokens/ }));
+    const firstDesktopRow = container.querySelector("tbody tr");
+    expect(firstDesktopRow?.textContent).toContain("baseline");
+    expect(firstDesktopRow?.textContent).toContain("gpt-5.6-sol · medium");
+  });
+
   it("reveals diagnostic columns behind More metrics", async () => {
     mockFetch({ compare: { runs: COMPLETE_RUNS, subset: "36_v2" } });
     renderLeaderboard();
@@ -242,6 +267,22 @@ describe("Leaderboard page", () => {
     fireEvent.click(screen.getByRole("button", { name: "More metrics" }));
     expect(screen.getByRole("button", { name: /^Mean partial/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^Med tokens/ })).toBeInTheDocument();
+  });
+
+  it("renders legacy API rows without adjusted token fields", async () => {
+    const legacy = makeRun();
+    delete legacy.total_reported_tokens;
+    delete legacy.total_cache_read_tokens;
+    delete legacy.total_adjusted_tokens;
+    delete legacy.cache_read_share;
+    delete legacy.solves_per_million_adjusted_tokens;
+    delete legacy.token_policy;
+    delete legacy.cache_read_weight;
+    mockFetch({ compare: { runs: [legacy], subset: "36_v2" } });
+    const { container } = renderLeaderboard();
+
+    await screen.findByText("Ranked evidence");
+    expect(container.textContent).toContain("cache-read share unavailable");
   });
 
   it("labels zero cost as untracked instead of treating it as free", async () => {

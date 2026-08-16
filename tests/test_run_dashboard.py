@@ -394,6 +394,76 @@ def test_comparison_subset_filter_excludes_other_tasks(tmp_path):
     assert all(Path(c["result_path"]).is_absolute() for c in filt[0]["cells"])
 
 
+def test_cache_adjusted_token_summary_discounts_known_cache_reads():
+    summary = run_dashboard.cache_adjusted_token_summary(
+        {
+            "combined_total_tokens": 1_000,
+            "cache_read_tokens": 500,
+            "advisor_cache_read_tokens": 100,
+        }
+    )
+
+    assert summary == {
+        "reported_total_tokens": 1_000,
+        "cache_read_tokens": 600,
+        "adjusted_tokens": 460.0,
+        "cache_read_share": 0.6,
+        "token_policy": "cache-read-10pct-v1",
+        "cache_read_weight": 0.1,
+    }
+
+
+def test_cache_adjusted_token_summary_never_drops_main_total():
+    summary = run_dashboard.cache_adjusted_token_summary(
+        {
+            "combined_total_tokens": 900,
+            "total_tokens": 1_000,
+            "cache_read_tokens": 500,
+        }
+    )
+
+    assert summary["reported_total_tokens"] == 1_000
+    assert summary["adjusted_tokens"] == 550.0
+
+
+def test_comparison_backfills_cache_adjusted_efficiency(tmp_path):
+    res = tmp_path / "results"
+    first = res / "gpt-5.5" / "low" / "baseline" / "task-a" / "rep0" / "result.json"
+    second = res / "gpt-5.5" / "low" / "baseline" / "task-b" / "rep0" / "result.json"
+    _make_result(first, reward_binary=1, task="task-a", rep=0)
+    _make_result(second, reward_binary=0, task="task-b", rep=0)
+    first_payload = json.loads(first.read_text())
+    first_payload.update(
+        {
+            "combined_total_tokens": 1_000,
+            "cache_read_tokens": 500,
+            "advisor_cache_read_tokens": 100,
+        }
+    )
+    first.write_text(json.dumps(first_payload))
+    second_payload = json.loads(second.read_text())
+    second_payload.update(
+        {
+            "combined_total_tokens": 2_000,
+            "cache_read_tokens": 1_000,
+            "workflow_cache_read_tokens": 200,
+        }
+    )
+    second.write_text(json.dumps(second_payload))
+
+    [run] = run_dashboard.load_comparison_data(res)
+
+    assert run["total_reported_tokens"] == 3_000
+    assert run["total_cache_read_tokens"] == 1_800
+    assert run["total_adjusted_tokens"] == 1_380.0
+    assert run["cache_read_share"] == 0.6
+    assert run["solves_per_million_adjusted_tokens"] == pytest.approx(724.637681)
+    assert run["token_policy"] == "cache-read-10pct-v1"
+    assert run["cache_read_weight"] == 0.1
+    adjusted_by_task = {cell["task"]: cell["adjusted_tokens"] for cell in run["cells"]}
+    assert adjusted_by_task == {"task-a": 460.0, "task-b": 920.0}
+
+
 def test_comparison_discovers_symlinked_config_directory(tmp_path):
     res = tmp_path / "results"
     source = tmp_path / "worktree-results" / "pi-check"
