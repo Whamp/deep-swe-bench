@@ -2,7 +2,8 @@
 
 Validated 2026-07-31 for benchmark configs using Pi `0.83.0` and
 `openai-codex/gpt-5.6-luna`. The low route was revalidated with a local mock on
-Pi `0.84.1` for the read-long-lines pilot on 2026-08-10.
+Pi `0.84.1` for the read-long-lines pilot on 2026-08-10, and the high route was
+revalidated with a local mock on Pi `0.84.1` for `pi-fff@1.0.0` on 2026-08-16.
 
 ## Official model contract
 
@@ -80,11 +81,16 @@ Artifacts:
 `analysis/read-long-lines-pilot/provider-evidence/request-probe.jsonl` exercises
 Pi `0.84.1`'s real Codex Responses adapter against a local mock. The low record
 preserves `low` and sends `reasoning: {"effort":"low","summary":"auto"}` with
-one tool. No provider call was made for this revalidation.
+one tool.
+
+`analysis/openai-codex-gpt56-luna/high/request-probe-pi-0.84.1.jsonl` performs
+the same provider-free check for the `pi-fff@1.0.0` high leaf. It preserves
+`high` and sends `reasoning: {"effort":"high","summary":"auto"}` with one
+tool. No provider call was made for either Pi `0.84.1` revalidation.
 
 The existing Pi `0.83.0` live probe proves the subscription route accepted
-Luna. The confirmed read-long-lines preflight must prove the Pi `0.84.1`
-end-to-end route before fan-out.
+Luna. Each confirmed Pi `0.84.1` config preflight must prove its end-to-end route
+before fan-out.
 
 ## Benchmark implication
 
