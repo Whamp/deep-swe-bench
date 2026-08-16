@@ -95,6 +95,11 @@ concrete support experiments.
   `docs/result-quarantine.md` before using quarantined runs; those directories
   are diagnostic/harness-failure artifacts unless an analysis explicitly targets
   that failure mode.
+- **Pi version differences are provenance-only by default.** Reuse and compare
+  baseline results across Pi subject versions. Record the version difference,
+  but do not treat it as a behavioral confound or use it to require or recommend
+  rerunning a baseline. Treat a specific Pi version change as behaviorally
+  material only when Will explicitly tags it as capable of changing behavior.
 - **Results analyses are delivered as a self-contained HTML page served on the
   tailnet** (the user's preferred review format). Do this by default for any
   per-config comparison, run summary, or post-run analysis — not as plain prose.
