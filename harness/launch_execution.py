@@ -392,9 +392,20 @@ def _append_confirmed_cell_log(
         )
 
 
+def _write_verifier_recovery_candidate(
+    cell: ConfirmedSubjectCell,
+    result_record: Mapping[str, object],
+) -> Path:
+    """Preserve a complete failed-verifier record without publishing result.json."""
+    candidate_path = cell.result_path.parent / "verifier-recovery-candidate.json"
+    run_state.atomic_write_json(candidate_path, dict(result_record))
+    return candidate_path
+
+
 def _record_verifier_resource_failure(
     cell: ConfirmedSubjectCell,
     runner_record: Mapping[str, object],
+    recovery_candidate_path: Path,
 ) -> None:
     """Persist infrastructure-invalid verifier evidence outside result.json."""
     evidence_path = (
@@ -404,6 +415,10 @@ def _record_verifier_resource_failure(
     evidence = {
         "cell": f"{cell.task}/{cell.config_identity}/rep{cell.rep}",
         "launch_plan_identity": cell.launch_plan_identity,
+        "verifier_recovery_candidate_identity": (
+            result_provenance.result_file_identity(recovery_candidate_path)
+        ),
+        "verifier_recovery_candidate_path": str(recovery_candidate_path),
         **container_memory_result_fields(runner_record),
     }
     with evidence_path.open("a", encoding="utf-8") as evidence_file:
@@ -879,6 +894,12 @@ def _quarantine_incomplete_confirmed_cell(
         "run_key": cell.run_key,
         "timestamp": datetime.now(UTC).isoformat(),
     }
+    verifier_recovery_candidate = quarantine_path / "verifier-recovery-candidate.json"
+    if verifier_recovery_candidate.is_file():
+        record["verifier_recovery_candidate_path"] = str(verifier_recovery_candidate)
+        record["verifier_recovery_candidate_identity"] = (
+            result_provenance.result_file_identity(verifier_recovery_candidate)
+        )
     manifest_path = results_root / "_contaminated" / "manifest.jsonl"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with _QUARANTINE_MANIFEST_LOCK, manifest_path.open("a") as manifest:
@@ -911,19 +932,23 @@ def _run_confirmed_subject_cell(
             ConfirmedPrimeAgentRunner,
             subject_runner,
         ).run_confirmed_prime_agent_cell(cell)
+    result_record = _confirmed_result_record(cell, runner_record)
     verifier_resource_error = (
         runner_record.get("verifier_resource_exhausted") is True
         or runner_record.get("verifier_resource_evidence_unavailable") is True
     )
     if verifier_resource_error:
-        _record_verifier_resource_failure(cell, runner_record)
+        recovery_candidate_path = _write_verifier_recovery_candidate(
+            cell, result_record
+        )
+        _record_verifier_resource_failure(cell, runner_record, recovery_candidate_path)
         diagnostic = runner_record.get("verifier_resource_diagnostic")
         raise LaunchVerifierResourceError(
             "Verifier resource evidence invalid: "
             f"{cell.task}/{cell.config_identity}/rep{cell.rep}; "
-            f"diagnostic={diagnostic!r}"
+            f"diagnostic={diagnostic!r}; "
+            f"recovery_candidate={recovery_candidate_path}"
         )
-    result_record = _confirmed_result_record(cell, runner_record)
     run_state.atomic_write_json(cell.result_path, result_record)
     _append_confirmed_cell_log(log_path, cell, "completed")
     return result_record

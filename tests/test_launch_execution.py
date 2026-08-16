@@ -36,6 +36,7 @@ from harness.launch import (
     compile_launch_request,
     execute_confirmed_launch,
 )
+from harness.launch_contract import LaunchVerifierResourceError
 from scripts import run_dashboard
 
 
@@ -970,6 +971,82 @@ def test_confirmed_launch_retries_verifier_memory_exhaustion(
     evidence = json.loads(evidence_path.read_text().splitlines()[0])
     assert evidence["verifier_resource_exhausted"] is True
     assert evidence["launch_plan_identity"] == compiled.plan.identity
+    quarantine_records = [
+        json.loads(line)
+        for line in (
+            execution.result_path.parents[5]
+            / "_contaminated"
+            / "manifest.jsonl"
+        ).read_text().splitlines()
+    ]
+    verifier_retry = next(
+        record
+        for record in quarantine_records
+        if "verifier_recovery_candidate_path" in record
+    )
+    candidate_path = Path(verifier_retry["verifier_recovery_candidate_path"])
+    assert candidate_path.is_file()
+    assert verifier_retry["verifier_recovery_candidate_identity"] == (
+        f"sha256:{hashlib.sha256(candidate_path.read_bytes()).hexdigest()}"
+    )
+
+
+def test_confirmed_launch_preserves_verifier_recovery_candidate(
+    tmp_path: Path,
+) -> None:
+    """Verifier resource failure preserves a complete non-canonical candidate."""
+    compiled, _, _, _, _ = _compile_single_cell_launch(tmp_path)
+
+    class ExhaustedVerifierRunner(FakeConfirmedPiRunner):
+        """Return one complete subject record with invalid verifier resources."""
+
+        def run_confirmed_pi_cell(
+            self,
+            cell: ConfirmedPiCell,
+        ) -> dict[str, object]:
+            """Mark the verifier attempt as memory exhausted."""
+            record = super().run_confirmed_pi_cell(cell)
+            record.update(
+                {
+                    "verifier_exit": "memory_limit",
+                    "verifier_memory_events": {"oom_kill": 1},
+                    "verifier_resource_exhausted": True,
+                }
+            )
+            return record
+
+    runner = ExhaustedVerifierRunner(_planned_launch_plan_path(compiled))
+
+    with pytest.raises(
+        LaunchVerifierResourceError,
+        match="Verifier resource evidence invalid",
+    ):
+        execute_confirmed_launch(
+            compiled.plan,
+            confirmation_identity=compiled.plan.identity,
+            runtime_resolver=_runtime_resolver_for(compiled),
+            pi_runner=runner,
+        )
+
+    result_path = Path(compiled.plan.to_document()["batchCells"][0]["resultPath"])
+    candidate_path = result_path.parent / "verifier-recovery-candidate.json"
+    assert not result_path.exists()
+    candidate = json.loads(candidate_path.read_text())
+    assert candidate["verifier_resource_exhausted"] is True
+    assert candidate["verifier_memory_events"] == {"oom_kill": 1}
+    assert candidate["launch_plan_identity"] == compiled.plan.identity
+    assert candidate["resource_policy"]["verifier_memory_gib"] == 12.0
+    assert candidate["immutable_image_identities"]["verifier"].startswith("sha256:")
+    evidence = json.loads(
+        (
+            result_path.parent / "logs" / "verifier-resource-events.ndjson"
+        ).read_text()
+    )
+    assert evidence["verifier_recovery_candidate_path"] == str(candidate_path)
+    assert evidence["verifier_recovery_candidate_identity"] == (
+        f"sha256:{hashlib.sha256(candidate_path.read_bytes()).hexdigest()}"
+    )
+    assert (result_path.parent / "artifacts" / "model.patch").is_file()
 
 
 def test_confirmed_launch_pauses_before_rep_when_resource_halt_exists(

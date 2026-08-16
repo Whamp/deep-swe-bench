@@ -394,4 +394,6 @@ Completed run summaries and social-card graphics are under `reports/`.
 - `scripts/migrate_results.py` — migrate `runs/` -> `results/`.
 - `scripts/container_resource_supervisor.py` — singleton run-level host memory containment.
 - `scripts/container_memory_watchdog.py` — compatibility entrypoint for the resource supervisor.
+- `scripts/recover_quarantined_cells.py` — verifier-only recovery and result restoration.
 - `docs/result-quarantine.md` — local quarantine policy for invalid/diagnostic result dirs.
+- `docs/verifier-only-recovery.md` — rerun a failed verifier without another model call.

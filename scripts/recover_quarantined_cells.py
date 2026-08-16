@@ -58,6 +58,9 @@ class RecoveryOperation:
     expected_result_identity: str
     reason: str
     verifier_memory_gib: float | None = None
+    source_record_name: str = "result.json"
+    allow_verifier_memory_override: bool = False
+    source_archive: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +70,10 @@ class VerifierRecomputationEvidence:
     verifier_exit: int
     memory_status: Mapping[str, object]
     source_result_identity: str
+    source_record_name: str
     harness_commit: str
     reason: str
+    original_verifier_memory_gib: float
     verifier_memory_gib: float
 
 
@@ -84,9 +89,23 @@ def append_recovery_manifest(manifest: Path, record: Mapping[str, object]) -> No
         stream.write(json.dumps(dict(record), sort_keys=True) + "\n")
 
 
+def recovery_source_record_path(operation: RecoveryOperation) -> Path:
+    """Return the exact canonical result or failed-verifier candidate to recover."""
+    source_record = Path(operation.source_record_name)
+    if (
+        source_record.name != operation.source_record_name
+        or source_record.is_absolute()
+    ):
+        raise ValueError(
+            "recovery source record must be one filename: "
+            f"{operation.source_record_name!r}"
+        )
+    return operation.source / source_record
+
+
 def validate_recovery_operation(operation: RecoveryOperation) -> None:
     """Reject source drift and occupied destinations before changing a cell."""
-    result_path = operation.source / "result.json"
+    result_path = recovery_source_record_path(operation)
     if not result_path.is_file():
         raise FileNotFoundError(f"recovery source result is missing: {result_path}")
     observed_identity = file_identity(result_path)
@@ -95,10 +114,28 @@ def validate_recovery_operation(operation: RecoveryOperation) -> None:
             "recovery source result identity mismatch: "
             f"expected={operation.expected_result_identity}; observed={observed_identity}"
         )
-    if operation.destination.exists():
+    in_place_recomputation = (
+        operation.action == "recompute-verifier"
+        and operation.destination == operation.source
+    )
+    if operation.destination.exists() and not in_place_recomputation:
         raise FileExistsError(
             f"recovery destination already exists: {operation.destination}"
         )
+    if in_place_recomputation:
+        if operation.source_archive is None:
+            raise ValueError("in-place verifier recomputation requires sourceArchive")
+        if operation.source_archive.exists():
+            raise FileExistsError(
+                f"recovery source archive already exists: {operation.source_archive}"
+            )
+        resolved_source = operation.source.resolve()
+        resolved_archive = operation.source_archive.resolve()
+        if (
+            resolved_archive == resolved_source
+            or resolved_source in resolved_archive.parents
+        ):
+            raise ValueError("recovery source archive must be outside the source cell")
     if not operation.reason.strip():
         raise ValueError("recovery reason must not be empty")
 
@@ -120,6 +157,10 @@ def _recovery_record(
     }
     if operation.verifier_memory_gib is not None:
         record["verifier_memory_gib"] = operation.verifier_memory_gib
+    if operation.source_record_name != "result.json":
+        record["source_record_name"] = operation.source_record_name
+    if operation.source_archive is not None:
+        record["source_archive_path"] = str(operation.source_archive)
     return record
 
 
@@ -175,9 +216,17 @@ def build_recomputed_result(
         if field in reward:
             result[field] = reward[field]
     result.update(evidence.memory_status)
+    resource_policy = result.get("resource_policy")
+    if isinstance(resource_policy, Mapping):
+        result["resource_policy"] = {
+            **resource_policy,
+            "verifier_memory_gib": evidence.verifier_memory_gib,
+        }
     result["verifier_recomputation"] = {
         "harness_commit": evidence.harness_commit,
+        "original_verifier_memory_gib": evidence.original_verifier_memory_gib,
         "reason": evidence.reason,
+        "source_record_name": evidence.source_record_name,
         "source_result_identity": evidence.source_result_identity,
         "timestamp": datetime.now(UTC).isoformat(),
         "verifier_memory_gib": evidence.verifier_memory_gib,
@@ -237,6 +286,56 @@ def run_recovery_verifier_container(
     return completed.returncode, memory_status
 
 
+def load_verifier_recovery_source(
+    staging: Path,
+    operation: RecoveryOperation,
+) -> tuple[dict[str, object], str, float]:
+    """Load exact verifier image and memory provenance from one saved subject."""
+    source_record_path = staging / operation.source_record_name
+    original = cast(dict[str, object], json.loads(source_record_path.read_text()))
+    images = original.get("immutable_image_identities")
+    if not isinstance(images, dict) or not isinstance(images.get("verifier"), str):
+        raise TypeError(
+            "verifier recomputation requires immutable verifier image identity"
+        )
+    resource_policy = original.get("resource_policy")
+    if not isinstance(resource_policy, dict):
+        raise TypeError("verifier recomputation requires recorded resource policy")
+    recorded_memory_gib = resource_policy.get("verifier_memory_gib")
+    if not isinstance(recorded_memory_gib, int | float):
+        raise TypeError(
+            "verifier recomputation requires numeric recorded verifier memory"
+        )
+    if (
+        recorded_memory_gib != operation.verifier_memory_gib
+        and not operation.allow_verifier_memory_override
+    ):
+        raise ValueError(
+            "verifier recomputation memory override requires explicit approval: "
+            f"recorded={recorded_memory_gib}; "
+            f"requested={operation.verifier_memory_gib}"
+        )
+    return original, images["verifier"], float(recorded_memory_gib)
+
+
+def publish_recomputed_verifier_cell(
+    staging: Path,
+    operation: RecoveryOperation,
+) -> None:
+    """Atomically publish a verifier-only result and preserve an in-place source."""
+    if operation.source != operation.destination:
+        os.replace(staging, operation.destination)
+        return
+    assert operation.source_archive is not None
+    operation.source_archive.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(operation.source, operation.source_archive)
+    try:
+        os.replace(staging, operation.destination)
+    except OSError:
+        os.replace(operation.source_archive, operation.source)
+        raise
+
+
 def recompute_quarantined_verifier(
     operation: RecoveryOperation,
     manifest: Path,
@@ -258,27 +357,12 @@ def recompute_quarantined_verifier(
     shutil.rmtree(verifier_dir, ignore_errors=True)
     verifier_dir.mkdir()
     (staging / "logs").mkdir(exist_ok=True)
-    original = cast(
-        dict[str, object], json.loads((staging / "result.json").read_text())
+    original, verifier_image, recorded_memory_gib = load_verifier_recovery_source(
+        staging, operation
     )
-    images = original.get("immutable_image_identities")
-    if not isinstance(images, dict) or not isinstance(images.get("verifier"), str):
-        raise TypeError(
-            "verifier recomputation requires immutable verifier image identity"
-        )
-    resource_policy = original.get("resource_policy")
-    if not isinstance(resource_policy, dict):
-        raise TypeError("verifier recomputation requires recorded resource policy")
-    recorded_memory_gib = resource_policy.get("verifier_memory_gib")
-    if recorded_memory_gib != operation.verifier_memory_gib:
-        raise ValueError(
-            "verifier recomputation memory mismatch: "
-            f"recorded={recorded_memory_gib}; "
-            f"requested={operation.verifier_memory_gib}"
-        )
     verifier_exit, memory_status = run_recovery_verifier_container(
         staging,
-        images["verifier"],
+        verifier_image,
         operation.verifier_memory_gib,
     )
     if verifier_exit != 0:
@@ -301,15 +385,19 @@ def recompute_quarantined_verifier(
             verifier_exit=verifier_exit,
             memory_status=memory_status,
             source_result_identity=operation.expected_result_identity,
+            source_record_name=operation.source_record_name,
             harness_commit=harness_commit,
             reason=operation.reason,
+            original_verifier_memory_gib=recorded_memory_gib,
             verifier_memory_gib=operation.verifier_memory_gib,
         ),
     )
     (staging / "result.json").write_text(
         json.dumps(recomputed, indent=2, sort_keys=True) + "\n"
     )
-    os.replace(staging, operation.destination)
+    if operation.source_record_name != "result.json":
+        (staging / operation.source_record_name).unlink()
+    publish_recomputed_verifier_cell(staging, operation)
     append_recovery_manifest(
         manifest,
         _recovery_record(
@@ -341,6 +429,15 @@ def load_recovery_operations(spec_path: Path) -> list[RecoveryOperation]:
                 expected_result_identity=raw["expectedResultIdentity"],
                 reason=raw["reason"],
                 verifier_memory_gib=raw.get("verifierMemoryGiB"),
+                source_record_name=raw.get("sourceRecordName", "result.json"),
+                allow_verifier_memory_override=raw.get(
+                    "allowVerifierMemoryOverride", False
+                ),
+                source_archive=(
+                    Path(raw["sourceArchive"])
+                    if raw.get("sourceArchive") is not None
+                    else None
+                ),
             )
         )
     return operations
