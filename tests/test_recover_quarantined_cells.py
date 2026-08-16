@@ -154,6 +154,7 @@ def test_build_recomputed_result_replaces_only_grade_and_verifier_evidence() -> 
 
     assert recomputed["total_tokens"] == 123
     assert recomputed["reward_binary"] == 1
+    assert recomputed["reward_unverified"] is False
     assert recomputed["f2p_passed"] == 24
     assert recomputed["verifier_exit"] == 0
     assert recomputed["verifier_memory_events"] == {"oom_kill": 0}

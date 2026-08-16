@@ -278,6 +278,14 @@ Main success metric is `reward_partial` from DeepSWE `reward.json`. Binary
 `reward` is reported, but long-horizon tasks often show partial progress before
 full solve, so partial is the primary paired metric.
 
+`reward_binary` is 0 or 1, never negative: a cell whose verifier never produced
+`reward.json` (empty patch, verifier timeout, degeneration skip) scores an
+honest zero with `reward_unverified: true` in its result record, so naive score
+averaging cannot treat an unverified cell as worse than a failed one. The
+diagnostic reason stays in `verifier_exit`. Cells recorded before this rule
+carry a retired `-1` sentinel with the same meaning; historical live cells were
+migrated by `scripts/backfill_reward_sentinels.py`.
+
 Token metric is the executor total read from the native session:
 
 ```text

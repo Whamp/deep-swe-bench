@@ -96,7 +96,7 @@ def main() -> int:
             xs_rel.append(cr["rel_frac"])
             ys_edge.append(br["edge_coverage"])
             ys_part.append(cr["reward_partial"] or 0.0)
-            ys_solved.append(cr["reward_binary"] or 0)
+            ys_solved.append(max(cr["reward_binary"] or 0, 0))
         return {
             "n": len(xs_rel),
             "rel_vs_edge": corr(xs_rel, ys_edge),

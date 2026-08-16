@@ -44,6 +44,7 @@ _GRADE_FIELDS = {
     "p2p_total",
     "reward_binary",
     "reward_partial",
+    "reward_unverified",
 }
 
 
@@ -166,6 +167,7 @@ def build_recomputed_result(
         {
             "reward_binary": reward["reward"],
             "reward_partial": float(cast(int | float, reward["partial"])),
+            "reward_unverified": bool(reward.get("unverified", False)),
             "verifier_exit": evidence.verifier_exit,
         }
     )

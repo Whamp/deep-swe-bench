@@ -40,6 +40,7 @@ from lib import (
     load_task,
     read_reward,
     result_record,
+    reward_grade_fields,
     subject_container_name,
 )
 from pi_rpc_runner import run_pi_rpc
@@ -450,7 +451,10 @@ def run_cell(
         for d in (prime_config_tmp, task_public):
             shutil.rmtree(d, ignore_errors=True)
 
-    reward = {"reward": -1, "partial": 0.0}
+    # Unverified cells (empty patch, verifier timeout) keep this zero-grade
+    # default; reward_grade_fields records them with reward_unverified: True
+    # instead of the retired -1 sentinel.
+    reward = {"reward": 0, "partial": 0.0, "unverified": True}
     if status.get("patch_bytes", 0) > 0:
         ensure_verifier_image(task)
         verifier_cname = f"{cname}-verifier"
@@ -563,8 +567,7 @@ def run_cell(
         initial_context_capture_path="initial_context"
         if capture_initial_context
         else None,
-        reward_binary=reward.get("reward", -1),
-        reward_partial=float(reward.get("partial", 0.0)),
+        **reward_grade_fields(reward),
         f2p=reward.get("f2p"),
         p2p=reward.get("p2p"),
         f2p_passed=reward.get("f2p_passed"),

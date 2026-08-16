@@ -110,16 +110,43 @@ def instruction_text(task: Task) -> str:
 
 
 def read_reward(verifier_dir: Path) -> dict:
-    """Parse the verifier's reward.json (continuous metric = 'partial')."""
+    """Parse the verifier's reward.json (continuous metric = 'partial').
+
+    A cell whose verifier produced no reward.json scores an honest zero with
+    ``unverified: True`` — never a negative sentinel, which naive score
+    averaging treats as worse than failure.
+    """
     rj = verifier_dir / "reward.json"
     if not rj.exists():
         # crash sentinel from test.sh's EXIT trap
         rt = verifier_dir / "reward.txt"
         if rt.exists():
-            return {"reward": -1, "partial": 0.0, "_sentinel": rt.read_text().strip()}
-        return {"reward": -1, "partial": 0.0, "_missing": True}
+            return {
+                "reward": 0,
+                "partial": 0.0,
+                "unverified": True,
+                "_sentinel": rt.read_text().strip(),
+            }
+        return {"reward": 0, "partial": 0.0, "unverified": True, "_missing": True}
     d = json.loads(rj.read_text())
     return d
+
+
+def reward_grade_fields(reward: dict) -> dict:
+    """Result-record grade fields for one cell's verifier reward.
+
+    Cells with no verifier reward.json (empty patch, verifier timeout,
+    degeneration skip) score zero — never the retired -1 sentinel — with
+    ``reward_unverified: True`` preserving the distinction. A parsed
+    verifier reward.json carries no ``unverified`` key, so its grade records
+    as verified.
+    """
+    unverified = reward.get("unverified", "reward" not in reward)
+    return {
+        "reward_binary": reward.get("reward", 0),
+        "reward_partial": float(reward.get("partial", 0.0)),
+        "reward_unverified": bool(unverified),
+    }
 
 
 def model_leaf(model: str, advisor_model: str | None = None) -> str:

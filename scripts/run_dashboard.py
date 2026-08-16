@@ -273,6 +273,12 @@ def _mean(values: list[float]) -> float:
     return float(statistics.fmean(valid))
 
 
+def _binary(value: Any) -> int:
+    """Cell reward_binary as 0/1: historical -1 unverified sentinels clamp
+    to an honest zero instead of scoring below failure."""
+    return max(int(value or 0), 0)
+
+
 def _rep_from_parts(parts: tuple[str, ...]) -> int:
     """Best-effort integer rep number from a result path (e.g. 'rep2' -> 2)."""
     raw = parts[-2]
@@ -353,7 +359,7 @@ def load_comparison_data(
         thinking = cells_raw[0]["_thinking"]
         config = cells_raw[0]["_config"]
 
-        binaries = [c.get("reward_binary") or 0 for c in cells_raw]
+        binaries = [_binary(c.get("reward_binary")) for c in cells_raw]
         partials = [c.get("reward_partial") or 0.0 for c in cells_raw]
         costs = [c.get("cost_usd") or 0.0 for c in cells_raw]
         tokens = [c.get("total_tokens") or 0 for c in cells_raw]
@@ -373,7 +379,7 @@ def load_comparison_data(
                     "config": c.get("config", config),
                     "rep": c.get("_rep", c.get("rep", 0)),
                     "result_path": c.get("_result_path", ""),
-                    "reward_binary": c.get("reward_binary") or 0,
+                    "reward_binary": _binary(c.get("reward_binary")),
                     "reward_partial": c.get("reward_partial") or 0.0,
                     "total_tokens": c.get("total_tokens") or 0,
                     "cost_usd": c.get("cost_usd") or 0.0,

@@ -56,6 +56,7 @@ from lib import (  # noqa: E402
     load_task,
     read_reward,
     result_record,
+    reward_grade_fields,
     subject_container_name,
 )
 from pi_config import read_config_pi_flags, validate_pi_flags  # noqa: E402
@@ -699,7 +700,10 @@ def run_cell(
                 shutil.rmtree(d, ignore_errors=True)
 
     # --- verify in a pristine, air-gapped container ---
-    reward = {"reward": -1, "partial": 0.0}
+    # Unverified cells (empty patch, verifier timeout, degeneration skip)
+    # keep this zero-grade default; reward_grade_fields records them with
+    # reward_unverified: True instead of the retired -1 sentinel.
+    reward = {"reward": 0, "partial": 0.0, "unverified": True}
     patch_bytes = status.get("patch_bytes", 0)
     if should_run_verifier(patch_bytes, status.get("agent_exit")):
         ensure_verifier_image(task)
@@ -775,8 +779,7 @@ def run_cell(
         openai_codex_oauth_passed=pass_openai_codex_oauth,
         initial_context_capture_enabled=capture_initial_context,
         initial_context_capture_path="initial_context" if capture_initial_context else None,
-        reward_binary=reward.get("reward", -1),
-        reward_partial=float(reward.get("partial", 0.0)),
+        **reward_grade_fields(reward),
         f2p=reward.get("f2p"), p2p=reward.get("p2p"),
         f2p_passed=reward.get("f2p_passed"), f2p_total=reward.get("f2p_total"),
         p2p_passed=reward.get("p2p_passed"), p2p_total=reward.get("p2p_total"),
