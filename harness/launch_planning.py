@@ -18,6 +18,9 @@ from harness import (
     result_provenance,
     versioned_smoke_contract,
 )
+from harness.degeneration_watchdog import (
+    validate_named_degeneration_watchdog_policy,
+)
 from harness.launch_contract import (
     CompiledLaunch,
     ExplicitResultReuseDecision,
@@ -253,6 +256,14 @@ def _validate_launch_policies(request: LaunchRequest) -> None:
             "Launch RPC-quiescence policy invalid: expected a finite "
             f"non-negative number; got {rpc_quiescence_s!r}"
         )
+    degeneration_watchdog = request.policies.degeneration_watchdog
+    if degeneration_watchdog is not None:
+        if request.subject != "pi":
+            raise ValueError(
+                "Launch degeneration-watchdog policy invalid: only Pi RPC "
+                "subjects are supported"
+            )
+        validate_named_degeneration_watchdog_policy(degeneration_watchdog)
     if not isinstance(request.policies.capture_initial_context, bool):
         raise TypeError(
             "Launch initial-context policy invalid: expected true or false; "
@@ -1932,6 +1943,43 @@ def _render_planned_cell_lines(
     return lines
 
 
+def _render_degeneration_watchdog_policy(policy: object) -> str:
+    if policy is None:
+        return "Degeneration watchdog: disabled"
+    if not isinstance(policy, Mapping):
+        raise TypeError(
+            "Launch degeneration-watchdog policy invalid: expected an object"
+        )
+    progress_tool_names = policy.get("progress_tool_names")
+    if not isinstance(progress_tool_names, list | tuple) or not all(
+        isinstance(name, str) for name in progress_tool_names
+    ):
+        raise TypeError(
+            "Launch degeneration-watchdog policy invalid: progress tools must "
+            "be strings"
+        )
+    no_progress_limit = policy.get("max_tool_calls_without_progress")
+    no_progress_summary = (
+        "cross-turn no-progress heuristic=disabled"
+        if no_progress_limit is None
+        else (
+            f"max tool calls without progress={no_progress_limit}; "
+            f"progress tools={', '.join(progress_tool_names)}"
+        )
+    )
+    return (
+        f"Degeneration watchdog: {policy.get('profile')}; "
+        "max assistant chars="
+        f"{policy.get('max_assistant_chars_per_turn')}/turn; "
+        "max assistant output="
+        f"{policy.get('max_assistant_output_tokens_per_turn')} tokens/turn; "
+        f"max tool calls={policy.get('max_tool_calls_per_turn')}/turn; "
+        "max identical tool calls="
+        f"{policy.get('max_identical_tool_calls_per_turn')}/turn; "
+        f"{no_progress_summary}"
+    )
+
+
 def _render_launch_receipt(document: LaunchPlanDocument) -> str:
     counts = document["counts"]
     subject = document["subject"]
@@ -2015,6 +2063,9 @@ def _render_launch_receipt(document: LaunchPlanDocument) -> str:
                     "rate-limit backoff="
                     f"{policies['rate_limit_backoff_s']}s"
                 )
+            ),
+            _render_degeneration_watchdog_policy(
+                policies["degeneration_watchdog"]
             ),
             "",
             "TASK SELECTION",

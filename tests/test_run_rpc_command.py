@@ -503,6 +503,13 @@ class ProbeCommandTests(unittest.TestCase):
         self.assertFalse(run_cell.call_args.kwargs["persist_result_index"])
 
 
+class DegenerationVerifierAdmissionTests(unittest.TestCase):
+    def test_watchdog_failure_never_runs_verifier(self) -> None:
+        self.assertFalse(run.should_run_verifier(100, "degeneration"))
+        self.assertFalse(run.should_run_verifier(0, 0))
+        self.assertTrue(run.should_run_verifier(100, 0))
+
+
 class RunPiCommandTests(unittest.TestCase):
     def test_pi_cmd_uses_rpc_without_print_mode_and_preserves_session_dir(self):
         cmd = run.pi_cmd(

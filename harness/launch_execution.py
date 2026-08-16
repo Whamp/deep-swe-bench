@@ -24,6 +24,9 @@ from harness.container_resources import (
     container_memory_result_fields,
     read_resource_halt_reason,
 )
+from harness.degeneration_watchdog import (
+    degeneration_watchdog_policy_from_mapping,
+)
 from harness.launch_contract import (
     ConfirmedLaunchExecution,
     ConfirmedOmpRunner,
@@ -195,6 +198,7 @@ def _confirmed_subject_cell(
         thinking=document["thinking"],
         result_path=Path(result_path),
         rpc_quiescence_s=policies.rpc_quiescence_s,
+        degeneration_watchdog=policies.degeneration_watchdog,
         run_key=Path(document["paths"]["statePath"]).name,
         state_path=Path(document["paths"]["statePath"]),
         subject=subject["name"],
@@ -295,6 +299,11 @@ def _confirmed_result_record(
     return {
         **record,
         **_confirmed_cell_provenance(cell),
+        "degeneration_watchdog_policy": (
+            asdict(cell.degeneration_watchdog)
+            if cell.degeneration_watchdog is not None
+            else None
+        ),
         "config_name": config_identity.name,
         "config_version": config_identity.version,
     }
@@ -349,6 +358,11 @@ def _confirmed_run_manifest(
     manifest.update(
         {
             "capture_initial_context": policies.capture_initial_context,
+            "degeneration_watchdog": (
+                asdict(policies.degeneration_watchdog)
+                if policies.degeneration_watchdog is not None
+                else None
+            ),
             "config_identities": list(_execution_config_identities(document)),
             "launch_plan_identity": document["planIdentity"],
             "reference_baseline_config": document["baselineConfig"],
@@ -521,6 +535,20 @@ def _confirmed_launch_request(
     cell_retries = policies.get("cell_retries")
     agent_timeout_s = policies.get("agent_timeout_s")
     rpc_quiescence_s = policies.get("rpc_quiescence_s")
+    raw_degeneration_watchdog = policies.get("degeneration_watchdog")
+    if raw_degeneration_watchdog is not None and not isinstance(
+        raw_degeneration_watchdog,
+        Mapping,
+    ):
+        raise TypeError(
+            "Confirmed degeneration-watchdog policy invalid: expected an "
+            "object or null"
+        )
+    degeneration_watchdog = degeneration_watchdog_policy_from_mapping(
+        cast(Mapping[str, object], raw_degeneration_watchdog)
+        if isinstance(raw_degeneration_watchdog, Mapping)
+        else None
+    )
     capture_initial_context = policies.get("capture_initial_context")
     auto_resume = policies.get("auto_resume")
     max_quota_wait_s = policies.get("max_quota_wait_s")
@@ -592,6 +620,7 @@ def _confirmed_launch_request(
                 float(agent_timeout_s) if agent_timeout_s is not None else None
             ),
             rpc_quiescence_s=float(rpc_quiescence_s),
+            degeneration_watchdog=degeneration_watchdog,
             capture_initial_context=capture_initial_context,
             auto_resume=auto_resume,
             max_quota_wait_s=float(max_quota_wait_s),

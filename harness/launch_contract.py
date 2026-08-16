@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import NotRequired, Protocol, TypedDict, cast
 
 from harness import run_state
+from harness.degeneration_watchdog import DegenerationWatchdogPolicy
 
 
 class LaunchClarificationError(ValueError):
@@ -167,6 +168,7 @@ class LaunchExecutionPolicies:
     cell_retries: int
     agent_timeout_s: float | None = None
     rpc_quiescence_s: float = 2.0
+    degeneration_watchdog: DegenerationWatchdogPolicy | None = None
     capture_initial_context: bool = True
     auto_resume: bool = True
     max_quota_wait_s: float = 21600.0
@@ -272,6 +274,7 @@ class ConfirmedSubjectCell:
     thinking: str
     result_path: Path
     rpc_quiescence_s: float
+    degeneration_watchdog: DegenerationWatchdogPolicy | None
     run_key: str
     state_path: Path
     subject: str

@@ -4,12 +4,27 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
+from harness.degeneration_watchdog import coding_agent_early_gate_watchdog
 from harness.pi_rpc_runner import run_pi_rpc
 
 
 class PiRpcRunnerTests(unittest.TestCase):
+    def test_standalone_cli_keeps_direct_import_path(self):
+        runner = Path(__file__).parents[1] / "harness" / "pi_rpc_runner.py"
+
+        completed = subprocess.run(
+            [sys.executable, str(runner), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Run a Pi RPC process", completed.stdout)
+
     def write_fake_rpc(self, directory: Path, body: str) -> Path:
         script = directory / "fake_pi_rpc.py"
         script.write_text(textwrap.dedent(body))
@@ -129,6 +144,56 @@ class PiRpcRunnerTests(unittest.TestCase):
             runner_log = (root / "pi-rpc-runner.jsonl").read_text()
             self.assertIn('"event":"quiescent"', runner_log)
             self.assertIn('"reason":"agent_end"', runner_log)
+
+    def test_degeneration_watchdog_aborts_and_records_compact_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = self.write_fake_rpc(
+                root,
+                """
+                import json, sys, time
+                for raw in sys.stdin:
+                    cmd = json.loads(raw)
+                    if cmd.get("type") == "prompt":
+                        print(json.dumps({"id": cmd.get("id"), "type": "response", "command": "prompt", "success": True}), flush=True)
+                        for index in range(4):
+                            print(json.dumps({"type": "tool_execution_start", "toolCallId": f"read-{index}", "toolName": "read", "args": {"path": "/app/src/index.ts"}}), flush=True)
+                    elif cmd.get("type") == "abort":
+                        print(json.dumps({"type": "response", "command": "abort", "success": True}), flush=True)
+                        break
+                    elif cmd.get("type") == "get_state":
+                        print(json.dumps({"id": cmd.get("id"), "type": "response", "command": "get_state", "success": True, "data": {"isStreaming": True, "pendingMessageCount": 0}}), flush=True)
+                    time.sleep(0.01)
+                """,
+            )
+            policy = replace(
+                coding_agent_early_gate_watchdog(),
+                max_tool_calls_per_turn=20,
+                max_identical_tool_calls_per_turn=3,
+            )
+
+            result = run_pi_rpc(
+                [sys.executable, str(fake)],
+                prompt_text="repeat forever",
+                stderr_path=root / "pi.stderr.txt",
+                runner_log_path=root / "pi-rpc-runner.jsonl",
+                timeout_s=5,
+                quiescence_s=0.1,
+                state_poll_s=0.05,
+                degeneration_watchdog_policy=policy,
+            )
+
+            self.assertEqual(result.exit_code, "degeneration")
+            self.assertFalse(result.timed_out)
+            self.assertIsNotNone(result.degeneration_watchdog)
+            assert result.degeneration_watchdog is not None
+            self.assertEqual(
+                result.degeneration_watchdog["reason"],
+                "identical_tool_calls_per_turn",
+            )
+            runner_log = (root / "pi-rpc-runner.jsonl").read_text()
+            self.assertIn('"event":"degeneration_watchdog"', runner_log)
+            self.assertNotIn("/app/src/index.ts", runner_log)
 
     def test_timeout_kills_process_and_reports_timeout(self):
         with tempfile.TemporaryDirectory() as td:

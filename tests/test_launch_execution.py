@@ -16,6 +16,10 @@ from unittest.mock import patch
 import pytest
 
 from harness import config_lock, launch, run_batch
+from harness.degeneration_watchdog import (
+    DegenerationWatchdogPolicy,
+    coding_agent_early_gate_watchdog,
+)
 from harness.launch import (
     CompiledLaunch,
     ConfirmedOmpCell,
@@ -306,6 +310,7 @@ def _compile_existing_fixture(
     rpc_quiescence_s: float = 2.0,
     capture_initial_context: bool = True,
     auto_resume: bool = True,
+    degeneration_watchdog: DegenerationWatchdogPolicy | None = None,
 ) -> CompiledLaunch:
     """Compile an initialized launch fixture without changing its config."""
     repository_root = tmp_path / "repository"
@@ -331,6 +336,7 @@ def _compile_existing_fixture(
             rpc_quiescence_s=rpc_quiescence_s,
             capture_initial_context=capture_initial_context,
             auto_resume=auto_resume,
+            degeneration_watchdog=degeneration_watchdog,
         ),
         reuse_decisions=reuse_decisions,
     )
@@ -586,6 +592,7 @@ def _compile_single_cell_launch(
     rpc_quiescence_s: float = 2.0,
     capture_initial_context: bool = True,
     auto_resume: bool = True,
+    degeneration_watchdog: DegenerationWatchdogPolicy | None = None,
     config_lock_metadata: Mapping[str, object] | None = None,
 ) -> tuple[CompiledLaunch, Path, Path, Path, Path]:
     repository_root = tmp_path / "repository"
@@ -639,6 +646,7 @@ def run_cell(config, task, **kwargs):
         "fixture_persist_result_index": kwargs["persist_result_index"],
         "fixture_resource_policy": dict(kwargs["resource_policy"]),
         "fixture_rpc_quiescence": kwargs["rpc_quiescence"],
+        "fixture_degeneration_watchdog": kwargs.get("degeneration_watchdog"),
         "fixture_runner_path": str(Path(__file__).resolve()),
         "fixture_timeout": kwargs["agent_timeout"],
         "reward_binary": 1,
@@ -667,6 +675,7 @@ def run_cell(config, task, **kwargs):
         rpc_quiescence_s=rpc_quiescence_s,
         capture_initial_context=capture_initial_context,
         auto_resume=auto_resume,
+        degeneration_watchdog=degeneration_watchdog,
     )
     return compiled, config_leaf, smoke_contract, results_root, state_root
 
@@ -841,6 +850,7 @@ def test_execute_command_default_pi_runner_uses_planned_workspace(
         agent_timeout_s=321.0,
         rpc_quiescence_s=4.5,
         capture_initial_context=False,
+        degeneration_watchdog=coding_agent_early_gate_watchdog(),
     )
     reviewed_plan_path = tmp_path / "reviewed-launch-plan.json"
     reviewed_plan_path.write_text(compiled.plan.canonical_json)
@@ -873,6 +883,15 @@ def test_execute_command_default_pi_runner_uses_planned_workspace(
     assert result["fixture_persist_result_index"] is False
     assert result["fixture_timeout"] == 321.0
     assert result["fixture_rpc_quiescence"] == 4.5
+    assert result["fixture_degeneration_watchdog"] == {
+        "max_assistant_chars_per_turn": 180_000,
+        "max_assistant_output_tokens_per_turn": 50_000,
+        "max_identical_tool_calls_per_turn": 4,
+        "max_tool_calls_per_turn": 24,
+        "max_tool_calls_without_progress": 48,
+        "profile": "coding-agent-early-gate-v1",
+        "progress_tool_names": ["edit", "write"],
+    }
     assert result["fixture_capture_initial_context"] is False
     assert result["fixture_credential_routes"] == ["FIXTURE_CREDENTIAL"]
     registered_state = _registered_state_path(state_root, "confirmed-fixture")

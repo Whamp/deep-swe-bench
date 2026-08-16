@@ -17,7 +17,9 @@ confirmation and must not execute canonical reps.
      baseline identity, task selector, reps, workers, stable run id, preflight
      and result policies, cell retry limit, agent timeout, RPC quiescence,
      initial-context capture policy, central `--state-root`, `--plan-out`, and
-     `--receipt-out`.
+     `--receipt-out`. For an early coding-agent behavioral gate, select the
+     named `coding-agent-early-gate-v1` degeneration watchdog profile; leave it
+     disabled for ordinary comparisons unless the operator requests it.
    - Keep the result root in the originating workspace when intended; point the
      state root at the configured central dashboard location.
    - Planning may inspect committed files, local subject versions, credential
@@ -45,8 +47,9 @@ confirmation and must not execute canonical reps.
    - Verify the config identities and lock identities, tested subject versions,
      required capabilities, exact behavior differences from the baseline, task
      selection, reps, concurrency, cell retry limit, agent timeout, RPC
-     quiescence, initial-context capture, preflight cells, conditional batch
-     cells, result root, central state path, and originating workspace.
+     quiescence, degeneration-watchdog profile and rendered thresholds,
+     initial-context capture, preflight cells, conditional batch cells, result
+     root, central state path, and originating workspace.
    - Treat legacy config/result warnings as limitations, not modern provenance.
      Legacy evidence is reusable only through an explicit decision naming the
      exact earlier identity, recorded provenance, result identity, and rationale.
@@ -101,7 +104,8 @@ confirmation and must not execute canonical reps.
 7. **Ask for exact-plan confirmation.**
    - Present the receipt, plan file, receipt file, plan identity, role table,
      credentials, thinking evidence, preflight contract, paths, dashboard
-     command/URL, resource policy, host admission, and supervisor status.
+     command/URL, resource policy, host admission, supervisor status, and any
+     enabled degeneration-watchdog profile with every rendered threshold.
    - Ask the operator to approve the exact `sha256:...` plan identity. Do not
      execute until that approval appears in the current conversation.
    - Any changed behavior or plan identity requires a new receipt and renewed
@@ -136,7 +140,11 @@ confirmation and must not execute canonical reps.
      preflight diagnostics, result provenance, native sessions, role usage
      evidence, transport logs, result counts, and dashboard projection in the
      same turn. Verify hard Docker limits and labels on active subject and
-     verifier containers, plus supervisor process and event-log evidence.
+     verifier containers, plus supervisor process and event-log evidence. When
+     the watchdog fires, require a compact `degeneration_watchdog` runner event,
+     `agent_exit="degeneration"`, `agent_degeneration_watchdog` evidence, and a
+     skipped verifier; treat that cell as a behavioral failure, not infrastructure
+     timeout.
    - Process liveness, heartbeat, a subject exit of zero, or source inspection is
      not correctness evidence.
    - Completion: plan, state, smoke evidence, provenance, fan-out, counts, and
