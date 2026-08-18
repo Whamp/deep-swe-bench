@@ -54,6 +54,7 @@ from degeneration_watchdog import (
 from lib import (  # noqa: E402
     REPO,
     load_task,
+    materialize_task_public,
     read_reward,
     result_record,
     reward_grade_fields,
@@ -568,8 +569,7 @@ def run_cell(
     # solution/ and hidden tests/ are verifier-only (baked into the verifier
     # image); never mount the raw task dir into the agent container.
     task_public = tempfile.mkdtemp(prefix="dsw-task-public-")
-    shutil.copy2(task.dir / "instruction.md", Path(task_public) / "instruction.md")
-    shutil.copy2(task.dir / "pre_artifacts.sh", Path(task_public) / "pre_artifacts.sh")
+    materialize_task_public(task, Path(task_public))
     run_args = ["docker", "run", "-d", "--name", cname,
                 *planned_container_resource_docker_args(
                     resource_policy,

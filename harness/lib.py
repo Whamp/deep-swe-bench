@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,7 @@ class Task:
     verifier_timeout_s: float
     title: str
     category: str
+    collect_commands: tuple[str, ...] = ()
 
     @property
     def pi_image(self) -> str:
@@ -92,6 +94,9 @@ def load_task(task_id: str, root: Path | None = None) -> Task:
     meta = tomllib.loads((tdir / "task.toml").read_text())
     md = meta["metadata"]
     env = meta["environment"]
+    collect_commands = tuple(
+        entry["command"] for entry in meta["verifier"].get("collect", [])
+    )
     return Task(
         id=task_id,
         dir=tdir,
@@ -102,7 +107,34 @@ def load_task(task_id: str, root: Path | None = None) -> Task:
         verifier_timeout_s=float(meta["verifier"]["timeout_sec"]),
         title=md.get("display_title", task_id),
         category=md.get("category", ""),
+        collect_commands=collect_commands,
     )
+
+
+def materialize_task_public(task: Task, task_public: Path) -> None:
+    """Populate the agent-visible /task mount for one cell.
+
+    The agent sees only instruction.md plus the patch-capture script. Tasks
+    carry either a legacy pre_artifacts.sh file (preferred verbatim) or
+    [[verifier.collect]] commands in task.toml, which are synthesized into an
+    equivalent pre_artifacts.sh so the capture step stays identical.
+    """
+    task_public = Path(task_public)
+    task_public.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(task.dir / "instruction.md", task_public / "instruction.md")
+    legacy = task.dir / "pre_artifacts.sh"
+    if legacy.is_file():
+        shutil.copy2(legacy, task_public / "pre_artifacts.sh")
+        return
+    if not task.collect_commands:
+        raise FileNotFoundError(
+            f"task {task.id!r} provides neither pre_artifacts.sh nor "
+            "[[verifier.collect]] commands"
+        )
+    script = "#!/bin/bash\n" + "\n".join(task.collect_commands) + "\n"
+    capture = task_public / "pre_artifacts.sh"
+    capture.write_text(script)
+    capture.chmod(0o755)
 
 
 def instruction_text(task: Task) -> str:
