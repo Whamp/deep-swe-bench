@@ -10,12 +10,12 @@ This note records the provider, thinking, tool-calling, usage, and runtime path 
 - Provider/API: `local-vllm`, OpenAI-compatible chat completions.
 - Runtime image: `sha256:f91e8283e7ad116b8664b4a936dba88ebafcb8910a968dce2a3c34420f010adf`.
 - Whamp/vLLM commit: `3ec20cebe` over the DSML/SwiGLU/FlashMLA/hierarchical-all-reduce speed stack.
-- Context window: 140,000 tokens.
+- Context window: 148,000 tokens (post-acceptance production gate; live runtime reports `max_model_len` 148000).
 - Maximum output: 65,536 tokens.
 - Billing: local compute.
 - Credential route: `LOCAL_VLLM_API_KEY`; the endpoint accepts a non-secret placeholder.
 
-The server uses four RTX 3090 GPUs with tensor parallelism 4, `max_num_seqs=2`, 154,519 GPU KV-cache tokens, FP8 DeepSeek MLA KV, chunked prefill, automatic tool choice, and the `deepseek_v4` reasoning/tool parsers. It passed exact needle retrieval at 119,730 prompt tokens. The acceptance profile retains only 71–73 MiB idle VRAM after long-context execution.
+The server uses four RTX 3090 GPUs with tensor parallelism 4, `max_num_seqs=2`, 154,519 GPU KV-cache tokens (acceptance-gate figure), FP8 DeepSeek MLA KV, chunked prefill, automatic tool choice, and the `deepseek_v4` reasoning/tool parsers. It passed exact needle retrieval at 119,730 prompt tokens. This is the post-acceptance production baseline; the live gate observed on 2026-08-19 reports `max_model_len` 148000, and the acceptance profile retained only 71–73 MiB idle VRAM after long-context execution.
 
 ## Thinking and request shape
 
