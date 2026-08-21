@@ -13,6 +13,7 @@ events into the existing ``tool-usage.jsonl`` sidecar used by parse_usage.py.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -71,6 +72,23 @@ def _json_line(obj: dict[str, Any]) -> str:
 def _write_runner_log(log: IO[str], event: str, **fields: Any) -> None:
     log.write(_json_line({"event": event, **fields}))
     log.flush()
+
+
+def _write_degeneration_diagnostic(
+    path: Path,
+    payload: dict[str, Any],
+) -> dict[str, int | str]:
+    """Atomically persist one bounded degeneration diagnostic with mode 0600."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode()
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    temporary_path.write_bytes(encoded)
+    temporary_path.chmod(0o600)
+    temporary_path.replace(path)
+    return {
+        "diagnostic_bytes": len(encoded),
+        "diagnostic_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
 
 
 def _auto_ui_response(request: dict[str, Any]) -> dict[str, Any] | None:
@@ -135,12 +153,20 @@ def run_pi_rpc(
     shutdown_timeout_s: float = 10.0,
     quiesce_after_agent_end: bool = False,
     degeneration_watchdog_policy: DegenerationWatchdogPolicy | None = None,
+    degeneration_diagnostic_path: Path | None = None,
 ) -> RpcRunResult:
     """Run a Pi RPC command until idle plus quiescence or timeout.
 
     ``cmd`` should launch Pi in RPC mode, usually via ``docker exec -i``. The
     prompt is sent over the RPC protocol rather than as CLI text/file args.
     """
+    if (
+        degeneration_diagnostic_path is not None
+        and degeneration_watchdog_policy is None
+    ):
+        raise ValueError(
+            "Degeneration diagnostic path requires a degeneration watchdog policy"
+        )
     start = time.monotonic()
     runner_log_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
@@ -274,8 +300,24 @@ def run_pi_rpc(
                     response_errors = list(state.response_errors)
                     write_error = state.write_error
                     degeneration_evidence = state.degeneration_watchdog
+                    event_counts = dict(state.event_counts)
 
                 if degeneration_evidence is not None:
+                    diagnostic_metadata: dict[str, int | str] = {}
+                    if degeneration_diagnostic_path is not None:
+                        assert degeneration_watchdog is not None
+                        diagnostic_metadata = _write_degeneration_diagnostic(
+                            degeneration_diagnostic_path,
+                            {
+                                "policy_profile": degeneration_watchdog.policy.profile,
+                                "rpc_event_counts": event_counts,
+                                "schema_version": 1,
+                                "unfinished_response": (
+                                    degeneration_watchdog.unfinished_response_diagnostic()
+                                ),
+                                "violation": degeneration_evidence,
+                            },
+                        )
                     abort_sent = _send_command(
                         proc,
                         stdin_lock,
@@ -286,6 +328,7 @@ def run_pi_rpc(
                         runner_log,
                         "degeneration_watchdog",
                         **degeneration_evidence,
+                        **diagnostic_metadata,
                         abort_sent=abort_sent,
                     )
                     break

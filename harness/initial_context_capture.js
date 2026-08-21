@@ -1,4 +1,5 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 
 const SCHEMA_VERSION = 1;
@@ -11,6 +12,10 @@ function envInt(name, fallback) {
   if (!raw) return fallback;
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function envEnabled(name) {
+  return ["1", "true", "yes"].includes((process.env[name] || "").toLowerCase());
 }
 
 function captureDir(ctx) {
@@ -39,6 +44,31 @@ function writeText(ctx, name, content) {
 
 function writeJson(ctx, name, value) {
   writeText(ctx, name, `${JSON.stringify(value, redactingReplacer(), 2)}\n`);
+}
+
+function writeAtomicText(ctx, name, content) {
+  const dir = captureDir(ctx);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, name);
+  const temporaryPath = join(dir, `.${name}.tmp`);
+  writeFileSync(temporaryPath, content, { encoding: "utf8", mode: 0o600 });
+  renameSync(temporaryPath, path);
+}
+
+function writeLatestProviderRequest(ctx, requestCount, payload) {
+  const encoded = `${JSON.stringify(payload, redactingReplacer(), 2)}\n`;
+  writeAtomicText(ctx, "provider_request_latest.json", encoded);
+  const metadata = {
+    schemaVersion: SCHEMA_VERSION,
+    providerRequestCount: requestCount,
+    payloadBytes: Buffer.byteLength(encoded),
+    payloadSha256: createHash("sha256").update(encoded).digest("hex"),
+  };
+  writeAtomicText(
+    ctx,
+    "provider_request_latest_meta.json",
+    `${JSON.stringify(metadata, null, 2)}\n`,
+  );
 }
 
 function maybeGetSystemPrompt(event, ctx) {
@@ -80,6 +110,9 @@ function requestStop(ctx, phase) {
 export default function initialContextCapture(pi) {
   const maxContexts = envInt("PI_INITIAL_CONTEXT_MAX_CONTEXTS", DEFAULT_MAX_CONTEXTS);
   const maxProviderRequests = envInt("PI_INITIAL_CONTEXT_MAX_PROVIDER_REQUESTS", DEFAULT_MAX_PROVIDER_REQUESTS);
+  const captureLatestProviderRequest = envEnabled(
+    "PI_INITIAL_CONTEXT_CAPTURE_LATEST_PROVIDER_REQUEST",
+  );
   const stop = stopAfter();
   let contextCount = 0;
   let providerRequestCount = 0;
@@ -89,6 +122,7 @@ export default function initialContextCapture(pi) {
       schemaVersion: SCHEMA_VERSION,
       maxContexts,
       maxProviderRequests,
+      captureLatestProviderRequest,
       stopAfter: stop || null,
       cwd: ctx?.cwd,
       capturedAt: new Date().toISOString(),
@@ -122,6 +156,9 @@ export default function initialContextCapture(pi) {
 
   pi.on("before_provider_request", (event, ctx) => {
     providerRequestCount += 1;
+    if (captureLatestProviderRequest) {
+      writeLatestProviderRequest(ctx, providerRequestCount, event?.payload ?? null);
+    }
     if (providerRequestCount > maxProviderRequests) return;
     writeJson(ctx, `provider_request_${String(providerRequestCount).padStart(4, "0")}.json`, event?.payload ?? null);
     if (providerRequestCount === 1 && stop === "before_provider_request") requestStop(ctx, stop);

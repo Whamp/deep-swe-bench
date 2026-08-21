@@ -118,10 +118,16 @@ def initial_context_capture_mount(enabled: bool) -> list[str]:
     return ["-v", f"{INITIAL_CONTEXT_CAPTURE_SOURCE}:{INITIAL_CONTEXT_CAPTURE_CONTAINER}:ro"]
 
 
-def initial_context_capture_env(enabled: bool) -> list[str]:
+def initial_context_capture_env(
+    enabled: bool,
+    *,
+    capture_latest_provider_request: bool = False,
+) -> list[str]:
     if not enabled:
         return []
     env = ["-e", f"PI_INITIAL_CONTEXT_DIR={INITIAL_CONTEXT_CAPTURE_OUT}"]
+    if capture_latest_provider_request:
+        env += ["-e", "PI_INITIAL_CONTEXT_CAPTURE_LATEST_PROVIDER_REQUEST=1"]
     for name in (
         "PI_INITIAL_CONTEXT_MAX_CONTEXTS",
         "PI_INITIAL_CONTEXT_MAX_PROVIDER_REQUESTS",
@@ -558,7 +564,10 @@ def run_cell(
         credential_routes,
         already_passed=frozenset(passed_credential_routes),
     )
-    env_flag += initial_context_capture_env(capture_initial_context)
+    env_flag += initial_context_capture_env(
+        capture_initial_context,
+        capture_latest_provider_request=(degeneration_watchdog_policy is not None),
+    )
 
     print(f"[cell] task={task_id} config={config} lang={task.language} "
           f"budget={agent_timeout:.0f}s model={model} thinking={thinking}", flush=True)
@@ -630,6 +639,11 @@ def run_cell(
             timeout_s=agent_timeout,
             quiescence_s=rpc_quiescence,
             degeneration_watchdog_policy=degeneration_watchdog_policy,
+            degeneration_diagnostic_path=(
+                cell / "logs" / "agent-degeneration-diagnostic.json"
+                if degeneration_watchdog_policy is not None
+                else None
+            ),
         )
         status["agent_exit"] = rpc_result.exit_code
         if rpc_result.timed_out:

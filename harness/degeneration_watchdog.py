@@ -4,13 +4,32 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 _CODING_AGENT_EARLY_GATE_PROFILE = "coding-agent-early-gate-v1"
 _CODING_AGENT_RESPONSE_GATE_PROFILE = "coding-agent-response-gate-v1"
+DEGENERATION_RESPONSE_SAMPLE_CHARS = 16_384
+_STREAM_DELTA_TYPES = frozenset({"text_delta", "thinking_delta", "toolcall_delta"})
+_STREAM_BLOCK_TYPES = {
+    "text_start": "text",
+    "thinking_start": "thinking",
+    "toolcall_start": "toolcall",
+}
+_STREAM_BLOCK_END_TYPES = {
+    "text_end": "text",
+    "thinking_end": "thinking",
+    "toolcall_end": "toolcall",
+}
+_USAGE_FIELDS = (
+    "input",
+    "output",
+    "cacheRead",
+    "cacheWrite",
+    "totalTokens",
+)
 _POLICY_FIELDS = frozenset(
     {
         "profile",
@@ -250,6 +269,7 @@ class DegenerationWatchdog:
         self.tool_calls_without_progress = 0
         self.tool_signatures_this_turn: Counter[str] = Counter()
         self.violation: DegenerationViolation | None = None
+        self._reset_unfinished_response()
 
     def observe(self, event: Mapping[str, Any]) -> DegenerationViolation | None:
         """Consume one decoded RPC event and return the first violation."""
@@ -261,7 +281,9 @@ class DegenerationWatchdog:
             self.assistant_chars_this_turn = 0
             self.tool_calls_this_turn = 0
             self.tool_signatures_this_turn.clear()
+            self._reset_unfinished_response()
             return None
+        self._observe_unfinished_response(event)
         handler = {
             "message_update": self._observe_message_update,
             "message_end": self._observe_message_end,
@@ -269,6 +291,87 @@ class DegenerationWatchdog:
             "tool_execution_end": self._observe_tool_end,
         }.get(event_type)
         return handler(event) if handler is not None else None
+
+    def unfinished_response_diagnostic(self) -> dict[str, Any]:
+        """Return bounded evidence from the current unfinished response."""
+        open_blocks = [
+            {"content_index": content_index, "type": block_type}
+            for content_index, block_type in sorted(self._open_blocks.items())
+        ]
+        return {
+            "delta_event_counts": dict(self._delta_event_counts),
+            "first_chars": self._first_response_chars,
+            "last_chars": "".join(self._last_response_chunks),
+            "latest_usage": dict(self._latest_usage),
+            "open_blocks": open_blocks,
+            "stream_event_counts": dict(self._stream_event_counts),
+            "total_chars": self._response_chars,
+        }
+
+    def _reset_unfinished_response(self) -> None:
+        self._response_chars = 0
+        self._first_response_chars = ""
+        self._last_response_chunks: deque[str] = deque()
+        self._last_response_chars = 0
+        self._delta_event_counts: Counter[str] = Counter()
+        self._stream_event_counts: Counter[str] = Counter()
+        self._open_blocks: dict[int, str] = {}
+        self._latest_usage: dict[str, int | float] = {}
+
+    def _observe_unfinished_response(self, event: Mapping[str, Any]) -> None:
+        if event.get("type") != "message_update":
+            return
+        update = event.get("assistantMessageEvent")
+        if not isinstance(update, Mapping):
+            return
+        update_type = update.get("type")
+        if not isinstance(update_type, str):
+            return
+        self._stream_event_counts[update_type] += 1
+        content_index = update.get("contentIndex")
+        if update_type in _STREAM_BLOCK_TYPES and isinstance(content_index, int):
+            self._open_blocks[content_index] = _STREAM_BLOCK_TYPES[update_type]
+        elif (
+            update_type in _STREAM_BLOCK_END_TYPES
+            and isinstance(content_index, int)
+            and self._open_blocks.get(content_index)
+            == _STREAM_BLOCK_END_TYPES[update_type]
+        ):
+            self._open_blocks.pop(content_index)
+        if update_type in _STREAM_DELTA_TYPES:
+            delta = update.get("delta")
+            if isinstance(delta, str):
+                self._delta_event_counts[update_type] += 1
+                self._record_response_delta(delta)
+        usage = event.get("usage")
+        if isinstance(usage, Mapping):
+            self._latest_usage = {
+                field: value
+                for field in _USAGE_FIELDS
+                if not isinstance((value := usage.get(field)), bool)
+                and isinstance(value, int | float)
+            }
+
+    def _record_response_delta(self, delta: str) -> None:
+        self._response_chars += len(delta)
+        first_remaining = DEGENERATION_RESPONSE_SAMPLE_CHARS - len(
+            self._first_response_chars
+        )
+        if first_remaining > 0:
+            self._first_response_chars += delta[:first_remaining]
+        if not delta:
+            return
+        self._last_response_chunks.append(delta)
+        self._last_response_chars += len(delta)
+        while self._last_response_chars > DEGENERATION_RESPONSE_SAMPLE_CHARS:
+            excess = self._last_response_chars - DEGENERATION_RESPONSE_SAMPLE_CHARS
+            first_chunk = self._last_response_chunks[0]
+            if len(first_chunk) <= excess:
+                self._last_response_chunks.popleft()
+                self._last_response_chars -= len(first_chunk)
+            else:
+                self._last_response_chunks[0] = first_chunk[excess:]
+                self._last_response_chars -= excess
 
     def _observe_message_update(
         self,
