@@ -17,7 +17,7 @@ REPO = Path(__file__).resolve().parents[1]
 # Bump when harness/Dockerfile.pi-agent changes in a way that should invalidate
 # cached per-task pi images. v2 added ripgrep/fd-find; v3 updated Pi to 0.81.1
 # for GPT-5.6-SOL; v4 updates Pi to 0.84.1 for max thinking and current models.
-PI_IMAGE_REV = "v4-pi0840-tools"
+PI_IMAGE_REV = "v4-pi0841-tools"
 PRIME_AGENT_IMAGE_REV = "v3-prime-agent070-executor-thinking"
 
 
