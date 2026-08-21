@@ -40,6 +40,7 @@ from container_resources import (  # noqa: E402
 from lib import (  # noqa: E402
     REPO,
     load_task,
+    materialize_task_public,
     read_reward,
     result_record,
     reward_grade_fields,
@@ -355,8 +356,7 @@ def run_cell(
 
     task_public = tempfile.mkdtemp(prefix="dsw-task-public-")
     auth_tmp = tempfile.mkdtemp(prefix="dsw-omp-auth-")
-    shutil.copy2(task.dir / "instruction.md", Path(task_public) / "instruction.md")
-    shutil.copy2(task.dir / "pre_artifacts.sh", Path(task_public) / "pre_artifacts.sh")
+    materialize_task_public(task, Path(task_public))
     create_filtered_omp_agent_db(Path(auth_tmp) / "agent" / "agent.db")
     omp_path = omp_binary_path or omp_binary()
 

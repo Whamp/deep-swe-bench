@@ -38,6 +38,7 @@ from container_resources import (
 from lib import (
     REPO,
     load_task,
+    materialize_task_public,
     read_reward,
     result_record,
     reward_grade_fields,
@@ -295,8 +296,7 @@ def run_cell(
 
     task_public = tempfile.mkdtemp(prefix="dsw-task-public-")
     prime_config_tmp = tempfile.mkdtemp(prefix="dsw-prime-agent-config-")
-    shutil.copy2(task.dir / "instruction.md", Path(task_public) / "instruction.md")
-    shutil.copy2(task.dir / "pre_artifacts.sh", Path(task_public) / "pre_artifacts.sh")
+    materialize_task_public(task, Path(task_public))
     shutil.copy2(settings_path, Path(prime_config_tmp) / "settings.json")
     (Path(prime_config_tmp) / "models.json").write_text(
         json.dumps(prime_agent_proxy_models(), indent=2) + "\n"
