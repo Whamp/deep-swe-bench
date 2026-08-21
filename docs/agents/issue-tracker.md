@@ -2,6 +2,10 @@
 
 Issues for this repo live as GitHub issues. Use the `gh` CLI for all operations.
 
+## Canonical triage labels
+
+`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`
+
 ## Conventions
 
 - **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.

@@ -6,8 +6,16 @@ description: Use before adding or changing a deep-swe-bench config release, mode
 # Benchmark Config Validation
 
 A config release is not ready for confirmed planning until its identity, lock,
-roles, compatibility, and durable preflight evidence are reviewable. Never invent
-or alter config-authored prompt text without approval of the exact wording.
+roles, compatibility, and durable preflight evidence are reviewable.
+
+**Config prompt text is approval-gated.** Never invent or alter config-authored
+prompt text — `system_preamble.md`, `orchestration.md`,
+`--append-system-prompt`, or any other instruction surface — without approval of
+the exact wording. Supposedly neutral guidance such as “work normally” or “use
+your judgment” still needs approval. Allowed exceptions are prompt/tool surfaces
+registered by the extension or tool under test itself: tool definitions, prompt
+snippets, prompt guidelines, and extension-owned hook output. If extra wording
+seems necessary, propose the exact text and wait for approval before writing it.
 
 ## Process
 
@@ -77,9 +85,18 @@ or alter config-authored prompt text without approval of the exact wording.
      availability before approval.
 
 6. **Write durable smoke contracts in config space.**
+   - Config leaves are split by thinking level: each model+thinking pair a
+     config runs at lives under
+     `configs/<config>/<model-leaf>/<thinking>/` with a `settings.json` pinning
+     `defaultThinkingLevel`, and results are always split by thinking level too
+     (`results/<model-leaf>/<thinking>/<config>/`). When adding a new thinking
+     level to a config, create the leaf; do not rely on the top-level fallback.
    - Put feature assertions in
      `configs/<identity>/smoke.json` or the authoritative leaf-local
      `configs/<identity>/<model-leaf>/<thinking>/smoke.json`; leaf-local wins.
+     The per-thinking `smoke.json` asserts the session actually ran at that
+     level (`"thinkingLevel":"<level>"` in session logs) plus the matching
+     `docs/`+`analysis/` thinking evidence.
    - Treat the smoke contract as validation, not agent behavior. It is excluded
      from the config lock and pinned as assertions in each launch plan. A
      contract-only correction may revalidate exact saved artifacts without a

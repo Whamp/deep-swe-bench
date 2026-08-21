@@ -37,7 +37,7 @@ Issues and external PRs are tracked in GitHub with the `gh` CLI. See `docs/agent
 
 ### Triage labels
 
-Use the default canonical triage labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+Use the canonical triage labels listed in `docs/agents/issue-tracker.md`.
 
 ### Domain docs
 
@@ -60,31 +60,18 @@ concrete support experiments.
   source.
 - Do not bake feature-specific smoke checks into `harness/run_batch.py`; put them
   in config-authored `smoke.json` contracts.
-- **Do not invent config prompt text.** When creating or changing a config, do not
-  add `system_preamble.md`, `orchestration.md`, `--append-system-prompt`, or any
-  other config-authored instruction text unless Will explicitly approves the
-  exact wording first. This includes supposedly neutral guidance such as “work
-  normally” or “use your judgment.” Allowed exceptions are prompt/tool surfaces
-  registered by the extension or tool under test itself, such as tool definitions,
-  prompt snippets, prompt guidelines, or extension-owned hook output. If extra
-  wording seems necessary, propose the exact text and wait for approval before
-  writing it.
-- **Config leaves are split by thinking level.** Each model+thinking pair a config
-  runs at lives under `configs/<config>/<model-leaf>/<thinking>/` (e.g.
-  `configs/pi-codex-goal/gpt-5.5/xhigh/`) with a `settings.json` pinning
-  `defaultThinkingLevel` and a per-thinking `smoke.json` that asserts the session
-  actually ran at that level (`"thinkingLevel":"<level>"` in session logs) plus
-  the matching `docs/`+`analysis/` thinking evidence. Leaf-local `smoke.json`
-  wins over a top-level `configs/<config>/smoke.json`, which is only a fallback.
-  Results are always split by thinking level too
-  (`results/<model-leaf>/<thinking>/<config>/`). When adding a new thinking level
-  to a config, create the leaf; do not rely on the top-level fallback.
-- If a benchmark launch has advisor, observational-memory workers, subagents,
-  local-vLLM shims, or any other secondary model, stop and get explicit user
-  confirmation before running it.
-- For benchmark launches, “working” means the smoke gate passed and left evidence
-  in the result tree. A live process, dashboard heartbeat, or an `ok` line is not
-  enough.
+- **Do not invent config prompt text** — approval-gated, with narrow
+  extension-owned exceptions. [benchmark-config-validation](.pi/skills/benchmark-config-validation/SKILL.md)
+  owns the rule.
+- **Config leaves are split by thinking level** — leaf layout, smoke precedence,
+  and results-tree paths are owned by
+  [benchmark-config-validation](.pi/skills/benchmark-config-validation/SKILL.md).
+- Launches with any secondary model (advisor, observational-memory workers,
+  subagents, local-vLLM shims) go through the same exact-plan gate as every other
+  launch — [benchmark-launch](.pi/skills/benchmark-launch/SKILL.md) owns it.
+- A benchmark launch counts as **working** only per
+  [benchmark-launch](.pi/skills/benchmark-launch/SKILL.md) step 9 — never from
+  liveness, heartbeats, or an `ok` line.
 - Every confirmed launch must declare subject/verifier memory, additional swap,
   and host reserve in its approved plan. Verify the persistent
   `scripts/container_resource_supervisor.py` singleton before execution. It
@@ -100,17 +87,7 @@ concrete support experiments.
   but do not treat it as a behavioral confound or use it to require or recommend
   rerunning a baseline. Treat a specific Pi version change as behaviorally
   material only when Will explicitly tags it as capable of changing behavior.
-- **Results analyses are delivered as a self-contained HTML page served on the
-  tailnet** (the user's preferred review format). Do this by default for any
-  per-config comparison, run summary, or post-run analysis — not as plain prose.
-  Match the project report design system (CSS variables `--bg`/`--surface`/
-  `--ink`/`--blue`/`--green`/`--red`/`--amber`, plus `.hero`, `.stats`/`.stat`,
-  `.pill good/bad/caution/neutral`, comparison `<table>` with verdict `.tag`s,
-  `.callout`, deterministic CSS/SVG bar charts — never AI-generated charts). The
-  reference templates are `reports/om-memory-pilot-w10/index.html` and
-  `analysis/omp-vs-pi-36v2/index.html`. Always include: hero + verdict pills +
-  KPI stat cards, the key comparison table(s), and a conclusion in callouts.
-  Serve with `python3 -m http.server <port> --bind 0.0.0.0` from the report dir
-  inside a tmux session; pick a free port (8788/8789/5173 are taken), verify
-  `curl http://100.112.72.93:<port>/` returns 200, then give the URL. lavish-axi
-  has no tailnet host-bind, so do not use it for tailnet serving.
+- **Results analyses are delivered as tailnet-served HTML reports**, by default
+  for any per-config comparison, run summary, or post-run analysis — never plain
+  prose. Format, design system, report home, and serving procedure live in
+  [report-delivery](docs/agents/report-delivery.md).

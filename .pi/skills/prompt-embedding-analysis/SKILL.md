@@ -52,9 +52,11 @@ Leading rule: **neighbors are questions, not answers**. Embedding closeness rank
    - Completion: every conclusion states both the evidence and the caveat that limits the claim.
 
 7. **Report and verify.**
-   - Deliver a self-contained HTML report under `reports/`, using the project report design system.
-   - Include hero/verdict pills/KPI cards, primary comparison tables, deterministic SVG/chart where useful, evidence/caveat callouts, and clear next experiments.
-   - Validate with builder execution, `py_compile`, `json.tool`, HTML parse, required-string checks, placeholder scan, and tailnet `curl` HTTP 200.
+   - Deliver per [report-delivery](../../../docs/agents/report-delivery.md):
+     self-contained HTML, project design system, canonical report home,
+     tailnet serving.
+   - Validate with builder execution, `py_compile`, `json.tool`, HTML parse,
+     required-string checks, placeholder scan, and tailnet `curl` HTTP 200.
    - Completion: report URL, artifact paths, and validation evidence are handed off.
 
 ## Pitfalls

@@ -7,7 +7,9 @@ description: Use before preparing or executing a confirmed deep-swe-bench launch
 
 Canonical benchmark results require a compiled launch plan and explicit approval
 of that exact plan identity. Repeating raw model/config/task arguments is not
-confirmation and must not execute canonical reps.
+confirmation and must not execute canonical reps. This gate applies in full to
+launches with advisor, observational-memory workers, subagents, local-vLLM
+shims, or any other secondary model — they get no separate or weaker path.
 
 ## Process
 
