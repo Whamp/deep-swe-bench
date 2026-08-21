@@ -4,7 +4,11 @@ Issues for this repo live as GitHub issues. Use the `gh` CLI for all operations.
 
 ## Canonical triage labels
 
-`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`
+- `needs-triage` — maintainer needs to evaluate
+- `needs-info` — waiting on the reporter for more information
+- `ready-for-agent` — fully specified, ready for an AFK agent
+- `ready-for-human` — requires human implementation
+- `wontfix` — will not be actioned
 
 ## Conventions
 

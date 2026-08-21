@@ -147,7 +147,7 @@ shims, or any other secondary model — they get no separate or weaker path.
      `agent_exit="degeneration"`, `agent_degeneration_watchdog` evidence, and a
      skipped verifier; treat that cell as a behavioral failure, not infrastructure
      timeout.
-   - Process liveness, heartbeat, a subject exit of zero, or source inspection is
-     not correctness evidence.
+   - Process liveness, heartbeat, a subject exit of zero, an `ok` progress line,
+     or source inspection is not correctness evidence.
    - Completion: plan, state, smoke evidence, provenance, fan-out, counts, and
      dashboard all agree.

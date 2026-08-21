@@ -17,8 +17,8 @@ Both are first-class. Pick based on whether the report is the whole deliverable
 
 ## Design system
 
-Match the project report design system. Do not invent a new visual language per
-report.
+Match the project report design system — one visual language across all
+reports.
 
 - CSS variables: `--bg`, `--surface`, `--ink`, `--blue`, `--green`, `--red`,
   `--amber`.

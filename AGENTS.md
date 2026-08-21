@@ -37,7 +37,7 @@ Issues and external PRs are tracked in GitHub with the `gh` CLI. See `docs/agent
 
 ### Triage labels
 
-Use the canonical triage labels listed in `docs/agents/issue-tracker.md`.
+When labeling issues or external PRs, use the canonical triage labels listed in `docs/agents/issue-tracker.md`.
 
 ### Domain docs
 
@@ -70,8 +70,7 @@ concrete support experiments.
   subagents, local-vLLM shims) go through the same exact-plan gate as every other
   launch — [benchmark-launch](.pi/skills/benchmark-launch/SKILL.md) owns it.
 - A benchmark launch counts as **working** only per
-  [benchmark-launch](.pi/skills/benchmark-launch/SKILL.md) step 9 — never from
-  liveness, heartbeats, or an `ok` line.
+  [benchmark-launch](.pi/skills/benchmark-launch/SKILL.md) step 9.
 - Every confirmed launch must declare subject/verifier memory, additional swap,
   and host reserve in its approved plan. Verify the persistent
   `scripts/container_resource_supervisor.py` singleton before execution. It

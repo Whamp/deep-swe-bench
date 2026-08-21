@@ -22,14 +22,8 @@ If any of these files don't exist, **proceed silently**. Don't flag their absenc
 /
 ├── CONTEXT.md
 ├── docs/
-│   ├── adr/
-│   │   ├── 0001-directory-and-vocabulary-reorganization.md
-│   │   ├── … (numbered sequentially; see the directory for current ADRs)
+│   ├── adr/          (numbered sequentially; the directory is the index)
 │   └── agents/
-│       ├── domain.md
-│       ├── issue-tracker.md
-│       ├── local-model-analysis.md
-│       └── report-delivery.md
 └── ...
 ```
 

@@ -29,9 +29,9 @@ Use this when a benchmark delta hides churn: one config gains some cells and los
 
 6. **Compare winning and losing patterns.** Do not infer skill guidance from losses alone. Run the same packet method on right-only wins, then compare recurring patterns in wins vs losses. Semantic embeddings may prioritize review only: separate prompt-only from outcome/trajectory inputs, exclude same-task reps, and require direct trajectory evidence before promoting a mechanism. Completion: the synthesis separates “keep” patterns from “prevent” patterns and labels embedding findings exploratory.
 
-7. **Translate to skill-design hypotheses.** Propose checkable process changes,
-   not vague advice — each with a trigger, an action, and a completion
-   criterion (see the `writing-for-agents` skill). For a local model, build the scaffoldability ledger required by `docs/agents/local-model-analysis.md` and separate serving, harness, execution-control, repository-understanding, and core-capability failures. Completion: each proposed guidance change has a trigger, an action, a completion criterion, observed cells it could have changed, known counterexamples, and a minimal same-model A/B; single-case proposals remain hypotheses.
+7. **Translate to skill-design hypotheses.** Apply `writing-for-agents`
+   discipline: propose checkable process changes, not vague advice — each with a
+   trigger, an action, and a completion criterion. For a local model, build the scaffoldability ledger required by `docs/agents/local-model-analysis.md` and separate serving, harness, execution-control, repository-understanding, and core-capability failures. Completion: each proposed guidance change has a trigger, an action, a completion criterion, observed cells it could have changed, known counterexamples, and a minimal same-model A/B; single-case proposals remain hypotheses.
 
 8. **Publish as an evidence-first report.** Deliver per
    [report-delivery](../../../docs/agents/report-delivery.md): a self-contained
