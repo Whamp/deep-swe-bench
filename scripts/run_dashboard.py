@@ -542,6 +542,35 @@ def load_comparison_data(
 # ---------------------------------------------------------------------------
 
 
+def _declared_launch_results_roots(state_root: Path) -> list[Path]:
+    """Return result roots declared by attributable structured launch plans."""
+    if not state_root.is_dir():
+        return []
+
+    results_roots: list[Path] = []
+    for run_dir in state_root.iterdir():
+        if not run_dir.is_dir():
+            continue
+        plan = load_json(run_dir / "launch-plan.json") or {}
+        plan_run_id = plan.get("runId")
+        raw_paths = plan.get("paths")
+        paths = raw_paths if isinstance(raw_paths, dict) else {}
+        raw_results_root = paths.get("resultsRoot")
+        if not isinstance(plan_run_id, str) or not plan_run_id:
+            continue
+        if not isinstance(raw_results_root, str) or not raw_results_root:
+            continue
+
+        if _launch_plan_structured_state_target(run_dir, state_root) is None:
+            continue
+
+        results_root = Path(raw_results_root)
+        if not results_root.is_absolute():
+            continue
+        results_roots.append(results_root.resolve())
+    return results_roots
+
+
 def resolve_dashboard_path(
     raw_path: str, *, repo_root: Path = ROOT, state_root: Path = DEFAULT_STATE_ROOT
 ) -> Path:
@@ -551,7 +580,11 @@ def resolve_dashboard_path(
     if not candidate.is_absolute():
         candidate = repo_root / candidate
     resolved = candidate.resolve()
-    allowed_roots = [repo_root.resolve(), state_root.resolve()]
+    allowed_roots = [
+        repo_root.resolve(),
+        state_root.resolve(),
+        *_declared_launch_results_roots(state_root),
+    ]
     for allowed in allowed_roots:
         try:
             resolved.relative_to(allowed)

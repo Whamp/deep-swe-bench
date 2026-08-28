@@ -1518,6 +1518,101 @@ def test_http_api_cell_trajectory_endpoint_paginates(tmp_path):
         thread.join(timeout=5)
 
 
+def test_http_api_cell_trajectory_allows_launch_worktree_preflight_result(tmp_path):
+    dashboard_repo = tmp_path / "dashboard-repo"
+    state_root = dashboard_repo / "results" / "_runs"
+    launch_workspace = tmp_path / "launch-worktree"
+    result = (
+        launch_workspace
+        / "results"
+        / "model"
+        / "high"
+        / "cfg"
+        / "smoke-task"
+        / "rep0"
+        / "result.json"
+    )
+    result.parent.mkdir(parents=True)
+    result.write_text(json.dumps({"task": "smoke-task", "config": "cfg", "rep": 0}))
+    _write_session(
+        result.parent / "session" / "s.jsonl",
+        [_assistant_turn([{"type": "text", "text": "preflight work"}])],
+    )
+
+    run_dir = state_root / "worktree-preflight--planhash"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(json.dumps({"run_id": "worktree-preflight"}))
+    (run_dir / "launch-plan.json").write_text(
+        json.dumps(
+            {
+                "runId": "worktree-preflight",
+                "paths": {
+                    "resultsRoot": str(launch_workspace / "results"),
+                    "statePath": str(run_dir),
+                    "stateRoot": str(state_root),
+                    "workspace": str(launch_workspace),
+                },
+            }
+        )
+    )
+
+    undeclared_result = tmp_path / "undeclared-results" / "result.json"
+    undeclared_result.parent.mkdir()
+    undeclared_result.write_text("{}")
+    _write_session(
+        undeclared_result.parent / "session" / "s.jsonl",
+        [_assistant_turn([{"type": "text", "text": "must stay private"}])],
+    )
+    unattributed_run_dir = state_root / "unattributed-plan"
+    unattributed_run_dir.mkdir()
+    (unattributed_run_dir / "launch-plan.json").write_text(
+        json.dumps(
+            {
+                "runId": "unattributed-plan",
+                "paths": {
+                    "resultsRoot": str(undeclared_result.parent),
+                    "statePath": str(unattributed_run_dir),
+                },
+            }
+        )
+    )
+
+    server = run_dashboard.make_server(
+        host="127.0.0.1",
+        port=0,
+        state_root=state_root,
+        detail="summary",
+        repo_root=dashboard_repo,
+        legacy_root=dashboard_repo / "runs",
+        results_root=dashboard_repo / "results",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        declared_query = urllib.parse.urlencode({"path": str(result)})
+        with urllib.request.urlopen(
+            f"{base}/api/cell-trajectory?{declared_query}", timeout=5
+        ) as response:
+            trajectory = json.loads(response.read().decode("utf-8"))["trajectory"]
+        assert trajectory["found"] is True
+        assert trajectory["turns"][0]["blocks"][0]["text"] == "preflight work"
+
+        undeclared_query = urllib.parse.urlencode({"path": str(undeclared_result)})
+        with urllib.request.urlopen(
+            f"{base}/api/cell-trajectory?{undeclared_query}", timeout=5
+        ) as response:
+            blocked = json.loads(response.read().decode("utf-8"))["trajectory"]
+        assert blocked == {
+            "found": False,
+            "error": "path outside dashboard allowlist",
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_stale_running_run_is_reclassified_as_stalled(tmp_path):
     """A run whose heartbeat went stale was abandoned; project it as 'stalled',
     not 'running', while preserving the declared state for transparency."""
