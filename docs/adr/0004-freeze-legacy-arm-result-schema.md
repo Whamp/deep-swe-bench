@@ -1,4 +1,4 @@
-# 0004 — Freeze the legacy `arm_*` result schema and `/arm` mount
+# 0004: Freeze the legacy `arm_*` names and `/arm` mount
 
 ## Context
 
@@ -20,10 +20,11 @@ perturbed.
 
 ## Decision
 
-Freeze, don't rename. The `arm_*` result fields, the `/arm:ro` mount, and the
-`arm_cfg` variable are a **frozen historical schema**, retained indefinitely.
-`CONTEXT.md`'s "_Avoid_: arm" applies to **new** names only; these existing
-surfaces are grandfathered and labelled legacy.
+Freeze the names, not the complete result schema. Retain the `arm_*` result
+fields, the `/arm:ro` mount, and the `arm_cfg` variable indefinitely.
+`CONTEXT.md`'s "_Avoid_: arm" applies to new names only. New result versions may
+add fields or migrate other data as long as they preserve the legacy `arm_*`
+fields and their meanings. ADR-0009 applies this rule to result schema v2.
 
 ## Considered options
 
@@ -41,5 +42,5 @@ surfaces are grandfathered and labelled legacy.
   surfaces are left alone.
 - `CONTEXT.md`'s `config` entry points here so the "_Avoid_: arm" rule is not
   read as "rename the legacy fields."
-- If `result.json` is ever versioned or migrated wholesale, fold this freeze
-  into that migration rather than doing it piecemeal.
+- Result schema migrations preserve the legacy `arm_*` fields unchanged. They
+  can add versioned fields and alter unrelated retention behavior.

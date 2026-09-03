@@ -876,6 +876,9 @@ def test_execute_command_default_pi_runner_uses_planned_workspace(
     result_path = plan_document["batchCells"][0]["resultPath"]
     assert isinstance(result_path, str)
     result = json.loads(Path(result_path).read_text())
+    assert result["result_schema_version"] == 2
+    assert result["verifier_summary"]["source_report"] is None
+    assert result["verifier_summary"]["nonpassing_tests"] == []
     assert result["fixture_runner_path"] == plan_document["subject"]["runner"]
     assert result["fixture_config_root"] == str(config_leaf.parents[1])
     assert result["fixture_config_leaf"] == str(config_leaf)

@@ -129,6 +129,14 @@ def _cell_artifact_kind(relative_path: str) -> str:
 
 
 def _load_cell_test_summary(cell_path: Path) -> dict[str, int] | None:
+    result_record = _load_json_object(cell_path / "result.json")
+    verifier_summary = result_record.get("verifier_summary")
+    compact_summary = (
+        verifier_summary.get("tests") if isinstance(verifier_summary, dict) else None
+    )
+    keys = ("tests", "passed", "failed", "skipped", "pending", "other")
+    if isinstance(compact_summary, dict):
+        return {key: int(_number(compact_summary.get(key))) for key in keys}
     candidates = (
         cell_path / "verifier" / "ctrf.json",
         cell_path / "verifier" / "reports" / "new-ctrf.json",
@@ -139,7 +147,6 @@ def _load_cell_test_summary(cell_path: Path) -> dict[str, int] | None:
         summary = results.get("summary") if isinstance(results, dict) else None
         if not isinstance(summary, dict):
             continue
-        keys = ("tests", "passed", "failed", "skipped", "pending", "other")
         return {key: int(_number(summary.get(key))) for key in keys}
     return None
 

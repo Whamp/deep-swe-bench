@@ -269,6 +269,9 @@ def test_recompute_failed_verifier_candidate_with_memory_override(
     assert archive.joinpath("verifier-recovery-candidate.json").is_file()
     assert not cell.joinpath("verifier-recovery-candidate.json").exists()
     result = json.loads(cell.joinpath("result.json").read_text())
+    assert result["result_schema_version"] == 2
+    assert result["verifier_summary"]["source_report"] is None
+    assert not cell.joinpath("verifier").exists()
     assert result["total_tokens"] == 123
     assert result["reward_binary"] == 1
     assert result["resource_policy"]["subject_memory_gib"] == 4.0

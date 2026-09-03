@@ -27,6 +27,10 @@ from harness.container_resources import (
     verifier_memory_events_shell_args,
 )
 from harness.lib import read_reward
+from harness.verifier_evidence import (
+    raw_verifier_retention_requested,
+    write_compact_verifier_result,
+)
 
 RecoveryAction = Literal["restore", "quarantine-for-rerun", "recompute-verifier"]
 _VERIFIER_EVIDENCE_FIELDS = {
@@ -392,8 +396,12 @@ def recompute_quarantined_verifier(
             verifier_memory_gib=operation.verifier_memory_gib,
         ),
     )
-    (staging / "result.json").write_text(
-        json.dumps(recomputed, indent=2, sort_keys=True) + "\n"
+    recomputed.pop("result_schema_version", None)
+    recomputed.pop("verifier_summary", None)
+    write_compact_verifier_result(
+        staging,
+        recomputed,
+        retain_raw_verifier_evidence=raw_verifier_retention_requested(),
     )
     if operation.source_record_name != "result.json":
         (staging / operation.source_record_name).unlink()

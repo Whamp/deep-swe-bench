@@ -25,8 +25,9 @@ Each cell is one `(task, config, rep)`:
    extension follow-up work finish before the harness stops the cell.
 4. Commit any uncommitted agent edits, then run the task's `pre_artifacts.sh` to
    produce `/logs/artifacts/model.patch`.
-5. Build/run the task verifier image with `--network none` and capture
-   `/logs/verifier/reward.json`.
+5. Build and run the task verifier image with `--network none`. Publish scores
+   and compact failed-test evidence in schema-v2 `result.json`, then remove the
+   duplicate raw verifier reports and stdout.
 6. Read usage from pi's native `session/*.jsonl`; the full RPC event stream is
    not persisted. Compact sidecars such as advisor `tool-usage.jsonl` are
    filtered live when needed (see `docs/adr/0002-retire-pi-jsonl-stream-capture.md`).
@@ -37,6 +38,24 @@ Each cell is one `(task, config, rep)`:
 
 The verifier always runs in a pristine separate container, matching DeepSWE's
 separate-verifier setup.
+
+## Result retention
+
+`result.json` keeps existing score, usage, config, and provenance fields. Schema
+v2 adds `verifier_summary` with aggregate test counts, all non-passing tests,
+bounded failure diagnostics, memory events, and raw-artifact accounting. The
+harness preserves `artifacts/model.patch`, sessions, initial context, and agent
+logs.
+
+Set `DEEP_SWE_RETAIN_RAW_VERIFIER_EVIDENCE=1` before a confirmed launch, draft
+probe, or verifier-only recovery when an investigation needs full CTRF, JUnit,
+raw suite logs, and verifier stdout.
+
+Use `scripts/compact_verifier_results.py` to migrate historical results. It is a
+dry-run unless passed `--apply`, and it preserves cells whose reward evidence
+disagrees with `result.json`. See
+[ADR-0009](docs/adr/0009-compact-verifier-evidence.md) for the schema, external
+archive requirement, migration commands, and quarantine ledger.
 
 ## Configs
 
@@ -321,9 +340,10 @@ non-empty patches, verifier reward, token/cost accounting, and paired analysis.
 Important: stock headless `observational-memory` DeepSWE runs are diagnostic for
 this benchmark regime unless compaction/projection is explicitly exercised. In
 single-shot `pi -p` cells, observations/reflections can be recorded and folded
-without becoming executor-visible before useful work. Those historical stock OM
-result dirs are quarantined under `results/_contaminated/om-no-executor-projection/`;
-see [`docs/result-quarantine.md`](docs/result-quarantine.md).
+without becoming executor-visible before useful work. The compact
+`results/_contaminated/om-no-executor-projection.jsonl` ledger retains those
+historical stock OM results; see
+[`docs/result-quarantine.md`](docs/result-quarantine.md).
 
 For memory-content isolation, use the explicit 4-arm design:
 
@@ -388,6 +408,8 @@ Completed run summaries and social-card graphics are under `reports/`.
 - `harness/parse_usage.py` — native-session token/cost parser (+ advisor tool-usage path).
 - `harness/lib.py` — shared helpers incl. `model_leaf()`.
 - `harness/container_resources.py` — confirmed Docker limits, labels, and cgroup OOM evidence.
+- `harness/verifier_evidence.py` — schema-v2 verifier summaries and guarded raw-file pruning.
+- `harness/results_retention.py` — historical compaction and quarantine-ledger operations.
 - `harness/Dockerfile.pi-agent` — task image + pinned pi layer.
 - `scripts/run_dashboard.py` — polling web dashboard for `results/_runs` and legacy track files.
 - `scripts/materialize_configs.py` — build `configs/` from provenance.
@@ -395,5 +417,6 @@ Completed run summaries and social-card graphics are under `reports/`.
 - `scripts/container_resource_supervisor.py` — singleton run-level host memory containment.
 - `scripts/container_memory_watchdog.py` — compatibility entrypoint for the resource supervisor.
 - `scripts/recover_quarantined_cells.py` — verifier-only recovery and result restoration.
+- `scripts/compact_verifier_results.py` — dry-run/apply CLI for result retention migrations.
 - `docs/result-quarantine.md` — local quarantine policy for invalid/diagnostic result dirs.
 - `docs/verifier-only-recovery.md` — rerun a failed verifier without another model call.

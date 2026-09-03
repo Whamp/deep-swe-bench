@@ -1208,6 +1208,59 @@ def test_cell_trajectory_inventories_artifacts_and_verifier_summary(tmp_path):
     }
 
 
+def test_cell_trajectory_reads_compact_verifier_summary(tmp_path: Path) -> None:
+    result = (
+        tmp_path
+        / "results"
+        / "m"
+        / "high"
+        / "cfg"
+        / "task-a"
+        / "rep0"
+        / "result.json"
+    )
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "result_schema_version": 2,
+                "verifier_summary": {
+                    "schema_version": 1,
+                    "tests": {
+                        "tests": 5,
+                        "passed": 3,
+                        "failed": 2,
+                        "skipped": 0,
+                        "pending": 0,
+                        "other": 0,
+                    },
+                    "nonpassing_tests": [],
+                    "raw_artifacts": {"bytes": 100, "file_count": 2},
+                },
+            }
+        )
+    )
+    _write_session(
+        result.parent / "session" / "s.jsonl",
+        [_assistant_turn([{"type": "text", "text": "Done."}])],
+    )
+
+    trajectory = run_dashboard.load_cell_trajectory(
+        str(result),
+        repo_root=tmp_path,
+        state_root=tmp_path / "results" / "_runs",
+    )
+
+    assert trajectory["test_summary"] == {
+        "tests": 5,
+        "passed": 3,
+        "failed": 2,
+        "skipped": 0,
+        "pending": 0,
+        "other": 0,
+    }
+
+
 def test_cell_session_native_pi_extracts_tools_and_intent(tmp_path):
     result = tmp_path / "results" / "m" / "h" / "c" / "task" / "rep0" / "result.json"
     result.parent.mkdir(parents=True, exist_ok=True)

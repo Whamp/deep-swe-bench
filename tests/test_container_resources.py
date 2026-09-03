@@ -34,6 +34,7 @@ def test_verifier_memory_events_shell_preserves_image_environment() -> None:
     assert "-l" not in arguments[1]
     assert "bash /tests/test.sh" in arguments[2]
     assert "/sys/fs/cgroup/memory.events" in arguments[2]
+    assert "chmod -R a+rwX /logs/verifier" in arguments[2]
 
 
 def test_container_resource_docker_args_enforce_memory_without_extra_swap() -> None:

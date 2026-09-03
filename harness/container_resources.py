@@ -16,7 +16,8 @@ _GIB_BYTES = 1024**3
 VERIFIER_MEMORY_EVENTS_SHELL_COMMAND = (
     "status=0; bash /tests/test.sh || status=$?; "
     "cat /sys/fs/cgroup/memory.events > "
-    '/logs/verifier/memory-events.txt; exit "$status"'
+    "/logs/verifier/memory-events.txt; "
+    'chmod -R a+rwX /logs/verifier; exit "$status"'
 )
 _LABEL_PREFIX = "deep-swe-bench"
 _CONTAINER_START_LOCK = "container-start.lock"

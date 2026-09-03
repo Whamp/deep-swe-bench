@@ -19,6 +19,7 @@ from harness import (
     confirmed_preflight,
     result_provenance,
     run_state,
+    verifier_evidence,
 )
 from harness.container_resources import (
     container_memory_result_fields,
@@ -949,7 +950,15 @@ def _run_confirmed_subject_cell(
             f"diagnostic={diagnostic!r}; "
             f"recovery_candidate={recovery_candidate_path}"
         )
+    result_record = verifier_evidence.with_compact_verifier_evidence(
+        cell.result_path.parent,
+        result_record,
+        retain_raw_verifier_evidence=(
+            verifier_evidence.raw_verifier_retention_requested()
+        ),
+    )
     run_state.atomic_write_json(cell.result_path, result_record)
+    verifier_evidence.prune_raw_verifier_evidence(cell.result_path.parent)
     _append_confirmed_cell_log(log_path, cell, "completed")
     return result_record
 

@@ -54,7 +54,9 @@ A verifier resource failure does not publish `result.json`. The launch instead w
      --apply
    ```
 
-Recovery publishes `result.json` only when the replacement verifier exits successfully and its cgroup evidence shows no resource exhaustion. It removes the stale candidate from the published cell, moves the original attempt to `sourceArchive`, and appends an auditable manifest record.
+Recovery publishes schema-v2 `result.json` only when the replacement verifier exits successfully and its cgroup evidence shows no resource exhaustion. It embeds compact verifier evidence and removes the raw verifier reports and stdout. It then removes the stale candidate, moves the original attempt to `sourceArchive`, and appends an auditable manifest record.
+
+Set `DEEP_SWE_RETAIN_RAW_VERIFIER_EVIDENCE=1` before recovery to keep the replacement verifier's raw files.
 
 The recovered result keeps the original subject usage and artifacts. It updates `resource_policy.verifier_memory_gib` to the limit actually used and records both limits under `verifier_recomputation`. Because the resource policy changed, the recovered result is not automatically compatible with the original lower-memory launch plan.
 

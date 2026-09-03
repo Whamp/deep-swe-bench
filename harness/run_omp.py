@@ -66,6 +66,10 @@ from run import (  # noqa: E402
     strip_patch_paths,
     transient_model_error,
 )
+from verifier_evidence import (  # noqa: E402
+    raw_verifier_retention_requested,
+    write_compact_verifier_result,
+)
 
 DEFAULT_MODEL = "openai-codex/gpt-5.5"
 DEFAULT_THINKING = "low"
@@ -538,7 +542,11 @@ def run_cell(
         **usage,
     )
     if persist_result_file:
-        (cell / "result.json").write_text(json.dumps(rec, indent=2))
+        rec = write_compact_verifier_result(
+            cell,
+            rec,
+            retain_raw_verifier_evidence=raw_verifier_retention_requested(),
+        )
     if persist_result_index:
         rl = results_tree.Tree.of(model, thinking, repo=REPO).results_jsonl
         rl.parent.mkdir(parents=True, exist_ok=True)
