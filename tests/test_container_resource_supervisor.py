@@ -39,6 +39,153 @@ def _container(
     )
 
 
+def _docker_inspection(name: str) -> str:
+    return json.dumps(
+        [
+            {
+                "Name": f"/{name}",
+                "Config": {
+                    "Labels": {
+                        "deep-swe-bench.run-key": "run-a",
+                        "deep-swe-bench.state-path": "/tmp/run-a",
+                        "deep-swe-bench.host-reserve-bytes": str(12 * 1024**3),
+                    }
+                },
+                "HostConfig": {"Memory": 12 * 1024**3},
+            }
+        ]
+    )
+
+
+def _mock_subprocess_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    responses: list[subprocess.CompletedProcess[str]],
+) -> list[list[str]]:
+    response_iterator = iter(responses)
+    commands: list[list[str]] = []
+
+    def fake_run(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        commands.append(command)
+        return next(response_iterator)
+
+    monkeypatch.setattr(resource_supervisor.subprocess, "run", fake_run)
+    return commands
+
+
+def test_read_managed_containers_resamples_after_docker_stats_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A container teardown race cannot terminate resource monitoring."""
+    commands = _mock_subprocess_sequence(
+        monkeypatch,
+        [
+            subprocess.CompletedProcess([], 0, "tearing-down\n", ""),
+            subprocess.CompletedProcess([], 0, _docker_inspection("tearing-down"), ""),
+            subprocess.CompletedProcess(
+                [],
+                1,
+                "tearing-down\t1GiB / 12GiB\n",
+                "EOF\n",
+            ),
+            subprocess.CompletedProcess([], 0, "remaining\n", ""),
+            subprocess.CompletedProcess([], 0, _docker_inspection("remaining"), ""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                "remaining\t2GiB / 12GiB\n",
+                "",
+            ),
+        ],
+    )
+
+    containers = resource_supervisor.read_managed_containers()
+
+    assert containers == [
+        ManagedContainer(
+            name="remaining",
+            run_key="run-a",
+            state_path=Path("/tmp/run-a"),
+            memory_usage_bytes=2 * 1024**3,
+            memory_limit_bytes=12 * 1024**3,
+            host_reserve_bytes=12 * 1024**3,
+        )
+    ]
+    assert commands[2][-1] == "tearing-down"
+    assert commands[5][-1] == "remaining"
+
+
+def test_read_managed_containers_raises_after_bounded_stats_eof_resampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistent Docker stats EOF errors fail hard after one resample."""
+    commands = _mock_subprocess_sequence(
+        monkeypatch,
+        [
+            subprocess.CompletedProcess([], 0, "container-a\n", ""),
+            subprocess.CompletedProcess([], 0, _docker_inspection("container-a"), ""),
+            subprocess.CompletedProcess([], 1, "", "EOF\n"),
+            subprocess.CompletedProcess([], 0, "container-a\n", ""),
+            subprocess.CompletedProcess([], 0, _docker_inspection("container-a"), ""),
+            subprocess.CompletedProcess([], 1, "", "EOF\n"),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="diagnostic='EOF'"):
+        resource_supervisor.read_managed_containers()
+
+    assert len(commands) == 6
+    assert sum(command[1] == "stats" for command in commands) == 2
+
+
+def test_read_managed_containers_does_not_retry_other_docker_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-teardown Docker failures remain immediate hard failures."""
+    commands = _mock_subprocess_sequence(
+        monkeypatch,
+        [
+            subprocess.CompletedProcess([], 0, "container-a\n", ""),
+            subprocess.CompletedProcess([], 0, _docker_inspection("container-a"), ""),
+            subprocess.CompletedProcess([], 1, "", "permission denied\n"),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="diagnostic='permission denied'"):
+        resource_supervisor.read_managed_containers()
+
+    assert len(commands) == 3
+    assert commands[-1][1] == "stats"
+
+
+def test_read_managed_containers_returns_normal_sample_without_resampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A complete Docker snapshot returns its resource accounting directly."""
+    commands = _mock_subprocess_sequence(
+        monkeypatch,
+        [
+            subprocess.CompletedProcess([], 0, "container-a\n", ""),
+            subprocess.CompletedProcess([], 0, _docker_inspection("container-a"), ""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                "container-a\t3GiB / 12GiB\n",
+                "",
+            ),
+        ],
+    )
+
+    containers = resource_supervisor.read_managed_containers()
+
+    assert containers[0].name == "container-a"
+    assert containers[0].memory_usage_bytes == 3 * 1024**3
+    assert len(commands) == 3
+
+
 def test_docker_memory_stats_require_every_managed_container() -> None:
     """Missing or malformed usage cannot silently bias run selection."""
     with pytest.raises(

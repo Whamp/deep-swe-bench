@@ -31,6 +31,11 @@ _MANAGED_LABEL = "deep-swe-bench.managed"
 _RUN_KEY_LABEL = "deep-swe-bench.run-key"
 _STATE_PATH_LABEL = "deep-swe-bench.state-path"
 _HOST_RESERVE_LABEL = "deep-swe-bench.host-reserve-bytes"
+_DOCKER_SNAPSHOT_ATTEMPTS = 2
+
+
+class _DockerStatsSnapshotRace(RuntimeError):
+    """Report Docker stats losing a container during one snapshot."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,8 +371,31 @@ def read_host_resource_snapshot() -> HostResourceSnapshot:
     return HostResourceSnapshot(available_memory_bytes=available_memory_bytes)
 
 
-def read_managed_containers() -> list[ManagedContainer]:
-    """Read labeled Docker containers, hard limits, and current aggregate usage."""
+def _require_docker_stats_output(names: Sequence[str]) -> str:
+    """Read Docker memory stats and identify a disappearing-container race."""
+    command = [
+        "docker",
+        "stats",
+        "--no-stream",
+        "--format",
+        "{{.Name}}\\t{{.MemUsage}}",
+        *names,
+    ]
+    completed = _run(command, timeout=60)
+    if completed.returncode != 0:
+        diagnostic = (completed.stdout + completed.stderr).strip()
+        message = (
+            "Container resource supervisor command failed: "
+            f"command={command!r}; diagnostic={diagnostic!r}"
+        )
+        if completed.stderr.strip() == "EOF":
+            raise _DockerStatsSnapshotRace(message)
+        raise RuntimeError(message)
+    return completed.stdout
+
+
+def _read_managed_containers_snapshot() -> list[ManagedContainer]:
+    """Read one labeled-container snapshot with limits and aggregate usage."""
     names = [
         line
         for line in _require_command_output(
@@ -391,17 +419,7 @@ def read_managed_containers() -> list[ManagedContainer]:
         raise TypeError(
             "Container resource supervisor inspection invalid: expected a list"
         )
-    stats = _require_command_output(
-        [
-            "docker",
-            "stats",
-            "--no-stream",
-            "--format",
-            "{{.Name}}\\t{{.MemUsage}}",
-            *names,
-        ],
-        timeout=60,
-    )
+    stats = _require_docker_stats_output(names)
     usage_by_name = parse_docker_memory_stats(
         stats,
         expected_names=names,
@@ -450,6 +468,17 @@ def read_managed_containers() -> list[ManagedContainer]:
             )
         )
     return sorted(containers, key=lambda container: container.name)
+
+
+def read_managed_containers() -> list[ManagedContainer]:
+    """Read managed containers, resampling one Docker stats teardown race."""
+    for attempt in range(_DOCKER_SNAPSHOT_ATTEMPTS):
+        try:
+            return _read_managed_containers_snapshot()
+        except _DockerStatsSnapshotRace:
+            if attempt + 1 == _DOCKER_SNAPSHOT_ATTEMPTS:
+                raise
+    raise AssertionError("Docker snapshot attempts unexpectedly exhausted")
 
 
 def _append_jsonl(path: Path, document: Mapping[str, object]) -> None:
