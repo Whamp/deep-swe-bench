@@ -471,7 +471,20 @@ def _read_managed_containers_snapshot() -> list[ManagedContainer]:
 
 
 def read_managed_containers() -> list[ManagedContainer]:
-    """Read managed containers, resampling one Docker stats teardown race."""
+    """Read managed containers with one finite Docker stats EOF resample.
+
+    Returns:
+        A complete labeled-container snapshot. The list is empty only when a
+        successful Docker listing reports no managed containers.
+
+    Raises:
+        _DockerStatsSnapshotRace: Docker stats reports EOF for both snapshot
+            attempts.
+        RuntimeError: A Docker command fails for any other reason. Non-EOF
+            failures are not retried.
+        TypeError: Docker inspection data has an invalid shape or ownership.
+        ValueError: Docker inspection JSON or memory stats are invalid.
+    """
     for attempt in range(_DOCKER_SNAPSHOT_ATTEMPTS):
         try:
             return _read_managed_containers_snapshot()

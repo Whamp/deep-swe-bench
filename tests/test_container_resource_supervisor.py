@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,33 @@ def _docker_inspection(name: str) -> str:
             }
         ]
     )
+
+
+def _successful_docker_snapshot(
+    name: str,
+    *,
+    usage_gib: int,
+) -> list[subprocess.CompletedProcess[str]]:
+    return [
+        subprocess.CompletedProcess([], 0, f"{name}\n", ""),
+        subprocess.CompletedProcess([], 0, _docker_inspection(name), ""),
+        subprocess.CompletedProcess(
+            [],
+            0,
+            f"{name}\t{usage_gib}GiB / 12GiB\n",
+            "",
+        ),
+    ]
+
+
+def _docker_stats_eof_snapshot(
+    name: str,
+) -> list[subprocess.CompletedProcess[str]]:
+    return [
+        subprocess.CompletedProcess([], 0, f"{name}\n", ""),
+        subprocess.CompletedProcess([], 0, _docker_inspection(name), ""),
+        subprocess.CompletedProcess([], 1, "", "EOF\n"),
+    ]
 
 
 def _mock_subprocess_sequence(
@@ -134,7 +162,7 @@ def test_read_managed_containers_raises_after_bounded_stats_eof_resampling(
         ],
     )
 
-    with pytest.raises(RuntimeError, match="diagnostic='EOF'"):
+    with pytest.raises(resource_supervisor._DockerStatsSnapshotRace):
         resource_supervisor.read_managed_containers()
 
     assert len(commands) == 6
@@ -184,6 +212,118 @@ def test_read_managed_containers_returns_normal_sample_without_resampling(
     assert containers[0].name == "container-a"
     assert containers[0].memory_usage_bytes == 3 * 1024**3
     assert len(commands) == 3
+
+
+def test_main_continues_polling_after_docker_stats_teardown_eof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The running supervisor survives teardown and completes another poll."""
+    commands = _mock_subprocess_sequence(
+        monkeypatch,
+        [
+            *_docker_stats_eof_snapshot("tearing-down"),
+            *_successful_docker_snapshot("remaining", usage_gib=2),
+            *_successful_docker_snapshot("remaining", usage_gib=3),
+        ],
+    )
+    monkeypatch.setattr(
+        resource_supervisor,
+        "read_host_resource_snapshot",
+        lambda: HostResourceSnapshot(available_memory_bytes=48 * 1024**3),
+    )
+    stop_supervisor: Callable[[int, object], None] | None = None
+    sleep_intervals: list[float] = []
+
+    def fake_signal(
+        signum: int,
+        handler: Callable[[int, object], None],
+    ) -> None:
+        nonlocal stop_supervisor
+        if signum == resource_supervisor.signal.SIGTERM:
+            stop_supervisor = handler
+
+    def fake_sleep(interval: float) -> None:
+        sleep_intervals.append(interval)
+        if len(sleep_intervals) == 2:
+            assert stop_supervisor is not None
+            stop_supervisor(resource_supervisor.signal.SIGTERM, None)
+
+    monkeypatch.setattr(resource_supervisor.signal, "signal", fake_signal)
+    monkeypatch.setattr(resource_supervisor.time, "sleep", fake_sleep)
+    event_log = tmp_path / "events.ndjson"
+    pidfile = tmp_path / "supervisor.pid"
+
+    exit_code = resource_supervisor.main(
+        [
+            "--interval",
+            "0.25",
+            "--event-log",
+            str(event_log),
+            "--pidfile",
+            str(pidfile),
+        ]
+    )
+
+    events = [json.loads(line) for line in event_log.read_text().splitlines()]
+    assert exit_code == 0
+    assert [event["event"] for event in events] == [
+        "resource_supervisor_started",
+        "resource_supervisor_stopped",
+    ]
+    assert sleep_intervals == [0.25, 0.25]
+    assert [command[-1] for command in commands if command[1] == "stats"] == [
+        "tearing-down",
+        "remaining",
+        "remaining",
+    ]
+    assert not pidfile.exists()
+
+
+def test_main_raises_after_persistent_docker_stats_eof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The main loop fails closed when both Docker snapshots end in EOF."""
+    commands = _mock_subprocess_sequence(
+        monkeypatch,
+        [
+            *_docker_stats_eof_snapshot("container-a"),
+            *_docker_stats_eof_snapshot("container-a"),
+        ],
+    )
+    monkeypatch.setattr(
+        resource_supervisor,
+        "read_host_resource_snapshot",
+        lambda: HostResourceSnapshot(available_memory_bytes=48 * 1024**3),
+    )
+    monkeypatch.setattr(resource_supervisor.signal, "signal", lambda *args: None)
+    sleep_intervals: list[float] = []
+    monkeypatch.setattr(
+        resource_supervisor.time,
+        "sleep",
+        lambda interval: sleep_intervals.append(interval),
+    )
+    event_log = tmp_path / "events.ndjson"
+    pidfile = tmp_path / "supervisor.pid"
+
+    with pytest.raises(resource_supervisor._DockerStatsSnapshotRace):
+        resource_supervisor.main(
+            [
+                "--interval",
+                "0.25",
+                "--event-log",
+                str(event_log),
+                "--pidfile",
+                str(pidfile),
+            ]
+        )
+
+    events = [json.loads(line) for line in event_log.read_text().splitlines()]
+    assert [event["event"] for event in events] == ["resource_supervisor_started"]
+    assert sleep_intervals == []
+    assert len(commands) == 6
+    assert not pidfile.exists()
 
 
 def test_docker_memory_stats_require_every_managed_container() -> None:
